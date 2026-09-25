@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gates:
+    name: gates (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain pinned in rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - name: Restore the cargo build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: rustfmt
+        run: |
+          cargo fmt --all --check \
+            || { echo "::error::rustfmt found unformatted code. Fix: run 'cargo fmt --all' and commit the result."; exit 1; }
+
+      - name: clippy
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings \
+            || { echo "::error::clippy found violations. Fix: run 'cargo clippy --workspace --all-targets -- -D warnings' locally and clear every warning."; exit 1; }
+
+      - name: tests
+        run: |
+          cargo test --workspace \
+            || { echo "::error::tests failed. Fix: run 'cargo test --workspace' locally, make it pass, and commit."; exit 1; }
+
+      - name: docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --workspace --no-deps \
+            || { echo "::error::rustdoc found broken intra-doc links or other warnings. Fix: run 'RUSTDOCFLAGS=\"-D warnings\" cargo doc --workspace --no-deps' locally and repair the docs."; exit 1; }
+
+      - name: cargo-deny
+        run: |
+          cargo deny check \
+            || { echo "::error::cargo-deny rejected the dependency graph (licence, source, duplicate or advisory). Fix: run 'cargo deny check' locally and follow its report."; exit 1; }
+
+  wasm:
+    name: wasm-safety
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain pinned in rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - name: Restore the cargo build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Keep ks-lang and ks-core free of non-workspace dependencies
+        shell: bash
+        run: |
+          if ! graph=$(cargo tree -p ks-lang -p ks-core -e normal --target wasm32-unknown-unknown --prefix none); then
+            echo "::error::'cargo tree' failed to resolve the workspace. Fix: check the Cargo.toml dependency declarations."
+            exit 1
+          fi
+          names=$(printf '%s\n' "$graph" | sed -E 's/ v[0-9].*$//' | grep -v '^$' | sort -u || true)
+          echo "wasm32-unknown-unknown dependency graph of ks-lang and ks-core:"
+          echo "$names"
+          violations=$(printf '%s\n' "$names" | grep -vE '^(ks-lang|ks-core)$' || true)
+          if [ -n "$violations" ]; then
+            echo "::error::ks-lang/ks-core are not wasm-safe: non-workspace dependencies found. Fix: keep both crates free of external dependencies (no tokio/mio/socket2/async-std) and free of std::fs/std::net."
+            echo "Offending entries:"
+            echo "$violations"
+            exit 1
+          fi
+
+      - name: Build ks-lang and ks-core for wasm32-unknown-unknown
+        run: |
+          cargo build -p ks-lang -p ks-core --target wasm32-unknown-unknown \
+            || { echo "::error::wasm32-unknown-unknown build failed. Fix: run 'cargo build -p ks-lang -p ks-core --target wasm32-unknown-unknown' locally; ks-lang and ks-core must stay I/O-free (no std::fs, no std::net, no tokio)."; exit 1; }

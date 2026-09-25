@@ -1,0 +1,8 @@
+# Ports, policy and ADRs are the load-bearing contracts — a maintainer reviews changes to them.
+*                                   @ParallelEntrepreneur
+/docs/adr/                          @ParallelEntrepreneur
+/crates/core/src/ports/             @ParallelEntrepreneur
+**/policy/                          @ParallelEntrepreneur
+**/policy.rs                        @ParallelEntrepreneur
+/deny.toml                          @ParallelEntrepreneur
+/.github/                           @ParallelEntrepreneur

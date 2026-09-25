@@ -2,11 +2,11 @@
 
 **Deploys you can read.** One typed workflow file per repo (`ship.ks`). It builds your images, plans and applies your infrastructure, waits for a human and deploys. It's checked before anything runs, and it runs the same on your laptop as in CI.
 
-This repository will hold the engine, the checker, the `keepshipping` CLI, the language server and the built-in steps. **Nothing here runs yet.** It holds this README, a placeholder licence and the first architecture decision record. The plan is in the issues, starting with the master plan, [#1](https://github.com/Keep-Shipping/harness/issues/1). The site, [keepshipping.run](https://keepshipping.run), shows the planned design: its workflow files, CLI output and timings aren't measurements.
+This repository will hold the engine, the checker, the `keepshipping` CLI, the language server and the built-in steps. **Nothing here runs yet.** The workspace skeleton is in place — crates with no product logic, the CI gates, the contributor docs and the ADR index — next to a placeholder licence and the first architecture decision record. The plan is in the issues, starting with the master plan, [#1](https://github.com/Keep-Shipping/harness/issues/1). The site, [keepshipping.run](https://keepshipping.run), shows the planned design: its workflow files, CLI output and timings aren't measurements.
 
 ## How it will be built
 
-Keep Shipping is a **harness** in the style of Factory Zero's [Cratefield harness](https://github.com/Cratefield/harness): a small Rust core, **ports** (traits), and **adapters** (the only vendor-aware code), composed at compile time.
+Keep Shipping is a **harness** in the style of Factory Zero's [Cratefield harness](https://github.com/Cratefield/harness): a small Rust core, **ports** (traits), and **adapters** (the only vendor-aware code), composed at compile time. The layering and the crate map are documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 > **Steps only see ports.**
 > A step never talks to a Docker socket, a cloud SDK, a CI environment variable or a model API directly. It asks for an `ImageBuilder`, a `Registry`, an `IacTool`, an `ApprovalChannel`. Adapters answer. That's what lets the same engine run the same file on a laptop and in CI: only the `RunContext` and the adapters change.
@@ -30,20 +30,20 @@ adapters/*: buildkit, oci-distribution, sigstore, tofu-cli, kube, ssh, deno scri
 
 Step families (`oci.*`, `tofu.*` / `terraform.*`, `k8s.*`, `vm.*`, `fn.*`, `approval`, `decide`, TypeScript scripts) implement one `StepKind` trait, the way Cratefield modules implement `Module`. `Harness::build()` refuses a composition where a step needs a port nobody provides, where two steps claim the same name, or where a step was built against a different contract version.
 
-### Planned crates
+### Crates
 
-| Crate | Role |
-|---|---|
-| `ks-lang` | Lexer, parser, lossless syntax tree with spans, formatter. No I/O, wasm-safe |
-| `ks-core` | Type system, checker, diagnostics registry, the `StepKind` trait, port traits, the `Harness` builder |
-| `ks-engine` | DAG planner and executor, run state (park and resume), policy enforcement, run log |
-| `ks-cli` | The `keepshipping` binary |
-| `ks-lsp` | Language server (`keepshipping lsp`) |
-| `ks-testing` | Fakes for every port, plus the conformance kits steps and adapters must pass |
-| `steps/*` | Built-in step families |
-| `adapters/*` | One crate per vendor integration |
-| `sdk/ts` | `@keepshipping/sdk` for TypeScript escape-hatch steps |
-| `ventures/keepshipping` | The optional hosted parts (waitlist, web approvals, run-log viewer, blocks index) as a Cratefield venture |
+| Path | Crate | Role |
+|---|---|---|
+| `crates/lang` | `ks-lang` | Lexer, parser, lossless syntax tree with spans, formatter. No I/O, wasm-safe |
+| `crates/core` | `ks-core` | Type system, checker, diagnostics registry, the `StepKind` trait, port traits, the `Harness` builder |
+| `crates/engine` | `ks-engine` | DAG planner and executor, run state (park and resume), policy enforcement, run log |
+| `crates/cli` | `ks-cli` | The `keepshipping` binary |
+| `crates/lsp` | `ks-lsp` | Language server (`keepshipping lsp`) |
+| `crates/testing` | `ks-testing` | Fakes for every port, plus the conformance kits steps and adapters must pass, and the ADR guard test |
+| `steps/*` | — | Built-in step families (later epic) |
+| `adapters/*` | — | One crate per vendor integration (later epic) |
+| `sdk/ts` | — | `@keepshipping/sdk` for TypeScript escape-hatch steps (later epic) |
+| `ventures/keepshipping` | — | The optional hosted parts (waitlist, web approvals, run-log viewer, blocks index) as a Cratefield venture (later epic) |
 
 The language and the layout are proposals until their ADRs are accepted: [#2](https://github.com/Keep-Shipping/harness/issues/2) (Rust), [#3](https://github.com/Keep-Shipping/harness/issues/3) (ports and adapters) and [#4](https://github.com/Keep-Shipping/harness/issues/4) (syntax).
 
@@ -59,11 +59,11 @@ The language and the layout are proposals until their ADRs are accepted: [#2](ht
 ## Contributing
 
 Conventions follow the Cratefield harness:
-- architecture changes go through a new ADR in [`docs/adr`](docs/adr), never by editing an accepted one;
+- architecture changes go through a new ADR in [`docs/adr`](docs/adr/README.md), never by editing an accepted one;
 - conventional commits with the issue number last;
-- merge gates `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` and `cargo doc` with `-D warnings`, plus `cargo deny`.
+- merge gates `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo doc --workspace --no-deps` with `-D warnings`, `cargo deny check`, plus the `wasm32-unknown-unknown` build of `ks-lang` and `ks-core`.
 
-`CONTRIBUTING.md` lands with the workspace scaffold.
+Start with [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Licence
 

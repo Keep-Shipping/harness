@@ -1,0 +1,18 @@
+[package]
+name = "ks-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "keepshipping"
+path = "src/main.rs"
+
+[dependencies]
+ks-engine.workspace = true
+
+[lints]
+workspace = true

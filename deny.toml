@@ -1,0 +1,38 @@
+# cargo-deny configuration (schema version 2). Run: cargo deny check
+# This workspace has no external dependencies yet; the lists below are the
+# permissive licences we expect to accumulate over time.
+
+[licenses]
+version = 2
+
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSD-Source-Code",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Zlib",
+]
+
+# Workspace crates are proprietary (LicenseRef-KeepShipping-Proprietary) and
+# unpublished (publish = false), so licence checks skip them entirely.
+private = { ignore = true }
+
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Internal path dependencies keep their own version, not a wildcard req.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[advisories]
+version = 2

@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.98"
+license = "LicenseRef-KeepShipping-Proprietary"
+publish = false
+repository = "https://github.com/Keep-Shipping/harness"
+
+[workspace.dependencies]
+ks-lang = { path = "crates/lang", version = "0.0.0" }
+ks-core = { path = "crates/core", version = "0.0.0" }
+ks-engine = { path = "crates/engine", version = "0.0.0" }
+ks-cli = { path = "crates/cli", version = "0.0.0" }
+ks-lsp = { path = "crates/lsp", version = "0.0.0" }
+ks-testing = { path = "crates/testing", version = "0.0.0" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
