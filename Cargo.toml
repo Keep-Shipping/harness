@@ -17,6 +17,7 @@ ks-engine = { path = "crates/engine", version = "0.0.0" }
 ks-cli = { path = "crates/cli", version = "0.0.0" }
 ks-lsp = { path = "crates/lsp", version = "0.0.0" }
 ks-testing = { path = "crates/testing", version = "0.0.0" }
+sha2 = "0.10"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
