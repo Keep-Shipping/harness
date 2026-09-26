@@ -10,5 +10,8 @@ repository.workspace = true
 [dependencies]
 ks-core.workspace = true
 
+[dev-dependencies]
+ks-testing.workspace = true
+
 [lints]
 workspace = true
