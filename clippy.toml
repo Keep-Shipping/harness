@@ -1,0 +1,3 @@
+# Shared clippy configuration. Note: crates/lang and crates/core each carry
+# their own clippy.toml (nearest file wins) that adds I/O bans for wasm safety.
+msrv = "1.98"
