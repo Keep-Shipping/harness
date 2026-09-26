@@ -1,0 +1,90 @@
+FILE@0..199
+  ENTRY@0..199
+    KEY@0..6 "policy"
+    COLON@6..7 ":"
+    NEWLINE@7..8 "\n"
+    ENTRY@8..199
+      INDENT@8..10 "  "
+      KEY@10..16 "agents"
+      COLON@16..17 ":"
+      NEWLINE@17..18 "\n"
+      ENTRY@18..65
+        INDENT@18..22 "    "
+        KEY@22..25 "can"
+        COLON@25..26 ":"
+        VALUE@26..65
+          WHITESPACE@26..30 "    "
+          TUPLE@30..64
+            PHRASE@30..35
+              WORD@30..35
+                WORD_TEXT@30..35 "check"
+            COMMA@35..36 ","
+            WHITESPACE@36..37 " "
+            PHRASE@37..42
+              WORD@37..42
+                WORD_TEXT@37..42 "build"
+            COMMA@42..43 ","
+            WHITESPACE@43..44 " "
+            PHRASE@44..48
+              WORD@44..48
+                WORD_TEXT@44..48 "plan"
+            COMMA@48..49 ","
+            WHITESPACE@49..50 " "
+            PHRASE@50..64
+              WORD@50..56
+                WORD_TEXT@50..56 "deploy"
+              WHITESPACE@56..57 " "
+              WORD@57..64
+                WORD_TEXT@57..64 "staging"
+          NEWLINE@64..65 "\n"
+      ENTRY@65..87
+        INDENT@65..69 "    "
+        KEY@69..72 "ask"
+        COLON@72..73 ":"
+        VALUE@73..87
+          WHITESPACE@73..77 "    "
+          TUPLE@77..86
+            PHRASE@77..86
+              WORD@77..86
+                WORD_TEXT@77..86 "@platform"
+          NEWLINE@86..87 "\n"
+      ENTRY@87..127
+        INDENT@87..91 "    "
+        KEY@91..97 "before"
+        COLON@97..98 ":"
+        VALUE@98..127
+          WHITESPACE@98..99 " "
+          TUPLE@99..126
+            PHRASE@99..104
+              WORD@99..104
+                WORD_TEXT@99..104 "apply"
+            COMMA@104..105 ","
+            WHITESPACE@105..106 " "
+            PHRASE@106..117
+              WORD@106..112
+                WORD_TEXT@106..112 "deploy"
+              WHITESPACE@112..113 " "
+              WORD@113..117
+                WORD_TEXT@113..117 "prod"
+            COMMA@117..118 ","
+            WHITESPACE@118..119 " "
+            PHRASE@119..126
+              WORD@119..126
+                WORD_TEXT@119..126 "destroy"
+          NEWLINE@126..127 "\n"
+      ENTRY@127..152
+        INDENT@127..131 "    "
+        KEY@131..136 "never"
+        COLON@136..137 ":"
+        VALUE@137..152
+          WHITESPACE@137..139 "  "
+          TUPLE@139..151
+            PHRASE@139..151
+              WORD@139..143
+                WORD_TEXT@139..143 "read"
+              WHITESPACE@143..144 " "
+              WORD@144..151
+                WORD_TEXT@144..151 "secrets"
+          NEWLINE@151..152 "\n"
+      COMMENT@152..198 "# humans follow the same file, minus the leash"
+      NEWLINE@198..199 "\n"

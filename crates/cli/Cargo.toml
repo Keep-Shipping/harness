@@ -12,7 +12,9 @@ name = "keepshipping"
 path = "src/main.rs"
 
 [dependencies]
+ks-core.workspace = true
 ks-engine.workspace = true
+ks-lang.workspace = true
 
 [lints]
 workspace = true

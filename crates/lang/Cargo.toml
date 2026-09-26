@@ -9,3 +9,7 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "parse"
+harness = false

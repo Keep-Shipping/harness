@@ -30,6 +30,8 @@ cargo build -p ks-lang -p ks-core --target wasm32-unknown-unknown
 
 CI also checks with `cargo tree` that `ks-lang` and `ks-core` pull in no tokio or native-only dependencies.
 
+Nightly CI additionally fuzzes the parser for 10 minutes ([`fuzz/`](fuzz)) and runs the `ks-lang` parse benchmark. Try the fuzzer yourself: `cargo +nightly fuzz run parse --target x86_64-unknown-linux-gnu` (the target is explicit because cargo-fuzz 0.13's static-musl default cannot link the sanitizer), and time the parser with `cargo bench -p ks-lang`.
+
 ## Commits
 
 One commit per issue, conventional-commit format with the issue number last:
