@@ -6,5 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod harness;
 pub mod ids;
 pub mod ports;
+pub mod step;
