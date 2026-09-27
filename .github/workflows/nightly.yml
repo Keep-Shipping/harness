@@ -1,0 +1,78 @@
+name: Nightly
+
+on:
+  schedule:
+    # Daily at 03:17 UTC — off-peak for both Europe and the US.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz (10 min)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly (minimal profile)
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+          rustup show nightly
+
+      - name: Restore the cargo build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Seed the corpus from the test fixtures
+        run: |
+          mkdir -p fuzz/corpus/parse
+          cp crates/lang/tests/fixtures/*.ks fuzz/corpus/parse/
+
+      # --target x86_64-unknown-linux-gnu: cargo-fuzz 0.13 defaults to static
+      # musl, where the address sanitizer cannot link.
+      - name: Fuzz the parser for 10 minutes
+        run: |
+          cargo +nightly fuzz run parse --target x86_64-unknown-linux-gnu -- -max_total_time=600 \
+            || { echo "::error::The fuzzer found a failure (crash, timeout or broken invariant). Fix: download the fuzz-artifacts upload, reproduce with 'cargo +nightly fuzz run parse --target x86_64-unknown-linux-gnu <artifact>', minimise it, and fix the root cause."; exit 1; }
+
+      - name: Upload fuzzing artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
+  bench:
+    name: bench (500-line parse under 5 ms)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain pinned in rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - name: Restore the cargo build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: benchmark
+        run: |
+          cargo bench -p ks-lang \
+            || { echo "::error::The parse benchmark exceeded its 5 ms budget for a 500-line file. Fix: run 'cargo bench -p ks-lang' locally, profile the regression, and bring the median back under budget."; exit 1; }

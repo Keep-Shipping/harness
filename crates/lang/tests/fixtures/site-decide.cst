@@ -1,0 +1,144 @@
+FILE@0..278
+  ENTRY@0..143
+    INDENT@0..2 "  "
+    KEY@2..6 "risk"
+    COLON@6..7 ":"
+    VALUE@7..18
+      WHITESPACE@7..11 "    "
+      TUPLE@11..17
+        PHRASE@11..17
+          WORD@11..17
+            WORD_TEXT@11..17 "decide"
+      NEWLINE@17..18 "\n"
+    ENTRY@18..44
+      INDENT@18..22 "    "
+      KEY@22..27 "model"
+      COLON@27..28 ":"
+      VALUE@28..44
+        WHITESPACE@28..31 "   "
+        TUPLE@31..43
+          PHRASE@31..43
+            WORD@31..43
+              WORD_TEXT@31..43 "typesafe/jev"
+        NEWLINE@43..44 "\n"
+    ENTRY@44..83
+      INDENT@44..48 "    "
+      KEY@48..51 "ask"
+      COLON@51..52 ":"
+      VALUE@52..83
+        WHITESPACE@52..57 "     "
+        TUPLE@57..82
+          PHRASE@57..82
+            STRING@57..82
+              QUOTE@57..58 "\""
+              STRING_TEXT@58..81 "How risky is this plan?"
+              QUOTE@81..82 "\""
+        NEWLINE@82..83 "\n"
+    ENTRY@83..109
+      INDENT@83..87 "    "
+      KEY@87..92 "input"
+      COLON@92..93 ":"
+      VALUE@93..109
+        WHITESPACE@93..96 "   "
+        TUPLE@96..108
+          PHRASE@96..108
+            WORD@96..108
+              WORD_TEXT@96..108 "plan.changes"
+        NEWLINE@108..109 "\n"
+    ENTRY@109..142
+      INDENT@109..113 "    "
+      KEY@113..120 "returns"
+      COLON@120..121 ":"
+      VALUE@121..142
+        WHITESPACE@121..122 " "
+        TUPLE@122..141
+          UNION@122..141
+            PHRASE@122..125
+              WORD@122..125
+                WORD_TEXT@122..125 "low"
+            WHITESPACE@125..126 " "
+            PIPE@126..127 "|"
+            WHITESPACE@127..128 " "
+            PHRASE@128..134
+              WORD@128..134
+                WORD_TEXT@128..134 "medium"
+            WHITESPACE@134..135 " "
+            PIPE@135..136 "|"
+            WHITESPACE@136..137 " "
+            PHRASE@137..141
+              WORD@137..141
+                WORD_TEXT@137..141 "high"
+        NEWLINE@141..142 "\n"
+    NEWLINE@142..143 "\n"
+  ENTRY@143..278
+    INDENT@143..145 "  "
+    KEY@145..151 "review"
+    COLON@151..152 ":"
+    VALUE@152..163
+      WHITESPACE@152..154 "  "
+      TUPLE@154..162
+        PHRASE@154..162
+          WORD@154..162
+            WORD_TEXT@154..162 "approval"
+      NEWLINE@162..163 "\n"
+    ENTRY@163..233
+      INDENT@163..167 "    "
+      KEY@167..171 "auto"
+      COLON@171..172 ":"
+      VALUE@172..233
+        WHITESPACE@172..176 "    "
+        TUPLE@176..232
+          AND_EXPR@176..232
+            IS_TEST@176..196
+              PHRASE@176..180
+                WORD@176..180
+                  WORD_TEXT@176..180 "risk"
+              WHITESPACE@180..181 " "
+              KEYWORD@181..183 "is"
+              WHITESPACE@183..184 " "
+              PHRASE@184..187
+                WORD@184..187
+                  WORD_TEXT@184..187 "low"
+              WHITESPACE@187..188 " "
+              OP@188..191 "≥"
+              WHITESPACE@191..192 " "
+              PHRASE@192..196
+                WORD@192..196
+                  WORD_TEXT@192..196 "0.95"
+            NEWLINE@196..197 "\n"
+            INDENT@197..210 "             "
+            KEYWORD@210..213 "and"
+            WHITESPACE@213..214 " "
+            COMPARE@214..232
+              PHRASE@214..227
+                WORD@214..227
+                  WORD_TEXT@214..227 "plan.destroys"
+              WHITESPACE@227..228 " "
+              OP@228..230 "=="
+              WHITESPACE@230..231 " "
+              PHRASE@231..232
+                WORD@231..232
+                  WORD_TEXT@231..232 "0"
+        NEWLINE@232..233 "\n"
+    ENTRY@233..278
+      INDENT@233..237 "    "
+      KEY@237..241 "else"
+      COLON@241..242 ":"
+      VALUE@242..278
+        WHITESPACE@242..246 "    "
+        TUPLE@246..277
+          PHRASE@246..259
+            WORD@246..249
+              WORD_TEXT@246..249 "ask"
+            WHITESPACE@249..250 " "
+            WORD@250..259
+              WORD_TEXT@250..259 "@platform"
+          COMMA@259..260 ","
+          WHITESPACE@260..261 " "
+          PHRASE@261..277
+            WORD@261..265
+              WORD_TEXT@261..265 "show"
+            WHITESPACE@265..266 " "
+            WORD@266..277
+              WORD_TEXT@266..277 "risk.reason"
+        NEWLINE@277..278 "\n"

@@ -1,0 +1,94 @@
+FILE@0..219
+  COMMENT@0..31 "# acme/blocks · web-service@v3"
+  NEWLINE@31..32 "\n"
+  ENTRY@32..52
+    KEY@32..37 "block"
+    COLON@37..38 ":"
+    VALUE@38..52
+      WHITESPACE@38..40 "  "
+      TUPLE@40..51
+        PHRASE@40..51
+          WORD@40..51
+            WORD_TEXT@40..51 "web-service"
+      NEWLINE@51..52 "\n"
+  ENTRY@52..219
+    KEY@52..58 "inputs"
+    COLON@58..59 ":"
+    NEWLINE@59..60 "\n"
+    ENTRY@60..83
+      INDENT@60..62 "  "
+      KEY@62..67 "image"
+      COLON@67..68 ":"
+      VALUE@68..83
+        WHITESPACE@68..72 "    "
+        TUPLE@72..82
+          PHRASE@72..82
+            WORD@72..82
+              WORD_TEXT@72..82 "oci.Digest"
+        NEWLINE@82..83 "\n"
+    ENTRY@83..102
+      INDENT@83..85 "  "
+      KEY@85..91 "domain"
+      COLON@91..92 ":"
+      VALUE@92..102
+        WHITESPACE@92..95 "   "
+        TUPLE@95..101
+          PHRASE@95..101
+            WORD@95..101
+              WORD_TEXT@95..101 "string"
+        NEWLINE@101..102 "\n"
+    ENTRY@102..122
+      INDENT@102..104 "  "
+      KEY@104..112 "replicas"
+      COLON@112..113 ":"
+      VALUE@113..122
+        WHITESPACE@113..114 " "
+        DEFAULT@114..121
+          TUPLE@114..117
+            PHRASE@114..117
+              WORD@114..117
+                WORD_TEXT@114..117 "int"
+          WHITESPACE@117..118 " "
+          OP@118..119 "="
+          WHITESPACE@119..120 " "
+          TUPLE@120..121
+            PHRASE@120..121
+              WORD@120..121
+                WORD_TEXT@120..121 "2"
+        NEWLINE@121..122 "\n"
+    NEWLINE@122..123 "\n"
+    COMMENT@123..136 "# in any repo"
+    NEWLINE@136..137 "\n"
+    ENTRY@137..219
+      INDENT@137..139 "  "
+      KEY@139..145 "deploy"
+      COLON@145..146 ":"
+      VALUE@146..169
+        WHITESPACE@146..149 "   "
+        TUPLE@149..168
+          PHRASE@149..168
+            WORD@149..168
+              WORD_TEXT@149..168 "acme/web-service@v3"
+        NEWLINE@168..169 "\n"
+      ENTRY@169..194
+        INDENT@169..173 "    "
+        KEY@173..178 "image"
+        COLON@178..179 ":"
+        VALUE@179..194
+          WHITESPACE@179..181 "  "
+          TUPLE@181..193
+            PHRASE@181..193
+              WORD@181..193
+                WORD_TEXT@181..193 "build.digest"
+          NEWLINE@193..194 "\n"
+      ENTRY@194..219
+        INDENT@194..198 "    "
+        KEY@198..204 "domain"
+        COLON@204..205 ":"
+        VALUE@205..219
+          WHITESPACE@205..206 " "
+          TUPLE@206..218
+            PHRASE@206..218
+              WORD@206..218
+                WORD_TEXT@206..218 "api.acme.dev"
+          NEWLINE@218..219 "\n"
