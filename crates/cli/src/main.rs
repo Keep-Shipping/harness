@@ -6,12 +6,14 @@
 use std::io::{IsTerminal, Write as _};
 use std::process::ExitCode;
 
+use ks_core::ports::run_context::ActorKind;
 use ks_core::{Trigger, TriggerKind};
 use ks_lang::Diagnostic;
 
 const USAGE: &str = concat!(
     "usage: keepshipping <check|run> [FILE]",
-    " [--env NAME] [--event \"push main\"] [--non-interactive]"
+    " [--env NAME] [--event \"push main\"] [--actor human|agent|ci]",
+    " [--secrets] [--non-interactive]"
 );
 
 fn main() -> ExitCode {
@@ -30,16 +32,32 @@ struct Options {
     file: String,
     env: Option<String>,
     event: Option<String>,
+    /// The actor the command would run as; a human unless `--actor` says
+    /// otherwise. Policy rules that bind the actor are enforced at check
+    /// time.
+    actor: ActorKind,
+    secrets: bool,
     non_interactive: bool,
 }
 
-fn parse_args(args: &[String]) -> Option<Options> {
-    let mut o = Options { file: "ship.ks".into(), env: None, event: None, non_interactive: false };
+/// `--secrets` belongs to `check` alone; `run` rejects it as the unknown
+/// flag it is there, like any other unrecognized option.
+fn parse_args(args: &[String], secrets: bool) -> Option<Options> {
+    let mut o = Options {
+        file: "ship.ks".into(),
+        env: None,
+        event: None,
+        actor: ActorKind::Human,
+        secrets: false,
+        non_interactive: false,
+    };
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--env" => o.env = Some(flag_value(&mut rest)?),
             "--event" => o.event = Some(flag_value(&mut rest)?),
+            "--actor" => o.actor = actor_kind(&flag_value(&mut rest)?)?,
+            "--secrets" if secrets => o.secrets = true,
             "--non-interactive" => o.non_interactive = true,
             flag if flag.starts_with('-') => return None,
             file => o.file = file.to_string(),
@@ -48,8 +66,19 @@ fn parse_args(args: &[String]) -> Option<Options> {
     Some(o)
 }
 
-/// The value after `--env`/`--event`. A missing value, or another flag where
-/// a value belongs, is a usage error instead of a silently swallowed option.
+/// `--actor human|agent|ci`; anything else is a usage error.
+fn actor_kind(text: &str) -> Option<ActorKind> {
+    match text {
+        "human" => Some(ActorKind::Human),
+        "agent" => Some(ActorKind::Agent),
+        "ci" => Some(ActorKind::Ci),
+        _ => None,
+    }
+}
+
+/// The value after `--env`/`--event`/`--actor`. A missing value, or another
+/// flag where a value belongs, is a usage error instead of a silently
+/// swallowed option.
 fn flag_value(rest: &mut std::slice::Iter<'_, String>) -> Option<String> {
     let value = rest.next()?;
     (!value.starts_with('-')).then(|| value.clone())
@@ -57,7 +86,9 @@ fn flag_value(rest: &mut std::slice::Iter<'_, String>) -> Option<String> {
 
 /// Parse and check `file`, printing every diagnostic as
 /// `file:line:col: severity: message`. Fails when the file cannot be read.
-fn load(file: &str) -> Option<(String, ks_core::Checked)> {
+/// The check runs as `actor`, so a policy rule binding the actor refuses the
+/// file before any run could start.
+fn load(file: &str, actor: ActorKind) -> Option<(String, ks_core::Checked)> {
     let src = match std::fs::read_to_string(file) {
         Ok(src) => src,
         Err(e) => {
@@ -65,7 +96,9 @@ fn load(file: &str) -> Option<(String, ks_core::Checked)> {
             return None;
         }
     };
-    let checked = ks_core::check(&ks_lang::parse(&src));
+    let catalog = ks_core::Catalog::builtin();
+    let options = ks_core::CheckOptions::new(&catalog).actor(actor);
+    let checked = ks_core::check_with(&ks_lang::parse(&src), &options);
     let lines = Lines::new(&src);
     for d in &checked.diagnostics {
         let (line, col) = lines.line_col(&src, d.span.start);
@@ -110,11 +143,16 @@ impl Lines {
 }
 
 fn check(args: &[String]) -> ExitCode {
-    let Some(o) = parse_args(args) else {
+    let Some(o) = parse_args(args, true) else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    let Some((_, checked)) = load(&o.file) else { return ExitCode::from(2) };
+    let Some((_, checked)) = load(&o.file, o.actor) else { return ExitCode::from(2) };
+    // The listing comes after the diagnostics and does not soften the exit
+    // code: a file with errors is still a failed check.
+    if o.secrets {
+        print_secrets(&checked);
+    }
     if has_errors(&checked) {
         ExitCode::from(1)
     } else {
@@ -123,16 +161,36 @@ fn check(args: &[String]) -> ExitCode {
     }
 }
 
+/// The `--secrets` listing: per environment, the secret references its
+/// resolver must serve and the steps that need them. Purely a projection of
+/// the checked file — no resolver is ever constructed and no store, env var
+/// or backend is read, so the listing is safe to run anywhere.
+fn print_secrets(checked: &ks_core::Checked) {
+    for env in ks_core::secret_requirements(checked) {
+        if env.requirements.is_empty() {
+            println!("{}: (none)", env.env);
+            continue;
+        }
+        for r in env.requirements {
+            let steps = r.steps.join(", ");
+            match &r.reference {
+                Some(reference) => println!("{}: {reference} ({steps})", env.env),
+                None => println!("{}: {} ({steps}) [no `secrets:` resolver]", env.env, r.key),
+            }
+        }
+    }
+}
+
 fn has_errors(checked: &ks_core::Checked) -> bool {
     checked.diagnostics.iter().any(|d| matches!(d.severity, ks_lang::Severity::Error))
 }
 
 fn run(args: &[String]) -> ExitCode {
-    let Some(o) = parse_args(args) else {
+    let Some(o) = parse_args(args, false) else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    let Some((_, checked)) = load(&o.file) else { return ExitCode::from(2) };
+    let Some((_, checked)) = load(&o.file, o.actor) else { return ExitCode::from(2) };
     if has_errors(&checked) {
         return ExitCode::from(1);
     }

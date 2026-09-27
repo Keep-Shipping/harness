@@ -36,6 +36,10 @@ pub enum CompositionError {
     NullType { step: String, field: String },
     /// A field's default does not match the field's (resolved) type.
     DefaultTypeMismatch { step: String, field: String },
+    /// A `type_def` tried to redefine one of the built-in named types.
+    ReservedTypeName { name: String },
+    /// A step's schema declares an output of type `Secret`; secrets flow into steps, never out.
+    SecretOutput { step: String, output: String },
 }
 
 impl fmt::Display for CompositionError {
@@ -72,6 +76,15 @@ impl fmt::Display for CompositionError {
                 write!(
                     f,
                     "step {step:?} field {field:?} has a default that does not match its type"
+                )
+            }
+            CompositionError::ReservedTypeName { name } => {
+                write!(f, "type {name:?} is built in and cannot be redefined")
+            }
+            CompositionError::SecretOutput { step, output } => {
+                write!(
+                    f,
+                    "step {step:?} output {output:?} declares type Secret, but outputs cannot be secrets"
                 )
             }
         }
@@ -145,14 +158,22 @@ impl HarnessBuilder {
     }
 
     /// Checks the whole composition and builds the harness, collecting every error: the clock
-    /// check first, then per step in registration order — duplicate names, port lists, step
-    /// API, and each schema field's type, null rule and default.
+    /// check and reserved type names first, then per step in registration order — duplicate
+    /// names, port lists, step API, secret outputs, and each schema field's type, null rule
+    /// and default.
     pub fn build(self) -> Result<Harness, BuildErrors> {
         let HarnessBuilder { ports, steps, types } = self;
         let mut errors = Vec::new();
 
         if ports.clock().is_none() {
             errors.push(CompositionError::MissingClock);
+        }
+
+        // The built-in names belong to the language; a `type_def` may not shadow them.
+        for def in types.values() {
+            if built_in(def.name).is_some() {
+                errors.push(CompositionError::ReservedTypeName { name: def.name.to_string() });
+            }
         }
 
         let mut name_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
@@ -193,7 +214,16 @@ impl HarnessBuilder {
                     found: step.step_api(),
                 });
             }
+            // In v1 secrets flow into steps, never out of them.
             let schema = step.schema();
+            for field in &schema.outputs {
+                if field.ty == TypeRef::Named("Secret") {
+                    errors.push(CompositionError::SecretOutput {
+                        step: name.to_string(),
+                        output: field.name.to_string(),
+                    });
+                }
+            }
             for field in schema.inputs.iter().chain(&schema.outputs) {
                 let resolved = resolve_in(&types, &field.ty);
                 if resolved == Some(ValueType::Null) {
@@ -277,7 +307,8 @@ impl Harness {
         self.ports.clock().expect("build() refuses a harness without a Clock")
     }
 
-    /// Resolves a type reference against the registered type definitions.
+    /// Resolves a type reference against the registered type definitions and the built-in
+    /// named types.
     pub fn resolve(&self, ty: &TypeRef) -> Option<ValueType> {
         resolve_in(&self.types, ty)
     }
@@ -366,11 +397,33 @@ impl Harness {
     }
 }
 
-/// Resolves a [`TypeRef`] against the registered definitions.
+/// The language's built-in named types, resolvable without an explicit `type_def` so TS steps
+/// and third-party steps can declare them. Registering a `type_def` with one of these names is
+/// refused ([`CompositionError::ReservedTypeName`]).
+const BUILT_IN_TYPES: &[TypeDef] = &[
+    TypeDef {
+        name: "Secret",
+        base: ValueType::String,
+        doc: "a secret reference, resolved per environment; never materialised at check time",
+    },
+    TypeDef { name: "duration", base: ValueType::String, doc: "a duration, e.g. `30s` or `1m`" },
+    TypeDef { name: "path", base: ValueType::String, doc: "a filesystem path" },
+    TypeDef { name: "url", base: ValueType::String, doc: "an absolute URL" },
+    TypeDef { name: "int", base: ValueType::Number, doc: "a whole number" },
+];
+
+/// The built-in named type with this name, if any.
+fn built_in(name: &str) -> Option<TypeDef> {
+    BUILT_IN_TYPES.iter().copied().find(|def| def.name == name)
+}
+
+/// Resolves a [`TypeRef`] against the registered definitions and the built-in named types.
 fn resolve_in(types: &BTreeMap<&'static str, TypeDef>, ty: &TypeRef) -> Option<ValueType> {
     match ty {
         TypeRef::Builtin(base) => Some(*base),
-        TypeRef::Named(name) => types.get(name).map(|def| def.base),
+        TypeRef::Named(name) => {
+            types.get(name).map(|def| def.base).or_else(|| built_in(name).map(|def| def.base))
+        }
     }
 }
 
@@ -562,6 +615,37 @@ mod tests {
                     r#"step "scale.app" field "replicas" has a default that does not match its type"#,
                 ],
             ),
+            (
+                "an output typed Secret",
+                clocked_builder().step(TestStep {
+                    schema: StepSchema {
+                        doc: "a step for tests",
+                        inputs: vec![Field::new(
+                            "token",
+                            TypeRef::Named("Secret"),
+                            "the registry token",
+                        )],
+                        outputs: vec![Field::new(
+                            "token",
+                            TypeRef::Named("Secret"),
+                            "the registry token",
+                        )],
+                    },
+                    ..step("registry.login")
+                }),
+                &[
+                    r#"step "registry.login" output "token" declares type Secret, but outputs cannot be secrets"#,
+                ],
+            ),
+            (
+                "a redefined built-in type",
+                clocked_builder().type_def(TypeDef {
+                    name: "Secret",
+                    base: ValueType::Number,
+                    doc: "not the language's Secret",
+                }),
+                &[r#"type "Secret" is built in and cannot be redefined"#],
+            ),
         ];
         for (case, builder, expected) in cases {
             let errors = builder.build().expect_err(case);
@@ -678,5 +762,64 @@ mod tests {
         ));
         outputs.remove("surprise");
         assert_eq!(harness.check_outputs(step.as_ref(), &outputs), Ok(()));
+    }
+
+    /// The built-in named types resolve without an explicit `type_def`; unregistered names
+    /// stay unknown.
+    #[test]
+    fn built_in_types_resolve_without_a_type_def() {
+        let harness = clocked_builder().build().expect("nothing needs registering");
+        for (name, base) in [
+            ("Secret", ValueType::String),
+            ("duration", ValueType::String),
+            ("path", ValueType::String),
+            ("url", ValueType::String),
+            ("int", ValueType::Number),
+        ] {
+            assert_eq!(harness.resolve(&TypeRef::Named(name)), Some(base), "{name}");
+        }
+        assert_eq!(harness.resolve(&TypeRef::Named("digest")), None);
+    }
+
+    /// A `Secret` input is welcome — the built-in name resolves without a
+    /// `type_def` — while a `Secret` output is refused at build time. The
+    /// run-time halves live in the `prepare_inputs`/`check_outputs` tests.
+    #[test]
+    fn secret_inputs_are_typed_like_strings_but_secret_outputs_are_refused() {
+        let builder = clocked_builder().step(TestStep {
+            schema: StepSchema {
+                doc: "a step for tests",
+                inputs: vec![
+                    Field::new("token", TypeRef::Named("Secret"), "the registry token")
+                        .with_default(Value::from("env:REGISTRY_TOKEN")),
+                ],
+                outputs: vec![Field::new("image", TypeRef::Named("Secret"), "the pushed image")],
+            },
+            ..step("registry.push")
+        });
+        assert!(matches!(
+            builder.build(),
+            Err(BuildErrors(errors))
+                if errors == vec![CompositionError::SecretOutput {
+                    step: "registry.push".to_string(),
+                    output: "image".to_string(),
+                }]
+        ));
+
+        let harness = clocked_builder()
+            .step(TestStep {
+                schema: StepSchema {
+                    doc: "a step for tests",
+                    inputs: vec![
+                        Field::new("token", TypeRef::Named("Secret"), "the registry token")
+                            .with_default(Value::from("env:REGISTRY_TOKEN")),
+                    ],
+                    outputs: vec![Field::new("image", TypeRef::Named("path"), "the pushed image")],
+                },
+                ..step("registry.push")
+            })
+            .build()
+            .expect("a Secret input is fine");
+        assert!(harness.step("registry.push").is_some(), "built-in `Secret` resolves");
     }
 }

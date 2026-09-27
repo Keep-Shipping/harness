@@ -6,20 +6,157 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use ks_lang::{Atom, Diagnostic, Entry, Expr, Span, StrPart, Word};
 
-use crate::catalog::{self, StepSpec, Ty};
-use crate::types::Type;
-use crate::workflow::{Env, Step, Trigger, TriggerKind, Workflow, implicit_default};
+use crate::catalog::{Catalog, StepTypes};
+use crate::ports::run_context::ActorKind;
+use crate::ports::secrets::SecretRef;
+use crate::types::{self, LiteralFit, Type};
+use crate::workflow::{
+    Env, NeverRule, Policy, Step, Trigger, TriggerKind, Workflow, implicit_default,
+};
 
 /// A checked file: the workflow it declares plus every diagnostic, parser
 /// and checker findings alike, sorted into source order.
 pub struct Checked {
     pub workflow: Workflow,
     pub diagnostics: Vec<Diagnostic>,
+    /// The type of every expression the checker typed: input values,
+    /// references, interpolations, sub-expressions.
+    /// [`Checked::type_at`] finds the entry to show at an offset.
+    pub types: Vec<(Span, Type)>,
+    /// Every `secrets.<name>` reference, in source order.
+    /// [`secret_requirements`] turns these into per-environment listings.
+    pub secret_uses: Vec<SecretUse>,
 }
 
-/// Type-check `parse` and build its [`Workflow`].
+impl Checked {
+    /// The innermost typed expression covering `offset`: its span and the
+    /// type the checker gave it. Ties go to the later record — the more
+    /// specific demand.
+    pub fn type_at(&self, offset: u32) -> Option<(Span, &Type)> {
+        self.types
+            .iter()
+            .filter(|(s, _)| s.contains(offset) || offset == s.end)
+            .max_by_key(|(s, _)| std::cmp::Reverse(s.len()))
+            .map(|(s, t)| (*s, t))
+    }
+}
+
+/// One `secrets.<name>` reference: the key, where it appears and the step
+/// that consumes it. Names and spans only — never a value.
+#[derive(Clone, Debug)]
+pub struct SecretUse {
+    /// The name under `secrets.` (`db_url` for `secrets.db_url`).
+    pub key: String,
+    /// Where the reference appears.
+    pub span: Span,
+    /// The step whose input consumes the secret.
+    pub step: String,
+}
+
+/// What one environment must provide for a run: the secrets the workflow
+/// names, as the environment's resolver serves them, with the steps that
+/// need each ([#27](https://github.com/Keep-Shipping/harness/issues/27)).
+#[derive(Clone, Debug)]
+pub struct EnvSecrets {
+    /// The environment's name.
+    pub env: String,
+    /// The `secrets:` resolver the environment reads from, when it declares
+    /// one.
+    pub resolver: Option<String>,
+    /// The secrets the run needs here, deduplicated, in first-use order.
+    pub requirements: Vec<SecretRequirement>,
+}
+
+/// One secret an environment must provide.
+#[derive(Clone, Debug)]
+pub struct SecretRequirement {
+    /// The key the workflow names: `db_url` for `secrets.db_url`.
+    pub key: String,
+    /// The `resolver:key` reference for this environment; `None` when the
+    /// environment declares no `secrets:` resolver. A reference — never a
+    /// value.
+    pub reference: Option<SecretRef>,
+    /// The steps that consume the secret, in declaration order.
+    pub steps: Vec<String>,
+}
+
+/// What each environment must provide for `checked` to run: per declared
+/// environment (or the implicit `default` when the file has no `envs:`),
+/// every `secrets.<name>` the workflow references, spelled as the
+/// environment's [`SecretRef`]s plus the steps that need them. Pure: it
+/// reads the checked file only, so no caller can reach a secret store
+/// through it — nothing is resolved, and no value exists here.
+#[must_use]
+pub fn secret_requirements(checked: &Checked) -> Vec<EnvSecrets> {
+    let uses = &checked.secret_uses;
+    let mut keys: Vec<&str> = Vec::new();
+    for u in uses {
+        if !keys.contains(&u.key.as_str()) {
+            keys.push(&u.key);
+        }
+    }
+    checked
+        .workflow
+        .envs()
+        .iter()
+        .map(|env| EnvSecrets {
+            env: env.name.clone(),
+            resolver: env.secrets.clone(),
+            requirements: keys
+                .iter()
+                .map(|key| {
+                    let mut steps: Vec<String> = Vec::new();
+                    for u in uses.iter().filter(|u| u.key == *key) {
+                        if !steps.contains(&u.step) {
+                            steps.push(u.step.clone());
+                        }
+                    }
+                    SecretRequirement {
+                        key: (*key).to_string(),
+                        reference: env.secrets.as_ref().map(|r| SecretRef::new(r, *key)),
+                        steps,
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Type-check `parse` and build its [`Workflow`], against the built-in
+/// [`Catalog`].
 pub fn check(parse: &ks_lang::Parse) -> Checked {
-    let mut c = Ctx { diags: parse.diagnostics().to_vec(), ..Ctx::default() };
+    let builtin = Catalog::builtin();
+    check_with(parse, &CheckOptions::new(&builtin))
+}
+
+/// Options for [`check_with`]: the catalog to check against, and — when the
+/// caller knows it — the actor the run would start under, so policy rules
+/// that bind that actor are enforced.
+pub struct CheckOptions<'a> {
+    pub(crate) catalog: &'a Catalog,
+    pub(crate) actor: Option<ActorKind>,
+}
+
+impl<'a> CheckOptions<'a> {
+    /// Checks against `catalog` instead of the built-in one.
+    pub fn new(catalog: &'a Catalog) -> CheckOptions<'a> {
+        CheckOptions { catalog, actor: None }
+    }
+
+    /// Checks the file as `actor` running it: a policy rule that binds the
+    /// actor is enforced, so an agent run needing secrets an
+    /// `agents: never: read secrets` rule forbids is refused here, before
+    /// anything starts.
+    #[must_use]
+    pub fn actor(mut self, actor: ActorKind) -> CheckOptions<'a> {
+        self.actor = Some(actor);
+        self
+    }
+}
+
+/// Type-check `parse` and build its [`Workflow`], against `options`.
+pub fn check_with(parse: &ks_lang::Parse, options: &CheckOptions<'_>) -> Checked {
+    let mut c = Ctx::new(options.catalog, options.actor, parse.diagnostics().to_vec());
     c.file(parse.file());
     c.finish_all()
 }
@@ -35,12 +172,15 @@ const TRIGGER_KINDS: [&str; 5] = ["push", "pr", "tag", "manual", "schedule"];
 
 const ENV_PROPERTIES: [&str; 5] = ["secrets", "ci-only", "approvers", "on", "vars"];
 
-#[derive(Default)]
-struct Ctx {
+struct Ctx<'a> {
+    catalog: &'a Catalog,
+    /// The actor the run would start under, when the caller knows it; policy
+    /// rules that bind it are enforced.
+    actor: Option<ActorKind>,
     diags: Vec<Diagnostic>,
     env_names: Vec<String>,
     env_vars: Vec<String>,
-    steps: Vec<StepInfo>,
+    steps: Vec<StepInfo<'a>>,
     /// `steps` names to indices, so a reference resolves in O(1); a linear
     /// scan made checking quadratic on files with many steps.
     index: HashMap<String, usize>,
@@ -49,14 +189,20 @@ struct Ctx {
     name: Option<String>,
     triggers: Vec<Trigger>,
     envs: Vec<Env>,
+    /// The `never:` rules the file declares.
+    policy: Policy,
+    /// Every `secrets.<name>` reference, in source order.
+    secret_uses: Vec<SecretUse>,
+    /// The type of every expression typed so far, for editor hover.
+    types: Vec<(Span, Type)>,
 }
 
-struct StepInfo {
+struct StepInfo<'a> {
     name: String,
     span: Span,
     kind_name: Option<String>,
     kind_span: Span,
-    spec: Option<&'static StepSpec>,
+    spec: Option<&'a StepTypes>,
     /// `decide` only: the answers declared under `returns:`.
     variants: Vec<String>,
 }
@@ -69,13 +215,37 @@ struct Edge {
     span: Span,
 }
 
-impl Ctx {
+impl<'a> Ctx<'a> {
+    fn new(catalog: &'a Catalog, actor: Option<ActorKind>, diags: Vec<Diagnostic>) -> Ctx<'a> {
+        Ctx {
+            catalog,
+            actor,
+            diags,
+            env_names: Vec::new(),
+            env_vars: Vec::new(),
+            steps: Vec::new(),
+            index: HashMap::new(),
+            edges: Vec::new(),
+            shown: Vec::new(),
+            name: None,
+            triggers: Vec::new(),
+            envs: Vec::new(),
+            policy: Policy::default(),
+            secret_uses: Vec::new(),
+            types: Vec::new(),
+        }
+    }
+
     fn err(&mut self, span: Span, message: impl Into<String>) {
         self.diags.push(Diagnostic::error(span, message));
     }
 
     fn err_hint(&mut self, span: Span, message: impl Into<String>, hint: impl Into<String>) {
         self.diags.push(Diagnostic::error(span, message).with_hint(hint));
+    }
+
+    fn record(&mut self, span: Span, ty: Type) {
+        self.types.push((span, ty));
     }
 
     fn file(&mut self, file: ks_lang::File<'_>) {
@@ -140,7 +310,7 @@ impl Ctx {
                 }
                 _ => (None, span),
             };
-            let spec = kind_name.as_deref().and_then(catalog::find);
+            let spec = kind_name.as_deref().and_then(|n| self.catalog.step(n));
             let variants = match spec.filter(|sp| sp.decision) {
                 Some(_) => s
                     .children()
@@ -191,10 +361,10 @@ impl Ctx {
             self.ty_of(idx, &e); // unknown kind: inputs unchecked, refs resolve
             return;
         };
-        let Some(ty) = catalog::input(spec, iname) else {
+        let Some(ty) = spec.input(iname) else {
             let span = input.key_span();
             let msg = format!("unknown input `{iname}` for step kind `{}`", spec.name);
-            match suggest(iname, &catalog::input_names(spec)) {
+            match suggest(iname, &spec.input_names()) {
                 Some(s) => self.err_hint(span, msg, format!("did you mean `{s}`?")),
                 None => self.err(span, msg),
             }
@@ -209,59 +379,148 @@ impl Ctx {
     }
 
     /// Check a value expression against the input's declared type.
-    fn demand_input(&mut self, idx: usize, ty: Ty, e: &Expr<'_>) {
+    fn demand_input(&mut self, idx: usize, want: Type, e: &Expr<'_>) {
+        // A typed default (`replicas: int = 2`): the annotation types the
+        // value, and the default must be a literal of it.
+        if let Some((word, ann, rhs)) = annotation_default(e) {
+            self.demand(word.node.span(), want, ann.clone(), None);
+            self.demand_input(idx, ann.clone(), rhs);
+            self.record(e.span(), ann);
+            return;
+        }
         // Strings report their own interpolations once (`str_typed`); for
         // every other shape this reference walk is the only check.
-        if !interp_allowed(ty) && !matches!(e, Expr::Atom { atom: Atom::Str(_), .. }) {
+        if !interp_allowed(&want) && !matches!(e, Expr::Atom { atom: Atom::Str(_), .. }) {
             for r in e.refs() {
                 if r.kind == ks_lang::NameKind::Interp {
                     self.err_hint(
                         r.span,
-                        format!("interpolation is not allowed in a `{}` value", ty.to_type()),
+                        format!("interpolation is not allowed in a `{want}` value"),
                         "interpolate only into string values",
                     );
                 }
             }
         }
         match e {
-            Expr::Atom { atom: Atom::Word(w), .. } => self.word_typed(idx, w, ty),
+            Expr::Atom { atom: Atom::Word(w), .. } => self.word_typed(idx, w, want),
             Expr::Atom { atom: Atom::Str(s), .. } => {
-                let got = self.str_typed(idx, s, ty);
-                self.demand(e.span(), ty, got, None);
+                let got = self.str_typed(idx, s, &want);
+                self.demand_literal(e.span(), want, got, Some(&s.value()));
             }
             Expr::Atom { atom: Atom::Paren { inner: Some(inner), .. }, .. } => {
-                self.demand_input(idx, ty, inner)
+                self.demand_input(idx, want, inner)
             }
+            Expr::Tuple { items, .. } => self.tuple_input(idx, items, want, e.span()),
             other => {
                 let got = self.ty_of(idx, other);
-                self.demand(other.span(), ty, got, None);
+                self.demand(other.span(), want, got, None);
             }
         }
     }
 
+    /// A tuple value: element-wise into a list or a record (positionally),
+    /// else a list of whatever its items spell.
+    fn tuple_input(&mut self, idx: usize, items: &[Expr<'_>], want: Type, span: Span) {
+        match &want {
+            Type::List(inner) => {
+                let inner = (**inner).clone();
+                for item in items {
+                    self.demand_input(idx, inner.clone(), item);
+                }
+            }
+            Type::Record(fields) => {
+                if items.len() != fields.len() {
+                    for item in items {
+                        self.ty_of(idx, item);
+                    }
+                    self.err(span, format!("expected {want}, got {} items", items.len()));
+                    return;
+                }
+                for (item, (_, ty)) in items.iter().zip(fields) {
+                    self.demand_input(idx, ty.clone(), item);
+                }
+            }
+            _ => {
+                let mut same: Option<Type> = None;
+                for item in items {
+                    let t = self.ty_of(idx, item);
+                    same = match same {
+                        None => Some(t),
+                        Some(u) if u == t => Some(u),
+                        _ => Some(Type::Any),
+                    };
+                }
+                let got = Type::List(Box::new(same.unwrap_or(Type::Any)));
+                self.demand(span, want, got, None);
+            }
+        }
+    }
+
+    /// Check a literal — a bare word or a quoted string — against `want`.
+    /// Literals are spelled into the type the input declares (`./x` is a
+    /// path, a member names its enum variant, a pasted digest warns);
+    /// anything else is the type mismatch it looks like.
+    fn demand_literal(&mut self, span: Span, want: Type, got: Type, text: Option<&str>) {
+        // A word the reference walk could not type is judged as the literal
+        // it spells, not as `any`.
+        let untyped = got == Type::Any && !matches!(want, Type::Any);
+        // The one `literal_fit` verdict, when a literal text can and must be
+        // judged: an untyped word always, a typed one only when the coercion
+        // below would fail.
+        let fit = text.and_then(|text| {
+            (untyped || !types::coerce(&want, &got)).then(|| (text, self.literal_fit(&want, text)))
+        });
+        match fit {
+            Some((_, LiteralFit::Ok)) => self.record(span, want),
+            Some((_, LiteralFit::Warn { message, hint })) => {
+                self.warn_hint(span, message, hint);
+                self.record(span, want);
+            }
+            // The word spells no literal of `want`: name what it does spell.
+            Some((text, LiteralFit::Err)) if untyped => {
+                self.demand(span, want, types::literal_type(text), None);
+            }
+            _ => {
+                if types::coerce(&want, &got) {
+                    self.record(span, if got == Type::Any { want } else { got });
+                } else {
+                    self.demand(span, want, got, None);
+                }
+            }
+        }
+    }
+
+    fn warn_hint(&mut self, span: Span, message: String, hint: String) {
+        self.diags.push(Diagnostic::warning(span, message).with_hint(hint));
+    }
+
+    /// [`types::literal`], with the catalog's answer for where a pasted
+    /// digest should have come from.
+    fn literal_fit(&self, want: &Type, text: &str) -> LiteralFit {
+        types::literal(want, text, self.digest_alt(want).as_deref())
+    }
+
     /// A bare word in a typed input position.
-    fn word_typed(&mut self, idx: usize, w: &Word<'_>, ty: Ty) {
+    fn word_typed(&mut self, idx: usize, w: &Word<'_>, want: Type) {
         let span = w.node.span();
         if w.scalar() == ks_lang::Scalar::DottedName {
             let Some((target, got)) = self.resolve_ref(idx, w.text(), span) else { return };
-            let want = ty.to_type();
-            let hint = match target {
-                Some(t) if !accepts(&want, &got) => self.steps[t]
-                    .spec
-                    .and_then(|sp| catalog::alt_output(sp, &want))
-                    .map(|alt| format!("did you mean `{}.{alt}`?", self.steps[t].name)),
-                _ => None,
+            let hint = if types::coerce(&want, &got) {
+                None
+            } else {
+                target.and_then(|t| self.mismatch_hint(t, &want))
             };
-            self.demand(span, ty, got, hint);
+            self.demand(span, want, got, hint);
         } else {
+            let text = w.text();
             let got = self.word_untyped(idx, w);
             // A word in a `push:` position is itself the tag literal.
-            let got = if ty == Ty::Named("oci.Tag") && got == Type::String {
-                Type::Named("oci.Tag")
+            let got = if got == Type::String && want.is_named("oci.Tag") {
+                Type::Named("oci.Tag".to_string())
             } else {
                 got
             };
-            self.demand(span, ty, got, None);
+            self.demand_literal(span, want, got, Some(text));
         }
     }
 
@@ -301,28 +560,30 @@ impl Ctx {
 
     /// A `{name}` interpolation: always a reference; never a secret.
     fn interp(&mut self, idx: usize, name: &str, span: Span) {
-        if let Some((_, ty)) = self.resolve_ref(idx, name, span)
-            && ty == Type::Secret
-        {
-            self.err_hint(
-                span,
-                format!("secret `{name}` cannot be interpolated into a string"),
-                "pass it to an input that takes a secret; secrets never go into strings or logs",
-            );
+        if let Some((_, ty)) = self.resolve_ref(idx, name, span) {
+            if ty == Type::Secret {
+                self.err_hint(
+                    span,
+                    format!("secret `{name}` cannot be interpolated into a string"),
+                    "pass it to an input that takes a secret; secrets never go into strings or logs",
+                );
+            } else {
+                self.record(span, ty);
+            }
         }
     }
 
     /// A quoted string; interpolations resolve as everywhere else.
-    fn str_typed(&mut self, idx: usize, s: &ks_lang::Str<'_>, ty: Ty) -> Type {
+    fn str_typed(&mut self, idx: usize, s: &ks_lang::Str<'_>, want: &Type) -> Type {
         for part in s.parts() {
             if let StrPart::Interp(i) = part
                 && let Some(name) = i.name()
             {
                 let span = i.name_span().unwrap_or_else(|| i.node.span());
-                if !interp_allowed(ty) {
+                if !interp_allowed(want) {
                     self.err_hint(
                         span,
-                        format!("interpolation is not allowed in a `{}` value", ty.to_type()),
+                        format!("interpolation is not allowed in a `{want}` value"),
                         "interpolate only into string values",
                     );
                 } else {
@@ -330,18 +591,59 @@ impl Ctx {
                 }
             }
         }
-        if ty == Ty::Named("oci.Tag") { Type::Named("oci.Tag") } else { Type::String }
+        if want.is_named("oci.Tag") { Type::Named("oci.Tag".to_string()) } else { Type::String }
     }
 
-    fn demand(&mut self, span: Span, ty: Ty, got: Type, hint: Option<String>) {
-        let want = ty.to_type();
-        if accepts(&want, &got) {
+    fn demand(&mut self, span: Span, want: Type, got: Type, hint: Option<String>) {
+        if types::coerce(&want, &got) {
+            self.record(span, if got == Type::Any { want } else { got });
             return;
         }
+        let message = format!("expected {want}, got {got}");
+        let hint = hint.or_else(|| secret_hint(&want, &got));
         match hint {
-            Some(h) => self.err_hint(span, format!("expected `{want}`, got `{got}`"), h),
-            None => self.err(span, format!("expected `{want}`, got `{got}`")),
+            Some(h) => self.err_hint(span, message, h),
+            None => self.err(span, message),
         }
+    }
+
+    /// The did-you-mean for a type mismatch: another output of the same
+    /// step that has the wanted type. The hint quotes the wanted type's
+    /// rationale when the catalog declares one
+    /// (`use build.digest so prod runs exactly the image you built`).
+    fn mismatch_hint(&self, target: usize, want: &Type) -> Option<String> {
+        let spec = self.steps[target].spec?;
+        let out = self.alt_output(spec, want)?;
+        let name = &self.steps[target].name;
+        Some(match self.catalog.rationale(want) {
+            Some(r) => format!("use {name}.{out} {r}"),
+            None => format!("use {name}.{out}, which is {} {want}", article(&want.to_string())),
+        })
+    }
+
+    /// Another output of `spec` with the wanted type; for a `decide`, the
+    /// `answer` output for one of its declared answers.
+    fn alt_output(&self, spec: &StepTypes, want: &Type) -> Option<String> {
+        spec.outputs
+            .iter()
+            .find(|(_, ty)| !matches!(ty, Type::Any) && types::coerce(want, ty))
+            .map(|(n, _)| n.clone())
+            .or_else(|| {
+                (spec.decision && matches!(want, Type::Decision(_))).then(|| "answer".to_string())
+            })
+    }
+
+    /// A same-workflow output of the wanted nominal type — where a pasted
+    /// digest should have come from instead (`build.digest`). With several
+    /// producers, the first in declaration order is suggested.
+    fn digest_alt(&self, want: &Type) -> Option<String> {
+        if !matches!(want, Type::Named(_)) {
+            return None;
+        }
+        self.steps.iter().find_map(|s| {
+            let spec = s.spec?;
+            spec.outputs.iter().find(|(_, ty)| ty == want).map(|(n, _)| format!("{}.{}", s.name, n))
+        })
     }
 
     // --- references -------------------------------------------------------
@@ -375,6 +677,18 @@ impl Ctx {
             return Some((Some(i), self.step_ref(i, rest, span)));
         }
         if let Some(t) = self.context(first, rest, span) {
+            // A secret reference is a requirement the run carries, wherever
+            // it appears — record it for the per-environment listing and the
+            // policy check.
+            if first == "secrets"
+                && let Some(name) = rest
+            {
+                self.secret_uses.push(SecretUse {
+                    key: name.to_string(),
+                    span,
+                    step: self.steps[cur].name.clone(),
+                });
+            }
             return Some((None, t));
         }
         let mut cands: Vec<&str> = self.steps.iter().map(|s| s.name.as_str()).collect();
@@ -404,9 +718,12 @@ impl Ctx {
             return Type::Any; // run-time output: the name is not verified
         }
         let spec = self.steps[i].spec;
-        match spec.and_then(|sp| catalog::output(sp, out)) {
-            Some(Ty::Answer) => Type::Decision(self.steps[i].variants.clone()),
-            Some(ty) if more.is_none() => ty.to_type(),
+        // A `decide` answer types as its declared `returns:` variants.
+        if spec.is_some_and(|sp| sp.decision) && out == "answer" && more.is_none() {
+            return Type::Decision(self.steps[i].variants.clone());
+        }
+        match spec.and_then(|sp| sp.output(out)) {
+            Some(ty) if more.is_none() => ty.clone(),
             Some(_) => Type::Any, // a field of a declared output, unchecked
             None => {
                 let name = self.steps[i].name.clone();
@@ -479,7 +796,7 @@ impl Ctx {
     // --- expressions ------------------------------------------------------
 
     fn ty_of(&mut self, cur: usize, e: &Expr<'_>) -> Type {
-        match e {
+        let t = match e {
             Expr::Default { rhs, .. } => self.ty_of(cur, rhs),
             Expr::Tuple { items, .. } => {
                 for i in items {
@@ -520,13 +837,15 @@ impl Ctx {
                 Type::Any
             }
             Expr::Atom { atom, .. } => self.atom(cur, atom),
-        }
+        };
+        self.record(e.span(), t.clone());
+        t
     }
 
     fn demand_bool(&mut self, cur: usize, e: &Expr<'_>) {
         let t = self.ty_of(cur, e);
-        if !accepts(&Type::Bool, &t) {
-            self.err(e.span(), format!("expected `Bool`, got `{t}`"));
+        if !types::coerce(&Type::Bool, &t) {
+            self.err(e.span(), format!("expected bool, got {t}"));
         }
     }
 
@@ -688,6 +1007,7 @@ impl Ctx {
                 {
                     let span = w.node.span();
                     if let Some((target, ty)) = self.resolve_ref(idx, w.text(), span) {
+                        self.record(span, ty.clone());
                         if ty == Type::Secret {
                             self.cannot_show_secret(span, w.text());
                         }
@@ -889,8 +1209,9 @@ impl Ctx {
 
     fn check_policy(&mut self, policy: Entry<'_>) {
         for subject in policy.children() {
-            match subject.key_name() {
-                Some("agents" | "humans") => {}
+            let kind = match subject.key_name() {
+                Some("agents") => Some(ActorKind::Agent),
+                Some("humans") => Some(ActorKind::Human),
                 Some(other) => {
                     let msg = format!("unknown policy subject `{other}`");
                     match suggest(other, &["agents", "humans"]) {
@@ -902,10 +1223,13 @@ impl Ctx {
                     continue;
                 }
                 None => continue,
-            }
+            };
             for p in subject.children() {
                 match p.key_name() {
-                    Some("can" | "before" | "never") => self.actions(p),
+                    // `never:` rules are retained on the workflow; `can:`
+                    // and `before:` grant and gate, they never forbid.
+                    Some("never") => self.actions(p, kind),
+                    Some("can" | "before") => self.actions(p, None),
                     Some("ask") => {
                         if let Some(v) = p.expr() {
                             for item in tuple_items(v) {
@@ -945,7 +1269,9 @@ impl Ctx {
     }
 
     /// `can`/`before`/`never`: tuples of `<verb> [<env>]` (`read secrets`).
-    fn actions(&mut self, entry: Entry<'_>) {
+    /// `subject` is the actor the rule binds — `Some` only for `never:`,
+    /// whose rules are retained on the workflow for enforcement.
+    fn actions(&mut self, entry: Entry<'_>, subject: Option<ActorKind>) {
         let Some(e) = entry.expr() else { return };
         for item in tuple_items(e.clone()) {
             let atoms = item.atoms();
@@ -969,7 +1295,9 @@ impl Ctx {
             }
             if text == "read" {
                 match atoms.get(1) {
-                    Some(Atom::Word(obj)) if obj.text() == "secrets" => {}
+                    Some(Atom::Word(obj)) if obj.text() == "secrets" => {
+                        self.forbid(subject, text, "secrets", item.span());
+                    }
                     Some(a) => self.err(a.span(), "`read` takes `secrets`"),
                     None => {
                         self.err_hint(verb.node.span(), "`read` takes `secrets`", "`read secrets`")
@@ -979,6 +1307,7 @@ impl Ctx {
             }
             let Some(Atom::Word(env)) = atoms.get(1) else { continue };
             let name = env.text();
+            self.forbid(subject, text, name, item.span());
             if self.env_names.iter().any(|e| e == name) {
                 continue;
             }
@@ -996,7 +1325,58 @@ impl Ctx {
 
     // --- graph ------------------------------------------------------------
 
+    /// Retains a `never:` rule when the entry declares one for a subject.
+    fn forbid(&mut self, subject: Option<ActorKind>, verb: &str, object: &str, span: Span) {
+        if let Some(subject) = subject {
+            self.policy.forbid(NeverRule {
+                subject,
+                verb: verb.to_string(),
+                object: object.to_string(),
+                span,
+            });
+        }
+    }
+
+    /// A policy check that binds the run's actor: when an agent runs a file
+    /// whose policy forbids agents to read secrets, every distinct secret
+    /// the run needs is refused once, at its first reference, so the run
+    /// stops before it starts.
+    fn enforce_actor_policy(&mut self) {
+        if self.actor != Some(ActorKind::Agent)
+            || !self.policy.forbids(ActorKind::Agent, "read", "secrets")
+        {
+            return;
+        }
+        // One refusal per distinct key, at its first reference span. The
+        // keys are collected owned so the loop below can borrow `self`
+        // mutably without cloning `secret_uses`.
+        let mut seen: HashSet<&str> = HashSet::new();
+        let firsts: Vec<(String, Span)> = self
+            .secret_uses
+            .iter()
+            .filter(|u| seen.insert(u.key.as_str()))
+            .map(|u| (u.key.clone(), u.span))
+            .collect();
+        if firsts.is_empty() {
+            return; // the rule binds, but this run needs no secrets
+        }
+        for (key, span) in &firsts {
+            self.err_hint(
+                *span,
+                format!(
+                    "policy forbids agents from reading secrets, but this run needs secrets.{key}"
+                ),
+                "the rule is `policy: agents: never: read secrets`",
+            );
+        }
+        // The rule's own location, so the report shows the line to change.
+        if let Some(span) = self.policy.rule_span(ActorKind::Agent, "read", "secrets") {
+            self.err(span, "the `never: read secrets` rule applies to this run");
+        }
+    }
+
     fn finish_all(mut self) -> Checked {
+        self.enforce_actor_policy();
         // Approval gating: an approval that shows S runs before every other
         // consumer of S, except steps the approval (transitively) depends on.
         let base: Vec<Edge> = std::mem::take(&mut self.edges);
@@ -1054,18 +1434,20 @@ impl Ctx {
             })
             .collect();
         let edges = edges.into_iter().map(|e| (e.from, e.to)).collect();
-        let workflow = Workflow::new(self.name, self.triggers, self.envs, steps, edges, order);
+        let workflow =
+            Workflow::new(self.name, self.triggers, self.envs, steps, edges, order, self.policy);
         // One file, one order: parser and checker findings interleaved in
         // source order, so CLI and editor output line up.
         let mut diagnostics = self.diags;
         diagnostics.sort_by_key(|d| (d.span.start, d.span.end));
-        Checked { workflow, diagnostics }
+        self.secret_uses.sort_by_key(|u| u.span.start);
+        Checked { workflow, diagnostics, types: self.types, secret_uses: self.secret_uses }
     }
 }
 
 // --- helpers ---------------------------------------------------------------
 
-fn member_error(c: &mut Ctx, ns: &str, name: &str, members: &[&str], span: Span) {
+fn member_error(c: &mut Ctx<'_>, ns: &str, name: &str, members: &[&str], span: Span) {
     match suggest(name, members) {
         Some(s) => c.err_hint(
             span,
@@ -1083,14 +1465,6 @@ fn split_first(text: &str) -> (&str, Option<&str>) {
     }
 }
 
-fn accepts(want: &Type, got: &Type) -> bool {
-    want == got
-        || matches!(want, Type::Any)
-        || matches!(got, Type::Any)
-        || (want == &Type::Float && got == &Type::Int)
-        || matches!(got, Type::Optional(inner) if accepts(want, inner))
-}
-
 /// A type without its `Optional` wrapper, so `git.tag?` compares against
 /// `String`.
 fn bare_optional(t: &Type) -> &Type {
@@ -1100,8 +1474,38 @@ fn bare_optional(t: &Type) -> &Type {
     }
 }
 
-fn interp_allowed(ty: Ty) -> bool {
-    matches!(ty, Ty::String | Ty::Any | Ty::Named("oci.Tag"))
+/// Interpolation composes strings; only string-valued inputs take it.
+fn interp_allowed(want: &Type) -> bool {
+    match want {
+        Type::String | Type::Any => true,
+        Type::Named(n) => n == "oci.Tag",
+        Type::Optional(inner) => interp_allowed(inner),
+        _ => false,
+    }
+}
+
+/// Why a `Secret` cannot flow where `want` is declared: only an input typed
+/// `Secret` takes one ([#27](https://github.com/Keep-Shipping/harness/issues/27)).
+fn secret_hint(want: &Type, got: &Type) -> Option<String> {
+    (matches!(got, Type::Secret) && !matches!(want, Type::Secret | Type::Any))
+        .then(|| "secrets flow only into inputs typed Secret".to_string())
+}
+
+/// `key: annotation = literal`: an inline type annotation with a default.
+/// Yields the annotation word (for its span), the type it spells and the
+/// default; `None` when the left side is no word that spells a type.
+fn annotation_default<'a>(e: &'a Expr<'a>) -> Option<(&'a Word<'a>, Type, &'a Expr<'a>)> {
+    let Expr::Default { lhs, rhs, .. } = e else { return None };
+    let Expr::Atom { atom: Atom::Word(w), .. } = lhs.as_ref() else { return None };
+    Type::parse(w.text()).map(|ty| (w, ty, rhs.as_ref()))
+}
+
+/// `an oci.Digest`, `a tofu.PlanFile`.
+fn article(name: &str) -> &'static str {
+    match name.as_bytes().first() {
+        Some(b'a' | b'e' | b'i' | b'o' | b'u') => "an",
+        _ => "a",
+    }
 }
 
 /// The answer words of a `returns:` value: `low | medium | high` or one word.
@@ -1198,7 +1602,7 @@ fn dependents_of<'a>(parents: &HashMap<&'a str, Vec<&'a str>>, start: &'a str) -
 
 /// A cycle in the edge order, reported as the path (`a → b → a`) and the
 /// span of the reference that closes it.
-fn find_cycle(steps: &[StepInfo], edges: &[Edge]) -> Option<(Vec<String>, Span)> {
+fn find_cycle(steps: &[StepInfo<'_>], edges: &[Edge]) -> Option<(Vec<String>, Span)> {
     let index: HashMap<&str, usize> =
         steps.iter().enumerate().map(|(i, s)| (s.name.as_str(), i)).collect();
     let n = steps.len();
@@ -1260,7 +1664,7 @@ fn dfs(adj: &[Vec<(usize, Span)>], state: &mut [u8], stack: &mut Vec<usize>) -> 
     None
 }
 
-fn topo(steps: &[StepInfo], edges: &[Edge]) -> Option<Vec<String>> {
+fn topo(steps: &[StepInfo<'_>], edges: &[Edge]) -> Option<Vec<String>> {
     let index: HashMap<&str, usize> =
         steps.iter().enumerate().map(|(i, s)| (s.name.as_str(), i)).collect();
     let n = steps.len();
@@ -1288,4 +1692,93 @@ fn topo(steps: &[StepInfo], edges: &[Edge]) -> Option<Vec<String>> {
         }
     }
     (order.len() == n).then(|| order.into_iter().map(|i| steps[i].name.clone()).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check_src(src: &str) -> Checked {
+        check(&ks_lang::parse(src))
+    }
+
+    const TWO_ENVS: &str = "\
+envs:
+  staging:
+    secrets: vault
+  prod:
+    secrets: env
+    ci-only: true
+steps:
+  migrate: db.migrate
+    url: secrets.db_url
+  report: db.report
+    url: secrets.db_url
+    key: secrets.api_key
+";
+
+    /// The listing is pure: it reads the checked file only, so this helper's
+    /// whole path — parse, check, project — never constructs a resolver or
+    /// reads a store.
+    #[test]
+    fn secret_requirements_list_each_environments_references() {
+        let checked = check_src(TWO_ENVS);
+        assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
+        let listing = secret_requirements(&checked);
+        assert_eq!(listing.len(), 2, "one entry per declared environment");
+        assert_eq!(listing[0].env, "staging");
+        assert_eq!(listing[0].resolver.as_deref(), Some("vault"));
+        assert_eq!(listing[1].env, "prod");
+        assert_eq!(listing[1].resolver.as_deref(), Some("env"));
+
+        let staging = &listing[0].requirements;
+        assert_eq!(staging.len(), 2, "deduplicated: db_url is named twice");
+        assert_eq!(staging[0].key, "db_url");
+        assert_eq!(
+            staging[0].reference.as_ref().map(ToString::to_string).as_deref(),
+            Some("vault:db_url")
+        );
+        assert_eq!(staging[0].steps, ["migrate", "report"]);
+        assert_eq!(staging[1].key, "api_key", "keys stay in first-use order");
+        assert_eq!(staging[1].steps, ["report"]);
+
+        // The same keys, resolved against the other environment's resolver.
+        let prod = &listing[1].requirements;
+        assert_eq!(
+            prod[0].reference.as_ref().map(ToString::to_string).as_deref(),
+            Some("env:db_url")
+        );
+    }
+
+    #[test]
+    fn an_environment_without_a_resolver_needs_one_explicitly() {
+        let checked = check_src(&TWO_ENVS.replace("    secrets: vault\n", ""));
+        let listing = secret_requirements(&checked);
+        assert_eq!(listing[0].resolver, None);
+        assert_eq!(listing[0].requirements[0].reference, None, "no resolver, no reference");
+        assert_eq!(listing[0].requirements[0].key, "db_url");
+    }
+
+    #[test]
+    fn a_file_without_envs_or_secrets_lists_the_default_as_none() {
+        let checked = check_src("steps:\n  build: oci.image\n    from: ./Dockerfile\n");
+        let listing = secret_requirements(&checked);
+        assert_eq!(listing.len(), 1);
+        assert_eq!(listing[0].env, "default");
+        assert!(listing[0].requirements.is_empty());
+    }
+
+    #[test]
+    fn secret_uses_carry_the_span_and_the_consuming_step() {
+        let checked = check_src(TWO_ENVS);
+        assert_eq!(
+            checked.secret_uses.len(),
+            3,
+            "every reference, deduplication is the listing's job"
+        );
+        let first = &checked.secret_uses[0];
+        assert_eq!(first.key, "db_url");
+        assert_eq!(first.step, "migrate");
+        assert!(first.span.start < checked.secret_uses[1].span.start, "source order");
+    }
 }

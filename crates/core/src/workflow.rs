@@ -3,6 +3,8 @@
 
 use ks_lang::Span;
 
+use crate::ports::run_context::ActorKind;
+
 /// One `on:` trigger.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Trigger {
@@ -69,6 +71,51 @@ pub(crate) fn implicit_default() -> Env {
     }
 }
 
+/// One `never:` rule: who may never do what
+/// (`agents: never: read secrets`).
+#[derive(Clone, Debug)]
+pub struct NeverRule {
+    /// The subject the rule binds.
+    pub subject: ActorKind,
+    /// The action verb (`read`).
+    pub verb: String,
+    /// The action object (`secrets`, or the environment another verb names).
+    pub object: String,
+    /// Where the rule is declared, for diagnostics that point at it.
+    pub span: Span,
+}
+
+/// The workflow's policy, as far as static checks enforce it: the `never:`
+/// rules a declared subject must respect. The checker enforces the agents'
+/// `read secrets` rule against agent runs
+/// ([#27](https://github.com/Keep-Shipping/harness/issues/27)); nothing else
+/// is refused yet.
+#[derive(Clone, Debug, Default)]
+pub struct Policy {
+    never: Vec<NeverRule>,
+}
+
+impl Policy {
+    /// Whether `subject` is forbidden `verb` on `object`.
+    #[must_use]
+    pub fn forbids(&self, subject: ActorKind, verb: &str, object: &str) -> bool {
+        self.never.iter().any(|r| r.subject == subject && r.verb == verb && r.object == object)
+    }
+
+    /// Where a rule binding `subject` to `verb` `object` is declared.
+    pub(crate) fn rule_span(&self, subject: ActorKind, verb: &str, object: &str) -> Option<Span> {
+        self.never
+            .iter()
+            .find(|r| r.subject == subject && r.verb == verb && r.object == object)
+            .map(|r| r.span)
+    }
+
+    /// Records a `never:` rule; `check` does this while reading `policy:`.
+    pub(crate) fn forbid(&mut self, rule: NeverRule) {
+        self.never.push(rule);
+    }
+}
+
 /// The checked workflow.
 #[derive(Clone, Debug, Default)]
 pub struct Workflow {
@@ -78,10 +125,12 @@ pub struct Workflow {
     steps: Vec<Step>,
     edges: Vec<(String, String)>,
     order: Option<Vec<String>>,
+    policy: Policy,
 }
 
 impl Workflow {
     /// Build a workflow directly; `check` does this from a parsed file.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         name: Option<String>,
         triggers: Vec<Trigger>,
@@ -89,8 +138,9 @@ impl Workflow {
         steps: Vec<Step>,
         edges: Vec<(String, String)>,
         order: Option<Vec<String>>,
+        policy: Policy,
     ) -> Self {
-        Self { name, triggers, envs, steps, edges, order }
+        Self { name, triggers, envs, steps, edges, order, policy }
     }
 
     pub fn name(&self) -> Option<&str> {
@@ -125,5 +175,10 @@ impl Workflow {
     /// A topological order of the steps, when the graph is acyclic.
     pub fn topo_order(&self) -> Option<&[String]> {
         self.order.as_deref()
+    }
+
+    /// The policy the file declares; empty when there is no `policy:` block.
+    pub fn policy(&self) -> &Policy {
+        &self.policy
     }
 }

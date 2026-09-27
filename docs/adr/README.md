@@ -17,4 +17,5 @@ A guard test (`cargo test -p ks-testing --test adr_guard`) checks every ADR belo
 | ADR | Title | Status |
 | --- | --- | --- |
 | [0000](0000-record-architecture-decisions.md) | Record architecture decisions | Accepted |
+| [0001](0001-typed-values-and-secret-references.md) | Typed values and secret references | Accepted |
 | [0100](0100-step-contract-and-composition-checks.md) | Step contract and composition checks | Accepted |
