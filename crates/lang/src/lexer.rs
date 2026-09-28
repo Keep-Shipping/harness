@@ -4,7 +4,7 @@
 //! trivia (whitespace, comment) and a `NEWLINE`. Value-level tokens are
 //! recognised only here; the parser groups them into nodes.
 
-use crate::diagnostic::{Diagnostic, Span};
+use crate::diagnostic::{Code, Diagnostic, Span};
 use crate::syntax::SyntaxKind;
 
 #[derive(Clone, Copy, Debug)]
@@ -63,6 +63,7 @@ impl<'src> Lexer<'src> {
                     if has_tab {
                         self.errors.push(
                             Diagnostic::error(
+                                Code::TabIndent,
                                 Span::new(ind_start as u32, self.pos as u32),
                                 "tab in indentation",
                             )
@@ -183,8 +184,12 @@ impl<'src> Lexer<'src> {
         }
         if tab {
             self.errors.push(
-                Diagnostic::error(Span::new(start as u32, self.pos as u32), "tab outside a string")
-                    .with_hint("use spaces; `keepshipping fmt` converts tabs"),
+                Diagnostic::error(
+                    Code::TabIndent,
+                    Span::new(start as u32, self.pos as u32),
+                    "tab outside a string",
+                )
+                .with_hint("use spaces; `keepshipping fmt` converts tabs"),
             );
         }
         self.push(SyntaxKind::Whitespace, start, self.pos);
@@ -236,6 +241,7 @@ impl<'src> Lexer<'src> {
                     self.flush_text(SyntaxKind::StringText, text_start);
                     self.errors.push(
                         Diagnostic::error(
+                            Code::Unclosed,
                             Span::new(open as u32, self.pos as u32),
                             "unclosed string",
                         )
@@ -247,6 +253,7 @@ impl<'src> Lexer<'src> {
                     self.flush_text(SyntaxKind::StringText, text_start);
                     self.errors.push(
                         Diagnostic::error(
+                            Code::Unclosed,
                             Span::new(open as u32, self.pos as u32),
                             "unclosed string",
                         )
@@ -301,6 +308,7 @@ impl<'src> Lexer<'src> {
             if !is_dotted_name(text) {
                 self.errors.push(
                     Diagnostic::error(
+                        Code::BadInterp,
                         Span::new(mid_start as u32, mid_end as u32),
                         format!("invalid interpolation name `{text}`"),
                     )
@@ -309,16 +317,24 @@ impl<'src> Lexer<'src> {
             }
         } else if closed {
             self.errors.push(
-                Diagnostic::error(Span::new(brace as u32, mid_end as u32), "empty interpolation")
-                    .with_hint("put a dotted name inside, like {git.sha}"),
+                Diagnostic::error(
+                    Code::BadInterp,
+                    Span::new(brace as u32, mid_end as u32),
+                    "empty interpolation",
+                )
+                .with_hint("put a dotted name inside, like {git.sha}"),
             );
         }
         if closed {
             self.single(SyntaxKind::RBrace);
         } else {
             self.errors.push(
-                Diagnostic::error(Span::new(brace as u32, self.pos as u32), "unclosed `{`")
-                    .with_hint("add a closing `}`"),
+                Diagnostic::error(
+                    Code::Unclosed,
+                    Span::new(brace as u32, self.pos as u32),
+                    "unclosed `{`",
+                )
+                .with_hint("add a closing `}`"),
             );
         }
     }

@@ -43,7 +43,7 @@ pub use ast::{
     Atom, BlockString, CmpOp, Entry, Expr, File, Interp, NameKind, NameRef, Scalar, Str, StrPart,
     Value, Word, WordPart, classify_scalar,
 };
-pub use diagnostic::{Diagnostic, Severity, Span};
+pub use diagnostic::{Code, Diagnostic, Label, Severity, Span};
 pub use syntax::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken};
 
 /// The result of parsing: a lossless tree, the source it came from, and the

@@ -1,0 +1,1 @@
+::error file=ship.ks,line=21,col=12,endLine=21,endColumn=21,title=KS0101 deploy.image::expected oci.Digest, got string%0Ahint: use build.digest so prod runs exactly the image you built

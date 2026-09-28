@@ -40,6 +40,10 @@ One commit per issue, conventional-commit format with the issue number last:
 feat(engine): plan steps as a DAG (#42)
 ```
 
+## Error codes
+
+Every diagnostic carries a stable `KSxxxx` code, documented in [docs/ERRORS.md](docs/ERRORS.md) (generated — do not edit). To add a code: extend `ks_lang::Code`, document it in the exhaustive `explain` match in `crates/core/src/registry.rs` with a bad and a good example, then regenerate the docs with `UPDATE_GOLDEN=1 cargo test -p ks-core --test registry`. How diagnostics are printed — formats, exit codes, colour — is pinned in [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md).
+
 ## ADRs
 
 Architecture changes go through a new ADR — never by editing an accepted one.

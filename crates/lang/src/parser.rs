@@ -4,7 +4,7 @@
 //! arbitrary input it always terminates and never panics, and the tree it
 //! builds always prints back the exact source.
 
-use crate::diagnostic::{Diagnostic, Span};
+use crate::diagnostic::{Code, Diagnostic, Span};
 use crate::lexer::{Tok, lex};
 use crate::syntax::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken};
 
@@ -77,8 +77,12 @@ impl<'src> Parser<'src> {
                     // open level; keep the line as an entry of this block.
                     let span = self.indent_span(idx);
                     self.diags.push(
-                        Diagnostic::error(span, "indentation doesn't match any outer level")
-                            .with_hint("align with an outer block or with its siblings"),
+                        Diagnostic::error(
+                            Code::Syntax,
+                            span,
+                            "indentation doesn't match any outer level",
+                        )
+                        .with_hint("align with an outer block or with its siblings"),
                     );
                 }
                 Some(_) => return,
@@ -86,7 +90,7 @@ impl<'src> Parser<'src> {
             if self.toks[idx].kind != SyntaxKind::Key {
                 let span = self.indent_span(idx);
                 self.diags.push(
-                    Diagnostic::error(span, "expected `key:`")
+                    Diagnostic::error(Code::Syntax, span, "expected `key:`")
                         .with_hint("a line inside a block must start with `key:`"),
                 );
                 self.valueless_lines(out, false);
@@ -148,7 +152,7 @@ impl<'src> Parser<'src> {
                     let idx = self.next_content().expect("checked above");
                     let span = self.indent_span(idx);
                     self.diags.push(
-                        Diagnostic::error(span, "expected `key:`").with_hint(format!(
+                        Diagnostic::error(Code::Syntax, span, "expected `key:`").with_hint(format!(
                             "continue the value of `{key_text}` on this line, or dedent to close the block"
                         )),
                     );
@@ -170,9 +174,12 @@ impl<'src> Parser<'src> {
         if !had_value && !children.iter().any(|c| c.kind() == SyntaxKind::Entry) {
             let key_span = Span::new(key_tok.start, key_tok.end);
             self.diags.push(
-                Diagnostic::error(key_span, format!("missing value for `{key_text}`")).with_hint(
-                    format!("add a value after `{key_text}:`, or indent entries below it"),
-                ),
+                Diagnostic::error(
+                    Code::Syntax,
+                    key_span,
+                    format!("missing value for `{key_text}`"),
+                )
+                .with_hint(format!("add a value after `{key_text}:`, or indent entries below it")),
             );
         }
         out.push(node(SyntaxKind::Entry, children));
@@ -774,13 +781,13 @@ impl<'src> ValueParser<'src, '_> {
 
     fn diag(&mut self, span: Span, message: impl Into<String>) {
         if !self.suppress {
-            self.diags.push(Diagnostic::error(span, message));
+            self.diags.push(Diagnostic::error(Code::Syntax, span, message));
         }
     }
 
     fn diag_hint(&mut self, span: Span, message: impl Into<String>, hint: impl Into<String>) {
         if !self.suppress {
-            self.diags.push(Diagnostic::error(span, message).with_hint(hint));
+            self.diags.push(Diagnostic::error(Code::Syntax, span, message).with_hint(hint));
         }
     }
 
@@ -813,7 +820,7 @@ impl<'src> ValueParser<'src, '_> {
                 let text = self.text(t).to_string();
                 let span = Span::new(t.start, t.end);
                 self.diags.push(
-                    Diagnostic::error(span, format!("unexpected `{text}`"))
+                    Diagnostic::error(Code::Syntax, span, format!("unexpected `{text}`"))
                         .with_hint("check the value grammar in docs/LANGUAGE.md"),
                 );
                 first = false;
