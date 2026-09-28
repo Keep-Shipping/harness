@@ -1,6 +1,7 @@
 //! Diagnostics shared with the checker: the same `Diagnostic` type that
 //! `ks-core` emits, so editor and CLI output can treat parser and checker
-//! errors uniformly.
+//! errors uniformly. Every diagnostic carries a stable [`Code`], so tools
+//! and agents can react to a problem without matching on message text.
 
 use std::fmt;
 
@@ -70,27 +71,189 @@ impl fmt::Display for Severity {
     }
 }
 
+/// The kind of problem a [`Diagnostic`] reports, as a stable code agents and
+/// tools can match on. Codes are grouped by block — `KS00xx` syntax,
+/// `KS01xx` types, `KS02xx` names and references, `KS03xx` workflow
+/// structure, `KS04xx` policy, `KS05xx` secrets, `KS06xx` environment and CI
+/// warnings — and are never renumbered: gaps stay free for new codes.
+///
+/// The meaning, a bad and a good example of every code are documented in
+/// `docs/ERRORS.md`, generated from the registry in `ks-core`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Code {
+    /// The grammar could not place a token or a value.
+    Syntax,
+    /// A string or `{` interpolation was never closed.
+    Unclosed,
+    /// The name inside `{...}` is empty or not a dotted name.
+    BadInterp,
+    /// A tab sits in a line's indentation.
+    TabIndent,
+    /// A value does not have the type its input declares.
+    TypeMismatch,
+    /// A literal is well-formed but wrong for its type (a pasted digest).
+    PastedDigest,
+    /// A step or context name does not resolve.
+    UnknownRef,
+    /// An input name the step kind does not declare.
+    UnknownInput,
+    /// An output a step does not produce.
+    UnknownOutput,
+    /// An answer a `decide` step does not declare.
+    UnknownAnswer,
+    /// An `else:` action other than `ask` or `show`.
+    UnknownAction,
+    /// A step name declared twice.
+    DuplicateStep,
+    /// A step named like a context namespace (`git`, `secrets`, ...).
+    ReservedStepName,
+    /// A trigger the language does not know.
+    BadTrigger,
+    /// An environment is undeclared, misspelled or misconfigured.
+    EnvProblem,
+    /// Steps depend on each other in a circle.
+    Cycle,
+    /// A `policy:` subject or property the language does not know.
+    PolicyDecl,
+    /// A `policy:` action the language does not know.
+    PolicyAction,
+    /// A `never:` rule refuses this run before it starts.
+    PolicyForbidden,
+    /// A secret interpolated into a string, where it could leak.
+    SecretInString,
+    /// A secret passed to `show:`, which displays it.
+    SecretShown,
+    /// An optional context value used where it may be absent.
+    OptionalAbsent,
+}
+
+impl Code {
+    /// The code's stable spelling (`"KS0101"`), as printed in output and
+    /// documented in `docs/ERRORS.md`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Code::Syntax => "KS0001",
+            Code::Unclosed => "KS0002",
+            Code::BadInterp => "KS0003",
+            Code::TabIndent => "KS0004",
+            Code::TypeMismatch => "KS0101",
+            Code::PastedDigest => "KS0102",
+            Code::UnknownRef => "KS0201",
+            Code::UnknownInput => "KS0202",
+            Code::UnknownOutput => "KS0203",
+            Code::UnknownAnswer => "KS0204",
+            Code::UnknownAction => "KS0205",
+            Code::DuplicateStep => "KS0301",
+            Code::ReservedStepName => "KS0302",
+            Code::BadTrigger => "KS0303",
+            Code::EnvProblem => "KS0304",
+            Code::Cycle => "KS0305",
+            Code::PolicyDecl => "KS0401",
+            Code::PolicyAction => "KS0402",
+            Code::PolicyForbidden => "KS0403",
+            Code::SecretInString => "KS0501",
+            Code::SecretShown => "KS0502",
+            Code::OptionalAbsent => "KS0601",
+        }
+    }
+
+    /// Every code, in numeric order. Exhaustive documentation for each lives
+    /// in `ks_core::registry`.
+    pub const ALL: &'static [Code] = &[
+        Code::Syntax,
+        Code::Unclosed,
+        Code::BadInterp,
+        Code::TabIndent,
+        Code::TypeMismatch,
+        Code::PastedDigest,
+        Code::UnknownRef,
+        Code::UnknownInput,
+        Code::UnknownOutput,
+        Code::UnknownAnswer,
+        Code::UnknownAction,
+        Code::DuplicateStep,
+        Code::ReservedStepName,
+        Code::BadTrigger,
+        Code::EnvProblem,
+        Code::Cycle,
+        Code::PolicyDecl,
+        Code::PolicyAction,
+        Code::PolicyForbidden,
+        Code::SecretInString,
+        Code::SecretShown,
+        Code::OptionalAbsent,
+    ];
+}
+
+impl fmt::Display for Code {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A secondary span on a [`Diagnostic`]: another place in the source that
+/// helps explain the problem ("first defined here").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Label {
+    pub span: Span,
+    pub message: String,
+}
+
 /// A parse or check finding. `ks-lang` produces errors only; `ks-core` emits
-/// the same type, including warnings.
+/// the same type, including warnings. `code` names the kind of problem,
+/// `subject` — when the checker knows it — the dotted thing the finding is
+/// about (`deploy.image`), `labels` point at other places in the source.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
     pub severity: Severity,
+    pub code: Code,
     pub span: Span,
     pub message: String,
-    pub hint: Option<String>,
+    pub subject: Option<String>,
+    pub labels: Vec<Label>,
+    pub hints: Vec<String>,
 }
 
 impl Diagnostic {
-    pub fn error(span: Span, message: impl Into<String>) -> Self {
-        Self { severity: Severity::Error, span, message: message.into(), hint: None }
+    pub fn error(code: Code, span: Span, message: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Error,
+            code,
+            span,
+            message: message.into(),
+            subject: None,
+            labels: Vec::new(),
+            hints: Vec::new(),
+        }
     }
 
-    pub fn warning(span: Span, message: impl Into<String>) -> Self {
-        Self { severity: Severity::Warning, span, message: message.into(), hint: None }
+    pub fn warning(code: Code, span: Span, message: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Warning,
+            code,
+            span,
+            message: message.into(),
+            subject: None,
+            labels: Vec::new(),
+            hints: Vec::new(),
+        }
     }
 
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
-        self.hint = Some(hint.into());
+        self.hints.push(hint.into());
+        self
+    }
+
+    /// Names the dotted thing this finding is about (`deploy.image`), so
+    /// tools can act on it without parsing the message.
+    pub fn with_subject(mut self, subject: impl Into<String>) -> Self {
+        self.subject = Some(subject.into());
+        self
+    }
+
+    /// Adds a secondary span with a one-line explanation.
+    pub fn with_label(mut self, span: Span, message: impl Into<String>) -> Self {
+        self.labels.push(Label { span, message: message.into() });
         self
     }
 }
@@ -98,7 +261,7 @@ impl Diagnostic {
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {}: {}", self.severity, self.span, self.message)?;
-        if let Some(hint) = &self.hint {
+        for hint in &self.hints {
             write!(f, "\n  hint: {hint}")?;
         }
         Ok(())

@@ -202,8 +202,8 @@ steps:
     assert_eq!(warns.len(), 1, "{:#?}", checked.diagnostics);
     assert_eq!(warns[0].message, "digest literal pinned by value");
     assert_eq!(
-        warns[0].hint.as_deref(),
-        Some("pin by reference, not by pasted digest: use build.digest")
+        warns[0].hints.as_slice(),
+        ["pin by reference, not by pasted digest: use build.digest"]
     );
 }
 
@@ -881,7 +881,7 @@ fn an_agent_needing_secrets_the_policy_forbids_is_refused() {
     assert!(
         checked.diagnostics.iter().any(|d| d.message
             == "policy forbids agents from reading secrets, but this run needs secrets.db_url"
-            && d.hint.as_deref() == Some("the rule is `policy: agents: never: read secrets`")),
+            && d.hints.as_slice() == ["the rule is `policy: agents: never: read secrets`"]),
         "{:#?}",
         checked.diagnostics
     );

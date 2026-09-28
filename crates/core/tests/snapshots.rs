@@ -19,7 +19,7 @@ fn golden_path() -> PathBuf {
 }
 
 /// Render like the CLI does, minus the file prefix: `line:col: severity:
-/// message`, with the hint indented underneath.
+/// message`, with each hint indented underneath.
 fn render(src: &str, checked: &ks_core::Checked) -> String {
     let starts: Vec<u32> = std::iter::once(0)
         .chain(src.bytes().enumerate().filter(|(_, b)| *b == b'\n').map(|(i, _)| i as u32 + 1))
@@ -30,7 +30,7 @@ fn render(src: &str, checked: &ks_core::Checked) -> String {
         let col = src[starts[line] as usize..d.span.start as usize].chars().count() + 1;
         out.push_str(&format!("{}:{}: {}: {}", line + 1, col, d.severity.as_str(), d.message));
         out.push('\n');
-        if let Some(hint) = &d.hint {
+        for hint in &d.hints {
             out.push_str(&format!("  hint: {hint}\n"));
         }
     }
@@ -62,6 +62,15 @@ fn the_tagged_hero_snapshot_is_exactly_the_mismatch_and_its_hint() {
          hint: use build.digest so prod runs exactly the image you built\n",
         "the committed snapshot must be exactly the digest mismatch"
     );
+    // The canonical mistake is KS0101, about `deploy.image`, and nothing
+    // else: no other diagnostic, no secondary span.
+    let checked = ks_core::check(&ks_lang::parse(&tagged));
+    assert_eq!(checked.diagnostics.len(), 1, "{:#?}", checked.diagnostics);
+    let d = &checked.diagnostics[0];
+    assert_eq!(d.code, ks_lang::Code::TypeMismatch);
+    assert_eq!(d.code.as_str(), "KS0101");
+    assert_eq!(d.subject.as_deref(), Some("deploy.image"));
+    assert!(d.labels.is_empty(), "the mismatch carries no secondary span");
 }
 
 #[test]

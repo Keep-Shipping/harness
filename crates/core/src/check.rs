@@ -4,7 +4,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use ks_lang::{Atom, Diagnostic, Entry, Expr, Span, StrPart, Word};
+use ks_lang::{Atom, Code, Diagnostic, Entry, Expr, Span, StrPart, Word};
 
 use crate::catalog::{Catalog, StepTypes};
 use crate::ports::run_context::ActorKind;
@@ -178,6 +178,9 @@ struct Ctx<'a> {
     /// rules that bind it are enforced.
     actor: Option<ActorKind>,
     diags: Vec<Diagnostic>,
+    /// The dotted path of the entry being checked (`deploy.image`), attached
+    /// to every diagnostic raised while it is checked.
+    subject: Option<String>,
     env_names: Vec<String>,
     env_vars: Vec<String>,
     steps: Vec<StepInfo<'a>>,
@@ -221,6 +224,7 @@ impl<'a> Ctx<'a> {
             catalog,
             actor,
             diags,
+            subject: None,
             env_names: Vec::new(),
             env_vars: Vec::new(),
             steps: Vec::new(),
@@ -236,12 +240,26 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn err(&mut self, span: Span, message: impl Into<String>) {
-        self.diags.push(Diagnostic::error(span, message));
+    /// Push an error, stamped with the entry path under check, if any.
+    fn push(&mut self, d: Diagnostic) {
+        self.diags.push(match self.subject.clone() {
+            Some(s) => d.with_subject(s),
+            None => d,
+        });
     }
 
-    fn err_hint(&mut self, span: Span, message: impl Into<String>, hint: impl Into<String>) {
-        self.diags.push(Diagnostic::error(span, message).with_hint(hint));
+    fn err(&mut self, code: Code, span: Span, message: impl Into<String>) {
+        self.push(Diagnostic::error(code, span, message));
+    }
+
+    fn err_hint(
+        &mut self,
+        code: Code,
+        span: Span,
+        message: impl Into<String>,
+        hint: impl Into<String>,
+    ) {
+        self.push(Diagnostic::error(code, span, message).with_hint(hint));
     }
 
     fn record(&mut self, span: Span, ty: Type) {
@@ -263,7 +281,11 @@ impl<'a> Ctx<'a> {
         for e in file.entries() {
             match e.key_name() {
                 Some("name") => self.name = self.scalar_text(e),
-                Some("on") => self.triggers = self.triggers_of(e),
+                Some("on") => {
+                    self.subject = Some("on".to_string());
+                    self.triggers = self.triggers_of(e);
+                    self.subject = None;
+                }
                 Some("steps") => self.check_steps(e),
                 Some("envs") => {
                     self.envs = self.check_envs(e);
@@ -294,14 +316,23 @@ impl<'a> Ctx<'a> {
             let span = s.key_span();
             if NAMESPACES.contains(&name) {
                 self.err_hint(
+                    Code::ReservedStepName,
                     span,
                     format!("step `{name}` is named like a context namespace"),
                     format!("rename the step; `{name}` is a reserved context name"),
                 );
                 continue;
             }
-            if self.step_index(name).is_some() {
-                self.err(span, format!("duplicate step `{name}`"));
+            if let Some(first) = self.step_index(name).map(|i| self.steps[i].span) {
+                self.push(
+                    Diagnostic::error(
+                        Code::DuplicateStep,
+                        span,
+                        format!("duplicate step `{name}`"),
+                    )
+                    .with_subject(name)
+                    .with_label(first, "first defined here"),
+                );
                 continue;
             }
             let (kind_name, kind_span) = match s.expr() {
@@ -347,10 +378,12 @@ impl<'a> Ctx<'a> {
 
     fn check_steps(&mut self, steps: Entry<'_>) {
         for s in steps.children() {
-            let Some(name) = s.key_name().and_then(|n| self.step_index(n)) else { continue };
+            let Some(idx) = s.key_name().and_then(|n| self.step_index(n)) else { continue };
             for input in s.children() {
                 let Some(iname) = input.key_name() else { continue };
-                self.check_input(name, iname, input);
+                self.subject = Some(format!("{}.{}", self.steps[idx].name, iname));
+                self.check_input(idx, iname, input);
+                self.subject = None;
             }
         }
     }
@@ -365,8 +398,10 @@ impl<'a> Ctx<'a> {
             let span = input.key_span();
             let msg = format!("unknown input `{iname}` for step kind `{}`", spec.name);
             match suggest(iname, &spec.input_names()) {
-                Some(s) => self.err_hint(span, msg, format!("did you mean `{s}`?")),
-                None => self.err(span, msg),
+                Some(s) => {
+                    self.err_hint(Code::UnknownInput, span, msg, format!("did you mean `{s}`?"))
+                }
+                None => self.err(Code::UnknownInput, span, msg),
             }
             return;
         };
@@ -394,6 +429,7 @@ impl<'a> Ctx<'a> {
             for r in e.refs() {
                 if r.kind == ks_lang::NameKind::Interp {
                     self.err_hint(
+                        Code::TypeMismatch,
                         r.span,
                         format!("interpolation is not allowed in a `{want}` value"),
                         "interpolate only into string values",
@@ -433,7 +469,11 @@ impl<'a> Ctx<'a> {
                     for item in items {
                         self.ty_of(idx, item);
                     }
-                    self.err(span, format!("expected {want}, got {} items", items.len()));
+                    self.err(
+                        Code::TypeMismatch,
+                        span,
+                        format!("expected {want}, got {} items", items.len()),
+                    );
                     return;
                 }
                 for (item, (_, ty)) in items.iter().zip(fields) {
@@ -473,7 +513,7 @@ impl<'a> Ctx<'a> {
         match fit {
             Some((_, LiteralFit::Ok)) => self.record(span, want),
             Some((_, LiteralFit::Warn { message, hint })) => {
-                self.warn_hint(span, message, hint);
+                self.warn_hint(Code::PastedDigest, span, message, hint);
                 self.record(span, want);
             }
             // The word spells no literal of `want`: name what it does spell.
@@ -490,8 +530,8 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn warn_hint(&mut self, span: Span, message: String, hint: String) {
-        self.diags.push(Diagnostic::warning(span, message).with_hint(hint));
+    fn warn_hint(&mut self, code: Code, span: Span, message: String, hint: String) {
+        self.push(Diagnostic::warning(code, span, message).with_hint(hint));
     }
 
     /// [`types::literal`], with the catalog's answer for where a pasted
@@ -563,6 +603,7 @@ impl<'a> Ctx<'a> {
         if let Some((_, ty)) = self.resolve_ref(idx, name, span) {
             if ty == Type::Secret {
                 self.err_hint(
+                    Code::SecretInString,
                     span,
                     format!("secret `{name}` cannot be interpolated into a string"),
                     "pass it to an input that takes a secret; secrets never go into strings or logs",
@@ -582,6 +623,7 @@ impl<'a> Ctx<'a> {
                 let span = i.name_span().unwrap_or_else(|| i.node.span());
                 if !interp_allowed(want) {
                     self.err_hint(
+                        Code::TypeMismatch,
                         span,
                         format!("interpolation is not allowed in a `{want}` value"),
                         "interpolate only into string values",
@@ -602,8 +644,8 @@ impl<'a> Ctx<'a> {
         let message = format!("expected {want}, got {got}");
         let hint = hint.or_else(|| secret_hint(&want, &got));
         match hint {
-            Some(h) => self.err_hint(span, message, h),
-            None => self.err(span, message),
+            Some(h) => self.err_hint(Code::TypeMismatch, span, message, h),
+            None => self.err(Code::TypeMismatch, span, message),
         }
     }
 
@@ -695,8 +737,8 @@ impl<'a> Ctx<'a> {
         cands.extend_from_slice(&NAMESPACES);
         let msg = format!("unknown step or context value `{first}`");
         match suggest(first, &cands) {
-            Some(s) => self.err_hint(span, msg, format!("did you mean `{s}`?")),
-            None => self.err(span, msg),
+            Some(s) => self.err_hint(Code::UnknownRef, span, msg, format!("did you mean `{s}`?")),
+            None => self.err(Code::UnknownRef, span, msg),
         }
         None
     }
@@ -730,6 +772,7 @@ impl<'a> Ctx<'a> {
                 let msg = format!("step `{name}` has no output `{out}`");
                 if spec.is_some_and(|sp| sp.runtime_outputs) {
                     self.err_hint(
+                        Code::UnknownOutput,
                         span,
                         msg,
                         format!(
@@ -741,8 +784,13 @@ impl<'a> Ctx<'a> {
                         .map(|sp| sp.outputs.iter().map(|(n, _)| n.to_string()).collect())
                         .unwrap_or_default();
                     match suggest(out, &outs) {
-                        Some(s) => self.err_hint(span, msg, format!("did you mean `{s}`?")),
-                        None => self.err(span, msg),
+                        Some(s) => self.err_hint(
+                            Code::UnknownOutput,
+                            span,
+                            msg,
+                            format!("did you mean `{s}`?"),
+                        ),
+                        None => self.err(Code::UnknownOutput, span, msg),
                     }
                 }
                 Type::Any
@@ -767,7 +815,12 @@ impl<'a> Ctx<'a> {
             ("git" | "pr" | "run" | "ci" | "env", name) => {
                 let msg = format!("unknown context value `{ns}.{name}`");
                 match suggest(name, &self.env_vars) {
-                    Some(s) => self.err_hint(span, msg, format!("did you mean `env.{s}`?")),
+                    Some(s) => self.err_hint(
+                        Code::UnknownRef,
+                        span,
+                        msg,
+                        format!("did you mean `env.{s}`?"),
+                    ),
                     None => match (ns, name) {
                         ("git", n) => {
                             member_error(self, "git", n, &["branch", "ref", "sha", "tag"], span)
@@ -777,7 +830,7 @@ impl<'a> Ctx<'a> {
                             member_error(self, "run", n, &["actor", "id", "is_agent"], span)
                         }
                         ("ci", n) => member_error(self, "ci", n, &["provider"], span),
-                        _ => self.err(span, msg),
+                        _ => self.err(Code::UnknownRef, span, msg),
                     },
                 }
                 return None;
@@ -785,9 +838,11 @@ impl<'a> Ctx<'a> {
             _ => return None, // not a namespace: the caller reports it
         };
         if matches!(ty, Type::Optional(_)) {
-            self.diags.push(
-                Diagnostic::warning(span, format!("optional value `{ns}.{name}` may be absent"))
-                    .with_hint("it has no value on a laptop or outside a pull request"),
+            self.warn_hint(
+                Code::OptionalAbsent,
+                span,
+                format!("optional value `{ns}.{name}` may be absent"),
+                "it has no value on a laptop or outside a pull request".to_string(),
             );
         }
         Some(ty)
@@ -845,7 +900,7 @@ impl<'a> Ctx<'a> {
     fn demand_bool(&mut self, cur: usize, e: &Expr<'_>) {
         let t = self.ty_of(cur, e);
         if !types::coerce(&Type::Bool, &t) {
-            self.err(e.span(), format!("expected bool, got {t}"));
+            self.err(Code::TypeMismatch, e.span(), format!("expected bool, got {t}"));
         }
     }
 
@@ -905,7 +960,7 @@ impl<'a> Ctx<'a> {
             return Type::Bool;
         }
         let span = Span::new(lhs.span().start.min(rhs.span().start), rhs.span().end);
-        self.err(span, format!("cannot compare `{lt}` and `{rt}`"));
+        self.err(Code::TypeMismatch, span, format!("cannot compare `{lt}` and `{rt}`"));
         Type::Bool
     }
 
@@ -917,16 +972,19 @@ impl<'a> Ctx<'a> {
         let span = word.node.span();
         match suggest(text, variants) {
             Some(s) => self.err_hint(
+                Code::UnknownAnswer,
                 span,
                 format!("unknown answer `{text}`"),
                 format!("did you mean `{s}`?"),
             ),
             None if variants.is_empty() => self.err_hint(
+                Code::UnknownAnswer,
                 span,
                 format!("unknown answer `{text}`"),
                 "declare the answers under `returns:`",
             ),
             None => self.err(
+                Code::UnknownAnswer,
                 span,
                 format!("unknown answer `{text}` (expected one of {})", variants.join(", ")),
             ),
@@ -951,17 +1009,24 @@ impl<'a> Ctx<'a> {
                 if !self.env_names.iter().any(|e| e == text) {
                     let msg = format!("unknown environment `{text}`");
                     match suggest(text, &self.env_names) {
-                        Some(s) => {
-                            self.err_hint(name.node.span(), msg, format!("did you mean `{s}`?"))
-                        }
-                        None => self.err(name.node.span(), msg),
+                        Some(s) => self.err_hint(
+                            Code::EnvProblem,
+                            name.node.span(),
+                            msg,
+                            format!("did you mean `{s}`?"),
+                        ),
+                        None => self.err(Code::EnvProblem, name.node.span(), msg),
                     }
                 }
             } else {
-                self.err(answer.span(), "expected an environment name");
+                self.err(Code::EnvProblem, answer.span(), "expected an environment name");
             }
             if threshold.is_some() {
-                self.err(subject.span(), "environment tests take no confidence threshold");
+                self.err(
+                    Code::EnvProblem,
+                    subject.span(),
+                    "environment tests take no confidence threshold",
+                );
             }
             return Type::Bool;
         }
@@ -970,27 +1035,39 @@ impl<'a> Ctx<'a> {
                 if let Some(w) = subject_word(answer) {
                     self.answer(&vs, &w);
                 } else {
-                    self.err(answer.span(), "expected an answer word");
+                    self.err(Code::UnknownAnswer, answer.span(), "expected an answer word");
                 }
                 if let Some(bound) = threshold {
                     self.confidence(bound);
                 }
             }
             Type::Any => {}
-            other => self.err(subject.span(), format!("expected a decision, got `{other}`")),
+            other => self.err(
+                Code::TypeMismatch,
+                subject.span(),
+                format!("expected a decision, got `{other}`"),
+            ),
         }
         Type::Bool
     }
 
     fn confidence(&mut self, bound: &Expr<'_>) {
         let Expr::Atom { atom: Atom::Word(w), .. } = bound else {
-            self.err(bound.span(), "confidence must be a number between 0 and 1");
+            self.err(
+                Code::TypeMismatch,
+                bound.span(),
+                "confidence must be a number between 0 and 1",
+            );
             return;
         };
         let ok = w.scalar() == ks_lang::Scalar::Number
             && w.text().parse::<f64>().is_ok_and(|n| (0.0..=1.0).contains(&n));
         if !ok {
-            self.err(w.node.span(), "confidence must be a number between 0 and 1");
+            self.err(
+                Code::TypeMismatch,
+                w.node.span(),
+                "confidence must be a number between 0 and 1",
+            );
         }
     }
 
@@ -1017,6 +1094,7 @@ impl<'a> Ctx<'a> {
                     }
                 }
                 _ => self.err_hint(
+                    Code::UnknownRef,
                     item.span(),
                     "expected a reference (`step.output`)",
                     "show takes step outputs and context values",
@@ -1028,6 +1106,7 @@ impl<'a> Ctx<'a> {
     /// Secrets must never be displayed; same rule as interpolation.
     fn cannot_show_secret(&mut self, span: Span, name: &str) {
         self.err_hint(
+            Code::SecretShown,
             span,
             format!("secret `{name}` cannot be shown"),
             "secrets never go into strings or logs",
@@ -1039,6 +1118,7 @@ impl<'a> Ctx<'a> {
         for item in tuple_items(e.clone()) {
             let Some(Atom::Word(verb)) = item.atoms().first() else {
                 self.err_hint(
+                    Code::UnknownAction,
                     item.span(),
                     "expected an action",
                     "`ask @platform` or `show risk.reason`",
@@ -1049,13 +1129,22 @@ impl<'a> Ctx<'a> {
             match verb.text() {
                 "ask" => {
                     if rest.is_empty() {
-                        self.err_hint(item.span(), "`ask` takes a handle", "`ask @platform`");
+                        self.err_hint(
+                            Code::UnknownAction,
+                            item.span(),
+                            "`ask` takes a handle",
+                            "`ask @platform`",
+                        );
                     }
                     for a in rest {
                         if let Atom::Word(w) = a {
                             let got = self.word_untyped(idx, w);
                             if got != Type::Handle {
-                                self.err(w.node.span(), format!("expected `Handle`, got `{got}`"));
+                                self.err(
+                                    Code::TypeMismatch,
+                                    w.node.span(),
+                                    format!("expected `Handle`, got `{got}`"),
+                                );
                             }
                         }
                     }
@@ -1063,6 +1152,7 @@ impl<'a> Ctx<'a> {
                 "show" => {
                     if rest.is_empty() {
                         self.err_hint(
+                            Code::UnknownAction,
                             item.span(),
                             "`show` takes a reference",
                             "`show risk.reason`",
@@ -1077,23 +1167,27 @@ impl<'a> Ctx<'a> {
                                 }
                             } else if w.scalar() != ks_lang::Scalar::Handle {
                                 self.err_hint(
+                                    Code::UnknownRef,
                                     span,
                                     format!("expected a reference, got `{}`", w.text()),
                                     "show takes step outputs and context values",
                                 );
                             }
                         } else {
-                            self.err(a.span(), "expected a reference");
+                            self.err(Code::UnknownRef, a.span(), "expected a reference");
                         }
                     }
                 }
                 other => {
                     let msg = format!("unknown action `{other}`");
                     match suggest(other, &["ask", "show"]) {
-                        Some(s) => {
-                            self.err_hint(verb.node.span(), msg, format!("did you mean `{s}`?"))
-                        }
-                        None => self.err(verb.node.span(), msg),
+                        Some(s) => self.err_hint(
+                            Code::UnknownAction,
+                            verb.node.span(),
+                            msg,
+                            format!("did you mean `{s}`?"),
+                        ),
+                        None => self.err(Code::UnknownAction, verb.node.span(), msg),
                     }
                 }
             }
@@ -1113,7 +1207,7 @@ impl<'a> Ctx<'a> {
         let hint = "`push main`, `pr`, `tag v*`, `manual`";
         let atoms = e.atoms();
         let Some(Atom::Word(kind)) = atoms.first() else {
-            self.err_hint(e.span(), "expected a trigger", hint);
+            self.err_hint(Code::BadTrigger, e.span(), "expected a trigger", hint);
             return None;
         };
         let text = kind.text();
@@ -1124,14 +1218,16 @@ impl<'a> Ctx<'a> {
             "tag" => TriggerKind::Tag,
             "manual" => TriggerKind::Manual,
             "schedule" => {
-                self.err(span, "`schedule` triggers are not supported yet");
+                self.err(Code::BadTrigger, span, "`schedule` triggers are not supported yet");
                 return None;
             }
             other => {
                 let msg = format!("unknown trigger `{other}`");
                 match suggest(other, &TRIGGER_KINDS) {
-                    Some(s) => self.err_hint(span, msg, format!("did you mean `{s}`?")),
-                    None => self.err(span, msg),
+                    Some(s) => {
+                        self.err_hint(Code::BadTrigger, span, msg, format!("did you mean `{s}`?"))
+                    }
+                    None => self.err(Code::BadTrigger, span, msg),
                 }
                 return None;
             }
@@ -1151,19 +1247,22 @@ impl<'a> Ctx<'a> {
             env.name = name.into();
             env.span = e.key_span();
             for p in e.children() {
-                match p.key_name() {
-                    Some("on") => env.triggers = self.triggers_of(p),
-                    Some("ci-only") => match p.expr().as_ref().and_then(value_word).as_deref() {
+                let Some(prop) = p.key_name() else { continue };
+                self.subject = Some(format!("{name}.{prop}"));
+                match prop {
+                    "on" => env.triggers = self.triggers_of(p),
+                    "ci-only" => match p.expr().as_ref().and_then(value_word).as_deref() {
                         Some("true") => env.ci_only = true,
                         Some("false") => {}
                         _ => self.err_hint(
+                            Code::EnvProblem,
                             p.key_span(),
                             "`ci-only` takes `true` or `false`",
                             "`ci-only: true`",
                         ),
                     },
-                    Some("secrets") => env.secrets = self.scalar_text(p),
-                    Some("approvers") => {
+                    "secrets" => env.secrets = self.scalar_text(p),
+                    "approvers" => {
                         if let Some(v) = p.expr() {
                             for item in tuple_items(v) {
                                 match &item {
@@ -1171,6 +1270,7 @@ impl<'a> Ctx<'a> {
                                         env.approvers.push(w.text().into());
                                         if w.scalar() != ks_lang::Scalar::Handle {
                                             self.err_hint(
+                                                Code::TypeMismatch,
                                                 w.node.span(),
                                                 format!("expected `Handle`, got `{}`", w.text()),
                                                 "approvers are handles, like `@platform`",
@@ -1178,6 +1278,7 @@ impl<'a> Ctx<'a> {
                                         }
                                     }
                                     _ => self.err_hint(
+                                        Code::TypeMismatch,
                                         item.span(),
                                         "expected a handle",
                                         "approvers are handles, like `@platform`",
@@ -1186,21 +1287,24 @@ impl<'a> Ctx<'a> {
                             }
                         }
                     }
-                    Some("vars") => {
+                    "vars" => {
                         env.vars =
                             p.children().filter_map(|c| c.key_name()).map(String::from).collect();
                     }
-                    Some(other) => {
+                    other => {
                         let msg = format!("unknown environment property `{other}`");
                         match suggest(other, &ENV_PROPERTIES) {
-                            Some(s) => {
-                                self.err_hint(p.key_span(), msg, format!("did you mean `{s}`?"))
-                            }
-                            None => self.err(p.key_span(), msg),
+                            Some(s) => self.err_hint(
+                                Code::EnvProblem,
+                                p.key_span(),
+                                msg,
+                                format!("did you mean `{s}`?"),
+                            ),
+                            None => self.err(Code::EnvProblem, p.key_span(), msg),
                         }
                     }
-                    None => {}
                 }
+                self.subject = None;
             }
             out.push(env);
         }
@@ -1208,29 +1312,34 @@ impl<'a> Ctx<'a> {
     }
 
     fn check_policy(&mut self, policy: Entry<'_>) {
-        for subject in policy.children() {
-            let kind = match subject.key_name() {
+        for actor in policy.children() {
+            let kind = match actor.key_name() {
                 Some("agents") => Some(ActorKind::Agent),
                 Some("humans") => Some(ActorKind::Human),
                 Some(other) => {
                     let msg = format!("unknown policy subject `{other}`");
                     match suggest(other, &["agents", "humans"]) {
-                        Some(s) => {
-                            self.err_hint(subject.key_span(), msg, format!("did you mean `{s}`?"))
-                        }
-                        None => self.err(subject.key_span(), msg),
+                        Some(s) => self.err_hint(
+                            Code::PolicyDecl,
+                            actor.key_span(),
+                            msg,
+                            format!("did you mean `{s}`?"),
+                        ),
+                        None => self.err(Code::PolicyDecl, actor.key_span(), msg),
                     }
                     continue;
                 }
                 None => continue,
             };
-            for p in subject.children() {
-                match p.key_name() {
+            for p in actor.children() {
+                let Some(prop) = p.key_name() else { continue };
+                self.subject = Some(format!("{}.{prop}", actor.key_name().unwrap_or_default()));
+                match prop {
                     // `never:` rules are retained on the workflow; `can:`
                     // and `before:` grant and gate, they never forbid.
-                    Some("never") => self.actions(p, kind),
-                    Some("can" | "before") => self.actions(p, None),
-                    Some("ask") => {
+                    "never" => self.actions(p, kind),
+                    "can" | "before" => self.actions(p, None),
+                    "ask" => {
                         if let Some(v) = p.expr() {
                             for item in tuple_items(v) {
                                 match &item {
@@ -1238,6 +1347,7 @@ impl<'a> Ctx<'a> {
                                         if w.scalar() != ks_lang::Scalar::Handle =>
                                     {
                                         self.err_hint(
+                                            Code::TypeMismatch,
                                             w.node.span(),
                                             format!("expected `Handle`, got `{}`", w.text()),
                                             "`ask` takes handles, like `@platform`",
@@ -1245,6 +1355,7 @@ impl<'a> Ctx<'a> {
                                     }
                                     Expr::Atom { .. } => {}
                                     _ => self.err_hint(
+                                        Code::TypeMismatch,
                                         item.span(),
                                         "expected a handle",
                                         "`ask` takes handles, like `@platform`",
@@ -1253,17 +1364,20 @@ impl<'a> Ctx<'a> {
                             }
                         }
                     }
-                    Some(other) => {
+                    other => {
                         let msg = format!("unknown policy property `{other}`");
                         match suggest(other, &["ask", "can", "before", "never"]) {
-                            Some(s) => {
-                                self.err_hint(p.key_span(), msg, format!("did you mean `{s}`?"))
-                            }
-                            None => self.err(p.key_span(), msg),
+                            Some(s) => self.err_hint(
+                                Code::PolicyDecl,
+                                p.key_span(),
+                                msg,
+                                format!("did you mean `{s}`?"),
+                            ),
+                            None => self.err(Code::PolicyDecl, p.key_span(), msg),
                         }
                     }
-                    None => {}
                 }
+                self.subject = None;
             }
         }
     }
@@ -1277,6 +1391,7 @@ impl<'a> Ctx<'a> {
             let atoms = item.atoms();
             if atoms.is_empty() {
                 self.err_hint(
+                    Code::PolicyAction,
                     item.span(),
                     "expected an action",
                     "`apply`, `deploy prod`, `read secrets`",
@@ -1288,8 +1403,13 @@ impl<'a> Ctx<'a> {
             if !POLICY_VERBS.contains(&text) {
                 let msg = format!("unknown action `{text}`");
                 match suggest(text, &POLICY_VERBS) {
-                    Some(s) => self.err_hint(verb.node.span(), msg, format!("did you mean `{s}`?")),
-                    None => self.err(verb.node.span(), msg),
+                    Some(s) => self.err_hint(
+                        Code::PolicyAction,
+                        verb.node.span(),
+                        msg,
+                        format!("did you mean `{s}`?"),
+                    ),
+                    None => self.err(Code::PolicyAction, verb.node.span(), msg),
                 }
                 continue;
             }
@@ -1298,10 +1418,13 @@ impl<'a> Ctx<'a> {
                     Some(Atom::Word(obj)) if obj.text() == "secrets" => {
                         self.forbid(subject, text, "secrets", item.span());
                     }
-                    Some(a) => self.err(a.span(), "`read` takes `secrets`"),
-                    None => {
-                        self.err_hint(verb.node.span(), "`read` takes `secrets`", "`read secrets`")
-                    }
+                    Some(a) => self.err(Code::PolicyAction, a.span(), "`read` takes `secrets`"),
+                    None => self.err_hint(
+                        Code::PolicyAction,
+                        verb.node.span(),
+                        "`read` takes `secrets`",
+                        "`read secrets`",
+                    ),
                 }
                 continue;
             }
@@ -1314,11 +1437,17 @@ impl<'a> Ctx<'a> {
             let msg = format!("undeclared environment `{name}`");
             match suggest(name, &self.env_names) {
                 Some(s) => self.err_hint(
+                    Code::EnvProblem,
                     env.node.span(),
                     msg,
                     format!("did you mean `{s}`? or declare it under `envs:`"),
                 ),
-                None => self.err_hint(env.node.span(), msg, "declare it under `envs:`"),
+                None => self.err_hint(
+                    Code::EnvProblem,
+                    env.node.span(),
+                    msg,
+                    "declare it under `envs:`",
+                ),
             }
         }
     }
@@ -1362,6 +1491,7 @@ impl<'a> Ctx<'a> {
         }
         for (key, span) in &firsts {
             self.err_hint(
+                Code::PolicyForbidden,
                 *span,
                 format!(
                     "policy forbids agents from reading secrets, but this run needs secrets.{key}"
@@ -1371,7 +1501,11 @@ impl<'a> Ctx<'a> {
         }
         // The rule's own location, so the report shows the line to change.
         if let Some(span) = self.policy.rule_span(ActorKind::Agent, "read", "secrets") {
-            self.err(span, "the `never: read secrets` rule applies to this run");
+            self.err(
+                Code::PolicyForbidden,
+                span,
+                "the `never: read secrets` rule applies to this run",
+            );
         }
     }
 
@@ -1417,7 +1551,7 @@ impl<'a> Ctx<'a> {
 
         let order = match find_cycle(&self.steps, &edges) {
             Some((path, span)) => {
-                self.err(span, format!("cycle: {}", path.join(" → ")));
+                self.err(Code::Cycle, span, format!("cycle: {}", path.join(" → ")));
                 None
             }
             None => topo(&self.steps, &edges),
@@ -1450,11 +1584,12 @@ impl<'a> Ctx<'a> {
 fn member_error(c: &mut Ctx<'_>, ns: &str, name: &str, members: &[&str], span: Span) {
     match suggest(name, members) {
         Some(s) => c.err_hint(
+            Code::UnknownRef,
             span,
             format!("unknown context value `{ns}.{name}`"),
             format!("did you mean `{ns}.{s}`?"),
         ),
-        None => c.err(span, format!("unknown context value `{ns}.{name}`")),
+        None => c.err(Code::UnknownRef, span, format!("unknown context value `{ns}.{name}`")),
     }
 }
 

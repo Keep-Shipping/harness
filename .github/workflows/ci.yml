@@ -102,3 +102,58 @@ jobs:
         run: |
           cargo build -p ks-lang -p ks-core --target wasm32-unknown-unknown \
             || { echo "::error::wasm32-unknown-unknown build failed. Fix: run 'cargo build -p ks-lang -p ks-core --target wasm32-unknown-unknown' locally; ks-lang and ks-core must stay I/O-free (no std::fs, no std::net, no tokio)."; exit 1; }
+
+  offline:
+    name: check needs no network
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain pinned in rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - name: Restore the cargo build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the CLI
+        run: cargo build -p ks-cli
+
+      - name: Check the fixtures inside a network namespace with no interfaces
+        run: |
+          # `check` reads files and must never reach for anything else. In a
+          # namespace with no interfaces a connection attempt fails fast
+          # (ENETUNREACH), so reaching at all would abort the run with an
+          # unexpected result; the `timeout` catches hangs. The fixtures
+          # carry intentional errors, so exit 1 is the one acceptable
+          # outcome.
+          rc=0
+          sudo unshare --net -- timeout 60 ./target/debug/keepshipping check --all \
+            crates/cli/tests/fixtures > /tmp/offline-check.out || rc=$?
+          cat /tmp/offline-check.out
+          if [ "$rc" -ne 1 ]; then
+            echo "::error::expected exit 1 (the fixtures' diagnostics), got $rc. Fix: keep 'keepshipping check' free of network access and store reads; it may only read the files it checks."
+            exit 1
+          fi
+          grep -q "expected oci.Digest, got string" /tmp/offline-check.out \
+            || { echo "::error::the fixtures were not actually checked."; exit 1; }
+
+  bench:
+    name: check budget (cold 1 s, warm p95 100 ms)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain pinned in rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - name: Restore the cargo build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Bench the check path against its budget
+        run: |
+          cargo bench -p ks-cli --bench check \
+            || { echo "::error::the check budget is blown (cold 1 s, warm p95 100 ms). Fix: run 'cargo bench -p ks-cli --bench check' locally, read the numbers, and make the check path fast again before adding anything to it."; exit 1; }

@@ -1,6 +1,6 @@
 //! Environment selection: which declared environment a run uses.
 
-use ks_lang::{Diagnostic, Span};
+use ks_lang::{Code, Diagnostic, Span};
 
 use crate::check::suggest;
 use crate::workflow::{Trigger, Workflow};
@@ -29,9 +29,9 @@ pub fn select_env(
                 let names: Vec<String> = envs.iter().map(|e| e.name.clone()).collect();
                 let msg = format!("unknown environment `{request}`");
                 Err(match suggest(request, &names) {
-                    Some(s) => Diagnostic::error(Span::default(), msg)
+                    Some(s) => Diagnostic::error(Code::EnvProblem, Span::default(), msg)
                         .with_hint(format!("did you mean `{s}`?")),
-                    None => Diagnostic::error(Span::default(), msg)
+                    None => Diagnostic::error(Code::EnvProblem, Span::default(), msg)
                         .with_hint(format!("declared environments: {}", names.join(", "))),
                 })
             }

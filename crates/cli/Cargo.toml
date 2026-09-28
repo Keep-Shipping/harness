@@ -11,6 +11,10 @@ repository.workspace = true
 name = "keepshipping"
 path = "src/main.rs"
 
+[[bench]]
+name = "check"
+harness = false
+
 [dependencies]
 ks-core.workspace = true
 ks-engine.workspace = true

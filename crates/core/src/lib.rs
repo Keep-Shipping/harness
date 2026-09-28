@@ -34,6 +34,7 @@ mod env;
 pub mod harness;
 pub mod ids;
 pub mod ports;
+pub mod registry;
 pub mod step;
 mod types;
 mod workflow;
@@ -44,5 +45,6 @@ pub use check::{
     secret_requirements,
 };
 pub use env::{EnvChoice, select_env};
+pub use registry::{Explanation, explain};
 pub use types::{LiteralFit, Type, coerce, literal, literal_type};
 pub use workflow::{Env, NeverRule, Policy, Step, Trigger, TriggerKind, Workflow};

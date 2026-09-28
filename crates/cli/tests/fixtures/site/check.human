@@ -1,0 +1,7 @@
+✗ ship.ks:21  deploy.image  expected oci.Digest, got string
+  │
+21 │     image: build.tag
+  │            ^^^^^^^^^
+  hint: use build.digest so prod runs
+        exactly the image you built
+0 steps ran. Nothing was touched.
