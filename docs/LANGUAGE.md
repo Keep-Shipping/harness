@@ -230,6 +230,43 @@ Each subject takes:
 An environment named in a policy action must be declared under `envs:`
 (`error: undeclared environment \`prod\``, with a hint to declare it).
 
+When the actor is known (`keepshipping check --actor human|agent|ci`, default
+`human`), the policy binds that actor: an `agents: never: read secrets` rule
+refuses an agent run that needs any `secrets.<name>` — an error at the
+reference (`policy forbids agents from reading secrets, but this run needs
+secrets.db_url`) plus a diagnostic on the rule's own line, so the run stops
+before it starts. Human, CI and unknown-actor checks are unaffected.
+
+## Types and secrets
+
+Every value has a type, and types never convert implicitly
+([#24](https://github.com/Keep-Shipping/harness/issues/24)):
+
+- Primitives: `string`, `int`, `float`, `bool`, `duration`, `path`, `url`;
+  composites `list[T]`, `map[T]`, records, `low | medium` enums, `T?`
+  optionals. Only `int` → `float` widens; a `string` is never a `path` or a
+  digest. An annotation word must spell a real type: an unknown bare word is
+  taken as a nominal type name (`web.Cluster`), so a misspelled primitive
+  (`itn`) names a nominal type no value satisfies rather than checking as
+  the primitive it was meant to be.
+- Nominal types (`oci.Digest`, `tofu.PlanFile`, ...) come from step schemas:
+  they coerce only to themselves, and a mismatch diagnostic names both types
+  (`expected oci.Digest, got string`) and suggests a same-workflow output of
+  the wanted type (`use build.digest so prod runs exactly the image you
+  built`). A well-formed `sha256:…` *literal* where a digest is declared is
+  accepted with a warning: pin by reference, not by pasted digest.
+- `secrets.<name>` is typed `Secret`
+  ([#27](https://github.com/Keep-Shipping/harness/issues/27)). A `Secret`
+  flows only into an input declared `Secret`; interpolating one into a word
+  or string, or `show:`ing one, is an error — secrets never reach strings or
+  logs. Step outputs cannot be `Secret`.
+- `keepshipping check --secrets` prints, per environment, every reference
+  the run needs as `resolver:key` plus the steps that need it
+  (`staging: vault:db_url (migrate)`; `default: (none)` when nothing is
+  needed; `[no \`secrets:\` resolver]` when the environment declares none).
+  It is a pure projection of the checked file: no resolver is constructed
+  and no store is read.
+
 ## Decisions pending ADRs
 
 The language's design is tracked by the ADRs indexed in `docs/adr/`; the

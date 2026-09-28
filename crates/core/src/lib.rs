@@ -38,7 +38,11 @@ pub mod step;
 mod types;
 mod workflow;
 
-pub use check::{Checked, check};
+pub use catalog::{Catalog, CatalogError, StepTypes};
+pub use check::{
+    CheckOptions, Checked, EnvSecrets, SecretRequirement, SecretUse, check, check_with,
+    secret_requirements,
+};
 pub use env::{EnvChoice, select_env};
-pub use types::Type;
-pub use workflow::{Env, Step, Trigger, TriggerKind, Workflow};
+pub use types::{LiteralFit, Type, coerce, literal, literal_type};
+pub use workflow::{Env, NeverRule, Policy, Step, Trigger, TriggerKind, Workflow};

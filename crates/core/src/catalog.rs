@@ -1,138 +1,446 @@
-//! The built-in step catalog: the inputs each kind checks and the outputs it
-//! declares. Custom step families (the `StepKind` trait) plug in later.
+//! The step catalog: the step kinds a check knows, with the input and
+//! output types each declares, plus the nominal type vocabulary those
+//! schemas share ([#24](https://github.com/Keep-Shipping/harness/issues/24)).
 
-use crate::types::Type;
+use std::collections::HashMap;
+use std::fmt;
 
-/// Catalog entry for one built-in step kind.
-pub(crate) struct StepSpec {
-    pub name: &'static str,
-    pub inputs: &'static [(&'static str, Ty)],
-    pub outputs: &'static [(&'static str, Ty)],
+use crate::harness::Harness;
+use crate::ports::script_host::{Value, ValueType};
+use crate::step::{StepSchema, TypeRef};
+use crate::types::{self, Type};
+
+/// One step kind's contract as the checker reads it: the input types values
+/// are checked against, and the output types references resolve to.
+#[derive(Clone, Debug)]
+pub struct StepTypes {
+    /// The kind's stable name (`oci.image`).
+    pub name: String,
+    /// Inputs by name, in declaration order.
+    pub inputs: Vec<(String, Type)>,
+    /// Outputs by name, in declaration order.
+    pub outputs: Vec<(String, Type)>,
     /// Outputs known only at run time; read as `<step>.out.<name>`.
     pub runtime_outputs: bool,
-    /// `decide`: the bare step name types as `Decision(returns)`.
+    /// `decide`: the bare step name and its `answer` output type as the
+    /// declared `returns:` variants.
     pub decision: bool,
-}
-
-/// A catalog type: a compact mirror of [`Type`] for the static table. The
-/// `decide` answer output depends on the step's `returns:`, so it is a
-/// marker ([`Ty::Answer`]) resolved per step.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Ty {
-    String,
-    Bool,
-    Int,
-    Float,
-    Path,
-    Handle,
-    Any,
-    Named(&'static str),
-    Answer,
-}
-
-impl Ty {
-    pub(crate) fn to_type(self) -> Type {
-        match self {
-            Ty::String => Type::String,
-            Ty::Bool => Type::Bool,
-            Ty::Int => Type::Int,
-            Ty::Float => Type::Float,
-            Ty::Path => Type::Path,
-            Ty::Handle => Type::Handle,
-            Ty::Any | Ty::Answer => Type::Any,
-            Ty::Named(n) => Type::Named(n),
-        }
-    }
-
-    fn matches(self, t: &Type) -> bool {
-        match self {
-            Ty::Answer => matches!(t, Type::Decision(_) | Type::Any),
-            other => other.to_type() == *t || t == &Type::Any,
-        }
-    }
 }
 
 /// `when:` is a reserved input on every step: a boolean expression.
 const WHEN: &str = "when";
 
-pub(crate) const STEPS: &[StepSpec] = &[
-    StepSpec {
-        name: "oci.image",
-        inputs: &[("from", Ty::Path), ("push", Ty::Named("oci.Tag")), ("sign", Ty::Bool)],
-        outputs: &[("digest", Ty::Named("oci.Digest")), ("tag", Ty::String), ("signed", Ty::Bool)],
-        runtime_outputs: false,
-        decision: false,
-    },
-    StepSpec {
-        name: "tofu.plan",
-        inputs: &[("dir", Ty::Path)],
-        outputs: &[
-            ("file", Ty::Named("tofu.PlanFile")),
-            ("changes", Ty::Named("tofu.Changes")),
-            ("adds", Ty::Int),
-            ("destroys", Ty::Int),
-        ],
-        runtime_outputs: false,
-        decision: false,
-    },
-    StepSpec {
-        name: "approval",
-        inputs: &[("show", Ty::Any), ("from", Ty::Handle), ("auto", Ty::Bool), ("else", Ty::Any)],
-        outputs: &[("approved", Ty::Bool), ("by", Ty::String)],
-        runtime_outputs: false,
-        decision: false,
-    },
-    StepSpec {
-        name: "tofu.apply",
-        inputs: &[("plan", Ty::Named("tofu.PlanFile"))],
-        outputs: &[],
-        runtime_outputs: true,
-        decision: false,
-    },
-    StepSpec {
-        name: "k8s.rollout",
-        inputs: &[("image", Ty::Named("oci.Digest")), ("to", Ty::Any), ("wait", Ty::Any)],
-        outputs: &[],
-        runtime_outputs: true,
-        decision: false,
-    },
-    StepSpec {
-        name: "decide",
-        inputs: &[
-            ("model", Ty::String),
-            ("ask", Ty::String),
-            ("input", Ty::Any),
-            ("returns", Ty::Any),
-        ],
-        outputs: &[("answer", Ty::Answer), ("confidence", Ty::Float), ("reason", Ty::String)],
-        runtime_outputs: false,
-        decision: true,
-    },
+impl StepTypes {
+    /// The declared type of input `name` (`when:` is always a bool).
+    pub(crate) fn input(&self, name: &str) -> Option<Type> {
+        if name == WHEN {
+            return Some(Type::Bool);
+        }
+        self.inputs.iter().find(|(n, _)| n == name).map(|(_, ty)| ty.clone())
+    }
+
+    /// The declared type of output `name`.
+    pub(crate) fn output(&self, name: &str) -> Option<&Type> {
+        self.outputs.iter().find(|(n, _)| n == name).map(|(_, ty)| ty)
+    }
+
+    /// The input names a value could be meant for, `when:` included.
+    pub(crate) fn input_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.inputs.iter().map(|(n, _)| n.clone()).collect();
+        v.push(WHEN.to_string());
+        v
+    }
+}
+
+/// Why a schema could not join a [`Catalog`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogError {
+    message: String,
+}
+
+impl CatalogError {
+    fn new(message: impl Into<String>) -> CatalogError {
+        CatalogError { message: message.into() }
+    }
+}
+
+impl fmt::Display for CatalogError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CatalogError {}
+
+/// The step kinds a check knows, and the nominal types their schemas name.
+/// [`Catalog::builtin`] carries the built-in families; schemas for custom
+/// steps join with [`Catalog::add_schema`].
+#[derive(Default)]
+pub struct Catalog {
+    steps: HashMap<String, StepTypes>,
+    /// The declared nominal types with, when known, why they exist — type
+    /// mismatch hints quote the rationale.
+    types: Vec<(&'static str, Option<&'static str>)>,
+}
+
+impl Catalog {
+    /// The built-in catalog: the built-in step kinds plus the domain
+    /// families' nominal types.
+    #[must_use]
+    pub fn builtin() -> Catalog {
+        let mut catalog = Catalog { types: FAMILIES.to_vec(), ..Catalog::default() };
+        let mut add = |name: &str,
+                       inputs: &[(&str, Type)],
+                       outputs: &[(&str, Type)],
+                       runtime_outputs: bool,
+                       decision: bool| {
+            catalog.steps.insert(
+                name.to_string(),
+                StepTypes {
+                    name: name.to_string(),
+                    inputs: owned(inputs),
+                    outputs: owned(outputs),
+                    runtime_outputs,
+                    decision,
+                },
+            );
+        };
+        add(
+            "oci.image",
+            &[("from", Type::Path), ("push", named("oci.Tag")), ("sign", Type::Bool)],
+            &[("digest", named("oci.Digest")), ("tag", Type::String), ("signed", Type::Bool)],
+            false,
+            false,
+        );
+        add(
+            "tofu.plan",
+            &[("dir", Type::Path)],
+            &[
+                ("file", named("tofu.PlanFile")),
+                ("changes", named("tofu.Changes")),
+                ("adds", Type::Int),
+                ("destroys", Type::Int),
+            ],
+            false,
+            false,
+        );
+        add(
+            "approval",
+            &[
+                ("show", Type::Any),
+                ("from", Type::Handle),
+                ("auto", Type::Bool),
+                ("else", Type::Any),
+            ],
+            &[("approved", Type::Bool), ("by", Type::String)],
+            false,
+            false,
+        );
+        add("tofu.apply", &[("plan", named("tofu.PlanFile"))], &[], true, false);
+        add(
+            "k8s.rollout",
+            &[("image", named("oci.Digest")), ("to", Type::Any), ("wait", Type::Any)],
+            &[],
+            true,
+            false,
+        );
+        // `answer` is resolved per step from its `returns:` variants.
+        add(
+            "decide",
+            &[
+                ("model", Type::String),
+                ("ask", Type::String),
+                ("input", Type::Any),
+                ("returns", Type::Any),
+            ],
+            &[("answer", Type::Any), ("confidence", Type::Float), ("reason", Type::String)],
+            false,
+            true,
+        );
+        catalog
+    }
+
+    /// Adds a custom step kind from its schema. Field defaults make an input
+    /// optional and are checked against the field's declared type. Fails
+    /// when `name` is already in the catalog, or when the schema declares an
+    /// output of type `Secret`: a secret output would invite exactly the
+    /// leaks the type system exists to prevent.
+    pub fn add_schema(&mut self, name: &str, schema: &StepSchema) -> Result<(), CatalogError> {
+        if self.steps.contains_key(name) {
+            return Err(CatalogError::new(format!("step `{name}` is already in the catalog")));
+        }
+        self.insert_schema(name, schema)
+    }
+
+    /// Builds a catalog from a harness: the built-in step kinds plus every
+    /// custom step registered there, the harness's schema winning on a name
+    /// clash. Fails when a schema breaks the [`Catalog`] rules.
+    pub fn from_harness(harness: &Harness) -> Result<Catalog, CatalogError> {
+        let mut catalog = Catalog::builtin();
+        for step in harness.steps() {
+            let name = step.name();
+            catalog.steps.remove(name);
+            catalog.insert_schema(name, &step.schema())?;
+        }
+        Ok(catalog)
+    }
+
+    fn insert_schema(&mut self, name: &str, schema: &StepSchema) -> Result<(), CatalogError> {
+        let mut inputs = Vec::new();
+        for field in &schema.inputs {
+            let ty = ty_of_ref(field.ty);
+            match &field.default {
+                Some(default) => {
+                    if !default_fits(&ty, default) {
+                        return Err(CatalogError::new(format!(
+                            "default for input `{}` does not fit its declared type {ty}",
+                            field.name
+                        )));
+                    }
+                    inputs.push((field.name.to_string(), Type::Optional(Box::new(ty))));
+                }
+                None => inputs.push((field.name.to_string(), ty)),
+            }
+        }
+        let mut outputs = Vec::new();
+        for field in &schema.outputs {
+            let ty = ty_of_ref(field.ty);
+            if ty == Type::Secret {
+                return Err(CatalogError::new("step outputs cannot be Secret in v1"));
+            }
+            outputs.push((field.name.to_string(), ty));
+        }
+        self.steps.insert(
+            name.to_string(),
+            StepTypes {
+                name: name.to_string(),
+                inputs,
+                outputs,
+                runtime_outputs: false,
+                decision: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// The step kind registered under `name`.
+    pub(crate) fn step(&self, name: &str) -> Option<&StepTypes> {
+        self.steps.get(name)
+    }
+
+    /// Why the nominal type `want` exists, when the catalog declares one.
+    pub(crate) fn rationale(&self, want: &Type) -> Option<&'static str> {
+        let Type::Named(name) = want else { return None };
+        self.types.iter().find(|(n, _)| *n == name.as_str()).and_then(|(_, r)| *r)
+    }
+}
+
+/// The domain families' nominal types, declared so schemas and hints share
+/// one vocabulary. The rationale, when present, is why the type exists;
+/// mismatch hints quote it as written.
+const FAMILIES: &[(&str, Option<&str>)] = &[
+    ("oci.Digest", Some("so prod runs exactly the image you built")),
+    ("oci.Ref", None),
+    ("oci.Tag", None),
+    ("oci.Artifact", None),
+    ("tofu.PlanFile", None),
+    ("tofu.Changes", None),
+    ("tofu.Outputs", None),
+    ("k8s.Cluster", None),
+    ("k8s.Namespace", None),
+    ("vm.Hosts", None),
+    ("fn.Version", None),
+    ("Secret", None),
+    ("Team", None),
+    ("Env", None),
 ];
 
-pub(crate) fn find(name: &str) -> Option<&'static StepSpec> {
-    STEPS.iter().find(|s| s.name == name)
+fn named(n: &str) -> Type {
+    Type::Named(n.to_string())
 }
 
-pub(crate) fn input(spec: &StepSpec, name: &str) -> Option<Ty> {
-    if name == WHEN {
-        return Some(Ty::Bool);
+fn owned(fields: &[(&str, Type)]) -> Vec<(String, Type)> {
+    fields.iter().map(|(n, ty)| (n.to_string(), ty.clone())).collect()
+}
+
+/// Maps a schema type reference onto a checker type: builtins map onto
+/// their primitives, names through [`Type::parse`] (`Secret`, `duration`,
+/// `int`, `oci.Digest`); an unknown name is nominal.
+fn ty_of_ref(ty: TypeRef) -> Type {
+    match ty {
+        TypeRef::Builtin(ValueType::Bool) => Type::Bool,
+        TypeRef::Builtin(ValueType::Number) => Type::Float,
+        TypeRef::Builtin(ValueType::String) => Type::String,
+        TypeRef::Builtin(ValueType::List) => Type::List(Box::new(Type::Any)),
+        TypeRef::Builtin(ValueType::Map) => Type::Map(Box::new(Type::Any)),
+        TypeRef::Builtin(ValueType::Null) => Type::Any,
+        TypeRef::Named(n) => Type::parse(n).unwrap_or_else(|| Type::Named(n.to_string())),
     }
-    spec.inputs.iter().find(|(n, _)| *n == name).map(|(_, ty)| *ty)
 }
 
-pub(crate) fn output(spec: &StepSpec, name: &str) -> Option<Ty> {
-    spec.outputs.iter().find(|(n, _)| *n == name).map(|(_, ty)| *ty)
+/// Whether a field's default value fits its declared type.
+fn default_fits(ty: &Type, value: &Value) -> bool {
+    match (ty, value) {
+        (Type::Any, _) => true,
+        (Type::Bool, Value::Bool(_)) => true,
+        (Type::Int, Value::Number(n)) => n.fract() == 0.0,
+        (Type::Float, Value::Number(_)) => true,
+        (Type::String, Value::String(_)) => true,
+        (Type::Optional(inner), v) => default_fits(inner, v),
+        (Type::List(inner), Value::List(items)) => items.iter().all(|i| default_fits(inner, i)),
+        (Type::Map(inner), Value::Map(entries)) => entries.values().all(|v| default_fits(inner, v)),
+        // Durations, paths and nominal types are spelled as strings.
+        (_, Value::String(text)) => matches!(types::literal(ty, text, None), types::LiteralFit::Ok),
+        _ => false,
+    }
 }
 
-/// Another output of the same kind with the wanted type, for
-/// did-you-mean hints on type mismatches.
-pub(crate) fn alt_output(spec: &StepSpec, want: &Type) -> Option<&'static str> {
-    spec.outputs.iter().find(|(_, ty)| ty.matches(want)).map(|(n, _)| *n)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::step::Field;
 
-pub(crate) fn input_names(spec: &StepSpec) -> Vec<String> {
-    let mut v: Vec<String> = spec.inputs.iter().map(|(n, _)| n.to_string()).collect();
-    v.push(WHEN.to_string());
-    v
+    fn schema(inputs: Vec<Field>, outputs: Vec<Field>) -> StepSchema {
+        StepSchema { doc: "a test step", inputs, outputs }
+    }
+
+    fn field(name: &'static str, ty: TypeRef) -> Field {
+        Field::new(name, ty, "")
+    }
+
+    #[test]
+    fn builtin_carries_the_built_in_steps() {
+        let catalog = Catalog::builtin();
+        let image = catalog.step("oci.image").expect("oci.image");
+        assert_eq!(image.output("digest"), Some(&named("oci.Digest")));
+        assert_eq!(image.input("push"), Some(named("oci.Tag")));
+        assert_eq!(image.input("when"), Some(Type::Bool), "when is reserved");
+        let decide = catalog.step("decide").expect("decide");
+        assert!(decide.decision);
+    }
+
+    #[test]
+    fn the_digest_rationale_is_what_hints_quote() {
+        let catalog = Catalog::builtin();
+        assert_eq!(
+            catalog.rationale(&named("oci.Digest")),
+            Some("so prod runs exactly the image you built")
+        );
+        assert_eq!(catalog.rationale(&named("oci.Tag")), None);
+        assert_eq!(catalog.rationale(&Type::String), None);
+    }
+
+    #[test]
+    fn a_schema_joins_with_names_parsed_and_defaults_optional() {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .add_schema(
+                "web.deploy",
+                &schema(
+                    vec![
+                        field("replicas", TypeRef::Named("int")).with_default(Value::Number(2.0)),
+                        field("image", TypeRef::Named("oci.Digest")),
+                        field("weight", TypeRef::Builtin(ValueType::Number)),
+                        field("tags", TypeRef::Named("list[string]")),
+                    ],
+                    vec![],
+                ),
+            )
+            .expect("schema joins");
+        let deploy = catalog.step("web.deploy").expect("web.deploy");
+        assert_eq!(deploy.input("replicas"), Some(Type::Optional(Box::new(Type::Int))));
+        assert_eq!(deploy.input("image"), Some(named("oci.Digest")));
+        assert_eq!(deploy.input("weight"), Some(Type::Float), "schema numbers are floats");
+        assert_eq!(deploy.input("tags"), Some(Type::List(Box::new(Type::String))));
+    }
+
+    #[test]
+    fn a_duplicate_step_name_is_refused() {
+        let mut catalog = Catalog::builtin();
+        let err = catalog
+            .add_schema("oci.image", &schema(vec![], vec![]))
+            .expect_err("duplicate refused");
+        assert_eq!(err.to_string(), "step `oci.image` is already in the catalog");
+    }
+
+    #[test]
+    fn a_secret_output_is_refused_in_v1() {
+        let mut catalog = Catalog::builtin();
+        let err = catalog
+            .add_schema(
+                "leaky.step",
+                &schema(vec![], vec![field("token", TypeRef::Named("Secret"))]),
+            )
+            .expect_err("secret output refused");
+        assert_eq!(err.to_string(), "step outputs cannot be Secret in v1");
+        assert!(catalog.step("leaky.step").is_none(), "a refused schema joins nothing");
+    }
+
+    #[test]
+    fn a_default_that_fits_no_type_is_refused() {
+        let mut catalog = Catalog::builtin();
+        let err = catalog
+            .add_schema(
+                "web.deploy",
+                &schema(
+                    vec![field("replicas", TypeRef::Named("int")).with_default("two".into())],
+                    vec![],
+                ),
+            )
+            .expect_err("default refused");
+        assert_eq!(
+            err.to_string(),
+            "default for input `replicas` does not fit its declared type int"
+        );
+    }
+
+    /// A custom step needing no ports, so a harness builds without wiring.
+    struct CustomStep;
+
+    impl crate::step::StepKind for CustomStep {
+        fn name(&self) -> &'static str {
+            "test.custom"
+        }
+
+        fn version(&self) -> crate::step::Version {
+            crate::step::Version::new(1, 0, 0)
+        }
+
+        fn schema(&self) -> StepSchema {
+            schema(vec![field("name", TypeRef::Builtin(ValueType::String))], vec![])
+        }
+
+        fn requires(&self) -> &'static [crate::step::Port] {
+            &[]
+        }
+
+        fn action(&self, _inputs: &crate::step::Inputs) -> crate::step::ActionClass {
+            crate::step::ActionClass::new(crate::step::ActionKind::Other)
+        }
+
+        fn run(
+            &self,
+            _ctx: crate::step::StepCtx,
+            _inputs: crate::step::Inputs,
+        ) -> crate::ports::BoxFuture<'_, Result<crate::step::Outputs, crate::step::StepError>>
+        {
+            Box::pin(std::future::ready(Ok(crate::step::Outputs::new())))
+        }
+    }
+
+    #[test]
+    fn a_harness_lends_its_custom_steps_to_the_catalog() {
+        let harness = crate::harness::HarnessBuilder::new()
+            .ports(
+                crate::step::Ports::default()
+                    .with_clock(std::sync::Arc::new(crate::step::test_support::FixedClock)),
+            )
+            .step(CustomStep)
+            .build()
+            .expect("only the clock, which every harness needs");
+        let catalog = Catalog::from_harness(&harness).expect("schemas are legal");
+        assert!(catalog.step("oci.image").is_some(), "built-ins survive");
+        let custom = catalog.step("test.custom").expect("custom step");
+        assert_eq!(custom.input("name"), Some(Type::String));
+    }
 }

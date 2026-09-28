@@ -88,6 +88,7 @@ version = "0.0.0"
 name = "ks-lsp"
 version = "0.0.0"
 dependencies = [
+ "ks-core",
  "ks-lang",
 ]
 

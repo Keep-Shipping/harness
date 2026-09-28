@@ -74,8 +74,128 @@ fn check_prints_diagnostics_and_exits_1() {
     assert_eq!(code, 1);
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("error: "), "{stderr}");
-    assert!(stderr.contains("expected `oci.Digest`, got `String`"), "{stderr}");
-    assert!(stderr.contains("hint: did you mean `build.digest`?"), "{stderr}");
+    assert!(stderr.contains("expected oci.Digest, got string"), "{stderr}");
+    assert!(
+        stderr.contains("hint: use build.digest so prod runs exactly the image you built"),
+        "{stderr}"
+    );
+}
+
+/// Needs a secret the policy forbids agents to read: an agent run must be
+/// refused before anything starts.
+const AGENT_SECRET: &str = "\
+name: gated
+envs:
+  prod:
+    ci-only: true
+steps:
+  migrate: db.migrate
+    url: secrets.db_url
+policy:
+  agents:
+    never: read secrets
+";
+
+/// Two environments, only one with a resolver: the listing names the
+/// reference for one and flags the missing resolver for the other.
+const SECRET_LISTING: &str = "\
+name: listed
+envs:
+  staging:
+    secrets: vault
+  prod:
+    ci-only: true
+steps:
+  migrate: db.migrate
+    url: secrets.db_url
+  report: db.report
+    key: secrets.db_url
+";
+
+#[test]
+fn check_secrets_lists_each_environments_references_without_touching_a_store() {
+    // The guarantee is structural: the listing is a pure projection of the
+    // checked file (`ks_core::secret_requirements`), so this command has no
+    // resolver to construct and no store to read — parsing and checking
+    // never touch I/O.
+    let path = temp_site("listed.ks", SECRET_LISTING);
+    let (code, stdout, stderr) = keepshipping(&path, &["check", "--secrets"]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("staging: vault:db_url (migrate, report)"), "{stdout}");
+    assert!(stdout.contains("prod: db_url (migrate, report) [no `secrets:` resolver]"), "{stdout}");
+    assert!(stdout.contains("ok (2 steps)"), "{stdout}");
+}
+
+#[test]
+fn check_secrets_says_none_when_nothing_is_needed() {
+    let path = temp_site("hero-secrets.ks", HERO);
+    let (code, stdout, stderr) = keepshipping(&path, &["check", "--secrets"]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("default: (none)"), "{stdout}");
+}
+
+/// `--secrets` is a `check` flag: `run` rejects it as unknown, and `check`
+/// still exits 1 on errors even with the listing printed.
+#[test]
+fn run_rejects_secrets_and_check_prints_the_listing_despite_errors() {
+    let path = temp_site("run-secrets.ks", SECRET_LISTING);
+    let (code, stdout, stderr) = keepshipping(&path, &["run", "--secrets"]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 2);
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("usage: keepshipping"), "{stderr}");
+
+    let path = temp_site("gated-secrets.ks", AGENT_SECRET);
+    let (code, stdout, stderr) = keepshipping(&path, &["check", "--secrets", "--actor", "agent"]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 1, "errors still fail the check: {stderr}");
+    assert!(stderr.contains("policy forbids agents from reading secrets"), "{stderr}");
+    assert!(
+        stdout.contains("prod: db_url (migrate) [no `secrets:` resolver]"),
+        "the listing is printed anyway: {stdout}"
+    );
+    assert!(!stdout.contains("ok"), "{stdout}");
+}
+
+#[test]
+fn check_actor_agent_refuses_secrets_the_policy_forbids() {
+    let path = temp_site("gated.ks", AGENT_SECRET);
+    let (code, _, stderr) = keepshipping(&path, &["check", "--actor", "agent"]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains(
+            "error: policy forbids agents from reading secrets, but this run needs secrets.db_url"
+        ),
+        "{stderr}"
+    );
+    assert!(stderr.contains("hint: the rule is `policy: agents: never: read secrets`"), "{stderr}");
+
+    // The same file is fine for a human, the default actor.
+    let path = temp_site("gated.ks", AGENT_SECRET);
+    let (code, stdout, stderr) = keepshipping(&path, &["check"]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("ok (1 steps)"), "{stdout}");
+
+    // An unknown actor is a usage error.
+    let path = temp_site("gated.ks", AGENT_SECRET);
+    let (code, _, stderr) = keepshipping(&path, &["check", "--actor", "robot"]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("usage: keepshipping"), "{stderr}");
+}
+
+#[test]
+fn run_actor_agent_refuses_before_anything_starts() {
+    let path = temp_site("gated-run.ks", AGENT_SECRET);
+    let (code, stdout, stderr) = keepshipping(&path, &["run", "--env", "prod", "--actor", "agent"]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 1, "{stdout}");
+    assert!(stderr.contains("policy forbids agents from reading secrets"), "{stderr}");
+    assert!(!stdout.contains("environment:"), "nothing runs: {stdout}");
 }
 
 #[test]

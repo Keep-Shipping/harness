@@ -131,22 +131,6 @@ steps:
 }
 
 #[test]
-fn interpolating_a_secret_fails_with_a_hint() {
-    let src = "\
-steps:
-  build: oci.image
-    from: ./Dockerfile
-    push: ghcr.io/acme/api:{secrets.token}
-";
-    let all = messages(src);
-    assert!(
-        all.iter().any(|m| m.contains("secret `secrets.token` cannot be interpolated")
-            && m.contains("secrets never go into strings or logs")),
-        "{all:?}"
-    );
-}
-
-#[test]
 fn misspelled_step_gets_did_you_mean() {
     let src = "\
 steps:
@@ -174,11 +158,180 @@ steps:
 ";
     let all = messages(src);
     assert!(
-        all.iter()
-            .any(|m| m.contains("expected `oci.Digest`, got `String`")
-                && m.contains("`build.digest`")),
+        all.iter().any(|m| m.contains("expected oci.Digest, got string")
+            && m.contains("use build.digest so prod runs exactly the image you built")),
         "{all:?}"
     );
+}
+
+#[test]
+fn a_rationale_less_type_hint_says_what_the_output_is() {
+    let src = "\
+steps:
+  plan: tofu.plan
+    dir: ./infra
+  apply: tofu.apply
+    plan: plan.changes
+";
+    let all = messages(src);
+    assert!(
+        all.iter().any(|m| m.contains("expected tofu.PlanFile, got tofu.Changes")
+            && m.contains("use plan.file, which is a tofu.PlanFile")),
+        "{all:?}"
+    );
+}
+
+#[test]
+fn a_pasted_digest_literal_warns_and_names_the_reference() {
+    let digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let src = format!(
+        "\
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  deploy: k8s.rollout
+    image: \"sha256:{digest}\"
+"
+    );
+    let checked = check(&ks_lang::parse(&src));
+    let warns: Vec<_> = checked
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d.severity, ks_lang::Severity::Warning))
+        .collect();
+    assert_eq!(warns.len(), 1, "{:#?}", checked.diagnostics);
+    assert_eq!(warns[0].message, "digest literal pinned by value");
+    assert_eq!(
+        warns[0].hint.as_deref(),
+        Some("pin by reference, not by pasted digest: use build.digest")
+    );
+}
+
+#[test]
+fn an_unquoted_digest_literal_is_one_word_and_warns_too() {
+    let digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let src = format!(
+        "\
+steps:
+  deploy: k8s.rollout
+    image: sha256:{digest}
+  build: oci.image
+    from: ./Dockerfile
+"
+    );
+    let all = messages(&src);
+    assert!(
+        all.iter().any(|m| m.contains("digest literal pinned by value")
+            && m.contains("pin by reference, not by pasted digest")),
+        "{all:?}"
+    );
+}
+
+#[test]
+fn a_digest_literal_must_actually_be_a_digest() {
+    let src = "\
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  deploy: k8s.rollout
+    image: \"sha256:not-hex\"
+";
+    let all = messages(src);
+    assert!(all.iter().any(|m| m.contains("expected oci.Digest, got string")), "{all:?}");
+}
+
+#[test]
+fn a_string_is_never_another_familys_type() {
+    let src = "\
+steps:
+  apply: tofu.apply
+    plan: \"./infra/tfplan\"
+";
+    let all = messages(src);
+    assert!(all.iter().any(|m| m.contains("expected tofu.PlanFile, got string")), "{all:?}");
+}
+
+#[test]
+fn a_custom_catalog_types_its_own_steps() {
+    use ks_core::step::{Field, StepSchema, TypeRef};
+    let mut catalog = ks_core::Catalog::builtin();
+    catalog
+        .add_schema(
+            "web.deploy",
+            &StepSchema {
+                doc: "deploy the web service",
+                inputs: vec![
+                    Field::new("replicas", TypeRef::Named("int"), "how many"),
+                    Field::new("image", TypeRef::Named("oci.Digest"), "what"),
+                    Field::new("tags", TypeRef::Named("list[string]"), "labels"),
+                    Field::new("size", TypeRef::Named("s | m | l"), "which size"),
+                    Field::new("endpoint", TypeRef::Named("url"), "where"),
+                ],
+                outputs: vec![],
+            },
+        )
+        .expect("the schema joins");
+    let options = ks_core::CheckOptions::new(&catalog);
+    let check = |src: &str| ks_core::check_with(&ks_lang::parse(src), &options);
+
+    let src = "\
+steps:
+  deploy: web.deploy
+    replicas: int = 2
+    image: build.digest
+    tags: api, edge
+    size: m
+    endpoint: https://api.acme.dev
+  build: oci.image
+    from: ./Dockerfile
+";
+    assert!(check(src).diagnostics.is_empty(), "{:#?}", check(src).diagnostics);
+
+    // A default that is no literal of its annotation, an enum word that
+    // names no variant, a host that is no url.
+    let bad = src.replace("replicas: int = 2", "replicas: int = two");
+    assert!(check(&bad).diagnostics.iter().any(|d| d.message == "expected int, got string"));
+    let bad = src.replace("size: m", "size: xxl");
+    assert!(check(&bad).diagnostics.iter().any(|d| d.message == "expected s | m | l, got string"));
+    let bad = src.replace("endpoint: https://api.acme.dev", "endpoint: \"api.acme.dev\"");
+    assert!(check(&bad).diagnostics.iter().any(|d| d.message == "expected url, got string"));
+}
+
+#[test]
+fn a_record_input_checks_positionally_and_a_list_element_wise() {
+    use ks_core::step::{Field, StepSchema, TypeRef};
+    let mut catalog = ks_core::Catalog::builtin();
+    catalog
+        .add_schema(
+            "web.rollout",
+            &StepSchema {
+                doc: "roll out",
+                inputs: vec![
+                    Field::new(
+                        "wait",
+                        TypeRef::Named("{healthy: bool, grace: duration, port: int}"),
+                        "when ready",
+                    ),
+                    Field::new("hosts", TypeRef::Named("list[int]"), "which hosts"),
+                ],
+                outputs: vec![],
+            },
+        )
+        .expect("the schema joins");
+    let options = ks_core::CheckOptions::new(&catalog);
+    let check = |src: &str| ks_core::check_with(&ks_lang::parse(src), &options);
+
+    let src = "steps:\n  d: web.rollout\n    wait: true, 5m, 8080\n    hosts: 1, 2\n";
+    assert!(check(src).diagnostics.is_empty(), "{:#?}", check(src).diagnostics);
+
+    let bad = "steps:\n  d: web.rollout\n    wait: 5m, true, 8080\n    hosts: 1, 2\n";
+    assert!(check(bad).diagnostics.iter().any(|d| d.message == "expected bool, got duration"));
+    let bad = "steps:\n  d: web.rollout\n    wait: true, 5m\n    hosts: 1, 2\n";
+    assert!(check(bad).diagnostics.iter().any(|d| {
+        d.message == "expected {healthy: bool, grace: duration, port: int}, got 2 items"
+    }));
+    let bad = "steps:\n  d: web.rollout\n    wait: true, 5m\n    hosts: 1, x\n";
+    assert!(check(bad).diagnostics.iter().any(|d| d.message == "expected int, got string"));
 }
 
 #[test]
@@ -540,4 +693,252 @@ steps:
         Ok(EnvChoice::Selected("prod".into())),
         "an explicit request wins over the event"
     );
+}
+
+// --- secrets are typed (#27 AC1) -------------------------------------------
+
+#[test]
+fn a_secret_into_a_string_or_tag_input_errors_with_the_secret_hint() {
+    // `model` is a `string`; `push` is an `oci.Tag`. Neither takes a secret.
+    let src = "\
+steps:
+  judge: decide
+    model: secrets.db_url
+  build: oci.image
+    from: ./Dockerfile
+    push: secrets.token
+";
+    let all = messages(src);
+    assert!(
+        all.iter().any(|m| m.contains("expected string, got Secret")
+            && m.contains("secrets flow only into inputs typed Secret")),
+        "{all:?}"
+    );
+    assert!(
+        all.iter().any(|m| m.contains("expected oci.Tag, got Secret")
+            && m.contains("secrets flow only into inputs typed Secret")),
+        "{all:?}"
+    );
+}
+
+#[test]
+fn a_secret_interpolates_nowhere_in_a_word_or_a_string() {
+    let src = "\
+steps:
+  build: oci.image
+    from: ./Dockerfile
+    push: ghcr.io/acme/api:{secrets.token}
+  judge: decide
+    model: \"token is {secrets.token}\"
+";
+    let all = messages(src);
+    let seen = all.iter().filter(|m| {
+        m.contains("secret `secrets.token` cannot be interpolated into a string")
+            && m.contains("secrets never go into strings or logs")
+    });
+    assert_eq!(seen.count(), 2, "once per spelling, word and quoted string: {all:?}");
+}
+
+#[test]
+fn a_step_output_typed_secret_is_refused_before_any_file_is_checked() {
+    use ks_core::step::{
+        ActionClass, ActionKind, Field, Inputs, Outputs, Port, Ports, StepCtx, StepError, StepKind,
+        StepSchema, TypeRef, Version,
+    };
+
+    struct LeakyStep;
+
+    impl StepKind for LeakyStep {
+        fn name(&self) -> &'static str {
+            "leaky.step"
+        }
+
+        fn version(&self) -> Version {
+            Version::new(1, 0, 0)
+        }
+
+        fn schema(&self) -> StepSchema {
+            StepSchema {
+                doc: "would emit a secret as an output",
+                inputs: vec![],
+                outputs: vec![Field::new("token", TypeRef::Named("Secret"), "the token")],
+            }
+        }
+
+        fn requires(&self) -> &'static [Port] {
+            &[]
+        }
+
+        fn action(&self, _inputs: &Inputs) -> ActionClass {
+            ActionClass::new(ActionKind::Other)
+        }
+
+        fn run(
+            &self,
+            _ctx: StepCtx,
+            _inputs: Inputs,
+        ) -> ks_core::ports::BoxFuture<'_, Result<Outputs, StepError>> {
+            Box::pin(std::future::ready(Ok(Outputs::new())))
+        }
+    }
+
+    // `add_schema` refuses, so `check_with` can never see a Secret output.
+    let mut catalog = ks_core::Catalog::builtin();
+    let err = catalog
+        .add_schema(
+            "leaky.step",
+            &StepSchema {
+                doc: "would emit a secret as an output",
+                inputs: vec![],
+                outputs: vec![Field::new("token", TypeRef::Named("Secret"), "the token")],
+            },
+        )
+        .expect_err("secret output refused");
+    assert_eq!(err.to_string(), "step outputs cannot be Secret in v1");
+    // The refused schema joined nothing: the name is still free.
+    catalog
+        .add_schema("leaky.step", &StepSchema { doc: "harmless", inputs: vec![], outputs: vec![] })
+        .expect("the refused name stayed free");
+
+    // The harness route is closed too, so `Catalog::from_harness` cannot
+    // carry one in behind the checker's back.
+    struct ZeroClock;
+    impl ks_core::ports::clock::Clock for ZeroClock {
+        fn now(&self) -> std::time::SystemTime {
+            std::time::SystemTime::UNIX_EPOCH
+        }
+
+        fn sleep<'a>(
+            &'a self,
+            _duration: std::time::Duration,
+        ) -> ks_core::ports::BoxFuture<'a, ()> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+    let built = ks_core::harness::HarnessBuilder::new()
+        .ports(Ports::default().with_clock(std::sync::Arc::new(ZeroClock)))
+        .step(LeakyStep)
+        .build()
+        .expect_err("a harness refuses a Secret output");
+    assert!(
+        matches!(
+            built.errors(),
+            [ks_core::harness::CompositionError::SecretOutput { step, output }]
+                if step == "leaky.step" && output == "token"
+        ),
+        "{built}"
+    );
+}
+
+#[test]
+fn a_secret_flows_into_an_input_typed_secret() {
+    use ks_core::step::{Field, StepSchema, TypeRef};
+    let mut catalog = ks_core::Catalog::builtin();
+    catalog
+        .add_schema(
+            "vault.read",
+            &StepSchema {
+                doc: "uses a secret in the adapter",
+                inputs: vec![Field::new("token", TypeRef::Named("Secret"), "the token")],
+                outputs: vec![],
+            },
+        )
+        .expect("the schema joins");
+    let options = ks_core::CheckOptions::new(&catalog);
+    let src = "\
+steps:
+  read: vault.read
+    token: secrets.db_password
+";
+    let checked = ks_core::check_with(&ks_lang::parse(src), &options);
+    assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
+    // The run carries the requirement even though nothing leaks.
+    assert_eq!(checked.secret_uses.len(), 1);
+    assert_eq!(checked.secret_uses[0].key, "db_password");
+    assert_eq!(checked.secret_uses[0].step, "read");
+}
+
+// --- policy binds the actor (#27 AC3) --------------------------------------
+
+const SECRET_NEED: &str = "\
+envs:
+  prod:
+    ci-only: true
+steps:
+  migrate: db.migrate
+    url: secrets.db_url
+";
+
+#[test]
+fn an_agent_needing_secrets_the_policy_forbids_is_refused() {
+    let src = format!("{SECRET_NEED}policy:\n  agents:\n    never: read secrets\n");
+
+    // The agent run is refused, at the reference and at the rule.
+    let catalog = ks_core::Catalog::builtin();
+    let options =
+        ks_core::CheckOptions::new(&catalog).actor(ks_core::ports::run_context::ActorKind::Agent);
+    let checked = ks_core::check_with(&ks_lang::parse(&src), &options);
+    assert!(
+        checked.diagnostics.iter().any(|d| d.message
+            == "policy forbids agents from reading secrets, but this run needs secrets.db_url"
+            && d.hint.as_deref() == Some("the rule is `policy: agents: never: read secrets`")),
+        "{:#?}",
+        checked.diagnostics
+    );
+    assert!(
+        checked
+            .diagnostics
+            .iter()
+            .any(|d| d.message == "the `never: read secrets` rule applies to this run"),
+        "{:#?}",
+        checked.diagnostics
+    );
+
+    // The same file checks clean for a human.
+    let options =
+        ks_core::CheckOptions::new(&catalog).actor(ks_core::ports::run_context::ActorKind::Human);
+    let checked = ks_core::check_with(&ks_lang::parse(&src), &options);
+    assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
+
+    // And a check with no actor at all stays policy-silent.
+    let checked = check(&ks_lang::parse(&src));
+    assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
+
+    // Two references to the same key are refused once, at the first.
+    let src = format!(
+        "{SECRET_NEED}  report: db.report\n    url: secrets.db_url\npolicy:\n  agents:\n    \
+         never: read secrets\n"
+    );
+    let options =
+        ks_core::CheckOptions::new(&catalog).actor(ks_core::ports::run_context::ActorKind::Agent);
+    let checked = ks_core::check_with(&ks_lang::parse(&src), &options);
+    let refusals: Vec<_> = checked
+        .diagnostics
+        .iter()
+        .filter(|d| d.message.starts_with("policy forbids agents"))
+        .collect();
+    assert_eq!(refusals.len(), 1, "one per distinct key, not per reference: {:#?}", refusals);
+    assert_eq!(checked.diagnostics.len(), 2, "the refusal plus the one on the rule");
+}
+
+#[test]
+fn an_agent_runs_when_the_file_needs_no_secrets_or_the_policy_stays_silent() {
+    // No secrets, policy or not: nothing to refuse.
+    let no_secrets = format!("{SECRET_NEED}policy:\n  agents:\n    never: read secrets\n");
+    let no_secrets = no_secrets.replace("    url: secrets.db_url\n", "");
+    let catalog = ks_core::Catalog::builtin();
+    let options =
+        ks_core::CheckOptions::new(&catalog).actor(ks_core::ports::run_context::ActorKind::Agent);
+    let checked = ks_core::check_with(&ks_lang::parse(&no_secrets), &options);
+    assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
+
+    // Secrets without the never-rule: the agent may read them.
+    let allowed = format!("{SECRET_NEED}policy:\n  agents:\n    can: read secrets\n");
+    let checked = ks_core::check_with(&ks_lang::parse(&allowed), &options);
+    assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
+
+    // A rule binding humans does not bind the agent.
+    let humans_only = format!("{SECRET_NEED}policy:\n  humans:\n    never: read secrets\n");
+    let checked = ks_core::check_with(&ks_lang::parse(&humans_only), &options);
+    assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
 }
