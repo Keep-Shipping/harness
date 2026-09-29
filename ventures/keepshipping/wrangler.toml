@@ -1,0 +1,38 @@
+# The early-access waitlist Worker (issue #146). `wrangler deploy` from
+# this directory; `wrangler d1 create` + `wrangler secret put` first (see
+# the README). The D1 binding name and the rate limiter name are load-bearing
+# in `src/lib.rs` (`Cloudflare::new().db("DB").rate_limiter("RATE_LIMITER")`).
+
+name = "keepshipping-waitlist"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-09-01"
+
+[build]
+command = "worker-build --release"
+
+[observability]
+enabled = true
+
+[vars]
+ENV = "production"
+
+[[ratelimits]]
+name = "RATE_LIMITER"
+namespace_id = "2001"
+
+[ratelimits.simple]
+limit = 30
+period = 60
+
+[[d1_databases]]
+binding = "DB"
+database_name = "keepshipping-waitlist"
+# Placeholder: replace with the id `wrangler d1 create keepshipping-waitlist`
+# prints. Deploy must fail until a real database exists, not silently bind
+# to someone else's.
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[[routes]]
+pattern = "api.keepshipping.run"
+custom_domain = true
