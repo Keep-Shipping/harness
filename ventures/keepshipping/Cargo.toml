@@ -1,0 +1,36 @@
+[package]
+name = "keepshipping-waitlist"
+description = "Keep Shipping's early-access waitlist: the hosted venture on the Cratefield harness waitlist module"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[lib]
+# `cdylib` is what `worker-build` compiles to wasm32 and deploys; `rlib`
+# exists so the integration tests in `tests/` can import the crate.
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+cratefield-core = "0.6"
+cratefield-runtime-cloudflare = "0.2"
+cratefield-module-waitlist = "0.2"
+cratefield-adapter-resend = "0.3"
+cratefield-adapter-turnstile = "0.2"
+serde_json = "1"
+worker = { version = "0.8.5", default-features = false, features = ["d1"] }
+
+# ulid (through cratefield-core) draws its randomness from getrandom, whose
+# wasm32 backend is opt-in per leaf crate. Never compiled on native targets.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", default-features = false, features = ["wasm_js"] }
+
+[dev-dependencies]
+cratefield-testing = "0.3"
+http = "1"
+pollster = "0.4"
