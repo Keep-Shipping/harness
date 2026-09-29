@@ -12,7 +12,7 @@ ks-lsp: the same ks-core, for editors
                                               │ only sees ports
 ports: RunContext · Secrets · ImageBuilder · Registry · Signer · IacTool · Cluster
        RemoteShell · FunctionHost · ScriptHost · ApprovalChannel · Directory
-       DecisionModel · RunLog · StateStore · BlockSource · PolicyStore
+       DecisionModel · RunLog · StateStore · BlockSource · BlocksIndex · PolicyStore
        HttpClient · Clock · IdGen
                                               │
 adapters/*: buildkit, oci-distribution, sigstore, tofu-cli, kube, ssh, deno script host,

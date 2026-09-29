@@ -257,7 +257,7 @@ fn json_span(w: &mut impl Write, lines: &Lines, src: &str, span: Span) -> io::Re
 
 /// A JSON string literal, escaped per RFC 8259: quote, backslash and the C0
 /// controls; everything else rides through as UTF-8.
-fn json_str(text: &str) -> String {
+pub(crate) fn json_str(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
     for c in text.chars() {

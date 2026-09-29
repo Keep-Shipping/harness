@@ -1,32 +1,45 @@
 //! Command-line parsing: one hand-rolled pass over the arguments, shared by
-//! `check` and `run`. Anything unrecognizable — flag, value or format — is a
-//! usage error, never a silently swallowed option.
+//! `check`, `run` and `blocks search`. Anything unrecognizable — flag, value
+//! or format — is a usage error, never a silently swallowed option.
 
 use ks_core::ports::run_context::ActorKind;
 
 use crate::render::Format;
+
+/// The most results `blocks search` asks the index for when `--limit` is
+/// not given.
+pub const DEFAULT_SEARCH_LIMIT: u32 = 20;
+/// The environment variable that configures the blocks index when `--index`
+/// is absent. `--index` wins.
+pub const INDEX_ENV: &str = "KEEPSSHIPPING_BLOCKS_INDEX";
 
 pub const USAGE: &str = "\
 usage: keepshipping check [FILE] [--all] [--format human|json|github]
                           [--warnings-as-errors] [--env NAME] [--event \"push main\"]
                           [--actor human|agent|ci] [--secrets]
        keepshipping run [FILE] [--env NAME] [--event \"push main\"] [--actor human|agent|ci]
-                        [--non-interactive]";
+                        [--non-interactive]
+       keepshipping blocks search <QUERY> [--index URL] [--limit N] [--format human|json]";
 
 /// Which subcommand's flags `parse_args` accepts. `--format`, `--all`,
 /// `--warnings-as-errors` and `--secrets` belong to `check` alone; `run`
-/// rejects them like any other unrecognized option.
+/// rejects them like any other unrecognized option. `blocks search` has its
+/// own `--format` (human or json, no github annotations), `--index` and
+/// `--limit`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Check,
     Run,
+    BlocksSearch,
 }
 
 /// The parsed command line. `path` is the `FILE` argument: the site file —
 /// or, with `--all`, the directory to walk — defaulting to `ship.ks` in the
-/// working directory when absent.
+/// working directory when absent. For `blocks search` the positional is the
+/// search text, carried in `query` instead.
 pub struct Options {
     pub path: Option<String>,
+    pub query: Option<String>,
     pub format: Format,
     pub all: bool,
     pub warnings_as_errors: bool,
@@ -38,11 +51,17 @@ pub struct Options {
     pub actor: ActorKind,
     pub secrets: bool,
     pub non_interactive: bool,
+    /// The base URL of the blocks index, from `--index`. Absent means the
+    /// command falls back to `INDEX_ENV`, and fails when neither is set.
+    pub index: Option<String>,
+    /// The `--limit` of `blocks search`, at least one.
+    pub limit: u32,
 }
 
 pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
     let mut o = Options {
         path: None,
+        query: None,
         format: Format::Human,
         all: false,
         warnings_as_errors: false,
@@ -51,11 +70,13 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
         actor: ActorKind::Human,
         secrets: false,
         non_interactive: false,
+        index: None,
+        limit: DEFAULT_SEARCH_LIMIT,
     };
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
-            "--format" if command == Command::Check => {
+            "--format" if command != Command::Run => {
                 o.format = Format::parse(&flag_value(&mut rest)?)?
             }
             "--all" if command == Command::Check => o.all = true,
@@ -65,12 +86,27 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
             "--event" => o.event = Some(flag_value(&mut rest)?),
             "--actor" => o.actor = actor_kind(&flag_value(&mut rest)?)?,
             "--non-interactive" => o.non_interactive = true,
+            "--index" if command == Command::BlocksSearch => o.index = Some(flag_value(&mut rest)?),
+            "--limit" if command == Command::BlocksSearch => {
+                let value = flag_value(&mut rest)?;
+                o.limit = value.parse().ok().filter(|limit| *limit > 0)?;
+            }
             flag if flag.starts_with('-') => return None,
-            // One positional: the site file, or the tree with `--all`. A
-            // second is almost always a typo, not a list to check.
-            file if o.path.is_none() => o.path = Some(file.to_string()),
+            // One positional: the site file, the tree with `--all`, or the
+            // search text. A second is almost always a typo, not a list to
+            // check.
+            file if o.path.is_none() && command != Command::BlocksSearch => {
+                o.path = Some(file.to_string())
+            }
+            text if o.query.is_none() && command == Command::BlocksSearch => {
+                o.query = Some(text.to_string())
+            }
             _ => return None,
         }
+    }
+    // GitHub annotations describe source spans; a search result has none.
+    if command == Command::BlocksSearch && o.format == Format::Github {
+        return None;
     }
     Some(o)
 }

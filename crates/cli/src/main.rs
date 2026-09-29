@@ -6,7 +6,10 @@
 #![forbid(unsafe_code)]
 
 mod args;
+mod blocks;
+mod blocks_index;
 mod check;
+mod http_client;
 mod render;
 
 use std::io::{IsTerminal, Write as _};
@@ -32,6 +35,7 @@ fn dispatch() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("check") => check::check(&args[1..]),
         Some("run") => run(&args[1..]),
+        Some("blocks") => blocks::blocks(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
