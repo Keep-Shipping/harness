@@ -10,6 +10,7 @@
 //! - [`supply_chain`] — signing, attestations and digests ([#50](https://github.com/Keep-Shipping/harness/issues/50));
 //! - [`iac`] — planning and applying infrastructure ([#51](https://github.com/Keep-Shipping/harness/issues/51));
 //! - [`http`] — bounded, policy-checked HTTP ([#57](https://github.com/Keep-Shipping/harness/issues/57));
+//! - [`blocks`] — the metadata-only blocks index ([#149](https://github.com/Keep-Shipping/harness/issues/149));
 //! - [`clock`] — time and sleeping, as a dependency rather than ambient;
 //! - [`id_gen`] — minting fresh run ids;
 //! - [`script_host`] — running the TypeScript escape-hatch steps.
@@ -34,6 +35,7 @@ use core::pin::Pin;
 /// documentation](self) for why the ports box instead of using `async-trait`.
 pub type BoxFuture<'a, T> = Pin<Box<dyn core::future::Future<Output = T> + Send + 'a>>;
 
+pub mod blocks;
 pub mod clock;
 pub mod http;
 pub mod iac;

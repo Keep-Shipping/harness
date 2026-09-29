@@ -19,6 +19,10 @@ harness = false
 ks-core.workspace = true
 ks-engine.workspace = true
 ks-lang.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+ks-testing.workspace = true
 
 [lints]
 workspace = true

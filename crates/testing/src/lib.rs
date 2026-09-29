@@ -14,6 +14,7 @@
 use std::future::Future;
 use std::task::Poll;
 
+pub mod blocks;
 pub mod clock;
 pub mod http;
 pub mod iac;
