@@ -31,6 +31,16 @@ async fn join(
         .await
 }
 
+/// The problem's slug: the part of `type` after `/problems/`. Since
+/// cratefield-core 0.7 the `type` URI is named under the serving venture's
+/// own base, so a client (and this test) matches on the slug, never on the
+/// full URI.
+fn problem_slug(response: &cratefield_testing::TestResponse) -> String {
+    let body = response.json();
+    let uri = body["type"].as_str().expect("a problem+json `type`");
+    uri.split_once("/problems/").map_or(uri, |(_, slug)| slug).to_owned()
+}
+
 fn entry_status(kit: &TestHarness, email: &str) -> Option<String> {
     let stmt = Statement::with_values(
         "SELECT status FROM waitlist_entries WHERE email_normalized = ?",
@@ -50,7 +60,7 @@ async fn missing_captcha_token_is_refused() {
     });
     let response = join(&kit, "nick@example.com", "keepshipping", "").await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
-    assert_eq!(response.json()["type"], "https://factory0.ventures/problems/captcha-failed");
+    assert_eq!(problem_slug(&response), "captcha-failed");
     assert_eq!(
         entry_status(&kit, "nick@example.com"),
         None,
@@ -79,7 +89,7 @@ async fn unknown_product_is_a_400_problem() {
     });
     let response = join(&kit, "nick@example.com", "not-our-product", "good").await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
-    assert_eq!(response.json()["type"], "https://factory0.ventures/problems/unknown-product");
+    assert_eq!(problem_slug(&response), "unknown-product");
 }
 
 #[pollster::test]
