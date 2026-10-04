@@ -5,7 +5,7 @@
 //! the captcha gate, the per-IP rate limiter and the admin export all come
 //! from published `cratefield` crates; what this crate owns is the
 //! business judgement — the venture's name and domain, the product code,
-//! the origins writes may come from, and the mail sender.
+//! the origins writes may come from, the mail sender and the mail theme.
 //!
 //! The shape mirrors `ventures/cratefield-waitlist` in the upstream
 //! harness repository: a `fetch` entry point that runs the origin guard and
@@ -18,18 +18,24 @@
 //! makes plain.
 //!
 //! Configuration lives in `wrangler.toml` next to this file; the secrets
-//! (`RESEND_API_KEY`, `TURNSTILE_SECRET`) are set with
-//! `wrangler secret put`. Both adapters are deliberately wired so that a
+//! (`OWLPOST_API_KEY`, `RESEND_API_KEY`, `TURNSTILE_SECRET`) are set with
+//! `wrangler secret put`. The adapters are deliberately wired so that a
 //! missing secret degrades safely rather than dangerously:
 //!
+//! * `OWLPOST_API_KEY` selects the preferred Owlpost mailer; when it is
+//!   unset the mailer falls back to Resend, which in turn reports
+//!   [`SendOutcome::NotConfigured`](cratefield_core::SendOutcome::NotConfigured)
+//!   when `RESEND_API_KEY` is unset too — the join still succeeds, the
+//!   entry is captured as `pending` with no mail sent, so the form keeps
+//!   working while the sending subdomain (issue #146's open question) is
+//!   being verified;
 //! * without `TURNSTILE_SECRET` no captcha port exists at all, and the
 //!   harness refuses joins in `ENV=production` (fail-closed — see the
-//!   module's `verify_human_form`);
-//! * without `RESEND_API_KEY` the Resend adapter reports
-//!   [`SendOutcome::NotConfigured`](cratefield_core::SendOutcome::NotConfigured),
-//!   and the join still succeeds: the entry is captured as `pending` with
-//!   no mail sent, so the form keeps working while the sending subdomain
-//!   (issue #146's open question) is being verified.
+//!   module's `verify_human_form`).
+//!
+//! Mail renders in the venture's own theme ([`mail_theme`], from
+//! `src/mail-theme.json`), with the optional `MAIL_THEME` var or secret
+//! merged over it field by field; see the venture README for the secrets.
 
 #![forbid(unsafe_code)]
 
@@ -39,18 +45,21 @@ pub use origin::{SITE_ORIGINS, write_origin_rejected};
 
 use std::sync::{Arc, OnceLock};
 
+use cratefield_adapter_owlpost::Owlpost;
 use cratefield_adapter_resend::Resend;
 use cratefield_adapter_turnstile::Turnstile;
-use cratefield_core::{Harness, Mailer, Venture};
+use cratefield_core::{Harness, Mailer, Template, Venture};
+use cratefield_mail_templates::MailTheme;
 use cratefield_module_waitlist::Waitlist;
 use cratefield_runtime_cloudflare::{
     Cloudflare, FetchClient, WorkersClock, serve, serve_scheduled,
 };
 use worker::{Context, Env, Request, Response, event};
 
-/// The envelope the confirm links are sent from. `send.` is the Resend
-/// sending subdomain the deployment must verify (see the venture README) —
-/// mail from the apex itself is exactly how cold mail looks.
+/// The envelope the confirm links are sent from. `send.` is the sending
+/// subdomain the deployment must verify with its mail provider — Owlpost
+/// preferred, Resend on the fallback path (see the venture README); mail
+/// from the apex itself is exactly how cold mail looks.
 const MAIL_FROM: &str = "no-reply@send.keepshipping.run";
 
 /// Turnstile widgets are pinned to the hostname they are served from, and
@@ -80,6 +89,31 @@ pub fn module() -> Waitlist {
         .status_redirect("https://keepshipping.run/")
 }
 
+/// The venture's mail theme: `src/mail-theme.json`, baked into the binary
+/// at compile time (the worker never reads a file at runtime). The
+/// deployment's optional `MAIL_THEME` config is merged over it per mail,
+/// field by field, so a colour can be adjusted without a rebuild.
+///
+/// # Panics
+///
+/// Never in practice: the `expect` can only fire if the checked-in JSON is
+/// edited into something that is not a [`MailTheme`], which the round-trip
+/// test pins.
+#[must_use]
+pub fn mail_theme() -> MailTheme {
+    MailTheme::from_json(include_str!("mail-theme.json"))
+        .expect("mail-theme.json is a valid MailTheme")
+}
+
+/// The waitlist mail templates rendered in the venture's [`mail_theme`],
+/// for `Harness::builder().templates(..)`. The module still merges the
+/// deployment's `MAIL_THEME` config over the theme at send time. Public so
+/// the integration tests mount exactly the mail the worker sends.
+#[must_use]
+pub fn templates() -> Vec<(String, Box<dyn Template>)> {
+    cratefield_module_waitlist::themed_templates(&mail_theme())
+}
+
 /// The Turnstile adapter, or `None` when `TURNSTILE_SECRET` is unset —
 /// which, in `ENV=production`, makes the harness refuse joins outright.
 fn captcha(env: &Env) -> Option<Turnstile> {
@@ -93,16 +127,61 @@ fn captcha(env: &Env) -> Option<Turnstile> {
     )
 }
 
-/// The Resend adapter. A missing `RESEND_API_KEY` is not an error: the
-/// adapter reports `NotConfigured`, the join is still captured as
-/// `pending`, and the runtime logs the skip — see the module docs.
+/// Which mail provider a deployment's secrets select. Both speak the same
+/// Resend-compatible wire shape; the choice is by key *presence*, never by
+/// retrying a provider that failed — a failed send must not become two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MailProvider {
+    /// `OWLPOST_API_KEY` is set: Owlpost, the preferred provider.
+    Owlpost,
+    /// No Owlpost key: Resend, whose adapter degrades to `NotConfigured`
+    /// when its own key is blank too.
+    Resend,
+}
+
+/// Picks the provider: Owlpost when a non-blank `OWLPOST_API_KEY` is set,
+/// Resend otherwise. Pure and natively testable, so the selection does not
+/// need Workers to be exercised.
+fn mail_provider(owlpost_key: Option<&str>) -> MailProvider {
+    match owlpost_key {
+        Some(key) if !key.trim().is_empty() => MailProvider::Owlpost,
+        _ => MailProvider::Resend,
+    }
+}
+
+/// The mail adapter the secrets select (see [`mail_provider`]). Neither
+/// key being present is not an error: Resend reports `NotConfigured`, the
+/// join is still captured as `pending`, and the runtime logs the skip —
+/// see the module docs.
 fn mailer(env: &Env) -> Arc<dyn Mailer> {
-    let api_key = env
-        .secret("RESEND_API_KEY")
-        .ok()
-        .map(|secret| secret.to_string())
-        .filter(|key| !key.is_empty());
-    Arc::new(Resend::new(Arc::new(FetchClient), Arc::new(WorkersClock), api_key, MAIL_FROM, None))
+    // Read a secret as trimmed text, blank counting as absent: a secret
+    // that mounted empty (or whitespace) is no key at all on this path,
+    // matching how the adapters read it — `Bearer ` would only earn a 401.
+    let read = |name: &str| {
+        env.secret(name)
+            .ok()
+            .map(|secret| secret.to_string())
+            .map(|key| key.trim().to_owned())
+            .filter(|key| !key.is_empty())
+    };
+    let owlpost_key = read("OWLPOST_API_KEY");
+    let resend_key = read("RESEND_API_KEY");
+    match mail_provider(owlpost_key.as_deref()) {
+        MailProvider::Owlpost => Arc::new(Owlpost::new(
+            Arc::new(FetchClient),
+            Arc::new(WorkersClock),
+            owlpost_key,
+            MAIL_FROM,
+            None,
+        )),
+        MailProvider::Resend => Arc::new(Resend::new(
+            Arc::new(FetchClient),
+            Arc::new(WorkersClock),
+            resend_key,
+            MAIL_FROM,
+            None,
+        )),
+    }
 }
 
 /// The frozen composition: built once per isolate on first use, immutable
@@ -126,6 +205,7 @@ fn instance(env: &Env) -> Arc<(Harness, Cloudflare)> {
             let harness = Harness::builder()
                 .venture(venture())
                 .module(module())
+                .templates(templates())
                 .runtime(runtime.clone())
                 .build()
                 .expect("the waitlist composition is static and validated in CI");
@@ -169,4 +249,21 @@ pub async fn scheduled(event: worker::ScheduledEvent, env: Env, ctx: worker::Sch
     // cron — the module's sweeps are idempotent by construction.
     let (harness, runtime) = &*instance(&env);
     serve_scheduled(harness, runtime, event, env, ctx).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MailProvider, mail_provider};
+
+    #[test]
+    fn a_set_owlpost_key_selects_owlpost() {
+        assert_eq!(mail_provider(Some("op_live_x")), MailProvider::Owlpost);
+    }
+
+    #[test]
+    fn absent_or_blank_owlpost_key_falls_back_to_resend() {
+        assert_eq!(mail_provider(None), MailProvider::Resend);
+        assert_eq!(mail_provider(Some("")), MailProvider::Resend);
+        assert_eq!(mail_provider(Some("   ")), MailProvider::Resend);
+    }
 }

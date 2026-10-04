@@ -3,48 +3,6 @@
 version = 4
 
 [[package]]
-name = "askama"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f75363874b771be265f4ffe307ca705ef6f3baa19011c149da8674a87f1b75c4"
-dependencies = [
- "askama_derive",
- "itoa",
- "percent-encoding",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "askama_derive"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "129397200fe83088e8a68407a8e2b1f826cf0086b21ccdb866a722c8bcd3a94f"
-dependencies = [
- "askama_parser",
- "basic-toml",
- "memchr",
- "proc-macro2",
- "quote",
- "rustc-hash",
- "serde",
- "serde_derive",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "askama_parser"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6ab5630b3d5eaf232620167977f95eb51f3432fc76852328774afbd242d4358"
-dependencies = [
- "memchr",
- "serde",
- "serde_derive",
- "winnow",
-]
-
-[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -127,15 +85,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "basic-toml"
-version = "0.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba62675e8242a4c4e806d12f11d136e626e6c8361d6b829310732241652a178a"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -216,6 +165,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
+name = "console"
+version = "0.16.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e96a4956774c13c126a8b5af4daa79384f4d826534c95a02d76afb39e2ab64e3"
+dependencies = [
+ "encode_unicode",
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -246,10 +206,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "cratefield-adapter-resend"
-version = "0.3.1"
+name = "cratefield-adapter-owlpost"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc8791ed4920f1d006679353253ac3ae3f815ee1da64e52fb9ff350ce619ed29"
+checksum = "ebc9b1f8b4d8a697a6f0fb2337c414c2c461dafceaf9e8a6bf00cc6a6640faff"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cratefield-core",
+ "getrandom",
+ "http",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "cratefield-adapter-resend"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "270bc3fa6b2a9cb5acba5028cccf0fdfa6015c0abe6adaa3d1b6b6a2f455027d"
 dependencies = [
  "async-trait",
  "bytes",
@@ -262,9 +238,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-adapter-sqlite"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89d9f9f07d7ca89e873353914cb4715164ae0c4fbcde3f61cc6ef7d5262b0a33"
+checksum = "0673c2dbc6d797a38cf010985410bffeb773dad246dadaa680bd220283286fc1"
 dependencies = [
  "async-trait",
  "cratefield-core",
@@ -276,9 +252,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-adapter-turnstile"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e64de8954dbb3783901a50da1ad197bb7f4fc72f3ea1470ec2c4118b353855b"
+checksum = "9c9a5887fe245caf04f5a66d3c91e07321f7cb8363610191db9dfc9a5e51fdb1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -291,9 +267,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-auth-client"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "739351599c26447aaede8bc4d5bf2400f991ded0d88f42dfffbfba626d53b62a"
+checksum = "212f03772edd81edba3f30dbbe82e1c4cf27bd83838cb99204212175b0f6eb12"
 dependencies = [
  "async-trait",
  "axum",
@@ -311,9 +287,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-core"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81ad996962e9d76cfacc39b7ee209ca87cd815f38bd50d9db19850ef0c1421ca"
+checksum = "40d159c9c54cfd5199802573a9a23526312bcf6d7657414845a70990196ee4a4"
 dependencies = [
  "async-trait",
  "axum",
@@ -341,14 +317,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "cratefield-module-waitlist"
-version = "0.3.0"
+name = "cratefield-mail-templates"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41099f86cdeb86de5726a58be53c153517c655aca78b650ebf5eb967853d0da0"
+checksum = "81b17e3cd128a8e7f281cfa3ec16284e011fd141eeed5eee12beb8f9c3762350"
 dependencies = [
- "askama",
+ "cratefield-core",
+ "getrandom",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "cratefield-module-waitlist"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "541ea59113956d8699e1ea1bcae3ad7ecbc33e7715993ccc3c228a635762049d"
+dependencies = [
  "axum",
  "cratefield-core",
+ "cratefield-mail-templates",
  "http",
  "schemars",
  "sea-query",
@@ -361,9 +350,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-runtime-cloudflare"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78d6c1762f4b34c5e61d413d0f8bf4159b81f1183aef49a27dfb7c8245d44e5a"
+checksum = "93ecc68b9f1b8034852d0287a3feb32745b5e78eff362d2d61167e212c91e272"
 dependencies = [
  "async-trait",
  "axum",
@@ -387,9 +376,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-testing"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef5ca2c562a418d42c9b029569866ba3d987dd7eb350c331392cecd2b1a5b32b"
+checksum = "192db47c5e91d18a62ef87cca8e77de4e4fb7059eed0105ecef0840f915ee650"
 dependencies = [
  "async-trait",
  "axum",
@@ -547,10 +536,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "encode_unicode"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+
+[[package]]
+name = "errno"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
 
 [[package]]
 name = "fallible-iterator"
@@ -563,6 +568,12 @@ name = "fallible-streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+
+[[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "ff"
@@ -902,6 +913,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "insta"
+version = "1.49.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b67d3d2e287e4b86c10b3f3b641033d1f89b74bdb39d05f34952e2b9a6fe21cd"
+dependencies = [
+ "console",
+ "once_cell",
+ "similar",
+ "tempfile",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -922,14 +945,17 @@ dependencies = [
 name = "keepshipping-waitlist"
 version = "0.0.0"
 dependencies = [
+ "cratefield-adapter-owlpost",
  "cratefield-adapter-resend",
  "cratefield-adapter-turnstile",
  "cratefield-core",
+ "cratefield-mail-templates",
  "cratefield-module-waitlist",
  "cratefield-runtime-cloudflare",
  "cratefield-testing",
  "getrandom",
  "http",
+ "insta",
  "pollster",
  "serde_json",
  "worker",
@@ -997,6 +1023,12 @@ dependencies = [
  "pkg-config",
  "vcpkg",
 ]
+
+[[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "litemap"
@@ -1276,10 +1308,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustc-hash"
-version = "2.1.3"
+name = "rustix"
+version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
+checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys",
+]
 
 [[package]]
 name = "rustversion"
@@ -1480,6 +1519,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "similar"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1583,6 +1628,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom",
+ "once_cell",
+ "rustix",
+ "windows-sys",
 ]
 
 [[package]]
@@ -1884,12 +1942,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "winnow"
-version = "0.7.15"
+name = "windows-link"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
+checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-sys"
+version = "0.61.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
- "memchr",
+ "windows-link",
 ]
 
 [[package]]

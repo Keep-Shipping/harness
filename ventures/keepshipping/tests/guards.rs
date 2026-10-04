@@ -5,14 +5,26 @@
 //! accepted (`202`) and captured as `pending` — with and without a working
 //! mailer. SQLite only: the venture never touches Postgres.
 
-use cratefield_core::{Decision, Statement};
+use cratefield_core::{Decision, MapConfig, Ports, Statement};
 use cratefield_testing::{
     FakeCaptcha, FakeMailer, FakeRateLimiter, MailerMode, TestHarness, request,
 };
 use http::{Method, StatusCode};
-use keepshipping_waitlist::{SITE_ORIGINS, module, venture};
+use keepshipping_waitlist::{SITE_ORIGINS, module, templates, venture};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// A kit mounting the venture, its module *and* its themed templates,
+/// exactly as `src/lib.rs` composes them — so the mail a test sees is the
+/// mail the worker sends (envelope sender included). `patch` swaps in
+/// fakes for the ports under test.
+fn kit(patch: impl FnOnce(&mut Ports)) -> TestHarness {
+    TestHarness::with_builder(
+        vec![Box::new(module())],
+        |builder| builder.venture(venture()).templates(templates()),
+        patch,
+    )
+}
 
 fn join_json(email: &str, product: &str, token: &str) -> String {
     if token.is_empty() {
@@ -55,7 +67,7 @@ async fn missing_captcha_token_is_refused() {
     // The captcha port is bound exactly as the worker binds it in
     // production — so the module must fail closed when the field is
     // absent, not wave the join through.
-    let kit = TestHarness::with_ports(vec![Box::new(module())], |ports| {
+    let kit = kit(|ports| {
         ports.captcha = Some(Arc::new(FakeCaptcha::with_tokens(["good"])));
     });
     let response = join(&kit, "nick@example.com", "keepshipping", "").await;
@@ -70,7 +82,7 @@ async fn missing_captcha_token_is_refused() {
 
 #[pollster::test]
 async fn wrong_captcha_token_is_refused_and_a_good_one_joins() {
-    let kit = TestHarness::with_ports(vec![Box::new(module())], |ports| {
+    let kit = kit(|ports| {
         ports.captcha = Some(Arc::new(FakeCaptcha::with_tokens(["good"])));
     });
     let bad = join(&kit, "nick@example.com", "keepshipping", "bad").await;
@@ -84,7 +96,7 @@ async fn wrong_captcha_token_is_refused_and_a_good_one_joins() {
 
 #[pollster::test]
 async fn unknown_product_is_a_400_problem() {
-    let kit = TestHarness::with_ports(vec![Box::new(module())], |ports| {
+    let kit = kit(|ports| {
         ports.captcha = Some(Arc::new(FakeCaptcha::with_tokens(["good"])));
     });
     let response = join(&kit, "nick@example.com", "not-our-product", "good").await;
@@ -95,7 +107,7 @@ async fn unknown_product_is_a_400_problem() {
 #[pollster::test]
 async fn rate_limit_denial_is_429_with_retry_after() {
     let deny = Decision { ok: false, retry_after: Some(Duration::from_secs(17)), quota: None };
-    let kit = TestHarness::with_ports(vec![Box::new(module())], move |ports| {
+    let kit = kit(move |ports| {
         ports.rate_limiter =
             Some(Arc::new(FakeRateLimiter::scripted(vec![deny.clone()], deny.clone())));
     });
@@ -106,7 +118,7 @@ async fn rate_limit_denial_is_429_with_retry_after() {
 
 #[pollster::test]
 async fn clean_join_defers_the_confirm_mail() {
-    let kit = TestHarness::with_ports(vec![Box::new(module())], |ports| {
+    let kit = kit(|ports| {
         ports.captcha = Some(Arc::new(FakeCaptcha::with_tokens(["good"])));
     });
     let response = join(&kit, "nick@example.com", "keepshipping", "good").await;
@@ -114,14 +126,48 @@ async fn clean_join_defers_the_confirm_mail() {
     kit.defer.drain().await;
     let sent = kit.mailer.sent();
     assert_eq!(sent.len(), 1, "exactly the join mail: {sent:?}");
-    assert!(sent[0].to.contains("nick@example.com"), "{sent:?}");
+    let mail = &sent[0];
+    assert!(mail.to.contains("nick@example.com"), "{sent:?}");
+    assert_eq!(mail.from, "no-reply@send.keepshipping.run", "envelope sender");
+    // The mail renders in the venture's composed theme: the Keep Shipping
+    // name, the site's blue, square corners, and a non-empty text part.
+    assert!(mail.html.contains("Keep Shipping"), "branding: {}", mail.html);
+    assert!(mail.html.contains("#1950cc"), "site accent: {}", mail.html);
+    assert!(mail.html.contains("border-radius:0"), "square corners: {}", mail.html);
+    assert!(!mail.text.trim().is_empty(), "a text part ships too");
+}
+
+#[pollster::test]
+async fn mail_theme_config_overrides_the_composed_theme() {
+    // The deployment's `MAIL_THEME` merges over the composed theme field by
+    // field, without a rebuild — here the button colour only.
+    let kit = TestHarness::with_builder(
+        vec![Box::new(module())],
+        |builder| builder.venture(venture()).templates(templates()),
+        |ports| {
+            ports.captcha = Some(Arc::new(FakeCaptcha::with_tokens(["good"])));
+            ports.config = Arc::new(MapConfig::from_pairs([(
+                "MAIL_THEME",
+                r##"{"light":{"button":"#ff0000"}}"##,
+            )]));
+        },
+    );
+    let response = join(&kit, "nick@example.com", "keepshipping", "good").await;
+    assert_eq!(response.status, StatusCode::ACCEPTED);
+    kit.defer.drain().await;
+    let sent = kit.mailer.sent();
+    assert_eq!(sent.len(), 1, "exactly the join mail: {sent:?}");
+    let html = &sent[0].html;
+    assert!(html.contains("background:#ff0000"), "override reaches the mail: {html}");
+    // Only the overridden field changes: the composed font survives.
+    assert!(html.contains("Bricolage Grotesque"), "composed theme survives: {html}");
 }
 
 #[pollster::test]
 async fn not_configured_mailer_still_captures_the_join() {
     // The deployment before the Resend subdomain is verified: no mail can
     // flow, but the waitlist must not silently drop signups.
-    let kit = TestHarness::with_ports(vec![Box::new(module())], |ports| {
+    let kit = kit(|ports| {
         ports.captcha = Some(Arc::new(FakeCaptcha::with_tokens(["good"])));
         ports.mailer = Some(Arc::new(FakeMailer::new(MailerMode::NotConfigured)));
     });

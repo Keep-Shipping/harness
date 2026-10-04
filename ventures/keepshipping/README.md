@@ -27,16 +27,37 @@ npm install -g wrangler   # or npx wrangler
 wrangler d1 create keepshipping-waitlist
 #   → put the printed database_id into wrangler.toml
 wrangler d1 migrations apply keepshipping-waitlist
-wrangler secret put RESEND_API_KEY    # Resend key for no-reply@send.keepshipping.run
+wrangler secret put OWLPOST_API_KEY   # preferred mailer; verify send.keepshipping.run in Owlpost
+wrangler secret put RESEND_API_KEY    # fallback mailer, used when no Owlpost key is set
 wrangler secret put TURNSTILE_SECRET  # Turnstile widget on keepshipping.run
 wrangler deploy
 ```
 
+The mailer is chosen by which secret is present, never by retrying a
+failed send: `OWLPOST_API_KEY` selects [Owlpost](https://owlpost.to) (send
+from `no-reply@send.keepshipping.run` — the sending domain
+`send.keepshipping.run` must be verified there); with no Owlpost key the
+mailer falls back to Resend on the same `RESEND_API_KEY` deployment.
+
 Secrets degrade safely: with no `TURNSTILE_SECRET` the harness refuses
-joins in production (fail-closed); with no `RESEND_API_KEY` the join is
-still captured as `pending`, just without confirm mail. `ADMIN_TOKEN` is
-the export credential — set it before pointing the admin tooling at the
-API.
+joins in production (fail-closed); with neither mail key the join is still
+captured as `pending`, just without confirm mail. `ADMIN_TOKEN` is the
+export credential — set it before pointing the admin tooling at the API.
+
+## Mail theme
+
+Mail renders in Keep Shipping's own theme, compiled in from
+[`src/mail-theme.json`](src/mail-theme.json) — brand name, logo, light and
+dark palettes, fonts, square corners (`radius: 0`), footer and contact.
+The header logo is the hosted PNG at
+`https://keepshipping.run/assets/email/logo-64.png` (serve it at twice the
+displayed 32×32, and keep it in place: every mail references it).
+
+A deployment can adjust any field without a rebuild by setting a
+`MAIL_THEME` config value — a JSON object with any subset of the theme's
+fields — as a `wrangler.toml` `[vars]` entry or a secret; it is merged
+field by field (nested `light`/`dark` objects merge key by key) over the
+composed theme at send time.
 
 ## Test
 
@@ -47,13 +68,14 @@ cargo test -p keepshipping-waitlist
 The integration tests mount the same module composition `src/lib.rs`
 serves, against the testing kit's fakes: captcha refusals, rate-limit
 `429`, unknown-product `400`, clean `202` + pending row, and the
-`NotConfigured` mailer path.
+`NotConfigured` mailer path. `tests/mail.rs` snapshots the themed confirm
+and confirmed mails (HTML and text) and round-trips the theme JSON.
 
 ## Pending before launch
 
-- Verify the `send.keepshipping.run` sending subdomain in Resend — until
-  then mail cannot flow and entries stay `pending` (the double opt-in mail
-  is the open question in #146).
+- Verify the `send.keepshipping.run` sending domain in Owlpost (or
+  Resend, on the fallback path) — until then mail cannot flow and entries
+  stay `pending` (the double opt-in mail is the open question in #146).
 - Create the Turnstile widget for `keepshipping.run`; the worker pins
   `expected_hostname` to the apex.
 - Privacy notice on the site before the form goes live (website#4): the
