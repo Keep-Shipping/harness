@@ -26,7 +26,7 @@ jobs:
       - name: Install nightly (minimal profile)
         run: |
           rustup toolchain install nightly --profile minimal --component rust-src
-          rustup show nightly
+          rustup run nightly rustc --version
 
       - name: Restore the cargo build cache
         uses: Swatinem/rust-cache@v2
