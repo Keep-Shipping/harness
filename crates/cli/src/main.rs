@@ -9,6 +9,12 @@ mod args;
 mod blocks;
 mod blocks_index;
 mod check;
+// The GitHub Actions run context (#150) is built and tested here, but the
+// command dispatch still has no run context to hand it: wiring CI-versus-local
+// selection into `run` waits for the local adapter. Until then nothing in the
+// binary names this module.
+#[allow(dead_code)]
+mod github_actions_run_context;
 mod http_client;
 mod render;
 
