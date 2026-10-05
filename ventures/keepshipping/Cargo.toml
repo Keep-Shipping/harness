@@ -17,11 +17,13 @@ crate-type = ["cdylib", "rlib"]
 workspace = true
 
 [dependencies]
-cratefield-core = "0.7"
-cratefield-runtime-cloudflare = "0.3"
-cratefield-module-waitlist = "0.3"
-cratefield-adapter-resend = "0.3.1"
-cratefield-adapter-turnstile = "0.2.1"
+cratefield-core = "0.8"
+cratefield-mail-templates = "0.1"
+cratefield-runtime-cloudflare = "0.4"
+cratefield-module-waitlist = "0.4"
+cratefield-adapter-owlpost = "0.2"
+cratefield-adapter-resend = "0.4"
+cratefield-adapter-turnstile = "0.3"
 serde_json = "1"
 worker = { version = "0.8.5", default-features = false, features = ["d1"] }
 
@@ -31,6 +33,7 @@ worker = { version = "0.8.5", default-features = false, features = ["d1"] }
 getrandom = { version = "0.4", default-features = false, features = ["wasm_js"] }
 
 [dev-dependencies]
-cratefield-testing = "0.4"
+cratefield-testing = "0.5"
 http = "1"
+insta = "1"
 pollster = "0.4"

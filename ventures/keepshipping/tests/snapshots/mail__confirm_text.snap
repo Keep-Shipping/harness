@@ -1,0 +1,16 @@
+---
+source: ventures/keepshipping/tests/mail.rs
+expression: rendered.text
+---
+Hold your spot
+
+Keep Shipping is admitting members in join order. Confirm your address to hold your place on the waitlist.
+
+Confirm my spot:
+https://api.keepshipping.run/v1/waitlist/confirm?token=01J9ZQ4M8K2D7X3B6N5R0T1V2W
+
+If you did not join this waitlist, ignore this email: nothing happens until the link is opened.
+
+--
+Sent to ada@example.com because this address was entered on the Keep Shipping waitlist.
+Keep Shipping · https://keepshipping.run · contact@keepshipping.run

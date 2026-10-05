@@ -1,0 +1,18 @@
+{
+  "brand_name": "Keep Shipping",
+  "wordmark": "Keep Shipping",
+  "site_url": "https://keepshipping.run",
+  "logo_url": "https://keepshipping.run/assets/email/logo-64.png",
+  "logo_alt": "Keep Shipping",
+  "logo_width": 32,
+  "logo_height": 32,
+  "logo_bg": null,
+  "light": {"bg":"#eef0f3","card":"#fbfcfd","border":"#ced1d6","ink":"#11161f","text":"#3e434b","muted":"#4e535b","accent":"#1950cc","button":"#1950cc","button_text":"#ffffff","code_bg":"#e6efff"},
+  "dark":  {"bg":"#11161f","card":"#1a1f29","border":"#3d434d","ink":"#ffffff","text":"#d5d7db","muted":"#a1a5ab","accent":"#9cbeff","button":"#4d81eb","button_text":"#11161f","code_bg":"#1e2735"},
+  "font": "'Bricolage Grotesque',system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif",
+  "mono": "'DM Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace",
+  "radius": 0,
+  "button_radius": 0,
+  "footer": [],
+  "contact": "contact@keepshipping.run"
+}

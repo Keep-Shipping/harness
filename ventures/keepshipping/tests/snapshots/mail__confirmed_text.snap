@@ -1,0 +1,14 @@
+---
+source: ventures/keepshipping/tests/mail.rs
+expression: rendered.text
+---
+You are #42
+
+Your spot on the Keep Shipping waitlist is confirmed. You are number 42 in line.
+
+Check my place:
+https://api.keepshipping.run/v1/waitlist/status?token=01J9ZQ4M8K2D7X3B6N5R0T1V2W
+
+--
+Sent to ada@example.com because you confirmed your spot on the Keep Shipping waitlist.
+Keep Shipping · https://keepshipping.run · contact@keepshipping.run
