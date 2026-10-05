@@ -1,0 +1,60 @@
+=== plain ===
+Destroys and replacements:
+- aws_db_instance.old   identifier old → (none)
+-/+ aws_instance.web   ami ami-1 → ami-2 (forces replacement) (replace_because_tainted)
+
+~ aws_rds_cluster.app   master_password (sensitive) → (sensitive), db_password (sensitive) → (sensitive), count 2 → (known after apply)
+1 to add · 1 to change · 2 to destroy
+=== terminal ===
+Destroys and replacements:
+[1;31m-[0m aws_db_instance.old   identifier old → (none)
+[1;31m-/+[0m aws_instance.web   ami ami-1 → ami-2 (forces replacement) (replace_because_tainted)
+
+[33m~[0m aws_rds_cluster.app   master_password (sensitive) → (sensitive), db_password (sensitive) → (sensitive), count 2 → (known after apply)
+1 to add · 1 to change · 2 to destroy
+=== markdown ===
+**1 to add · 1 to change · 2 to destroy**
+
+#### ⚠️ Destroys and replacements
+
+```diff
+- aws_db_instance.old   identifier old → (none)
+-/+ aws_instance.web   ami ami-1 → ami-2 (forces replacement) (replace_because_tainted)
+```
+
+```diff
+~ aws_rds_cluster.app   master_password (sensitive) → (sensitive), db_password (sensitive) → (sensitive), count 2 → (known after apply)
+```
+
+=== html ===
+<section class="ks-plan">
+<p class="ks-plan-summary">1 to add · 1 to change · 2 to destroy</p>
+<h4 class="ks-plan-risky">⚠️ Destroys and replacements</h4>
+<ul class="ks-plan-list">
+<li class="ks-plan-item ks-plan-destroy"><code>- aws_db_instance.old   identifier old → (none)</code></li>
+<li class="ks-plan-item ks-plan-replace"><code>-/+ aws_instance.web   ami ami-1 → ami-2 (forces replacement) (replace_because_tainted)</code></li>
+</ul>
+<ul class="ks-plan-list">
+<li class="ks-plan-item ks-plan-change"><code>~ aws_rds_cluster.app   master_password (sensitive) → (sensitive), db_password (sensitive) → (sensitive), count 2 → (known after apply)</code></li>
+</ul>
+</section>
+=== truncated ===
+Destroys and replacements:
+- aws_db_instance.old   identifier old → (none)
+-/+ aws_instance.web   ami ami-1 → ami-2 (forces replacement) (replace_because_tainted)
+
+… and 1 more — full plan: https://ci.example/plans/42
+1 to add · 1 to change · 2 to destroy
+=== truncated markdown ===
+**1 to add · 1 to change · 2 to destroy**
+
+#### ⚠️ Destroys and replacements
+
+```diff
+- aws_db_instance.old   identifier old → (none)
+-/+ aws_instance.web   ami ami-1 → ami-2 (forces replacement) (replace_because_tainted)
+```
+
+… and 1 more — [full plan](<https://ci.example/plans/42>)
+=== empty ===
+No changes.

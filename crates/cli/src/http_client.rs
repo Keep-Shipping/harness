@@ -311,29 +311,30 @@ fn content_length(fields: &[(String, String)]) -> Option<usize> {
         .and_then(|(_, value)| value.trim().parse().ok())
 }
 
+/// A test-only HTTP/1.1 server fixture, shared by this module's tests and
+/// `github_actions_run_context`'s: both drive the real [`TcpHttpClient`] over a
+/// real socket, so one fixture serves both.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ks_core::ports::http::HttpMethod;
-    use std::io::{BufRead, BufReader};
-    use std::net::SocketAddr;
+pub(crate) mod test_server {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{SocketAddr, TcpListener};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-
-    const BODY: &str = "{\"results\":[]}";
+    use std::time::Duration;
 
     /// What the server received: the request line plus headers, as text.
-    type Captured = Arc<Mutex<Vec<String>>>;
+    pub(crate) type Captured = Arc<Mutex<Vec<String>>>;
 
     /// A one-response HTTP server on a random port: answers every connection
-    /// with `head` + a content-length-framed `body`, recording request lines.
-    /// `hold` keeps connections unanswered (for the timeout test).
-    fn spawn_server(
+    /// with `status` + a content-length-framed `body`, recording the request
+    /// lines it saw. `hold` keeps connections unanswered (for the timeout
+    /// test). The third tuple member counts accepted connections.
+    pub(crate) fn spawn(
         status: &str,
         body: &str,
         hold: bool,
     ) -> (SocketAddr, Captured, Arc<AtomicUsize>) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let address = listener.local_addr().expect("addr");
         let captured: Captured = Arc::new(Mutex::new(Vec::new()));
         let connections = Arc::new(AtomicUsize::new(0));
@@ -377,6 +378,16 @@ mod tests {
         });
         (address, captured, connections)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_server::spawn as spawn_server;
+    use super::*;
+    use ks_core::ports::http::HttpMethod;
+    use std::sync::atomic::Ordering;
+
+    const BODY: &str = "{\"results\":[]}";
 
     fn client(host: &str, max_bytes: usize, timeout: Duration) -> TcpHttpClient {
         TcpHttpClient::new(HttpPolicy {

@@ -1,0 +1,28 @@
+=== plain ===
++ aws_lb.api
+~ aws_ecs_service.api   count 2 → 4
++ aws_route53_record.api
+2 to add · 1 to change · 0 to destroy
+=== terminal ===
+[32m+[0m aws_lb.api
+[33m~[0m aws_ecs_service.api   count 2 → 4
+[32m+[0m aws_route53_record.api
+2 to add · 1 to change · 0 to destroy
+=== markdown ===
+**2 to add · 1 to change · 0 to destroy**
+
+```diff
++ aws_lb.api
+~ aws_ecs_service.api   count 2 → 4
++ aws_route53_record.api
+```
+
+=== html ===
+<section class="ks-plan">
+<p class="ks-plan-summary">2 to add · 1 to change · 0 to destroy</p>
+<ul class="ks-plan-list">
+<li class="ks-plan-item ks-plan-add"><code>+ aws_lb.api</code></li>
+<li class="ks-plan-item ks-plan-change"><code>~ aws_ecs_service.api   count 2 → 4</code></li>
+<li class="ks-plan-item ks-plan-add"><code>+ aws_route53_record.api</code></li>
+</ul>
+</section>

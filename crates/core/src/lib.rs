@@ -33,6 +33,7 @@ mod check;
 mod env;
 pub mod harness;
 pub mod ids;
+pub mod plan_summary;
 pub mod ports;
 pub mod registry;
 pub mod step;
