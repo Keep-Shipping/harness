@@ -77,7 +77,7 @@ appears in diagnostics and logs.
   (`crates/core/src/ports/secrets.rs`) is constructed only by its own tests,
   no resolver adapter ships, `ci-only` is parsed (`Env::ci_only`) but never
   enforced, and `GithubActionsRunContext` reports an empty
-  `Capabilities::secret_resolvers`. The `StateStore` named in the redaction
+`Capabilities::secret_resolvers`. The `StateStore` named in the redaction
   rule is likewise a decided port (ADR 0005) with no code yet; that rule binds
   it once it lands. The decision stands that `check` warns when a step needs a
   secret the current context cannot resolve:
