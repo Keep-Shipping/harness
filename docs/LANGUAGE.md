@@ -1,10 +1,9 @@
 # The Keep Shipping language
 
-A site file is a line-oriented, indentation-scoped tree of `key: value`
-entries. This document specifies the concrete syntax the `ks-lang` front end
-parses; what the keys *mean* is the checker's job in `ks-core`. The grammar
-here is a proposal until the syntax ADR is accepted (see [Decisions pending
-ADRs](#decisions-pending-adrs)).
+A site file is a line-oriented, indentation-scoped `key: value` entry tree.
+This document specifies what `ks-lang` parses; `ks-core` decides meaning.
+[0003](adr/0003-workflow-syntax.md) accepts this grammar, fixing the output
+and operator rules; see [Decisions pending ADRs](#decisions-pending-adrs).
 
 ```ks
 # deploy the api: image → infra → prod
@@ -269,10 +268,11 @@ Every value has a type, and types never convert implicitly
 
 ## Decisions pending ADRs
 
-The language's design is tracked by the ADRs indexed in `docs/adr/`; the
-syntax ADR (issue [#4](https://github.com/Keep-Shipping/harness/issues/4)) is
-not reachable from this environment, so this front end records its choices
-here instead. Each is easy to revisit before the ADR lands:
+The language's design is tracked by the ADRs indexed in `docs/adr/`. ADR
+[0003](adr/0003-workflow-syntax.md) accepts this grammar and settles the two
+questions it left open; the bullets below that it covers are kept here
+unchanged, and the rest are this front end's own choices. Each is easy to
+revisit:
 
 - Generic entry tree: no top-level key is reserved; the checker assigns
   meaning (`name`, `steps`, `policy`, ...).
@@ -289,7 +289,7 @@ here instead. Each is easy to revisit before the ADR lands:
 - Tuples are comma-separated; juxtaposition (`deploy staging`) is a phrase,
   `|` a union of alternatives.
 - Run-time outputs are namespaced under `<step>.out.`; statically declared
-  outputs are read directly (`<step>.<output>`) (#4's open question).
+  outputs are read directly (`<step>.<output>`).
 - An approval that shows a step's outputs gates every other consumer of that
   step (approval gating adds graph edges).
 - A file without `envs:` has one implicit environment `default`, so a hero
