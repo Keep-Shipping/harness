@@ -42,8 +42,8 @@ appears in diagnostics and logs.
   so a secret in stdout, stderr or a dependency's stack trace is already
   scrubbable. Today only its tests call it; the run path is not wired to it
   yet, and that wiring is what this rule is for. Values are zeroised on drop.
-- Redacted values never reach the run log or any persisted state; only the
-  `resolver:key` reference does.
+- Redacted values never reach the run log, the `StateStore` or any other
+  persisted state; only the `resolver:key` reference does.
 - Each environment declares its resolver under `envs: <name>: secrets:`, and
   `check --secrets` lists `resolver:key` plus the steps that need each, from
   the checked file alone — no resolver is constructed and no store is read
@@ -77,11 +77,19 @@ appears in diagnostics and logs.
   (`crates/core/src/ports/secrets.rs`) is constructed only by its own tests,
   no resolver adapter ships, `ci-only` is parsed (`Env::ci_only`) but never
   enforced, and `GithubActionsRunContext` reports an empty
-  `Capabilities::secret_resolvers`. The follow-up work this ADR unblocks —
-  calling the funnel and wrapping the gate in a run, enforcing `ci-only` with
-  its check diagnostic, the two resolvers, and filling in the run context's
-  resolvers — is not attributed to specific issues here, only the intent. The
-  issues it unblocks are
+  `Capabilities::secret_resolvers`. The `StateStore` named in the redaction
+  rule is likewise a decided port (ADR 0005) with no code yet; that rule binds
+  it once it lands. The decision stands that `check` warns when a step needs a
+  secret the current context cannot resolve:
+  `SecretsError::NotAvailableInContext` already maps to
+  `CheckSeverity::Warning` (`crates/core/src/ports/secrets.rs`), but the
+  checker never calls `check_severity` — today `check --secrets` lists
+  references statically only. The follow-up work this ADR unblocks —
+  calling the funnel and wrapping the gate in a run, enforcing `ci-only`
+  with its check diagnostic, calling `check_severity` from the checker,
+  the two resolvers, and filling in the run context's resolvers —
+  is not attributed to specific issues here, only the intent.
+  The issues it unblocks are
   [#111](https://github.com/Keep-Shipping/harness/issues/111),
   [#49](https://github.com/Keep-Shipping/harness/issues/49) and
   [#91](https://github.com/Keep-Shipping/harness/issues/91).

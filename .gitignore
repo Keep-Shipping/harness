@@ -1,2 +1,12 @@
 # Rust / Cargo build artifacts
 /target
+
+# Local environment / credential files
+/.env
+/.envrc
+/.git-credentials
+/.gitmodules
+/.mcp.json
+/.netrc
+/.npmrc
+/.pypirc
