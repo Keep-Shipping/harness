@@ -20,6 +20,7 @@ A guard test (`cargo test -p ks-testing --test adr_guard`) checks every ADR belo
 | [0001](0001-typed-values-and-secret-references.md) | Typed values and secret references | Accepted |
 | [0002](0002-ports-and-adapters.md) | Ports and adapters | Accepted |
 | [0003](0003-workflow-syntax.md) | Workflow syntax | Accepted |
+| [0004](0004-secrets.md) | Secrets | Accepted |
 | [0005](0005-local-first-core-with-optional-hosted-services.md) | Local-first core with optional hosted services | Accepted |
 | [0013](0013-rust-workspace.md) | Rust workspace | Accepted |
 | [0100](0100-step-contract-and-composition-checks.md) | Step contract and composition checks | Accepted |
