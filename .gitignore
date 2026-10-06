@@ -11,5 +11,6 @@
 .pypirc
 # Git credential helpers
 .git-credentials
+.gitmodules
 # MCP client configuration (may embed endpoint tokens)
 .mcp.json
