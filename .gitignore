@@ -1,2 +1,15 @@
 # Rust / Cargo build artifacts
 /target
+
+# Local credential and secret files — never commit these.
+# Environment and shell loaders
+.env
+.envrc
+# Package manager / registry auth
+.netrc
+.npmrc
+.pypirc
+# Git credential helpers
+.git-credentials
+# MCP client configuration (may embed endpoint tokens)
+.mcp.json
