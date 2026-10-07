@@ -63,6 +63,25 @@ pub enum RunEvent {
     },
     /// A policy rule refused the run; `step` is `None` before any step ran.
     PolicyRefused { step: Option<String>, rule: String },
+    /// An approved plan could not be applied as approved, so the run stopped and is asking
+    /// again: `cause` is `"state"` when the tool found the state moved, `"drift"` when a
+    /// pre-apply recheck found the change set differs. `replanned` and `differs` are `None`
+    /// when the run stopped *before* it had a fresh plan to compare — the re-plan itself
+    /// failed — because "the run stopped and why" is worth recording even then.
+    PlanStale {
+        /// The step that was applying.
+        step: String,
+        /// `"state"` or `"drift"`.
+        cause: String,
+        /// The sha256 of the plan the approval was for.
+        approved: String,
+        /// The sha256 of the fresh plan the run asks about now, or `None` when the re-plan
+        /// failed.
+        replanned: Option<String>,
+        /// Whether the fresh plan's change set differs from the approved one's, or `None`
+        /// when there was no fresh plan to compare.
+        differs: Option<bool>,
+    },
     /// The run ended, with the digests of what it shipped.
     RunFinished { status: String, shipped: Vec<String> },
 }
@@ -81,6 +100,7 @@ impl RunEvent {
             RunEvent::DecideAnswered { .. } => "decide.answered",
             RunEvent::AttestationAttached { .. } => "attestation.attached",
             RunEvent::PolicyRefused { .. } => "policy.refused",
+            RunEvent::PlanStale { .. } => "plan.stale",
             RunEvent::RunFinished { .. } => "run.finished",
         }
     }
@@ -138,6 +158,12 @@ impl RunEvent {
             RunEvent::PolicyRefused { step, rule } => {
                 *step = step.as_deref().map(|name| r.redact(name));
                 *rule = r.redact(rule);
+            }
+            RunEvent::PlanStale { step, cause, approved, replanned, .. } => {
+                *step = r.redact(step);
+                *cause = r.redact(cause);
+                *approved = r.redact(approved);
+                *replanned = replanned.as_deref().map(|digest| r.redact(digest));
             }
             RunEvent::RunFinished { status, shipped } => {
                 *status = r.redact(status);
@@ -254,6 +280,16 @@ mod tests {
                 },
             ),
             ("policy.refused", RunEvent::PolicyRefused { step: Some(s()), rule: s() }),
+            (
+                "plan.stale",
+                RunEvent::PlanStale {
+                    step: s(),
+                    cause: s(),
+                    approved: s(),
+                    replanned: Some(s()),
+                    differs: Some(true),
+                },
+            ),
             ("run.finished", RunEvent::RunFinished { status: s(), shipped: hashes() }),
         ] {
             assert_eq!(event.kind(), kind);
