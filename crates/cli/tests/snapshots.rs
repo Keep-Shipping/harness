@@ -16,6 +16,10 @@ fn check(extra: &[&str]) -> (i32, String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_keepshipping"))
         .arg("check")
         .args(extra)
+        // The golden bytes are the ones from a terminal-less local run; a
+        // `CI` in the parent would add the undeclared-format warning to the
+        // fixture and rewrite the example this file pins.
+        .env_remove("CI")
         .current_dir(SITE)
         // Check now has a context, and it is detected from the environment:
         // these bytes are the same on a laptop and on a CI runner.

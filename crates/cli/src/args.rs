@@ -21,6 +21,7 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
        keepshipping run [FILE] [--env NAME] [--event \"push main\"] [--actor human|agent|ci]
                         [--context local|ci] [--non-interactive] [--until STEP]
                         [--skip STEP] [--allow-partial]
+       keepshipping fmt --upgrade [PATH...]
        keepshipping blocks search <QUERY> [--index URL] [--limit N] [--format human|json]
        keepshipping lsp";
 
@@ -29,11 +30,14 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
 /// rejects them like any other unrecognized option. `--until`, `--skip` and
 /// `--allow-partial` belong to `run` alone, and `--context` to both.
 /// `blocks search` has its own `--format` (human or json, no github
-/// annotations), `--index` and `--limit`.
+/// annotations), `--index` and `--limit`. `fmt` takes only `--upgrade` today:
+/// the formatter is not written yet, and every other flag it might grow is
+/// still a usage error.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Check,
     Run,
+    Fmt,
     BlocksSearch,
 }
 
@@ -73,6 +77,12 @@ pub struct Options {
     pub index: Option<String>,
     /// The `--limit` of `blocks search`, at least one.
     pub limit: u32,
+    /// `--upgrade` on `fmt`: rewrite each file to the format this build
+    /// writes. Without it there is no formatter to run.
+    pub upgrade: bool,
+    /// The paths `fmt --upgrade` was given: files, or directories to walk
+    /// for `ship.ks`. Empty means `ship.ks` in the working directory.
+    pub paths: Vec<String>,
 }
 
 pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
@@ -94,6 +104,8 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
         allow_partial: false,
         index: None,
         limit: DEFAULT_SEARCH_LIMIT,
+        upgrade: false,
+        paths: Vec::new(),
     };
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -115,6 +127,7 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
             "--until" if command == Command::Run => o.until = Some(flag_value(&mut rest)?),
             "--skip" if command == Command::Run => o.skip.push(flag_value(&mut rest)?),
             "--allow-partial" if command == Command::Run => o.allow_partial = true,
+            "--upgrade" if command == Command::Fmt => o.upgrade = true,
             "--index" if command == Command::BlocksSearch => o.index = Some(flag_value(&mut rest)?),
             "--limit" if command == Command::BlocksSearch => {
                 let value = flag_value(&mut rest)?;
@@ -130,6 +143,9 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
             text if o.query.is_none() && command == Command::BlocksSearch => {
                 o.query = Some(text.to_string())
             }
+            // `fmt` takes a list: it rewrites files, and rewriting several
+            // in one run is the whole reason it walks a tree at all.
+            path if command == Command::Fmt => o.paths.push(path.to_string()),
             _ => return None,
         }
     }

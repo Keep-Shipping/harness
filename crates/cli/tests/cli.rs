@@ -106,6 +106,11 @@ fn keepshipping(args: &[&str]) -> (i32, String, String) {
 fn run_in(dir: Option<&std::path::Path>, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_keepshipping"));
     cmd.args(args);
+    // These tests assert exact output, and the suite itself may be running
+    // on CI — where a header-less file gains an advisory warning it would
+    // not have anywhere else. The environment under test is the one these
+    // tests describe, not the one they happen to run in.
+    cmd.env_remove("CI");
     if let Some(dir) = dir {
         cmd.current_dir(dir);
     }
