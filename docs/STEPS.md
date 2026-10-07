@@ -9,6 +9,31 @@ Every step kind the harness ships, with its declared schema. Inputs are
 checked against the schema before the step runs; outputs, after.
 
 
+## `oci.artifact` (v1.0.0)
+
+Push files as an OCI artifact with an artifactType and media types.
+
+- Action: build
+- Requires: Registry
+- Optional: Signer
+
+Inputs:
+
+| Name | Type | Default | Description |
+| --- | --- | --- | --- |
+| `files` | list | - | the files to package as artifact layers |
+| `type` | string | - | artifact type: `helm`, `spdx`, `cyclonedx`, or a verbatim media type |
+| `push` | oci.Tag | - | where to push, e.g. `registry.example/charts/app:1.0.0` |
+| `subject` | oci.Digest | `` | the image digest this artifact describes, if any (empty for none) |
+| `sign` | bool | false | sign the pushed manifest digest |
+
+Outputs:
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `digest` | oci.Digest | the manifest digest the registry reported |
+| `ref` | oci.Ref | the repository@digest reference (by digest, never a tag) |
+
 ## `oci.image` (v1.0.0)
 
 Builds a container image from a Dockerfile, pushes it, and reports the digest the registry confirms.

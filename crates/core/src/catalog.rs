@@ -148,6 +148,21 @@ impl Catalog {
             false,
             false,
         );
+        // `subject` and `sign` carry defaults in the step schema, so the
+        // catalog types them as optional — what `insert_schema` would produce.
+        add(
+            "oci.artifact",
+            &[
+                ("files", Type::List(Box::new(Type::Any))),
+                ("type", Type::String),
+                ("push", named("oci.Tag")),
+                ("subject", Type::Optional(Box::new(named("oci.Digest")))),
+                ("sign", Type::Optional(Box::new(Type::Bool))),
+            ],
+            &[("digest", named("oci.Digest")), ("ref", named("oci.Ref"))],
+            false,
+            false,
+        );
         add(
             "tofu.plan",
             &[
@@ -388,6 +403,25 @@ mod tests {
         assert_eq!(image.input("when"), Some(Type::Bool), "when is reserved");
         let decide = catalog.step("decide").expect("decide");
         assert!(decide.decision);
+    }
+
+    /// `oci.artifact` carries the same types its step schema declares, so a
+    /// `.ks` file using it is checked rather than passing with no spec.
+    #[test]
+    fn builtin_carries_the_artifact_step() {
+        let catalog = Catalog::builtin();
+        let artifact = catalog.step("oci.artifact").expect("oci.artifact");
+        assert_eq!(artifact.input("files"), Some(Type::List(Box::new(Type::Any))));
+        assert_eq!(artifact.input("type"), Some(Type::String));
+        assert_eq!(artifact.input("push"), Some(named("oci.Tag")));
+        assert_eq!(
+            artifact.input("subject"),
+            Some(Type::Optional(Box::new(named("oci.Digest")))),
+            "subject defaults, so it is optional in a plan"
+        );
+        assert_eq!(artifact.input("sign"), Some(Type::Optional(Box::new(Type::Bool))));
+        assert_eq!(artifact.output("digest"), Some(&named("oci.Digest")));
+        assert_eq!(artifact.output("ref"), Some(&named("oci.Ref")));
     }
 
     #[test]
