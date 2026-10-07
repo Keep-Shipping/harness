@@ -6,7 +6,9 @@
 //! laptop and in CI — only the adapters change. The ports defined here:
 //!
 //! - [`run_context`] — who and where a run is (actor, repo, environment);
+//! - [`run_log`] — the append-only audit record of a run, hash-chained ([#55](https://github.com/Keep-Shipping/harness/issues/55));
 //! - [`secrets`] — resolving named secrets and redacting their values ([#49](https://github.com/Keep-Shipping/harness/issues/49));
+//! - [`state_store`] — working data and saved plans, per run ([#55](https://github.com/Keep-Shipping/harness/issues/55));
 //! - [`supply_chain`] — signing, attestations and digests ([#50](https://github.com/Keep-Shipping/harness/issues/50));
 //! - [`iac`] — planning and applying infrastructure ([#51](https://github.com/Keep-Shipping/harness/issues/51));
 //! - [`http`] — bounded, policy-checked HTTP ([#57](https://github.com/Keep-Shipping/harness/issues/57));
@@ -16,7 +18,7 @@
 //! - [`script_host`] — running the TypeScript escape-hatch steps.
 //!
 //! The remaining ports from the crate map (image building, registry, cluster,
-//! approvals, run log, …) land here with their issues.
+//! approvals, state, …) land here with their issues.
 //!
 //! # Async without dependencies
 //!
@@ -41,6 +43,8 @@ pub mod http;
 pub mod iac;
 pub mod id_gen;
 pub mod run_context;
+pub mod run_log;
 pub mod script_host;
 pub mod secrets;
+pub mod state_store;
 pub mod supply_chain;

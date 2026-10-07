@@ -454,7 +454,10 @@ mod tests {
         schema: StepSchema,
     }
 
-    /// A default-shaped [`TestStep`], for struct-update literals: `TestStep { api: 2, ..step("x") }`.
+    /// A default-shaped [`TestStep`], for struct-update literals: `TestStep { api: STEP_API + 1, ..step("x") }`.
+    ///
+    /// The mismatch fixtures below set `api` deliberately as [`STEP_API`] + 1 rather than a
+    /// literal, so that bumping [`STEP_API`] cannot silently stop them being a mismatch.
     fn step(name: &'static str) -> TestStep {
         TestStep {
             name,
@@ -532,6 +535,12 @@ mod tests {
     /// Every `build()` failure mode, refused with exactly these messages.
     #[test]
     fn build_reports_each_fault_with_its_exact_message() {
+        let api_mismatch = format!(
+            r#"step "oci.image" was built against step API {}, but this harness speaks step API {}"#,
+            STEP_API + 1,
+            STEP_API
+        );
+        let api_mismatch_msg = [api_mismatch.as_str()];
         let cases: Vec<(&str, HarnessBuilder, &[&str])> = vec![
             (
                 "a missing clock",
@@ -566,10 +575,8 @@ mod tests {
             ),
             (
                 "a step api mismatch",
-                clocked_builder().step(TestStep { api: 2, ..step("oci.image") }),
-                &[
-                    r#"step "oci.image" was built against step API 2, but this harness speaks step API 1"#,
-                ],
+                clocked_builder().step(TestStep { api: STEP_API + 1, ..step("oci.image") }),
+                &api_mismatch_msg,
             ),
             (
                 "an unknown named type",
@@ -660,7 +667,7 @@ mod tests {
     fn every_fault_is_reported_together_in_order() {
         let errors = Harness::builder() // no Clock, no Registry, no "digest" type
             .step(TestStep {
-                api: 2,
+                api: STEP_API + 1,
                 requires: &[Port::Registry],
                 schema: typed_schema(),
                 ..step("oci.image")
@@ -678,7 +685,10 @@ mod tests {
                     step: "oci.image".to_string(),
                     port: Port::Registry
                 },
-                CompositionError::StepApiMismatch { step: "oci.image".to_string(), found: 2 },
+                CompositionError::StepApiMismatch {
+                    step: "oci.image".to_string(),
+                    found: STEP_API + 1,
+                },
                 CompositionError::UnknownType {
                     step: "oci.image".to_string(),
                     field: "digest".to_string(),

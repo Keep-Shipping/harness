@@ -29,6 +29,24 @@ comment edits do not need any of that — the fingerprint normalises them away.
 
 Newest first, one heading per contract version, dated.
 
+## STEP_API 2
+
+- **2026-10-07** — Added the `RunLog` and `StateStore` ports
+  ([#55](https://github.com/Keep-Shipping/harness/issues/55)). `RunLog` is the
+  append-only, hash-chained audit record of what a run did — a step appends
+  events, reads them back by run, and verifies the chain; `StateStore` is
+  working data a run leaves behind under a run-scoped key, with `put`, `get`,
+  `list` and `delete_run`. They are two ports rather than one
+  `RunStorage` because the two have opposite lifetimes and opposite audiences:
+  the log is small, team-visible and kept long — it is what an audit, a
+  debugging session or a post-mortem reads — while state is bulk working data
+  that can be large and can carry sensitive values, and is kept only as long as
+  the run needs it. Folding them together would force one retention policy on
+  both, so either the audit trail is deleted with the scratch data or the
+  scratch data is retained for years. A step asking for `RunLog` is asking for
+  something that outlives the run; a step asking for `StateStore` is asking for
+  something that should not. No existing trait changed shape at this version.
+
 ## STEP_API 1
 
 - **2026-10-07** — The initial port contract
