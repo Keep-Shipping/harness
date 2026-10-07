@@ -199,6 +199,28 @@ pub struct Label {
     pub message: String,
 }
 
+/// A suggested edit: the bytes at `span` replaced by `replacement`.
+///
+/// `machine_applicable` marks an edit a tool may apply on its own —
+/// `keepshipping check --fix` takes exactly those. A suggestion the checker
+/// cannot prove unambiguous carries `false`: it is advice for a person, not
+/// an instruction for a machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fix {
+    /// The bytes to replace.
+    pub span: Span,
+    /// What to put in their place.
+    pub replacement: String,
+    /// Whether the edit is unambiguous enough to apply without a human.
+    pub machine_applicable: bool,
+}
+
+impl Fix {
+    pub fn new(span: Span, replacement: impl Into<String>, machine_applicable: bool) -> Self {
+        Self { span, replacement: replacement.into(), machine_applicable }
+    }
+}
+
 /// A parse or check finding. `ks-lang` produces errors only; `ks-core` emits
 /// the same type, including warnings. `code` names the kind of problem,
 /// `subject` — when the checker knows it — the dotted thing the finding is
@@ -212,6 +234,8 @@ pub struct Diagnostic {
     pub subject: Option<String>,
     pub labels: Vec<Label>,
     pub hints: Vec<String>,
+    /// Edits that would resolve the finding, in the order they apply.
+    pub fixes: Vec<Fix>,
 }
 
 impl Diagnostic {
@@ -224,6 +248,7 @@ impl Diagnostic {
             subject: None,
             labels: Vec::new(),
             hints: Vec::new(),
+            fixes: Vec::new(),
         }
     }
 
@@ -236,6 +261,7 @@ impl Diagnostic {
             subject: None,
             labels: Vec::new(),
             hints: Vec::new(),
+            fixes: Vec::new(),
         }
     }
 
@@ -254,6 +280,13 @@ impl Diagnostic {
     /// Adds a secondary span with a one-line explanation.
     pub fn with_label(mut self, span: Span, message: impl Into<String>) -> Self {
         self.labels.push(Label { span, message: message.into() });
+        self
+    }
+
+    /// Attaches a suggested edit — a did-you-mean rewrite, or the type-
+    /// directed output that would satisfy this value.
+    pub fn with_fix(mut self, fix: Fix) -> Self {
+        self.fixes.push(fix);
         self
     }
 }

@@ -942,3 +942,102 @@ fn an_agent_runs_when_the_file_needs_no_secrets_or_the_policy_stays_silent() {
     let checked = ks_core::check_with(&ks_lang::parse(&humans_only), &options);
     assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
 }
+
+// --- suggested fixes -------------------------------------------------------
+
+/// Splice every fix into `src`, back to front, the way `--fix` does.
+fn apply_fixes(src: &str, fixes: &[ks_lang::Fix]) -> String {
+    let mut out = src.to_string();
+    for f in fixes.iter().rev() {
+        out.replace_range(f.span.start as usize..f.span.end as usize, &f.replacement);
+    }
+    out
+}
+
+fn fixes_of(src: &str) -> Vec<ks_lang::Fix> {
+    check(&ks_lang::parse(src)).diagnostics.iter().flat_map(|d| d.fixes.iter()).cloned().collect()
+}
+
+/// Each case is one diagnostic: the code it carries, the fix it proposes
+/// and the bytes that fix names. Applying the fix must leave a file the
+/// checker is happy with.
+#[test]
+fn every_suggestion_rewrites_its_own_span_and_the_file_then_checks_clean() {
+    let base = "\
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  plan: tofu.plan
+    dir: ./infra
+  deploy: k8s.rollout
+    image: build.digest
+";
+    // (the misspelling, the code, the replacement, the bytes rewritten)
+    let cases = [
+        ("image: build.digest", "image: build.tag", "digest", "tag"),
+        ("from: ./Dockerfile", "frome: ./Dockerfile", "from", "frome"),
+        ("dir: ./infra", "dirr: ./infra", "dir", "dirr"),
+    ];
+    for (good, bad, replacement, rewritten) in cases {
+        let src = base.replace(good, bad);
+        let fixes = fixes_of(&src);
+        assert_eq!(fixes.len(), 1, "{bad}: {:#?}", fixes_of(&src));
+        let fix = &fixes[0];
+        assert_eq!(fix.replacement, replacement, "{bad}");
+        assert!(fix.machine_applicable, "{bad}: nothing ties it");
+        assert_eq!(fix.span.slice(&src), rewritten, "{bad}");
+        let fixed = apply_fixes(&src, &fixes);
+        assert_eq!(fixed, base, "{bad}: {fixed}");
+        let rechecked = check(&ks_lang::parse(&fixed));
+        assert!(rechecked.diagnostics.is_empty(), "{bad}: {:#?}", rechecked.diagnostics);
+    }
+}
+
+#[test]
+fn a_misspelled_output_is_fixed_by_rewriting_the_output_segment() {
+    let src = "\
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  plan: tofu.plan
+    dir: ./infra
+  review: approval
+    show: plan.change
+";
+    let fixes = fixes_of(src);
+    assert_eq!(fixes.len(), 1, "{:#?}", fixes_of(src));
+    assert_eq!((fixes[0].replacement.as_str(), fixes[0].machine_applicable), ("changes", true));
+    assert_eq!(fixes[0].span.slice(src), "change", "not the whole reference");
+    let fixed = apply_fixes(src, &fixes);
+    assert!(fixed.contains("show: plan.changes"), "{fixed}");
+    assert!(check(&ks_lang::parse(&fixed)).diagnostics.is_empty());
+}
+
+#[test]
+fn a_tie_is_hinted_but_never_applied() {
+    use ks_core::step::{Field, StepSchema, TypeRef};
+    let mut catalog = ks_core::Catalog::builtin();
+    catalog
+        .add_schema(
+            "web.deploy",
+            &StepSchema {
+                doc: "deploy the web service",
+                inputs: vec![
+                    Field::new("cat", TypeRef::Named("string"), "what"),
+                    Field::new("car", TypeRef::Named("string"), "what"),
+                ],
+                outputs: vec![],
+            },
+        )
+        .expect("the schema joins");
+    let options = ks_core::CheckOptions::new(&catalog);
+    // `cap` is one edit from both declared inputs: a person is told, a
+    // machine is not told what to choose.
+    let src = "steps:\n  d: web.deploy\n    cap: sofa\n";
+    let checked = ks_core::check_with(&ks_lang::parse(src), &options);
+    let d = &checked.diagnostics[0];
+    assert!(d.hints.iter().any(|h| h.starts_with("did you mean")), "{:#?}", d.hints);
+    let fix = &d.fixes[0];
+    assert_eq!(fix.replacement, "cat", "the first candidate, as the hint names it");
+    assert!(!fix.machine_applicable, "two names tie; --fix must not pick one");
+}
