@@ -23,6 +23,7 @@ pub mod run_context;
 pub mod run_log;
 pub mod script_host;
 pub mod secrets;
+pub mod state_store;
 pub mod step;
 pub mod supply_chain;
 

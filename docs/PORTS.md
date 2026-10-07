@@ -29,6 +29,18 @@ comment edits do not need any of that — the fingerprint normalises them away.
 
 Newest first, one heading per contract version, dated.
 
+## STEP_API 2
+
+- **2026-10-07** — Additive: the [`StateStore`](https://github.com/Keep-Shipping/harness/blob/main/crates/core/src/ports/state_store.rs)
+  port joined the contract
+  ([#42](https://github.com/Keep-Shipping/harness/issues/42)), carrying a
+  parked run's state and its saved plans. `StateStore` has two methods, `put`
+  and `get`, both scoped to a `RunId` and a key the port validates
+  (`check_key`), so no key can address anything outside its own run
+  directory. Nothing existing changed shape, and no step sees the port: the
+  engine uses the store directly, so `Port` and `define_ports!` are
+  untouched. The remaining ports are as declared above.
+
 ## STEP_API 1
 
 - **2026-10-07** — The initial port contract
