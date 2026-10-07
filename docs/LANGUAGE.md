@@ -14,6 +14,29 @@ steps:
     wait:  healthy, 5m
 ```
 
+## File name and association
+
+A site file is named `ship.ks`. The extension alone does not identify it:
+`.ks` belongs to Red Hat/Fedora Kickstart, so GitHub Linguist and most
+editors read a `ship.ks` as Kickstart until something claims the name
+itself ([#14](https://github.com/Keep-Shipping/harness/issues/14)).
+
+Association is therefore by file name, never by extension:
+
+- `keepshipping` reads the file at the repository root, or at the path
+  given to `--file`. It never scans a directory for `*.ks`.
+- Editor grammars, the tree-sitter grammar and Linguist must register
+  `ship.ks` and `*.ship.ks`, and nothing else. A grammar that claims
+  `*.ks` is wrong: it would take Kickstart files away from the people who
+  own them.
+- Parsing does not depend on the name. Any path given to `--file` is
+  parsed the same way; the name selects highlighting and discovery, not
+  meaning.
+
+Renaming the file later would change the site, the README and the language
+listing together, so the name is fixed here before the editor extension
+ships.
+
 ## Lexical grammar
 
 ```ebnf
@@ -303,3 +326,5 @@ revisit:
   single environment → ambiguous, a human picks.
 - Policy subjects are `agents` and `humans`; action verbs are the classes
   `check build test plan apply deploy destroy publish read` (#101).
+- A site file is `ship.ks` and is found by file name, never by the `.ks`
+  extension ([File name and association](#file-name-and-association)).
