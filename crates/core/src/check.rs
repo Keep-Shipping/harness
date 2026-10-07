@@ -6,6 +6,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use ks_lang::{Atom, Code, Diagnostic, Entry, Expr, Fix, Span, StrPart, Word};
 
+use crate::auto_rule::{self, MISSING_GUARD_HINT, MISSING_GUARD_MESSAGE};
 use crate::catalog::{Catalog, StepTypes};
 use crate::ports::run_context::ActorKind;
 use crate::ports::secrets::SecretRef;
@@ -436,8 +437,38 @@ impl<'a> Ctx<'a> {
         match iname {
             "show" => self.check_refs(idx, &e),
             "else" => self.check_actions(idx, &e),
+            "auto" => {
+                // Only `approval` gates on `auto:`; the destroys guard is its
+                // rule, not a convention every `auto:` input follows.
+                if spec.name == "approval" {
+                    self.check_auto_rule(&e);
+                }
+                self.demand_input(idx, ty, &e);
+            }
             "returns" => {} // variants were collected with the declarations
             _ => self.demand_input(idx, ty, &e),
+        }
+    }
+
+    /// An `approval` step's `auto:` may approve without a human only if it
+    /// says so: the destroys guard must be a top-level conjunct reading a
+    /// step that produces a `destroys` count. The engine adds the guard
+    /// either way (ADR 0012), so this warns about the file, not the run.
+    fn check_auto_rule(&mut self, e: &Expr<'_>) {
+        let plans: Vec<String> = self
+            .steps
+            .iter()
+            .filter(|s| s.spec.is_some_and(|sp| sp.output("destroys").is_some()))
+            .map(|s| s.name.clone())
+            .collect();
+        let is_plan_step = |name: &str| plans.iter().any(|n| n == name);
+        if !auto_rule::guards_destroys(e, &is_plan_step) {
+            self.warn_hint(
+                Code::AutoDestroys,
+                e.span(),
+                MISSING_GUARD_MESSAGE.to_string(),
+                MISSING_GUARD_HINT.to_string(),
+            );
         }
     }
 
