@@ -89,6 +89,26 @@ Outputs:
 | `digest` | string | the verified digest |
 | `identity` | string | the identity the signature was made as |
 
+## `tofu.apply` (v1.0.0)
+
+Applies exactly the plan file an approval was bound to, refusing if its sha256 no longer matches.
+
+- Action: apply
+- Requires: IacTool
+
+Inputs:
+
+| Name | Type | Default | Description |
+| --- | --- | --- | --- |
+| `plan` | map | - | the `tofu.PlanFile` `tofu.plan` emitted as `file`: `{path, sha256, dir}`, with `sha256` the digest the approval was bound to |
+
+Outputs:
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `out` | map | the root module's non-sensitive outputs, by name; sensitive ones are counted in the log, never returned |
+| `applied` | number | how many resources the apply changed (created, updated and destroyed) |
+
 ## `tofu.plan` (v1.0.0)
 
 Plans an infrastructure directory, and reports what it would change.

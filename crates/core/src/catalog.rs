@@ -195,7 +195,13 @@ impl Catalog {
             false,
             false,
         );
-        add("tofu.apply", &[("plan", named("tofu.PlanFile"))], &[], true, false);
+        add(
+            "tofu.apply",
+            &[("plan", named("tofu.PlanFile"))],
+            &[("out", named("tofu.Outputs")), ("applied", Type::Int)],
+            true,
+            false,
+        );
         add(
             "k8s.rollout",
             &[
