@@ -38,6 +38,7 @@ pub mod ports;
 pub mod registry;
 pub mod step;
 mod types;
+pub mod version;
 mod workflow;
 
 pub use catalog::{Catalog, CatalogError, StepTypes};
@@ -48,4 +49,5 @@ pub use check::{
 pub use env::{EnvChoice, select_env};
 pub use registry::{Explanation, explain};
 pub use types::{LiteralFit, Type, coerce, literal, literal_type};
+pub use version::{FORMAT_VERSION, SCRIPT_PROTOCOL, STEP_API};
 pub use workflow::{Env, NeverRule, Policy, Step, Trigger, TriggerKind, Workflow};
