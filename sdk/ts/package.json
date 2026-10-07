@@ -1,0 +1,29 @@
+{
+  "name": "@keepshipping/sdk",
+  "version": "0.1.0-pre.0",
+  "description": "TypeScript escape-hatch steps for Keep Shipping.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "check": "tsc --noEmit --project tsconfig.json",
+    "test": "node --test \"test/*.test.ts\""
+  },
+  "publishConfig": {
+    "access": "restricted",
+    "tag": "next"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.1",
+    "typescript": "5.9.3"
+  }
+}

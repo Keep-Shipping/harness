@@ -1,6 +1,10 @@
 # Rust / Cargo build artifacts
 /target
 
+# TypeScript SDK build artifacts and installed packages
+sdk/ts/dist/
+sdk/ts/node_modules/
+
 # Local credential and secret files — never commit these.
 # Environment and shell loaders
 .env
