@@ -246,8 +246,9 @@ pub struct ScriptFixture {
 /// The `ScriptHost` conformance fixtures: a right-typed echo, a fixture
 /// exercising every container and scalar type, and one scripted bug per
 /// typed error — a wrong-typed output, a missing output, an undeclared
-/// output, and a wrong-typed input. Real adapters (once #10 settles the
-/// protocol) map each fixture to an actual script file and must reproduce
+/// output, and a wrong-typed input. Real adapters (protocol settled in
+/// [ADR 0009](../../../docs/adr/0009-typescript-escape-hatch-runtime.md)) map
+/// each fixture to an actual script file and must reproduce
 /// both its `returns` behaviour and its `expected` result; the fake maps
 /// them in [`FakeScriptHost::with_fixtures`].
 pub fn fixtures() -> Vec<ScriptFixture> {
