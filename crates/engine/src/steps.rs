@@ -8,9 +8,10 @@ use std::sync::Arc;
 use ks_core::step::StepKind;
 
 use crate::oci_verify::OciVerify;
+use crate::tofu_apply::TofuApply;
 
 /// Every built-in step kind, in registration order. Empty until the first step family ships;
 /// `docs/STEPS.md` renders the placeholder until then.
 pub fn builtin_steps() -> Vec<Arc<dyn StepKind>> {
-    vec![Arc::new(OciVerify)]
+    vec![Arc::new(OciVerify), Arc::new(TofuApply)]
 }

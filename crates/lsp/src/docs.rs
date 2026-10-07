@@ -15,7 +15,7 @@ pub fn kind_doc(kind: &str) -> Option<&'static str> {
         "tofu.plan" => "Plan an infrastructure change, and count what it would add and destroy.",
         "approval" => "Hold the run until a human answers, showing an earlier step's outputs.",
         "tofu.apply" => {
-            "Apply a plan file. Its outputs are known only at run time, as `out.<name>`."
+            "Apply exactly the plan file an approval was bound to. Yields `applied` and the root outputs as `out.<name>`."
         }
         "k8s.rollout" => {
             "Roll a deployment out to a cluster. Its outputs are known only at run time."

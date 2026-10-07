@@ -14,3 +14,4 @@ pub mod secrets;
 pub mod signing;
 pub mod state;
 pub mod steps;
+pub mod tofu_apply;
