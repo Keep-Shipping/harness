@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cache;
 pub mod exec;
 pub mod journal;
 pub mod run;

@@ -118,6 +118,20 @@ impl FakeRegistry {
             .unwrap_or_default()
     }
 
+    /// Removes `digest` from `repository`, as a garbage collection or a registry
+    /// lifecycle hook would. Tags pointing at it go too, so a later `resolve`
+    /// reports `NotFound` rather than handing back a digest that is gone.
+    /// Deleting a digest that is not there is a no-op.
+    pub fn delete(&self, repository: &str, digest: &Digest) {
+        let mut state = self.lock();
+        if let Some(stored) = state.content.get_mut(repository) {
+            stored.remove(digest);
+        }
+        if let Some(tags) = state.tags.get_mut(repository) {
+            tags.retain(|_, tagged| tagged != digest);
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, RegistryState> {
         self.state.lock().expect("fake registry")
     }
