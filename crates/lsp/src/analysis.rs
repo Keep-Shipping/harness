@@ -612,14 +612,29 @@ steps:
     #[test]
     fn a_key_inside_a_step_offers_that_kinds_inputs() {
         let (doc, at) = typing("steps:\n  build: oci.image\n    fr", "    fr");
-        assert_eq!(labels(&doc, at), ["from", "push", "sign", "when"]);
+        assert_eq!(
+            labels(&doc, at),
+            [
+                "from",
+                "context",
+                "args",
+                "secrets",
+                "platforms",
+                "target",
+                "push",
+                "sign",
+                "sbom",
+                "cache",
+                "when"
+            ]
+        );
     }
 
     #[test]
     fn a_partial_dotted_name_offers_that_step_outputs() {
         let src = "steps:\n  build: oci.image\n  deploy: k8s.rollout\n    image: build.";
         let (doc, at) = typing(src, "build.");
-        assert_eq!(labels(&doc, at), ["digest", "tag", "signed"]);
+        assert_eq!(labels(&doc, at), ["digest", "ref", "tag", "signed", "sbom", "platforms"]);
     }
 
     #[test]

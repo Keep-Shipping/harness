@@ -75,6 +75,21 @@ there because comparing two cached builds proves nothing.
 
 ## Status today
 
+The attestation layout exists, and is not yet on the wire from a
+build. An in-toto v1 statement, a SLSA v1 provenance predicate and a
+DSSE envelope are built, signed and pushed against the image digest in
+`ks_engine::attestation` (#63): the envelope is an OCI artifact whose
+`subject` is the image, so `referrers` will list provenance and SBOM side
+by side. The run log has the transition for it —
+`RunEvent::AttestationAttached` and `Journal::attestation_attached` — but
+nothing emits it yet: that is the `oci.image` step and its BuildKit adapter
+([#59](https://github.com/Keep-Shipping/harness/issues/59),
+[ADR 0010](adr/0010-image-build-backend.md)), which also carries the `sbom`
+input the catalog now declares. Until the real `Signer` and `ImageBuilder`
+adapters exist, `cosign verify-attestation` is **not** verified against
+anything here: the tests sign with `ks-testing`'s deterministic fake, which
+is honest about not being cryptography.
+
 | Claim | Status |
 |---|---|
 | `oci.image` sets these knobs by default (`SOURCE_DATE_EPOCH` from the commit time, `rewrite-timestamp=true`, one pinned builder) | Planned — lands with the `oci.image` step and [ADR 0010](adr/0010-image-build-backend.md). No builder adapter exists yet: `builtin_steps()` returns no step kinds and [STEPS.md](STEPS.md) says so. |

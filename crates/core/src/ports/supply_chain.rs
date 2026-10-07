@@ -15,6 +15,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use super::BoxFuture;
+use super::secrets::SecretValue;
 
 /// A content digest: `sha256:<64 lowercase hex>` or `sha512:<128 lowercase
 /// hex>`.
@@ -392,21 +393,133 @@ pub trait Registry: Send + Sync {
     ) -> BoxFuture<'a, Result<(), RegistryError>>;
 }
 
+/// Where a build may keep the work it has already done.
+///
+/// Adapters map this onto their backend; the three values are the ones
+/// BuildKit itself offers, and nothing here promises a cache a step has
+/// not verified (see [`Registry::exists`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BuildCache {
+    /// Keep the cache in a registry, so it survives a fresh runner.
+    Registry,
+    /// Keep the cache on the machine running the build.
+    #[default]
+    Local,
+    /// Build with no cache at all.
+    None,
+}
+
+impl BuildCache {
+    /// The spelling a workflow uses for this mode.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BuildCache::Registry => "registry",
+            BuildCache::Local => "local",
+            BuildCache::None => "none",
+        }
+    }
+
+    /// Parses the spelling a workflow uses; `Err` carries what it was offered.
+    pub fn parse(text: &str) -> Result<BuildCache, String> {
+        match text {
+            "registry" => Ok(BuildCache::Registry),
+            "local" => Ok(BuildCache::Local),
+            "none" => Ok(BuildCache::None),
+            other => Err(other.to_string()),
+        }
+    }
+}
+
+impl fmt::Display for BuildCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The secrets one build mounts, keyed by the mount name the Dockerfile
+/// asks for — BuildKit's `RUN --mount=type=secret,id=<name>`.
+///
+/// These are mounts, never [`args`](BuildRequest::args): a build arg is
+/// recorded in the image history and in the provenance attestation, so a
+/// secret passed as one is a secret baked into the artifact. Values arrive
+/// as [`SecretValue`]s, which have no `Display`, no `Clone` and a `Debug`
+/// that prints `***`; the only way to read one is
+/// [`with_bytes`](SecretValue::with_bytes). For the same reason a
+/// `BuildRequest` is deliberately not `Clone`: a request cannot be copied
+/// without copying the secrets it carries.
+#[derive(Default)]
+pub struct BuildSecrets {
+    mounts: BTreeMap<String, SecretValue>,
+}
+
+impl BuildSecrets {
+    /// Creates an empty set of mounts.
+    pub fn new() -> BuildSecrets {
+        BuildSecrets { mounts: BTreeMap::new() }
+    }
+
+    /// Mounts `value` under `name`, returning whatever it replaced.
+    pub fn insert(&mut self, name: impl Into<String>, value: SecretValue) -> Option<SecretValue> {
+        self.mounts.insert(name.into(), value)
+    }
+
+    /// The value mounted under `name`.
+    pub fn get(&self, name: &str) -> Option<&SecretValue> {
+        self.mounts.get(name)
+    }
+
+    /// Whether nothing is mounted.
+    pub fn is_empty(&self) -> bool {
+        self.mounts.is_empty()
+    }
+
+    /// The mount names, sorted.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.mounts.keys().map(String::as_str)
+    }
+
+    /// The `(name, value)` mounts, sorted by name.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &SecretValue)> {
+        self.mounts.iter().map(|(name, value)| (name.as_str(), value))
+    }
+}
+
+/// Names and never values, exactly as
+/// [`SecretBundle`](crate::ports::secrets::SecretBundle) does it: a request
+/// is logged, and a log line must not become a way to read a secret.
+impl fmt::Debug for BuildSecrets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BuildSecrets").field("mounts", &self.names().collect::<Vec<_>>()).finish()
+    }
+}
+
 /// A request to build an image from a build context.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Default)]
 pub struct BuildRequest {
     /// The build context directory.
     pub context: PathBuf,
     /// The Dockerfile within (or relative to) the context.
     pub dockerfile: PathBuf,
-    /// Build args.
+    /// Build args. Public by name, opaque by content: everything a build
+    /// needs to know is here, and the only private field is the secrets.
     pub args: BTreeMap<String, String>,
-    /// Platforms to build for, e.g. `linux/amd64`.
+    /// Platforms to build for, e.g. `linux/amd64`. More than one produces an
+    /// OCI image index, so the digest a build reports addresses the index.
     pub platforms: Vec<String>,
     /// A specific stage to build, if any.
     pub target: Option<String>,
     /// The repository to push to, if the output should be pushed at all.
     pub push_to: Option<String>,
+    /// Secrets mounted into the build. Never build args — see
+    /// [`BuildSecrets`].
+    pub secrets: BuildSecrets,
+    /// Where the builder may keep the work it has already done.
+    pub cache: BuildCache,
+    /// Whether to produce an SBOM alongside the image. An adapter that
+    /// cannot is free to ignore it; the digest it reports says nothing
+    /// about one either way, so a caller that needs an artifact asks the
+    /// registry for referrers.
+    pub sbom: bool,
 }
 
 /// What a build produced. Content, never a tag: tagging is a `Registry`

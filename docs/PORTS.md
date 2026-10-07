@@ -31,6 +31,16 @@ Newest first, one heading per contract version, dated.
 
 ## STEP_API 2
 
+- **2026-10-07** — `BlockSource` and `PolicyStore`
+  ([#56](https://github.com/Keep-Shipping/harness/issues/56)) added, both
+  engine/CLI-only: `BlockSource` is how an online command resolves a block
+  reference and fetches its content by digest, and `PolicyStore` is how the
+  org baseline policy is read from outside the repository
+  ([ADR 0012](adr/0012-policy-authority.md)). Neither is in `Port` nor in
+  `define_ports!`, so `check` stays offline and no step can hold either, and
+  `STEP_API` does not move. The fingerprint covers every trait in `ports/`,
+  so the digest is re-pinned under `STEP_API 2` without a bump.
+
 - **2026-10-07** — Additive: the [`StateStore`](https://github.com/Keep-Shipping/harness/blob/main/crates/core/src/ports/state_store.rs)
   port joined the contract
   ([#42](https://github.com/Keep-Shipping/harness/issues/42)), carrying a

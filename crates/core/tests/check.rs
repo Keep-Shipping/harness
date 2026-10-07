@@ -158,7 +158,7 @@ steps:
 ";
     let all = messages(src);
     assert!(
-        all.iter().any(|m| m.contains("expected oci.Digest, got string")
+        all.iter().any(|m| m.contains("expected oci.Digest, got oci.Tag")
             && m.contains("use build.digest so prod runs exactly the image you built")),
         "{all:?}"
     );
@@ -249,6 +249,37 @@ steps:
 ";
     let all = messages(src);
     assert!(all.iter().any(|m| m.contains("expected tofu.PlanFile, got string")), "{all:?}");
+}
+
+/// `oci.artifact` is in the builtin catalog, so its inputs are typed: a
+/// `files` that is not a list is rejected rather than passing unchecked.
+#[test]
+fn an_artifact_step_is_typed_by_the_builtin_catalog() {
+    let src = "\
+steps:
+  chart: oci.artifact
+    files: ./chart.tgz
+    type: helm
+    push: registry.example/charts/app:1.0.0
+";
+    let all = messages(src);
+    assert!(all.iter().any(|m| m.contains("expected list[any], got path")), "{all:?}");
+}
+
+#[test]
+fn a_well_formed_artifact_step_checks_clean() {
+    let src = "\
+steps:
+  chart: oci.artifact
+    files:
+      - ./chart.tgz
+    type: helm
+    push: registry.example/charts/app:1.0.0
+    subject: \"sha256:\
+0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"
+";
+    let all = errors(src);
+    assert!(all.is_empty(), "{all:?}");
 }
 
 #[test]

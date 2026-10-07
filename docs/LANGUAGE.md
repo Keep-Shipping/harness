@@ -106,8 +106,8 @@ atom     = word | string | interp | "(" , [ value ] , ")" ;
 A continuation line (deeper, not `key:`) splices into the value, so
 
 ```ks
-auto:    risk is low ≥ 0.95
-         and plan.destroys == 0
+auto: risk is low >= 0.95
+      and plan.destroys == 0
 ```
 
 is one expression: `risk is low ≥ 0.95 and plan.destroys == 0`.
@@ -165,6 +165,48 @@ The typed AST normalises the tree for consumers, at every level: a
 single-item tuple collapses to its item and a single-atom phrase to that
 atom, so `auto:` above is an `and`-expression, not a one-element tuple, and
 `show: a, b` has two atoms for items, not two one-atom phrases.
+
+## Formatting
+
+`keepshipping fmt` rewrites a `.ks` file into one canonical form. `fmt
+--check` reports the same rewrite as a diff and exits 1 without writing; `fmt
+-` formats stdin to stdout, for an editor's format-on-save. A file that does
+not parse is refused and left untouched — `fmt` never reformats around a
+value it does not understand — and a problem with the command line or with
+reading a file is a usage error (exit 2).
+
+The formatter rebuilds every line from tokens, so only the whitespace
+*between* tokens changes: a string keeps its bytes, and only these are
+rewritten.
+
+- Indentation is two spaces per level, from the file's own leftmost entry —
+  a fragment indented for a surrounding block keeps its shape.
+- A file uses two value columns. Top-level entries share one, as wide as the
+  widest of their keys; every entry below them shares a second. Each is
+  measured from its own indentation, plus one space.
+- Consecutive lines carrying a trailing comment are aligned into one column,
+  as far right as the widest of them already reached — at least one space
+  separates a comment from its code. A blank line, a comment on a line of its
+  own, or a line with no comment ends the run and starts a new one.
+- A run of blank lines collapses to one, and no blank line is ever added
+  where the author wrote none.
+- Tabs in indentation become spaces; they are the one parse error `fmt`
+  still fixes, because replacing them is its job. A tab also widens an
+  editor's formatting request: a range handed to the language server becomes
+  a whole-file edit, because turning a tab into spaces can move the entries
+  around it.
+- `≥` and `≤` are rewritten as `>=` and `<=`.
+- Line endings become LF: a CRLF file is rewritten with plain newlines. A `\r`
+  that no `\n` follows is not a line ending here, so one in whitespace or
+  indentation is refused, exactly as a parse error is.
+- The file ends with exactly one newline.
+
+Formatting twice changes nothing the second time, and the formatter's
+output always parses — it re-parses what it built and refuses rather than
+handing back source it would not accept. Its output must also carry the same
+significant tokens, and the same comments in the same order, as the file it
+read; if a rewrite would change either, the result is refused too — declining
+to answer is a better answer than dropping a comment.
 
 ## References and interpolation
 
@@ -310,7 +352,7 @@ Every value has a type, and types never convert implicitly
   the primitive it was meant to be.
 - Nominal types (`oci.Digest`, `tofu.PlanFile`, ...) come from step schemas:
   they coerce only to themselves, and a mismatch diagnostic names both types
-  (`expected oci.Digest, got string`) and suggests a same-workflow output of
+  (`expected oci.Digest, got oci.Tag`) and suggests a same-workflow output of
   the wanted type (`use build.digest so prod runs exactly the image you
   built`). A well-formed `sha256:…` *literal* where a digest is declared is
   accepted with a warning: pin by reference, not by pasted digest.
@@ -383,10 +425,13 @@ revisit:
 
 - Generic entry tree: no top-level key is reserved; the checker assigns
   meaning (`name`, `steps`, `policy`, ...).
-- The root indent is set by the first entry, not fixed at column 0.
-- Sibling indentation must match exactly (no alignment tolerance).
+- The root indent is set by the first entry, not fixed at column 0; `fmt`
+  keeps it ([Formatting](#formatting)).
+- Sibling indentation must match exactly (no alignment tolerance); `fmt`
+  writes the canonical two-space-per-level form.
 - Tabs are diagnosed wherever they appear in indentation, with a `fmt`
-  hint; they still count as one indent character.
+  hint; they still count as one indent character, and `fmt` replaces them
+  with spaces.
 - Reserved words `and`, `or`, `not`, `is`; comparison operators in ASCII and
   Unicode spellings (`>=` / `≥`, `<=` / `≤`); `=` introduces a default.
 - `is` compares with an optional `≥`/`>=` threshold (`risk is low ≥ 0.95`).

@@ -32,6 +32,11 @@ followed, a `Tool` version, or a `Value`.
 Every field is length-prefixed and every sequence counted, so two different inputs can never
 produce the same bytes, and no map is walked in hash order. The key renders as `sha256:<hex>`.
 
+Because *every* resolved input is covered, a step whose inputs include a secret cannot
+distinguish a safe key from a hash of one: the key is written to disk and logged on every miss.
+A step that takes secrets therefore has to say so — `oci.image` returns `Caching::Never` for a
+run that mounts any, and keys on its build context for every other run.
+
 ## Verification before skip
 
 A key match is not enough. Before skipping, the engine hands the cached outputs back to the
@@ -58,6 +63,6 @@ it.
   both follow ADR 0008's GitHub Actions-first ordering.
 - **No `keepshipping run` wiring.** `run_step_cached` is the seam; the executor (#41) calls it
   once there is a run loop.
-- **No built-in step caches yet.** `builtin_steps()` is still empty; `oci.image` arrives with
-  #59.
+- **No built-in step caches other than `oci.image`.** `oci.image` (#59) is the first built-in
+  step to opt in, keyed on its build context; the rest arrive with their own families.
 - **No cache eviction.** Entries are small and never expire.

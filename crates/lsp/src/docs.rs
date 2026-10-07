@@ -9,6 +9,9 @@
 pub fn kind_doc(kind: &str) -> Option<&'static str> {
     Some(match kind {
         "oci.image" => "Build a container image from a Dockerfile, and publish its digest and tag.",
+        "oci.artifact" => {
+            "Push files as an OCI artifact by digest, optionally attached to an image and signed."
+        }
         "oci.verify" => {
             "Refuse to continue unless an image digest carries a signature from a named identity."
         }

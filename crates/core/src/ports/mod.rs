@@ -16,6 +16,8 @@
 //! - [`health`] — the shared vocabulary every port reports health in ([#78](https://github.com/Keep-Shipping/harness/issues/78));
 //! - [`http`] — bounded, policy-checked HTTP ([#57](https://github.com/Keep-Shipping/harness/issues/57));
 //! - [`blocks`] — the metadata-only blocks index ([#149](https://github.com/Keep-Shipping/harness/issues/149));
+//! - [`block_source`] — block content, resolved and fetched by digest ([#56](https://github.com/Keep-Shipping/harness/issues/56));
+//! - [`policy`] — the org baseline policy, read from outside the repository ([#56](https://github.com/Keep-Shipping/harness/issues/56));
 //! - [`clock`] — time and sleeping, as a dependency rather than ambient;
 //! - [`id_gen`] — minting fresh run ids;
 //! - [`run_log`] — the append-only record of what a run did ([#46](https://github.com/Keep-Shipping/harness/issues/46));
@@ -24,10 +26,13 @@
 //! - [`state_store`] — a parked run's state and its saved plans
 //!   ([#42](https://github.com/Keep-Shipping/harness/issues/42)).
 //!
-//! [`run_log`] is the one port a step never sees — the engine writes it, not a
-//! step — so it is not in the `Port` enum and `STEP_API` does not move when it
-//! changes. The remaining ports from the crate map (image building, registry,
-//! cluster, approvals, …) land here with their issues.
+//! [`run_log`], [`block_source`] and [`policy`] are the ports a step never sees
+//! — the engine and the CLI hold them, not a step — so none of the three is in
+//! the `Port` enum or in `define_ports!`, and `STEP_API` does not move when
+//! they change. `check` in particular stays pure and I/O-free: it reads a
+//! block's *digest* and a baseline's rules, and never resolves a version or
+//! fetches a document. The remaining ports from the crate map (image building,
+//! registry, cluster, approvals, …) land here with their issues.
 //!
 //! # Async without dependencies
 //!
@@ -47,6 +52,7 @@ use core::pin::Pin;
 pub type BoxFuture<'a, T> = Pin<Box<dyn core::future::Future<Output = T> + Send + 'a>>;
 
 pub mod approval;
+pub mod block_source;
 pub mod blocks;
 pub mod clock;
 pub mod cluster;
@@ -56,6 +62,7 @@ pub mod health;
 pub mod http;
 pub mod iac;
 pub mod id_gen;
+pub mod policy;
 pub mod remote_shell;
 pub mod run_context;
 pub mod run_log;

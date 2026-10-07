@@ -15,6 +15,7 @@ use std::future::Future;
 use std::task::Poll;
 
 pub mod approval;
+pub mod block_source;
 pub mod blocks;
 pub mod clock;
 pub mod cluster;
@@ -23,6 +24,7 @@ pub mod function_host;
 pub mod http;
 pub mod iac;
 pub mod id_gen;
+pub mod policy;
 pub mod remote_shell;
 pub mod run_context;
 pub mod run_log;

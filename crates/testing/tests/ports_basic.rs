@@ -3,15 +3,19 @@
 
 use std::time::Duration;
 
+use ks_core::ports::block_source::BlockSource;
 use ks_core::ports::clock::Clock;
 use ks_core::ports::http::{HttpClient, HttpError, HttpMethod, HttpRequest, HttpResponse};
 use ks_core::ports::id_gen::IdGen;
+use ks_core::ports::policy::PolicyStore;
 use ks_core::ports::secrets::{SecretRef, Secrets};
+use ks_testing::block_source::{FakeBlockSource, conformance as block_source_conformance};
 use ks_testing::clock::{FakeClock, conformance as clock_conformance};
 use ks_testing::http::{FakeHttpClient, conformance as http_conformance};
 use ks_testing::id_gen::{SequentialIdGen, conformance as id_gen_conformance};
+use ks_testing::policy::{FakePolicyStore, conformance as policy_conformance};
 use ks_testing::secrets::{FakeSecrets, conformance as secrets_conformance};
-use ks_testing::{block_on, secrets};
+use ks_testing::{block_on, block_source, policy, secrets};
 
 fn get(url: &str) -> HttpRequest {
     HttpRequest::new(HttpMethod::Get, url)
@@ -168,7 +172,15 @@ fn every_fake_passes_its_port_conformance_kit() {
 
     id_gen_conformance(&SequentialIdGen::new());
 
+    block_on(block_source_conformance(&FakeBlockSource::new()));
+
+    block_on(policy_conformance(&FakePolicyStore::new()));
+
     // And the conformance kits are usable through the port traits.
     let dynamic: &dyn Secrets = &resolver;
     block_on(secrets::conformance(dynamic));
+    let dynamic: &dyn BlockSource = &FakeBlockSource::new();
+    block_on(block_source::conformance(dynamic));
+    let dynamic: &dyn PolicyStore = &FakePolicyStore::new();
+    block_on(policy::conformance(dynamic));
 }
