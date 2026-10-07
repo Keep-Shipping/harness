@@ -1,5 +1,7 @@
 //! The catalog of built-in step kinds — what `docs/STEPS.md` is generated from. Step families
-//! land here as their crates land.
+//! land here as their crates land. `approval` lands with the run loop: when it does, whether a
+//! step auto-approves is decided by `ks_core::auto_rule::auto_approves`, which conjoins the
+//! destroys guard whatever the file's `auto:` expression says.
 
 use std::sync::Arc;
 

@@ -28,6 +28,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod auto_rule;
 mod catalog;
 mod check;
 mod env;
@@ -41,6 +42,7 @@ mod types;
 pub mod version;
 mod workflow;
 
+pub use auto_rule::{Decision, auto_approves, guards_destroys};
 pub use catalog::{Catalog, CatalogError, StepTypes};
 pub use check::{
     CheckOptions, Checked, EnvSecrets, SecretRequirement, SecretUse, check, check_with,

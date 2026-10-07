@@ -22,6 +22,7 @@ pub mod id_gen;
 pub mod run_context;
 pub mod script_host;
 pub mod secrets;
+pub mod step;
 pub mod supply_chain;
 
 /// Runs a future to completion on the current thread.
