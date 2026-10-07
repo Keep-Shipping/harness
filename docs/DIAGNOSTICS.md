@@ -214,15 +214,109 @@ skipping hidden directories, `target` and `node_modules`; checks each; prints
 paths relative to the walk root; prints the footer once; and exits with the
 worst result across files. No `ship.ks` anywhere is a usage error (exit 2).
 
+## `--repro`
+
+Reads the Dockerfiles an `oci.image` step names through its `from:`, resolved
+beside the site file, and warns (KS0801) about the inputs that can move
+between two builds: a base image without a `@sha256:` digest, an `apt` index
+read without a snapshot, an `ADD` of a URL without `--checksum=`. The
+findings are reported against the Dockerfile, with its own path and source,
+in whichever format was chosen — so snippets and annotations point at the
+lines of the file that actually carries the defect.
+
+Without the flag the Dockerfiles are never opened and the check reads the
+site file alone. A `from:` naming a file that cannot be read is a warning in
+its own right, reported against the `from:` itself. What each rule counts as
+pinned is written out in
+[REPRODUCIBILITY.md](REPRODUCIBILITY.md#checking-a-dockerfile-today).
+
 ## What check reads
 
 The check path reads the files it checks and nothing else — no network, no
 store, and no environment variables beyond `NO_COLOR` (the colour switch)
 and `CI` (which only widens the advisory "no format declared" warning, never
-what is enforced) — and resolution uses the built-in step catalog. CI proves
-the no-network part by running `check` on the fixtures inside a network
+what is enforced) — and resolution uses the built-in step catalog. `--repro`
+widens "the files it checks" to the Dockerfiles those site files name, and
+opens nothing else. CI proves the no-network part by running `check` on the
+fixtures inside a network
 namespace with no interfaces (the `offline` job).
 
 `--fix` is the one exception, and it is the flag's whole purpose: it writes
 back the files it checks, and only those. It still opens no socket and
 reads no store.
+
+## `keepshipping log`
+
+`keepshipping log [RUN-ID]` prints a run's events, one line per entry —
+`HH:MM:SS  type  field=value …`, with the time in UTC:
+
+```
+22:13:20  run.started  actor=ci  file_hash=sha256:aa  is_agent=false  trigger=push main
+22:13:20  step.started  step=build
+22:13:20  step.finished  duration_ms=1.2s  ok=true  outputs=digest  step=build
+22:13:20  approval.requested  artifacts=sha256:bb  channel=github  step=deploy
+22:13:20  run.finished  shipped=sha256:cc  status=shipped
+```
+
+With no run id the most recent run under `.keepshipping/runs/` is printed — a
+ULID sorts by time, so the newest is simply the last.
+
+`--format json` prints the entries as stored, byte for byte: a tool that
+re-checks the chain hashes exactly those lines. `github` is rejected — an entry
+has no source span to annotate. Printing never verifies, so a log that was
+edited still prints and can be read.
+
+`keepshipping log verify [RUN-ID]` checks the chain offline and prints
+`ok: N entries, chain intact`, or, at the first entry that does not hold,
+`<path>:<line>: chain broken: <reason>` on stderr and exit 1. Editing a field,
+deleting an entry and reordering two are caught, because every entry names the
+hash of the one before it. Truncating entries off the end is not — a prefix of
+a good chain is still a good chain, and telling that from a run that genuinely
+ended needs a signature over the tip ([#112]). It needs nothing but the file — no
+network, no store — so a CI job can fetch the log as an artifact and verify it
+there.
+
+## `keepshipping graph`
+
+`keepshipping graph [FILE] [--env NAME] [--event "push main"]` prints the
+plan — the steps in sequence order with their dependencies, what this
+environment would skip and why — and runs nothing. It reads the file exactly
+as `check` does, so the exit codes are the same: 1 when the file has errors,
+2 for usage, environment-selection and event problems, 0 otherwise. The
+diagnostics are `check`'s, in the human format: on stdout for `text`, and on
+stderr for the machine formats, which leave stdout parseable. Its `--format`
+names the plan, not a diagnostic, so they are its own:
+
+```
+ship.ks — 5 steps, env: default
+seq  step    kind         deps          gate
+  1  build   oci.image    —             run
+  2  plan    tofu.plan    —             run
+  3  review  approval     plan          run
+  4  apply   tofu.apply   plan, review  run
+  5  deploy  k8s.rollout  build, apply  run
+
+route: push → build → plan → review → apply → deploy
+0 steps ran. Nothing was touched.
+```
+
+- `text` (the default) is the report above. `gate` is `run`, `skip: …` with
+  the reason the step is out for this environment, or
+  `when: … (at run time)` for a condition only the run can settle. The route
+  line is the event the plan is for — `--event` if one was given, otherwise
+  the file's triggers joined by `|` because they are alternatives, not a
+  chain — and then the steps that would run, in sequence order. A file that
+  declares no `on:` has no event to lead with, so the line is the steps
+  alone.
+- `dot` is a `digraph` with one node per step (numbered, dashed when skipped)
+  and one edge per dependency, for Graphviz.
+- `json` is the same plan with a stable key order — `version`, `file`,
+  `env`, `triggers`, and `steps` (`seq`, `name`, `kind`, `deps`, `gate`) —
+  and nothing else on stdout, no footer. The dependencies are on the steps;
+  there is no second copy of them.
+
+An unknown `--format` value is a usage error (exit 2), for `graph` and
+`check` alike: `check --format dot` is not a thing. So is an `--event` no
+`on:` in the file reaches: a route no trigger can enter is not a plan, and
+`graph` says which triggers the file declares instead of printing one.
+

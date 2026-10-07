@@ -39,6 +39,7 @@ pub mod ids;
 pub mod plan_summary;
 pub mod ports;
 pub mod registry;
+pub mod repro;
 pub mod step;
 mod types;
 pub mod version;
@@ -56,4 +57,6 @@ pub use format::{BUILTIN as BUILTIN_FORMATS, Formats};
 pub use registry::{Explanation, explain};
 pub use types::{LiteralFit, Type, coerce, literal, literal_type};
 pub use version::{FORMAT_VERSION, SCRIPT_PROTOCOL, STEP_API};
-pub use workflow::{Env, NeverRule, Policy, Step, Trigger, TriggerKind, Workflow};
+pub use workflow::{
+    Condition, ContextTest, Env, NeverRule, Policy, Step, Trigger, TriggerKind, Workflow,
+};

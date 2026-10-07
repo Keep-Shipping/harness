@@ -44,6 +44,51 @@ pub struct Step {
     /// `ci-only: true`: the step refuses to run off CI
     /// ([#34](https://github.com/Keep-Shipping/harness/issues/34)).
     pub ci_only: bool,
+    /// The `when:` condition, when the step declares one. The planner reads
+    /// it: a condition that names no step is settled before the run starts,
+    /// one that reads step outputs cannot be.
+    pub when: Option<Condition>,
+}
+
+/// A step's `when:` condition, kept as written plus the two things a planner
+/// needs from it: which steps it reads (empty means it depends on context
+/// only) and, for the context-only shapes the language has, a form it can
+/// evaluate ([`Condition::test`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Condition {
+    /// The expression as written, for the run log and `keepshipping graph`.
+    pub source: String,
+    /// The steps the condition reads; empty when it is context-only.
+    pub steps: Vec<String>,
+    /// The condition in evaluable form, when it is one. `None` is never a
+    /// guess: the condition is settled at run time instead.
+    pub test: Option<ContextTest>,
+}
+
+/// A context-only `when:` in a form the planner can settle before the run
+/// starts ([#40](https://github.com/Keep-Shipping/harness/issues/40)).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContextTest {
+    /// A boolean literal (`when: false`).
+    Bool(bool),
+    /// The selected environment is this one (`when: env is prod`; its
+    /// negation is spelled `not env is prod`).
+    EnvIs { env: String },
+    /// The negation of a test (`when: not env is prod`).
+    Not(Box<ContextTest>),
+}
+
+impl ContextTest {
+    /// The test's verdict for the environment `env` selects. Pure: the same
+    /// file and event always give the same answer.
+    #[must_use]
+    pub fn eval(&self, env: &str) -> bool {
+        match self {
+            ContextTest::Bool(value) => *value,
+            ContextTest::EnvIs { env: wanted } => env == wanted,
+            ContextTest::Not(inner) => !inner.eval(env),
+        }
+    }
 }
 
 /// An environment: per-target overrides.

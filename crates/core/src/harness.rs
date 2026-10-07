@@ -454,10 +454,8 @@ mod tests {
         schema: StepSchema,
     }
 
-    /// A default-shaped [`TestStep`], for struct-update literals: `TestStep { api: STEP_API + 1, ..step("x") }`.
-    ///
-    /// The mismatch fixtures below set `api` deliberately as [`STEP_API`] + 1 rather than a
-    /// literal, so that bumping [`STEP_API`] cannot silently stop them being a mismatch.
+    /// A default-shaped [`TestStep`], for struct-update literals:
+    /// `TestStep { api: STEP_API + 1, ..step("x") }`.
     fn step(name: &'static str) -> TestStep {
         TestStep {
             name,
@@ -535,12 +533,18 @@ mod tests {
     /// Every `build()` failure mode, refused with exactly these messages.
     #[test]
     fn build_reports_each_fault_with_its_exact_message() {
-        let api_mismatch = format!(
-            r#"step "oci.image" was built against step API {}, but this harness speaks step API {}"#,
-            STEP_API + 1,
-            STEP_API
+        // The stale step's message names both numbers, so it cannot be a
+        // literal: `STEP_API + 1` keeps this case firing after every bump. The
+        // one formatted case owns a leaked `&'static [&'static str]` so it can
+        // sit in the same table as the literals.
+        let stale_api_message: &str = Box::leak(
+            format!(
+                r#"step "oci.image" was built against step API {}, but this harness speaks step API {STEP_API}"#,
+                STEP_API + 1
+            )
+            .into_boxed_str(),
         );
-        let api_mismatch_msg = [api_mismatch.as_str()];
+        let stale_api: &[&str] = std::slice::from_ref(&stale_api_message);
         let cases: Vec<(&str, HarnessBuilder, &[&str])> = vec![
             (
                 "a missing clock",
@@ -575,8 +579,10 @@ mod tests {
             ),
             (
                 "a step api mismatch",
+                // `STEP_API + 1`, not a literal: a bump to `STEP_API` must not
+                // quietly turn this case into a composition that now succeeds.
                 clocked_builder().step(TestStep { api: STEP_API + 1, ..step("oci.image") }),
-                &api_mismatch_msg,
+                stale_api,
             ),
             (
                 "an unknown named type",

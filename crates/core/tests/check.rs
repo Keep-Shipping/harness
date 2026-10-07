@@ -394,6 +394,171 @@ steps:
     assert!(all.iter().any(|m| m.contains("unknown environment `prod`")), "{all:?}");
 }
 
+const AFTER: &str = "\
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  plan: tofu.plan
+    dir: ./infra
+  apply: tofu.apply
+    after: plan
+    plan: plan.file
+  deploy: k8s.rollout
+    after: build, apply
+    image: build.digest
+";
+
+#[test]
+fn after_orders_without_data() {
+    let checked = check(&ks_lang::parse(AFTER));
+    assert!(errors(AFTER).is_empty(), "{:?}", checked.diagnostics);
+    let mut edges: Vec<_> = checked.workflow.edges().to_vec();
+    edges.sort();
+    assert_eq!(
+        edges,
+        [
+            ("apply".to_string(), "deploy".to_string()),
+            ("build".to_string(), "deploy".to_string()),
+            ("plan".to_string(), "apply".to_string()),
+        ]
+    );
+    let order = checked.workflow.topo_order().expect("acyclic");
+    assert_eq!(order, ["build", "plan", "apply", "deploy"]);
+}
+
+#[test]
+fn after_names_an_unknown_step_like_a_reference_and_a_loop_is_a_cycle() {
+    let misspelt = AFTER.replace("after: build, apply", "after: bild, apply");
+    let all = messages(&misspelt);
+    assert!(all.iter().any(|m| m.contains("`after:` names no step `bild`")), "{all:?}");
+    assert!(all.iter().any(|m| m.contains("did you mean `build`?")), "{all:?}");
+
+    let loop_ = AFTER.replace("after: plan", "after: apply");
+    let all = messages(&loop_);
+    assert!(all.iter().any(|m| m.contains("cycle: apply → apply")), "{all:?}");
+}
+
+#[test]
+fn after_takes_quoted_names_and_says_so_about_anything_else() {
+    let quoted = AFTER.replace("after: plan", "after: \"plan\"");
+    let checked = check(&ks_lang::parse(&quoted));
+    assert!(errors(&quoted).is_empty(), "{:#?}", checked.diagnostics);
+    assert!(checked.workflow.edges().contains(&("plan".to_string(), "apply".to_string())));
+    // A quoted name is a name, not a string value: an unknown one is still
+    // the unknown-reference diagnostic.
+    let unknown = quoted.replace("after: \"plan\"", "after: \"plann\"");
+    assert!(messages(&unknown).iter().any(|m| m.contains("names no step `plann`")));
+
+    // A value that is not a name cannot order anything, and says so rather
+    // than being ignored.
+    for bad in ["after: 3", "after: plan == 3", "after: [plan]"] {
+        let src = AFTER.replace("after: plan", bad);
+        let all = messages(&src);
+        assert!(all.iter().any(|m| m.contains("`after:` takes step names")), "{bad}: {all:?}");
+    }
+}
+
+#[test]
+fn an_after_edge_orders_without_making_the_follower_a_consumer() {
+    let src = "\
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  review: approval
+    show: build.digest
+    from: @platform
+  apply: oci.image
+    after: build
+    from: ./Dockerfile
+";
+    let checked = check(&ks_lang::parse(src));
+    assert!(errors(src).is_empty(), "{:#?}", checked.diagnostics);
+    // `apply` follows `build` without reading anything of it, so the approval
+    // that shows `build` has no consumer to gate: no `review → apply`.
+    let mut edges: Vec<_> = checked.workflow.edges().to_vec();
+    edges.sort();
+    assert_eq!(
+        edges,
+        [("build".to_string(), "apply".to_string()), ("build".to_string(), "review".to_string()),],
+        "{:#?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn a_data_edge_alongside_an_after_one_still_makes_the_follower_a_consumer() {
+    // `image:` before `after:`, and the other way round: the same file either
+    // way. Reading `build` is what makes `deploy` a consumer of it, so the
+    // approval that shows `build` gates it — whichever edge the file mentions
+    // first.
+    let build = "\
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  review: approval
+    show: build.digest
+    from: @platform
+  deploy: k8s.rollout
+";
+    let want = [
+        ("build".to_string(), "deploy".to_string()),
+        ("build".to_string(), "review".to_string()),
+        ("review".to_string(), "deploy".to_string()),
+    ];
+    for deploy in [
+        "    image: build.digest\n    after: build\n",
+        "    after: build\n    image: build.digest\n",
+    ] {
+        let src = format!("{build}{deploy}");
+        let checked = check(&ks_lang::parse(&src));
+        assert!(errors(&src).is_empty(), "{deploy}: {:#?}", checked.diagnostics);
+        let mut edges: Vec<_> = checked.workflow.edges().to_vec();
+        edges.sort();
+        assert_eq!(edges, want, "{deploy}: the approval stopped gating the follower");
+    }
+}
+
+#[test]
+fn a_when_names_the_steps_it_reads_and_is_evaluable_only_without_them() {
+    let checked = check(&ks_lang::parse(AFTER));
+    assert!(checked.workflow.step("deploy").expect("deploy").when.is_none());
+
+    let src = "\
+envs:
+  prod:
+    ci-only: true
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  one: oci.image
+    when: env is prod
+    from: ./Dockerfile
+  two: oci.image
+    when: not env is prod
+    from: ./Dockerfile
+  three: k8s.rollout
+    when: build.signed
+    image: build.digest
+";
+    let checked = check(&ks_lang::parse(src));
+    assert!(errors(src).is_empty(), "{:#?}", checked.diagnostics);
+    let when =
+        |name: &str| checked.workflow.step(name).and_then(|s| s.when.as_ref()).expect("a when");
+    assert_eq!(when("one").test, Some(ks_core::ContextTest::EnvIs { env: "prod".into() }));
+    assert_eq!(when("one").steps, Vec::<String>::new());
+    assert_eq!(
+        when("two").test,
+        Some(ks_core::ContextTest::Not(Box::new(ks_core::ContextTest::EnvIs {
+            env: "prod".into()
+        })))
+    );
+    // Reading a step output keeps the condition for the run, and makes the
+    // step it reads run first.
+    assert_eq!(when("three").steps, ["build"]);
+    assert_eq!(when("three").test, None);
+    assert!(checked.workflow.edges().contains(&("build".to_string(), "three".to_string())));
+}
+
 const POLICY_FILE: &str = "\
 name: policy-demo
 envs:

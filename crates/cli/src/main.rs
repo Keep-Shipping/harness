@@ -1,7 +1,8 @@
 //! The `keepshipping` command-line interface: `check` type-checks a site
 //! file (or, with `--all`, every `ship.ks` in a tree); `run` picks an
-//! environment and hands off to the engine. Output formats, exit codes and
-//! colour rules are pinned in `docs/DIAGNOSTICS.md`.
+//! environment and hands off to the engine; `graph` prints the plan the file
+//! would follow, without running it. Output formats, exit codes and colour
+//! rules are pinned in `docs/DIAGNOSTICS.md`.
 
 #![forbid(unsafe_code)]
 
@@ -16,9 +17,12 @@ mod drive;
 // binary names this module.
 #[allow(dead_code)]
 mod github_actions_run_context;
+mod graph;
 mod http_client;
+mod log;
 mod progress;
 mod render;
+mod run_log;
 mod upgrade;
 
 use std::io::{IsTerminal, Write as _};
@@ -49,8 +53,10 @@ fn dispatch() -> ExitCode {
         Some("check") => check::check(&args[1..]),
         Some("run") => run(&args[1..]),
         Some("fmt") => upgrade::fmt(&args[1..]),
+        Some("graph") => graph::graph(&args[1..]),
         Some("blocks") => blocks::blocks(&args[1..]),
         Some("lsp") => ks_lsp::serve(),
+        Some("log") => log::log(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
@@ -258,7 +264,7 @@ fn prompt(offered: &str, names: &[String]) -> Option<String> {
     names.contains(&name).then_some(name)
 }
 
-fn parse_event(text: &str) -> Result<Trigger, String> {
+pub(crate) fn parse_event(text: &str) -> Result<Trigger, String> {
     let mut parts = text.split_whitespace();
     let kind = match parts.next() {
         Some("push") => TriggerKind::Push,

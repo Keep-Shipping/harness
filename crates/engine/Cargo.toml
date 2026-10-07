@@ -9,8 +9,11 @@ repository.workspace = true
 
 [dependencies]
 ks-core.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
+ks-lang.workspace = true
 ks-testing.workspace = true
 
 [lints]

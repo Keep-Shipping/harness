@@ -12,7 +12,7 @@ use ks_core::harness::Harness;
 use ks_core::ports::BoxFuture;
 use ks_core::ports::secrets::Redactor;
 use ks_core::step::{
-    CancellationToken, Inputs, LogSink, Outputs, Port, StepCtx, StepError, StepLog,
+    CancellationToken, Inputs, LogSink, Outputs, Port, StepCtx, StepError, StepKind, StepLog,
 };
 
 /// Runs the step `name` from `harness` with `inputs`; `log` receives every record the engine
@@ -32,17 +32,42 @@ pub fn run_step<'a>(
             return Err(StepError::Cancelled);
         }
         let inputs = harness.prepare_inputs(step.as_ref(), inputs)?;
-        let step_log = StepLog::new(name, Arc::clone(&redactor), log);
-        step_log.info("step started", &[("action", step.action(&inputs).to_string().as_str())]);
-        let declared: Vec<Port> = step.requires().iter().chain(step.optional()).copied().collect();
-        let ctx = StepCtx::new(
-            harness.ports().restricted_to(&declared),
-            Arc::clone(harness.clock()),
-            cancel,
-            step_log,
-        );
-        let outputs = step.run(ctx, inputs).await?;
-        harness.check_outputs(step.as_ref(), &outputs)?;
-        Ok(outputs)
+        execute(harness, name, step.as_ref(), inputs, cancel, log, redactor).await
     })
+}
+
+/// The context a step runs in — and the one it verifies cached outputs in: only the ports it
+/// declared, the harness clock, the run's cancellation token and a redacting logger.
+pub(crate) fn step_ctx(
+    harness: &Harness,
+    step: &dyn StepKind,
+    name: &str,
+    cancel: CancellationToken,
+    log: Arc<dyn LogSink>,
+    redactor: Arc<Redactor>,
+) -> StepCtx {
+    let declared: Vec<Port> = step.requires().iter().chain(step.optional()).copied().collect();
+    StepCtx::new(
+        harness.ports().restricted_to(&declared),
+        Arc::clone(harness.clock()),
+        cancel,
+        StepLog::new(name, redactor, log),
+    )
+}
+
+/// Logs the action class, runs an already-prepared step, and checks what it returned.
+pub(crate) async fn execute(
+    harness: &Harness,
+    name: &str,
+    step: &dyn StepKind,
+    inputs: Inputs,
+    cancel: CancellationToken,
+    log: Arc<dyn LogSink>,
+    redactor: Arc<Redactor>,
+) -> Result<Outputs, StepError> {
+    let ctx = step_ctx(harness, step, name, cancel, log, redactor);
+    ctx.log().info("step started", &[("action", step.action(&inputs).to_string().as_str())]);
+    let outputs = step.run(ctx, inputs).await?;
+    harness.check_outputs(step, &outputs)?;
+    Ok(outputs)
 }

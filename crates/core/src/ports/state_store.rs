@@ -1,81 +1,92 @@
-//! The [`StateStore`] port: working data and saved plans, per run
-//! ([#55](https://github.com/Keep-Shipping/harness/issues/55)).
+//! The [`StateStore`] port: where a parked run's state and its saved plans live
+//! ([#42](https://github.com/Keep-Shipping/harness/issues/42)).
 //!
-//! Not everything a run produces is an audit record. The [run log](super::run_log)
-//! is append-only and hash-chained; state is the other kind of storage —
-//! scratch space a step writes so a later step can read it back, cached
-//! outputs, saved [`SavedPlan`](super::iac::SavedPlan)s. State is overwritten
-//! in place, scoped to one [`RunId`], and gone when the run is.
+//! A run that cannot finish in one job writes down where it got to and exits;
+//! resuming is a new job that re-checks the digest binding and carries on
+//! ([ADR 0005](../../../../docs/adr/0005-local-first-core-with-optional-hosted-services.md)).
+//! That split needs the run's whole state to be a few blobs, so this port is a
+//! blob store and nothing more — no listing, no partial update, no
+//! transactions. The record's shape is the engine's (`ks_engine::state::RunState`,
+//! which `ks-core` cannot link to); the store moves opaque bytes.
 //!
-//! # Sensitivity is an assertion, not a fact the store can check
+//! Two rules: plan bytes go in **addressed by digest** (`plan-<sha256>`, and
+//! the engine re-hashes what comes back), and state lives **only in storage the
+//! customer owns** — there is no hosted adapter for plan bytes, ever. Adapters
+//! whose backend is not the customer's own disk must encrypt at rest
+//! ([#122](https://github.com/Keep-Shipping/harness/issues/122)).
 //!
-//! [`Sensitivity`] says how a caller *claims* its bytes must be treated, and
-//! [`StateStore::put`] requires the claim on every call. The store cannot
-//! verify it: an adapter cannot tell a secret from a logo. Misclassification
-//! is a caller bug, and requiring the argument is what makes it a deliberate
-//! one instead of an omission.
+//! A third arrived with [#55](https://github.com/Keep-Shipping/harness/issues/55):
+//! every write says how sensitive its bytes are ([`Sensitivity`]), and the store
+//! *records* that. What the port does **not** do is act on it — it never
+//! encrypts, never redacts, never decides where the bytes go. Recording the
+//! classification is what lets an adapter that *can* do something about it do
+//! something, and what lets `list` tell a caller which of a run's blobs it
+//! should not print. The local adapter writes plaintext to the customer's own
+//! disk and that is correct there; an adapter whose backend is not that disk
+//! must encrypt [`Sensitivity::Secretish`] at rest ([#122](https://github.com/Keep-Shipping/harness/issues/122)).
 //!
-//! The claim is not optional decoration, though, because adapters differ
-//! enormously in who can read their bytes. An adapter that is *not* the
-//! customer's own local storage — hosted, shared, backed by someone else's
-//! disk — must encrypt [`Secretish`](Sensitivity::Secretish) values at rest.
-//! Saved plan files are [`Secretish`](Sensitivity::Secretish) because a plan
-//! carries whatever the infrastructure declared, including values a plan read
-//! from a secret.
-//!
-//! # Keys are boring on purpose
-//!
-//! A [`StateKey`] is short, printable ASCII with no surrounding whitespace, so
-//! the same key maps onto a filename, a column or an object key without an
-//! escaping layer in the middle. Anything more interesting than that belongs
-//! in the value, which is opaque bytes.
-//!
-//! # Deleting is the escape hatch, and it is not audited
-//!
-//! [`StateStore::delete_run`] is how an operator clears a run's working data.
-//! Nothing here records that it happened, and [`RunLog`](super::run_log::RunLog)
-//! will not do it for you: a step that deletes state should append its own
-//! `state.deleted` event, or the audit record will show a value that quietly
-//! stopped existing. The absence is stated plainly because it is a real gap,
-//! not an oversight to be discovered later.
+//! The classification is also a **ratchet**, not a label: once a key has been
+//! written as [`Sensitivity::Secretish`], a later [`Sensitivity::Plain`] write
+//! over that key is refused with [`StateError::Downgrade`] rather than quietly
+//! dropping the classification. A caller must not be able to strip "this is a
+//! secret" off data that was declared secret — not by a bug in its own
+//! bookkeeping, and not by an adapter that just took the last word it was given.
 
 use std::fmt;
 
-use super::BoxFuture;
 use crate::ids::RunId;
 
-/// How a value must be treated at rest, as asserted by whoever wrote it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+use super::BoxFuture;
+
+/// How sensitive the bytes under a key are
+/// ([#55](https://github.com/Keep-Shipping/harness/issues/55)).
+///
+/// The port records this and nothing more. It is a statement the *caller* makes
+/// about its own bytes — the store neither inspects them nor acts on the
+/// classification — so that an adapter knows which of its objects must not be
+/// written in the clear, and `list` can tell a reader which of a run's blobs it
+/// should not print.
+///
+/// [`Plain`] is the honest default and covers almost everything: a run's own
+/// `state.json` record is step names, digests and the actor who approved
+/// something. [`Secretish`] is for bytes that describe what the customer is
+/// about to do to their infrastructure — #55 names plan files, which spell out
+/// every resource and argument in the change. "Secretish" rather than "Secret"
+/// because the port has no way to tell it is right: a bad classification here is
+/// a caller's mistake, and the honest name is the one that admits the store
+/// cannot verify it.
+///
+/// The variants are declared least- to most-sensitive, so the derived `Ord`
+/// hands a caller the higher of two classifications with `max`. That ordering is
+/// offered, not relied on: the adapters shipped here (`LocalStateStore`,
+/// `MemoryStateStore`) do the ratchet with an explicit `is_secretish`
+/// comparison, and a third-party adapter wanting the ordering can derive or
+/// match on it as it sees fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Sensitivity {
-    /// Working data anyone on the team may read: step output, caches, scratch
-    /// files.
-    Ordinary,
-    /// Data that must be encrypted at rest by every adapter that is not the
-    /// customer's own local storage: saved plan files, anything a plan read
-    /// from a secret.
-    ///
-    /// This is the caller's assertion about the bytes, not something the
-    /// store verifies — an adapter cannot tell a secret from a logo, so
-    /// misclassifying is a caller bug. That is exactly why the classification
-    /// is a required argument on every [`StateStore::put`] rather than an
-    /// inferred property: an adapter guessing would get it wrong silently,
-    /// while a caller choosing has to be there when it goes wrong.
+    /// Ordinary run state: digests, step names, the parked record. Nothing here
+    /// is a secret, and an adapter may store it as it stands.
+    Plain,
+    /// Bytes that must not be handled casually — plan files, above all. An
+    /// adapter writing these anywhere but the customer's own disk encrypts them
+    /// at rest ([#122](https://github.com/Keep-Shipping/harness/issues/122)).
     Secretish,
 }
 
 impl Sensitivity {
-    /// Whether the value must be encrypted at rest.
-    pub fn is_secretish(self) -> bool {
-        match self {
-            Sensitivity::Ordinary => false,
-            Sensitivity::Secretish => true,
-        }
+    /// Whether these bytes are [`Sensitivity::Secretish`] — the one question an
+    /// adapter and a caller both actually ask, so it is a method rather than a
+    /// `matches!` repeated at each site.
+    pub fn is_secretish(&self) -> bool {
+        matches!(self, Sensitivity::Secretish)
     }
 
-    /// The lowercase wire and display form.
-    pub fn as_str(self) -> &'static str {
+    /// The wire and on-disk spelling, which is stable: it is what an adapter
+    /// writes into its own index and what an error message names, so it cannot
+    /// drift with a rename of the variant.
+    pub fn as_str(&self) -> &'static str {
         match self {
-            Sensitivity::Ordinary => "ordinary",
+            Sensitivity::Plain => "plain",
             Sensitivity::Secretish => "secretish",
         }
     }
@@ -87,222 +98,158 @@ impl fmt::Display for Sensitivity {
     }
 }
 
-/// A key under which one run stores one value.
+/// What [`StateStore::list`] reports about one stored key: the key, how the
+/// caller classified it, and how many bytes are under it.
 ///
-/// Printable ASCII only (`0x21..=0x7e`, so no spaces at all), at most 128
-/// bytes, never empty. That is narrow on purpose: the same key has to survive
-/// being a filename, an object key or a column name without an escaping layer
-/// in between.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct StateKey(String);
-
-impl StateKey {
-    /// Validates and wraps `key`.
-    ///
-    /// Rejects, in this order: an empty key, one longer than 128 bytes, a
-    /// leading or trailing space, and any byte outside `0x21..=0x7e` — no
-    /// spaces, no control characters, no Unicode, with the offending character
-    /// reported.
-    ///
-    /// The whitespace check comes before the byte check because a space is
-    /// `0x20`, one below the allowed range, so every padded key would
-    /// otherwise fail as [`NotPrintable`](InvalidStateKey::NotPrintable) and
-    /// [`SurroundingWhitespace`](InvalidStateKey::SurroundingWhitespace) would
-    /// name a rejection the type can never produce. The order is not about
-    /// leniency — no key may hold a space anywhere — it is about telling the
-    /// caller the most specific thing that is wrong.
-    pub fn new(key: impl Into<String>) -> Result<StateKey, InvalidStateKey> {
-        let key = key.into();
-        if key.is_empty() {
-            return Err(InvalidStateKey::Empty);
-        }
-        if key.len() > 128 {
-            return Err(InvalidStateKey::TooLong { len: key.len() });
-        }
-        if key.starts_with(' ') || key.ends_with(' ') {
-            return Err(InvalidStateKey::SurroundingWhitespace);
-        }
-        if let Some(character) =
-            key.chars().find(|character| !matches!(character, '\u{21}'..='\u{7e}'))
-        {
-            return Err(InvalidStateKey::NotPrintable { character });
-        }
-        Ok(StateKey(key))
-    }
-
-    /// The key as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for StateKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Why a [`StateKey`] was rejected.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InvalidStateKey {
-    /// The key was the empty string.
-    Empty,
-    /// The key was longer than the 128-byte limit.
-    TooLong {
-        /// The key's length in bytes.
-        len: usize,
-    },
-    /// The key held a byte outside printable ASCII (`0x21..=0x7e`) — a space,
-    /// a control character or a non-ASCII character.
-    NotPrintable {
-        /// The first character that is not printable ASCII.
-        character: char,
-    },
-    /// The key began or ended with a space.
-    SurroundingWhitespace,
-}
-
-impl fmt::Display for InvalidStateKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            InvalidStateKey::Empty => write!(f, "state key is empty"),
-            InvalidStateKey::TooLong { len } => {
-                write!(f, "state key is {len} bytes, over the 128-byte limit")
-            }
-            InvalidStateKey::NotPrintable { character } => {
-                write!(f, "state key contains {character:?}, which is not printable ASCII")
-            }
-            InvalidStateKey::SurroundingWhitespace => {
-                write!(f, "state key has leading or trailing whitespace")
-            }
-        }
-    }
-}
-
-impl std::error::Error for InvalidStateKey {}
-
-/// What [`StateStore::list`] reports about one stored value, without its
-/// bytes.
+/// Metadata only. There is no way to ask a store for a summary *of* some other
+/// run's bytes without asking for that run's bytes, and no summary carries any
+/// — a listing is something a caller can log, print, or hand to a human, and a
+/// listing that leaked the contents it describes would defeat the point of
+/// recording a sensitivity in the first place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateSummary {
-    /// The key the value is stored under.
-    pub key: StateKey,
-    /// The sensitivity it was written under.
+    /// The key the bytes are stored under, scoped to the run that was listed.
+    pub key: String,
+    /// The classification the last successful [`StateStore::put`] recorded.
     pub sensitivity: Sensitivity,
-    /// The value's length in bytes, so `list` never has to fetch values to
-    /// show how big they are.
+    /// How many bytes are stored — the length of the value, not of any
+    /// encoding an adapter applied to it.
     pub len: usize,
 }
 
-/// Why a [`StateStore`] call failed.
+/// Why a [`StateStore`] operation failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StateStoreError {
-    /// The store itself failed: disk, permissions, transport. What the backend
-    /// reported, safe to print.
-    Backend {
-        /// What went wrong, safe to print.
+pub enum StateError {
+    /// The key is not one [`check_key`] accepts, so writing it could escape
+    /// the run's own directory.
+    InvalidKey {
+        /// The rejected key.
+        key: String,
+        /// What is wrong with it, for the message.
+        reason: &'static str,
+    },
+    /// The write would have written [`Sensitivity::Plain`] over a key already
+    /// held as [`Sensitivity::Secretish`], and was refused.
+    ///
+    /// This is the ratchet #55 asks for. Silently accepting it would let a
+    /// caller — or a bug in one — strip a classification off data that was
+    /// declared secret, and the store would have no way to notice: the bytes
+    /// are unchanged, only the promise made about them. The stored bytes and
+    /// their recorded sensitivity are left exactly as they were; the caller
+    /// either writes [`Sensitivity::Secretish`] again, or picks a different key.
+    Downgrade {
+        /// The key that would have been downgraded.
+        key: String,
+    },
+    /// The backing store could not be reached or written: a full disk, a
+    /// failed upload, a revoked credential.
+    Unavailable {
+        /// What the adapter reported.
         message: String,
-    },
-    /// The value exceeds what this store accepts. State is working data meant
-    /// to be short; a long-lived record belongs in the
-    /// [run log](super::run_log).
-    TooLarge {
-        /// The key whose value is too large.
-        key: StateKey,
-        /// The value's length in bytes.
-        len: usize,
-        /// The store's limit, in bytes.
-        max: usize,
-    },
-    /// The key already holds [`Sensitivity::Secretish`] data and this `put`
-    /// claims [`Sensitivity::Ordinary`]. A key's sensitivity only ever
-    /// ratchets up, never down: otherwise a later `put` could quietly strip
-    /// the protection off data written earlier.
-    WouldDowngrade {
-        /// The key whose sensitivity would drop.
-        key: StateKey,
-        /// The sensitivity it is stored under today.
-        from: Sensitivity,
-        /// The sensitivity this `put` claims.
-        to: Sensitivity,
     },
 }
 
-impl fmt::Display for StateStoreError {
+impl fmt::Display for StateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StateStoreError::Backend { message } => write!(f, "state store failed: {message}"),
-            StateStoreError::TooLarge { key, len, max } => {
-                write!(f, "state value for {key} is {len} bytes, over the {max}-byte limit")
+            StateError::InvalidKey { key, reason } => {
+                write!(f, "{key:?} is not a usable state key ({reason})")
             }
-            StateStoreError::WouldDowngrade { key, from, to } => write!(
+            StateError::Downgrade { key } => write!(
                 f,
-                "refusing to store {key} as {to}: it already holds {from} data, and sensitivity only ratchets up"
+                "refusing to write plain bytes over {key:?}, which is already stored as \
+                 secretish; store it as secretish again, or use another key"
             ),
+            StateError::Unavailable { message } => {
+                write!(f, "the state store is unavailable: {message}")
+            }
         }
     }
 }
 
-impl std::error::Error for StateStoreError {}
+impl std::error::Error for StateError {}
 
-/// The `StateStore` port: opaque working data, namespaced by run.
+/// [`check_key`], as a predicate.
 ///
-/// # The contract
+/// The charset is `[a-z0-9]` first and `[a-z0-9._-]` after it: no separators, no
+/// `..`, no absolute paths, no surprises from a case-insensitive filesystem.
+pub fn is_valid_key(key: &str) -> bool {
+    check_key(key).is_ok()
+}
+
+/// [`is_valid_key`], with the rule the key broke, so an adapter can name it.
+pub fn check_key(key: &str) -> Result<(), &'static str> {
+    let mut characters = key.chars();
+    match characters.next() {
+        Some(first) if first.is_ascii_lowercase() || first.is_ascii_digit() => {}
+        Some(_) => return Err("keys start with a lowercase letter or a digit"),
+        None => return Err("the key is empty"),
+    }
+    if !characters
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err("keys hold only lowercase letters, digits, `.`, `_` and `-`");
+    }
+    if key.contains("..") {
+        return Err("keys cannot contain `..`");
+    }
+    Ok(())
+}
+
+/// The `StateStore` port: a per-run blob store.
 ///
-/// - **Namespaced by run, strictly.** State belongs to one [`RunId`]. A
-///   `RunId` that is not yours is simply absent — [`get`](StateStore::get)
-///   returns `Ok(None)` and the run does not appear in
-///   [`list`](StateStore::list). It is never another run's data.
-/// - **`put` overwrites.** Unlike the [log](super::run_log), state is working
-///   data, not an audit record: writing an existing key replaces its value in
-///   place. That asymmetry is the whole difference between the two ports.
-/// - **Absent is not an error.** `get` returns `Ok(None)` for a key that was
-///   never written.
-/// - **`list` returns summaries sorted by [`StateKey`]**, ascending.
-/// - **`delete_run` removes one run and nothing else.** Every other run is
-///   untouched, and a run with nothing stored is not an error. Deleting is the
-///   operator's escape hatch and is **not** recorded in the
-///   [`RunLog`](super::run_log::RunLog) — a step that deletes state should
-///   append its own `state.deleted` event so the audit record shows it.
-///
-/// # Adapter obligations
-///
-/// An adapter that is **not** local storage — hosted, shared, on someone
-/// else's disk — must encrypt [`Secretish`](Sensitivity::Secretish) values at
-/// rest. It must **not**
-/// encrypt ordinary values in a way that leaves [`list`](StateStore::list)
-/// unable to report their sensitivity: a summary's
-/// [`sensitivity`](StateSummary::sensitivity) is the sensitivity the value was
-/// written under, taken from adapter metadata, never something the adapter
-/// works out by decrypting. An adapter that cannot enumerate without
-/// decrypting every value cannot answer `list` honestly, and cannot be one.
+/// Keys are scoped to a [`RunId`], so two runs cannot see each other's objects
+/// however the adapter lays them out. `get` returning `Ok(None)` means "no such
+/// blob" — a normal answer, not an error.
 pub trait StateStore: Send + Sync {
-    /// Stores `bytes` under `key` for `run`, replacing any previous value, and
-    /// records `sensitivity` as the classification of those bytes.
+    /// Stores `bytes` under `key` for `run`, replacing any previous object with
+    /// that name, and records `sensitivity` as how they are to be treated.
+    /// Writes must be atomic and durable before this resolves: a reader sees the
+    /// old bytes or the new ones, and a run told it parked cannot then lose its
+    /// state. The recorded sensitivity must be durable with them — a store that
+    /// remembered a value's bytes but forgot that they were secretish has lost
+    /// the only thing it was told about them.
+    ///
+    /// Fails with [`StateError::Downgrade`] rather than writing
+    /// [`Sensitivity::Plain`] over a key already held as
+    /// [`Sensitivity::Secretish`], and in that case writes nothing at all.
     fn put<'a>(
         &'a self,
         run: &'a RunId,
-        key: &'a StateKey,
+        key: &'a str,
         bytes: &'a [u8],
         sensitivity: Sensitivity,
-    ) -> BoxFuture<'a, Result<(), StateStoreError>>;
+    ) -> BoxFuture<'a, Result<(), StateError>>;
 
-    /// Reads the value stored under `key` for `run`, or `Ok(None)` if there is
-    /// none.
+    /// Reads the object under `key` for `run`, or `Ok(None)` if there is none.
     fn get<'a>(
         &'a self,
         run: &'a RunId,
-        key: &'a StateKey,
-    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, StateStoreError>>;
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, StateError>>;
 
-    /// Summarises everything stored for `run`, sorted by [`StateKey`].
-    fn list<'a>(
-        &'a self,
-        run: &'a RunId,
-    ) -> BoxFuture<'a, Result<Vec<StateSummary>, StateStoreError>>;
+    /// Everything stored for `run` — metadata only, never bytes
+    /// ([`StateSummary`]).
+    ///
+    /// **Sorted by key**, so two calls against the same state return the same
+    /// order and a caller may render, diff or hash the result directly. An
+    /// adapter whose backend has no inherent order must sort before returning;
+    /// leaving the order down to whatever the object store happened to hand back
+    /// would make a listing that changes shape between calls.
+    ///
+    /// A run with nothing stored is an empty vector, not an error — the same
+    /// shape `get` gives a key it does not hold.
+    fn list<'a>(&'a self, run: &'a RunId) -> BoxFuture<'a, Result<Vec<StateSummary>, StateError>>;
 
-    /// Removes everything stored for `run`, leaving every other run untouched.
-    fn delete_run<'a>(&'a self, run: &'a RunId) -> BoxFuture<'a, Result<(), StateStoreError>>;
+    /// Removes every key stored for `run`, and nothing belonging to any other
+    /// run. This is how a finished run's state is cleaned up, so it is the one
+    /// operation in the port that destroys data: it is not undoable, and a caller
+    /// that still wants the bytes must not call it.
+    ///
+    /// Deleting a run that holds nothing — one that never parked, or was already
+    /// deleted — succeeds. Cleaning up after a run that did not run is not an
+    /// error; it is the normal case.
+    fn delete_run<'a>(&'a self, run: &'a RunId) -> BoxFuture<'a, Result<(), StateError>>;
 }
 
 #[cfg(test)]
@@ -311,110 +258,58 @@ mod tests {
 
     fn assert_send_sync<T: ?Sized + Send + Sync>() {}
 
-    fn key(text: &str) -> StateKey {
-        StateKey::new(text).expect("valid key")
-    }
-
     #[test]
     fn the_state_store_trait_is_dyn_compatible() {
         assert_send_sync::<dyn StateStore>();
     }
 
     #[test]
-    fn valid_keys_are_accepted() {
-        assert_eq!(key("plan").as_str(), "plan");
-        assert_eq!(key("cache/2/manifest").as_str(), "cache/2/manifest");
-        assert_eq!(key(&"k".repeat(128)).as_str().len(), 128);
-        // The printable-ASCII range starts at 0x21, so these are the extremes.
-        assert_eq!(key("!").as_str(), "!");
-        assert_eq!(key("~").as_str(), "~");
-        // The allowed range starts at 0x21, so a space is not printable for
-        // this purpose anywhere — interior or not.
-        assert_eq!(StateKey::new("a b"), Err(InvalidStateKey::NotPrintable { character: ' ' }));
-    }
-
-    #[test]
-    fn empty_and_overlong_keys_are_rejected() {
-        assert_eq!(StateKey::new(""), Err(InvalidStateKey::Empty));
-        assert_eq!(StateKey::new("k".repeat(129)), Err(InvalidStateKey::TooLong { len: 129 }));
-    }
-
-    #[test]
-    fn non_printable_keys_are_rejected_with_the_offending_character() {
-        assert_eq!(StateKey::new("café"), Err(InvalidStateKey::NotPrintable { character: 'é' }));
-        assert_eq!(StateKey::new("a\tb"), Err(InvalidStateKey::NotPrintable { character: '\t' }));
-        // A space is printable but not in the allowed range.
-        assert_eq!(StateKey::new("a b c"), Err(InvalidStateKey::NotPrintable { character: ' ' }));
-        // The first offending character is the one reported.
-        assert_eq!(
-            StateKey::new("ok\u{1}\u{2}"),
-            Err(InvalidStateKey::NotPrintable { character: '\u{1}' })
-        );
-    }
-
-    #[test]
-    fn keys_are_never_padded_with_spaces() {
-        assert_eq!(StateKey::new(" key"), Err(InvalidStateKey::SurroundingWhitespace));
-        assert_eq!(StateKey::new("key "), Err(InvalidStateKey::SurroundingWhitespace));
-    }
-
-    #[test]
-    fn invalid_state_key_errors_display_actionably() {
-        assert_eq!(InvalidStateKey::Empty.to_string(), "state key is empty");
-        let too_long = InvalidStateKey::TooLong { len: 200 }.to_string();
-        assert!(too_long.contains("200") && too_long.contains("128"), "{too_long}");
-        let not_printable = InvalidStateKey::NotPrintable { character: '\u{1}' }.to_string();
-        assert!(not_printable.contains("printable ASCII"), "{not_printable}");
-        let spaced = InvalidStateKey::SurroundingWhitespace.to_string();
-        assert!(spaced.contains("whitespace"), "{spaced}");
-    }
-
-    #[test]
-    fn sensitivity_describes_its_own_obligations() {
-        assert_eq!(Sensitivity::Ordinary.as_str(), "ordinary");
-        assert_eq!(Sensitivity::Secretish.as_str(), "secretish");
-        assert!(!Sensitivity::Ordinary.is_secretish());
-        assert!(Sensitivity::Secretish.is_secretish());
-        assert_eq!(Sensitivity::Secretish.to_string(), "secretish");
-        // The ordering is what "ratchets up, never down" means.
-        assert!(Sensitivity::Ordinary < Sensitivity::Secretish);
-    }
-
-    #[test]
-    fn state_store_errors_display_actionably() {
-        let backend = StateStoreError::Backend { message: "EACCES".to_string() }.to_string();
-        assert!(backend.contains("state store") && backend.contains("EACCES"), "{backend}");
-
-        let too_large =
-            StateStoreError::TooLarge { key: key("plan"), len: 9_000_000, max: 1_000_000 }
-                .to_string();
-        assert!(
-            too_large.contains("plan")
-                && too_large.contains("9000000")
-                && too_large.contains("1000000"),
-            "{too_large}"
-        );
-
-        let downgrade = StateStoreError::WouldDowngrade {
-            key: key("deploy.token"),
-            from: Sensitivity::Secretish,
-            to: Sensitivity::Ordinary,
+    fn keys_are_accepted_or_refused_with_the_rule_they_broke() {
+        for key in ["state.json", "plan-0", "a.b_c-d", "01h9zz"] {
+            assert!(is_valid_key(key), "{key} should be valid");
         }
-        .to_string();
-        assert!(
-            downgrade.contains("deploy.token")
-                && downgrade.contains("secretish")
-                && downgrade.contains("ordinary"),
-            "{downgrade}"
-        );
+        // Anything that could address outside the run directory, or that a
+        // case-insensitive filesystem would mangle.
+        for (key, rule) in [
+            ("", "empty"),
+            (".hidden", "start"),
+            ("State.json", "start"),
+            ("a/b", "only lowercase"),
+            ("dir\\file", "only lowercase"),
+            ("a..b", "`..`"),
+            ("naïve", "only lowercase"),
+        ] {
+            let refusal = check_key(key).expect_err(&format!("{key:?} must be refused"));
+            assert!(refusal.contains(rule), "{key:?}: {refusal}");
+        }
     }
 
     #[test]
-    fn a_summary_carries_metadata_only() {
-        let summary =
-            StateSummary { key: key("plan"), sensitivity: Sensitivity::Secretish, len: 4096 };
-        assert_eq!(summary.key.as_str(), "plan");
-        assert_eq!(summary.sensitivity, Sensitivity::Secretish);
-        assert_eq!(summary.len, 4096);
+    fn state_errors_display_actionably() {
+        let bad =
+            StateError::InvalidKey { key: "../x".to_string(), reason: "keys cannot contain `..`" };
+        assert!(bad.to_string().contains("../x"), "{bad}");
+        let down = StateError::Unavailable { message: "disk full".to_string() };
+        assert!(down.to_string().contains("disk full"), "{down}");
+        let refused = StateError::Downgrade { key: "plan-abc".to_string() };
+        let message = refused.to_string();
+        for fragment in ["plan-abc", "secretish", "plain"] {
+            assert!(message.contains(fragment), "{fragment} missing from {message}");
+        }
+    }
+
+    #[test]
+    fn a_sensitivity_names_itself_and_says_whether_it_is_secretish() {
+        assert!(!Sensitivity::Plain.is_secretish());
+        assert!(Sensitivity::Secretish.is_secretish());
+        // The spelling is what an adapter writes into its own index, so it is
+        // pinned here rather than left to follow a variant rename.
+        assert_eq!(Sensitivity::Plain.as_str(), "plain");
+        assert_eq!(Sensitivity::Secretish.as_str(), "secretish");
+        assert_eq!(Sensitivity::Secretish.to_string(), "secretish");
+        // The ordering the derive offers is pinned here so a future reordering
+        // is caught. Nothing in this repo's adapters relies on it: the ratchet
+        // is an explicit `is_secretish` comparison.
+        assert!(Sensitivity::Secretish > Sensitivity::Plain);
     }
 }

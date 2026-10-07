@@ -1,358 +1,252 @@
-//! Fake for the [`RunLog`] port: a real hash chain, in memory, that can be
-//! sealed, made to fail, and — for the sake of testing `verify` — tampered
-//! with.
+//! Fake for the [`RunLog`] port ([#46](https://github.com/Keep-Shipping/harness/issues/46)): it
+//! keeps every entry, in order, so "this transition emitted exactly one event" is an
+//! assertion rather than a hope — the same job [`RecordingSink`] does for a step's log lines.
+//! Plus the conformance kit every adapter must pass.
+//!
+//! [`RecordingSink`]: crate::step::RecordingSink
 
-use std::collections::BTreeMap;
-use std::fmt::Write as _;
-use std::sync::{Mutex, MutexGuard};
+use std::fmt;
+use std::sync::Mutex;
 
 use ks_core::ids::RunId;
 use ks_core::ports::BoxFuture;
-use ks_core::ports::run_log::{LogEntry, LogEvent, LogReport, RunLog, RunLogError, Seq};
-use ks_core::ports::supply_chain::Digest;
-use sha2::{Digest as _, Sha256};
+use ks_core::ports::run_log::{RunEvent, RunLog, RunLogError};
+use ks_core::ports::secrets::{Redactor, SecretValue};
 
-/// SHA-256 of `bytes`, lowercase hex — the one real hashing helper here.
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hex = String::with_capacity(64);
-    for byte in Sha256::digest(bytes) {
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
-}
-
-/// The [`Digest`] of `bytes`, computed with the real algorithm.
-fn digest_of(bytes: &[u8]) -> Digest {
-    Digest::sha256_from_hex(&sha256_hex(bytes)).expect("sha256 hex is canonical")
-}
-
-/// What one run's log holds, in append order.
-#[derive(Default)]
-struct RunLogState {
-    /// run → its entries, oldest first. Appends push, so the vector is already
-    /// ascending by [`Seq`].
-    runs: BTreeMap<RunId, Vec<LogEntry>>,
-    /// Whether [`sealed`](FakeRunLog::sealed) has been called.
-    sealed: bool,
-    /// Set by [`failing`](FakeRunLog::failing): every call fails with it.
-    failure: Option<String>,
-}
-
-/// A [`RunLog`] whose chain is genuinely hash-linked: every entry's `hash` is
-/// the real SHA-256 of its [`LogEntry::chained_bytes`], and every entry's
-/// `prev` is the `hash` of the entry before it.
+/// A [`RunLog`] that keeps every `(run, event)` it is handed, in order.
 ///
-/// Because the hashes are computed rather than recorded, [`verify`](RunLog::verify)
-/// recomputes them the same way a real adapter must, and
-/// [`tamper`](FakeRunLog::tamper) can produce a chain that really is broken.
+/// `Send + Sync`, so an `Arc<RecordingRunLog>` is the `Arc<dyn RunLog>` the engine journals
+/// through. `Debug` prints the entry count, never an entry: a run's log must not become a way
+/// to print one.
 ///
 /// ```
+/// use std::sync::Arc;
 /// use ks_core::ids::RunId;
-/// use ks_core::ports::run_log::{LogEvent, RunLog, Seq};
-/// use ks_testing::{block_on, run_log::FakeRunLog};
+/// use ks_core::ports::run_log::{RunEvent, RunLog};
+/// use ks_testing::{block_on, run_log::RecordingRunLog};
 ///
-/// let log = FakeRunLog::new();
-/// let run = RunId::from_parts(1_700_000_000_000, 7);
-/// let first = block_on(log.append(&run, LogEvent::new("run.started", "from ci"))).expect("append");
-/// assert_eq!(first, Seq::FIRST);
-/// block_on(log.append(&run, LogEvent::new("run.finished", "ok"))).expect("append");
-/// assert_eq!(block_on(log.read(&run)).expect("read").len(), 2);
-/// assert!(block_on(log.verify(&run)).expect("verify").is_intact());
+/// let log = Arc::new(RecordingRunLog::new());
+/// let run = RunId::from_parts(0, 0);
+/// block_on(log.append(&run, RunEvent::StepStarted { step: "build".to_string() })).unwrap();
+///
+/// assert_eq!(log.events().len(), 1);
+/// assert_eq!(format!("{log:?}"), "RecordingRunLog { entries: 1 }");
 /// ```
-///
-/// # What this fake does not model
-///
-/// - **Append-only across restarts.** Entries live in a `BTreeMap` for the
-///   life of the process. An adapter that rewrites its file on every append
-///   passes this fake's tests and fails in production; nothing here can catch
-///   that, which is why the port's own docs put the obligation on adapters.
-/// - **Per-run sealing.** [`sealed`](FakeRunLog::sealed) closes *every* run's
-///   log at once, because the fake has one switch. Real adapters seal the run
-///   that finished, which is why [`RunLogError::Sealed`] names a run.
-/// - **Redaction.** The fake stores `detail` text verbatim; the caller is
-///   responsible for having run it through the `Redactor` first, and the
-///   conformance kit does not pretend to check redaction.
 #[derive(Default)]
-pub struct FakeRunLog {
-    state: Mutex<RunLogState>,
+pub struct RecordingRunLog {
+    entries: Mutex<Vec<(RunId, RunEvent)>>,
 }
 
-impl FakeRunLog {
-    /// Creates a fake with an empty log for every run.
-    pub fn new() -> FakeRunLog {
-        FakeRunLog::default()
+impl RecordingRunLog {
+    /// Creates an empty log.
+    pub fn new() -> RecordingRunLog {
+        RecordingRunLog::default()
     }
 
-    /// Seals the fake: from now on every [`append`](RunLog::append) fails with
-    /// [`RunLogError::Sealed`] naming the run it was called for.
-    ///
-    /// Reading and verifying still work — a sealed log is a finished record,
-    /// not an unreadable one.
-    pub fn sealed(mut self) -> FakeRunLog {
-        self.lock_mut().sealed = true;
-        self
+    /// Every event so far, in order, across all runs.
+    #[must_use]
+    pub fn events(&self) -> Vec<RunEvent> {
+        self.entries
+            .lock()
+            .expect("recording run log poisoned")
+            .iter()
+            .map(|(_, e)| e.clone())
+            .collect()
     }
 
-    /// Scripts every call to fail with [`RunLogError::Backend`].
-    pub fn failing(mut self, message: impl Into<String>) -> FakeRunLog {
-        self.lock_mut().failure = Some(message.into());
-        self
-    }
-
-    /// Corrupts the stored entry at `seq` so its `hash` no longer matches its
-    /// content, and returns `false` if no run has an entry at that `Seq`.
-    ///
-    /// **This exists only so tests can prove [`verify`](RunLog::verify) catches
-    /// tampering.** No production code may call it: an adapter that could edit
-    /// its own stored entries would be the exact defect the port exists to
-    /// make observable. It rewrites the stored hash only — the event, `seq`
-    /// and `prev` links are left alone, so the damage is precisely "the
-    /// recorded hash disagrees with the bytes it claims to cover".
-    pub fn tamper(&self, seq: u64) -> bool {
-        let mut state = self.lock();
-        for entries in state.runs.values_mut() {
-            if let Some(entry) = entries.iter_mut().find(|entry| entry.seq.get() == seq) {
-                entry.hash = flipped(entry.hash.clone());
-                return true;
-            }
-        }
-        false
-    }
-
-    /// The entries stored for `run` so far, oldest first.
-    pub fn entries(&self, run: &RunId) -> Vec<LogEntry> {
-        self.lock().runs.get(run).cloned().unwrap_or_default()
-    }
-
-    /// Whether [`sealed`](FakeRunLog::sealed) has been called.
-    pub fn is_sealed(&self) -> bool {
-        self.lock().sealed
-    }
-
-    /// How many entries have been appended to `run` so far.
-    pub fn appended(&self, run: &RunId) -> usize {
-        self.lock().runs.get(run).map(Vec::len).unwrap_or(0)
-    }
-
-    fn lock(&self) -> MutexGuard<'_, RunLogState> {
-        self.state.lock().expect("fake run log")
-    }
-
-    fn lock_mut(&mut self) -> &mut RunLogState {
-        self.state.get_mut().expect("fake run log")
-    }
-
-    /// Appends `event`, hashing it into the chain — the real SHA-256 of
-    /// [`LogEntry::chained_bytes`], not a recorded value.
-    fn append_one(&self, run: &RunId, event: LogEvent) -> Result<Seq, RunLogError> {
-        let mut state = self.lock();
-        if state.sealed {
-            return Err(RunLogError::Sealed { run: run.clone() });
-        }
-        let entries = state.runs.entry(run.clone()).or_default();
-        let seq = Seq::new(entries.len() as u64 + 1);
-        let prev = entries.last().map(|entry| entry.hash.clone());
-        let entry = LogEntry {
-            seq,
-            event,
-            prev,
-            // The hash covers seq, event and prev but not itself, so any
-            // placeholder works; it is overwritten before the entry is stored.
-            hash: digest_of(b""),
-        };
-        let entry = LogEntry { hash: digest_of(&entry.chained_bytes()), ..entry };
-        entries.push(entry.clone());
-        Ok(entry.seq)
-    }
-
-    /// Recomputes the chain over the stored entries and reports the first
-    /// entry that does not verify.
-    fn walk(&self, run: &RunId) -> LogReport {
-        let state = self.lock();
-        let empty = Vec::new();
-        let entries = state.runs.get(run).unwrap_or(&empty);
-        let mut expected_prev: Option<Digest> = None;
-        let mut broken_at = None;
-        for entry in entries {
-            let recomputed = digest_of(&entry.chained_bytes());
-            if entry.prev != expected_prev || entry.hash != recomputed {
-                broken_at = Some(entry.seq);
-                break;
-            }
-            expected_prev = Some(entry.hash.clone());
-        }
-        LogReport {
-            entries: entries.len(),
-            // The head is the last stored entry's recorded hash. Over a broken
-            // chain that digest is exactly what is in doubt, which is what
-            // `broken_at` is there to say.
-            head: entries.last().map(|entry| entry.hash.clone()),
-            broken_at,
-        }
+    /// Every `(run, event)` pair so far, in order.
+    #[must_use]
+    pub fn entries(&self) -> Vec<(RunId, RunEvent)> {
+        self.entries.lock().expect("recording run log poisoned").clone()
     }
 }
 
-/// A [`Digest`] that differs from `digest` in its first hex digit — a stored
-/// hash that no longer describes the bytes it covers.
-fn flipped(digest: Digest) -> Digest {
-    let hex = digest.hex();
-    let first = if hex.starts_with('0') { '1' } else { '0' };
-    Digest::sha256_from_hex(&format!("{first}{}", &hex[1..]))
-        .expect("flipping one hex digit keeps the digest well formed")
-}
-
-impl RunLog for FakeRunLog {
+impl RunLog for RecordingRunLog {
     fn append<'a>(
         &'a self,
         run: &'a RunId,
-        event: LogEvent,
-    ) -> BoxFuture<'a, Result<Seq, RunLogError>> {
-        // The scripted failure is read and the guard dropped before the work
-        // runs, so the call below can take the mutex itself.
-        let failure = self.lock().failure.clone();
-        let result = match failure {
-            Some(message) => Err(RunLogError::Backend { message }),
-            None => self.append_one(run, event),
-        };
-        Box::pin(std::future::ready(result))
-    }
-
-    fn read<'a>(&'a self, run: &'a RunId) -> BoxFuture<'a, Result<Vec<LogEntry>, RunLogError>> {
-        let failure = self.lock().failure.clone();
-        let result = match failure {
-            Some(message) => Err(RunLogError::Backend { message }),
-            None => Ok(self.entries(run)),
-        };
-        Box::pin(std::future::ready(result))
-    }
-
-    fn verify<'a>(&'a self, run: &'a RunId) -> BoxFuture<'a, Result<LogReport, RunLogError>> {
-        let failure = self.lock().failure.clone();
-        let result = match failure {
-            Some(message) => Err(RunLogError::Backend { message }),
-            None => Ok(self.walk(run)),
-        };
-        Box::pin(std::future::ready(result))
+        event: RunEvent,
+    ) -> BoxFuture<'a, Result<(), RunLogError>> {
+        Box::pin(async move {
+            self.entries.lock().expect("recording run log poisoned").push((run.clone(), event));
+            Ok(())
+        })
     }
 }
 
-/// The `RunLog` conformance kit: every adapter — [`FakeRunLog`] here, the
-/// local filesystem and OCI-referrer adapters later
-/// ([#55](https://github.com/Keep-Shipping/harness/issues/55)) — must pass
-/// this.
+impl fmt::Debug for RecordingRunLog {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let count = self.entries.lock().expect("recording run log poisoned").len();
+        f.debug_struct("RecordingRunLog").field("entries", &count).finish()
+    }
+}
+
+/// A [`RunLog`] that refuses every entry: what a full disk, a closed file or a refused backend
+/// looks like from the engine. Asserted on in `tests/run_log.rs` rather than by the kit, which
+/// has only the adapter it is handed to judge.
+pub struct RefusingRunLog {
+    /// What the adapter says went wrong. It is the only thing it ever says.
+    pub message: String,
+}
+
+impl RunLog for RefusingRunLog {
+    fn append<'a>(
+        &'a self,
+        _run: &'a RunId,
+        _event: RunEvent,
+    ) -> BoxFuture<'a, Result<(), RunLogError>> {
+        let message = self.message.clone();
+        Box::pin(async move { Err(RunLogError::Backend { message }) })
+    }
+}
+
+/// One of each [`RunEvent`] variant, in the order a run meets them.
 ///
-/// The kit mints its own run ids from a fixed instant ([`RunId::from_parts`]),
-/// so it needs no [`IdGen`](ks_core::ports::id_gen::IdGen) and is
-/// deterministic; pass adapters that share one fake it does.
+/// `#[non_exhaustive]` guarantees only that a match outside `ks-core` may carry a wildcard arm — it
+/// does not make anyone extend this list, and nothing fails to compile when a variant is added
+/// elsewhere. So extending it is owned, by hand, by whoever adds a variant to [`RunEvent`], along
+/// with the wire form that stores it: an adapter's mapping refuses an event it has no form for,
+/// which is the right way to fail but shows up at runtime, not at build time.
+fn every_variant() -> Vec<RunEvent> {
+    let hashes = || vec!["sha256:aa".to_string()];
+    vec![
+        RunEvent::RunStarted {
+            file_hash: "sha256:f".to_string(),
+            event: "push".to_string(),
+            actor: "ada".to_string(),
+            is_agent: false,
+        },
+        RunEvent::StepStarted { step: "build".to_string() },
+        RunEvent::StepFinished {
+            step: "build".to_string(),
+            ok: true,
+            outputs: vec!["digest".to_string()],
+            duration_ms: 250,
+            error: None,
+        },
+        RunEvent::ApprovalRequested {
+            step: "apply-infra".to_string(),
+            channel: "tty".to_string(),
+            artifacts: hashes(),
+        },
+        RunEvent::ApprovalGranted {
+            step: "apply-infra".to_string(),
+            approver: "ada".to_string(),
+            channel: "tty".to_string(),
+            artifacts: hashes(),
+        },
+        RunEvent::ApprovalDenied {
+            step: "apply-infra".to_string(),
+            approver: "ada".to_string(),
+            channel: "tty".to_string(),
+            artifacts: hashes(),
+        },
+        RunEvent::DecideAnswered {
+            step: "apply-infra".to_string(),
+            model: "model".to_string(),
+            answer: "yes".to_string(),
+            confidence: 0.9,
+            probabilities: vec![("yes".to_string(), 0.9)],
+            threshold: 0.5,
+            outcome: "proceed".to_string(),
+        },
+        RunEvent::PolicyRefused {
+            step: Some("apply-infra".to_string()),
+            rule: "no-prod".to_string(),
+        },
+        RunEvent::RunFinished { status: "ok".to_string(), shipped: hashes() },
+    ]
+}
+
+/// The `RunLog` conformance kit: the fake here and the local
+/// `.keepshipping/runs/<id>.jsonl` one must both pass it — the second by
+/// `the_jsonl_adapter_passes_the_conformance_kit` in `crates/cli/src/run_log.rs`, which builds the
+/// real adapter and runs this against it.
 ///
-/// Checks, in order: appends come back as `Seq::FIRST`, then `previous + 1`,
-/// one at a time; `read` returns them in ascending `Seq` with no gaps and in
-/// the order they were appended; every entry links to its predecessor's hash
-/// (`None` at the first) and carries a `sha256` digest; `verify` calls the
-/// untampered chain intact with the append count and the last entry's hash as
-/// head; and a run that was never appended to reads empty and verifies intact
-/// over zero entries.
+/// The port is one method wide, so this is deliberately a short kit. It walks what an append
+/// surface can be held to: **every variant appends** and none is refused for being the shape it
+/// is; **a redacted event appends**, so an adapter never has to understand
+/// [`RunEvent::redacted`] to store one; **appends are additive** — the same entry appended again
+/// and again is accepted every time, because a log that refuses a repeat is deduplicating, and a
+/// log that quietly overwrites is not append-only; and **two runs are independent**, so one run's
+/// log cannot be the reason another's entry is lost.
 ///
-/// Hashes are *not* recomputed here — the kit takes a `&dyn RunLog`, so it
-/// cannot hash an adapter's entries without assuming their encoding. The
-/// real-SHA-256 recomputation lives in [`FakeRunLog`]'s own tests.
+/// Three properties a reader might look for are **not** here, and pretending otherwise would be
+/// the worse error. *What a failing adapter does* — whether it reports every refused append or
+/// only the first, and whether it passes the backend's own words along — belongs to that adapter
+/// and is covered by that adapter's own tests, because the engine may only fail a run on a
+/// refused append if the adapter reports it; the kit cannot see it, holding only the adapter it
+/// was handed, and a refusing fake of its own would just assert the kit against itself. (The
+/// engine's half — that it fails closed — is asserted in `crates/engine/tests/journal.rs`.)
+/// *What the adapter stored* is not checkable through a port with no read: that the event arrives
+/// scrubbed is asserted against the recording fake in `ks-testing`'s `tests/run_log.rs`, where the
+/// stored value is in reach. *Ordering and the hash chain* belong to the adapter — the chain is
+/// the CLI adapter's, verified by `crates/cli/src/run_log.rs`'s `verify` — and the engine's half of
+/// ordering is asserted consumer-side in `crates/engine/tests/journal.rs`.
 pub async fn conformance(log: &dyn RunLog) {
-    let run = RunId::from_parts(1_700_000_000_000, 0x00c0_ffee_0000_0001);
-    let kinds = ["run.started", "step.started", "step.succeeded"];
+    let run = RunId::from_parts(1_700_000_000_000, 1);
+    let other = RunId::from_parts(1_700_000_000_000, 2);
+    let append = async |run: &RunId, event: RunEvent| match log.append(run, event.clone()).await {
+        Ok(()) => {}
+        Err(error) => {
+            panic!("run_log conformance: {} must append: {error}", event.kind())
+        }
+    };
 
-    let mut previous: Option<Seq> = None;
-    for kind in kinds {
-        let event = LogEvent {
-            kind: kind.to_string(),
-            at: std::time::SystemTime::UNIX_EPOCH
-                + std::time::Duration::from_millis(1_700_000_000_000),
-            step: None,
-            detail: format!("run log conformance: {kind}"),
-        };
-        let seq = log
-            .append(&run, event)
-            .await
-            .unwrap_or_else(|error| panic!("run log conformance: append must succeed: {error}"));
-        let expected = match previous {
-            None => Seq::FIRST,
-            Some(previous) => Seq::new(previous.get() + 1),
-        };
-        assert_eq!(
-            seq, expected,
-            "run log conformance: append must return Seq::FIRST, then previous + 1"
-        );
-        previous = Some(seq);
+    // ---- every variant, and every variant twice: shape is not a reason to refuse ----
+    for event in every_variant() {
+        append(&run, event.clone()).await;
+        append(&run, event).await;
     }
 
-    let entries = log
-        .read(&run)
-        .await
-        .unwrap_or_else(|error| panic!("run log conformance: read must succeed: {error}"));
+    // ---- a redacted event is an ordinary entry ----
+    const SECRET: &str = "s3cr3t-token";
+    let mut redactor = Redactor::new();
+    redactor.register(&SecretValue::new(SECRET.as_bytes().to_vec()));
+    let redacted = RunEvent::StepFinished {
+        step: "apply-infra".to_string(),
+        ok: false,
+        outputs: vec![SECRET.to_string()],
+        duration_ms: 0,
+        error: Some(SECRET.to_string()),
+    }
+    .redacted(&redactor);
     assert_eq!(
-        entries.len(),
-        kinds.len(),
-        "run log conformance: read must return every appended entry"
+        redacted.kind(),
+        "step.finished",
+        "redaction changes an event's contents, never its kind: a wire format keys on the kind"
     );
-    for (index, entry) in entries.iter().enumerate() {
-        let expected = Seq::new(index as u64 + 1);
-        assert_eq!(
-            entry.seq, expected,
-            "run log conformance: read returns entries ascending by Seq with no gaps"
-        );
-        assert_eq!(
-            entry.event.kind, kinds[index],
-            "run log conformance: read returns entries in the order they were appended"
-        );
-    }
-    assert_eq!(
-        entries[0].prev, None,
-        "run log conformance: the first entry of a chain has no prev"
-    );
-    for pair in entries.windows(2) {
-        assert_eq!(
-            pair[1].prev,
-            Some(pair[0].hash.clone()),
-            "run log conformance: every entry links to its predecessor's hash"
-        );
-    }
-    for entry in &entries {
-        assert_eq!(
-            entry.hash.algorithm(),
-            "sha256",
-            "run log conformance: the chain is sha256, the only algorithm RunLog::chained_bytes defines"
-        );
-    }
-
-    let report = log
-        .verify(&run)
-        .await
-        .unwrap_or_else(|error| panic!("run log conformance: verify must succeed: {error}"));
+    let shown = format!("{redacted:?}");
     assert!(
-        report.is_intact(),
-        "run log conformance: an untouched chain must verify, got {report:?}"
+        shown.contains("***") && !shown.contains(SECRET),
+        "the event is scrubbed before it is appended, so the kit hands the adapter that, not the \
+         raw step output: {shown}"
     );
-    assert_eq!(report.entries, kinds.len(), "run log conformance: the report counts every entry");
-    assert_eq!(
-        report.head,
-        Some(entries.last().expect("entries were appended").hash.clone()),
-        "run log conformance: the head is the last entry's hash"
-    );
+    append(&run, redacted).await;
 
-    // A run nobody appended to: empty, not an error, and intact over nothing.
-    let untouched = RunId::from_parts(1_700_000_000_000, 0x00c0_ffee_0000_0002);
-    assert_eq!(
-        log.read(&untouched).await,
-        Ok(Vec::new()),
-        "run log conformance: a run that was never appended to reads empty"
-    );
-    let empty = log
-        .verify(&untouched)
-        .await
-        .unwrap_or_else(|error| panic!("run log conformance: verify must succeed: {error}"));
-    assert!(
-        empty.is_intact() && empty.entries == 0 && empty.head.is_none(),
-        "run log conformance: an empty log verifies intact over zero entries, got {empty:?}"
-    );
+    // ---- appends are additive: a repeat is another entry, not a replacement ----
+    let repeated = RunEvent::StepStarted { step: "build".to_string() };
+    for round in 0..4 {
+        assert!(
+            log.append(&run, repeated.clone()).await.is_ok(),
+            "run_log conformance: the same entry appended {round} times must land every time — \
+             an adapter that refuses or dedups a repeat is not append-only"
+        );
+    }
+
+    // ---- one run's log is never the reason another's entry is lost ----
+    append(
+        &other,
+        RunEvent::RunStarted {
+            file_hash: "sha256:f".to_string(),
+            event: "local".to_string(),
+            actor: "ada".to_string(),
+            is_agent: false,
+        },
+    )
+    .await;
+    append(&other, RunEvent::RunFinished { status: "ok".to_string(), shipped: Vec::new() }).await;
+    append(&run, RunEvent::RunFinished { status: "ok".to_string(), shipped: Vec::new() }).await;
 }
 
 #[cfg(test)]
@@ -360,130 +254,44 @@ mod tests {
     use super::*;
     use crate::block_on;
 
-    fn run(seed: u128) -> RunId {
-        RunId::from_parts(1_700_000_000_000, seed)
-    }
-
-    fn event(kind: &str) -> LogEvent {
-        LogEvent {
-            kind: kind.to_string(),
-            at: std::time::SystemTime::UNIX_EPOCH
-                + std::time::Duration::from_millis(1_700_000_000_123),
-            step: None,
-            detail: "the detail".to_string(),
-        }
-    }
-
-    fn append(log: &FakeRunLog, run: &RunId, kind: &str) -> Seq {
-        block_on(log.append(run, event(kind))).expect("append succeeds")
-    }
-
+    /// Pins the list against its names, so adding a variant here is a deliberate edit to a
+    /// nine-line expectation rather than an accident.
+    ///
+    /// What it cannot do is notice a variant added to `RunEvent` and not added here: nothing
+    /// outside `ks-core` can enumerate the enum, so a tenth variant is caught by whoever adds it —
+    /// `every_variant_is_built_and_is_named` naming it, and
+    /// `the_jsonl_adapter_passes_the_conformance_kit` in `crates/cli/src/run_log.rs` then holding
+    /// the adapter to a wire form for it.
     #[test]
-    fn a_fresh_fake_has_no_seeded_state() {
-        let log = FakeRunLog::new();
-        let run = run(1);
-        assert_eq!(log.entries(&run), Vec::<LogEntry>::new());
-        assert_eq!(log.appended(&run), 0);
-        assert!(!log.is_sealed());
-    }
-
-    /// The chain must be real hashing, not self-consistency: every stored hash
-    /// is recomputed here with `sha2`, from the encoding `ks-core` documents.
-    #[test]
-    fn every_stored_hash_is_the_sha256_of_its_chained_bytes() {
-        let log = FakeRunLog::new();
-        let run = run(2);
-        append(&log, &run, "run.started");
-        append(&log, &run, "step.started");
-        append(&log, &run, "step.succeeded");
-
-        let mut previous: Option<Digest> = None;
-        for entry in log.entries(&run) {
-            assert_eq!(
-                entry.hash,
-                digest_of(&entry.chained_bytes()),
-                "seq {}: the hash must be sha256 of the entry's own chained_bytes",
-                entry.seq
-            );
-            assert_eq!(entry.prev, previous, "seq {} must link to its predecessor", entry.seq);
-            previous = Some(entry.hash.clone());
-        }
-        assert!(previous.is_some());
-    }
-
-    #[test]
-    fn an_untouched_chain_verifies_and_tampering_breaks_it() {
-        let log = FakeRunLog::new();
-        let run = run(3);
-        append(&log, &run, "run.started");
-        append(&log, &run, "step.started");
-        append(&log, &run, "step.succeeded");
-
-        let intact = block_on(log.verify(&run)).expect("verify");
-        assert!(intact.is_intact(), "{intact:?}");
-        assert_eq!(intact.entries, 3);
-        assert_eq!(intact.head, Some(log.entries(&run)[2].hash.clone()));
-
-        assert!(log.tamper(2), "seq 2 exists, so it can be tampered with");
-        assert!(!log.tamper(99), "no entry sits at seq 99");
-        let broken = block_on(log.verify(&run)).expect("verify");
-        assert!(!broken.is_intact());
-        assert_eq!(broken.broken_at, Some(Seq::new(2)));
-    }
-
-    #[test]
-    fn reading_is_not_judging() {
-        let log = FakeRunLog::new();
-        let run = run(4);
-        append(&log, &run, "run.started");
-        append(&log, &run, "step.started");
-        log.tamper(1);
+    fn every_variant_is_built_and_is_named() {
+        let kinds: Vec<&str> = every_variant().iter().map(RunEvent::kind).collect();
         assert_eq!(
-            block_on(log.read(&run)).expect("read").len(),
-            2,
-            "read returns damaged entries too — hiding them would make a tampered run look quiet"
+            kinds,
+            [
+                "run.started",
+                "step.started",
+                "step.finished",
+                "approval.requested",
+                "approval.granted",
+                "approval.denied",
+                "decide.answered",
+                "policy.refused",
+                "run.finished",
+            ]
         );
-    }
-
-    #[test]
-    fn a_sealed_fake_refuses_appends_but_still_reads() {
-        let log = FakeRunLog::new().sealed();
-        let run = run(5);
-        assert!(log.is_sealed());
-        assert_eq!(
-            block_on(log.append(&run, event("run.started"))),
-            Err(RunLogError::Sealed { run: run.clone() })
-        );
-        assert_eq!(block_on(log.read(&run)).expect("read"), Vec::new());
-        assert!(block_on(log.verify(&run)).expect("verify").is_intact());
-    }
-
-    #[test]
-    fn a_failing_fake_fails_every_method() {
-        let log = FakeRunLog::new().failing("disk full");
-        let run = run(6);
-        let backend = RunLogError::Backend { message: "disk full".to_string() };
-        assert_eq!(block_on(log.append(&run, event("run.started"))), Err(backend.clone()));
-        assert_eq!(block_on(log.read(&run)), Err(backend.clone()));
-        assert_eq!(block_on(log.verify(&run)), Err(backend));
-    }
-
-    #[test]
-    fn runs_are_kept_apart() {
-        let log = FakeRunLog::new();
-        let first = run(7);
-        let second = run(8);
-        append(&log, &first, "run.started");
-        append(&log, &second, "run.started");
-        assert_eq!(log.appended(&first), 1);
-        assert_eq!(log.appended(&second), 1);
-        // Each run's chain starts over at Seq::FIRST.
-        assert_eq!(log.entries(&second)[0].seq, Seq::FIRST);
-        assert_eq!(log.entries(&second)[0].prev, None);
     }
 
     #[test]
     fn the_fake_passes_conformance() {
-        block_on(conformance(&FakeRunLog::new()));
+        block_on(conformance(&RecordingRunLog::new()));
+    }
+
+    /// The kit runs against `&dyn`, not against the concrete fake: the engine holds ports that
+    /// way, so an adapter written to the suite has to be able to pass it that way too.
+    #[test]
+    fn the_fake_passes_conformance_through_the_dyn_trait() {
+        let log = RecordingRunLog::new();
+        let dynamic: &dyn RunLog = &log;
+        block_on(conformance(dynamic));
     }
 }

@@ -32,7 +32,11 @@ pub struct StepTypes {
 }
 
 /// `when:` is a reserved input on every step: a boolean expression.
-const WHEN: &str = "when";
+pub(crate) const WHEN: &str = "when";
+
+/// `after:` is reserved too: the step(s) a step runs after, ordering without
+/// data ([#40](https://github.com/Keep-Shipping/harness/issues/40)).
+pub(crate) const AFTER: &str = "after";
 
 impl StepTypes {
     /// The declared type of input `name` (`when:` is always a bool).
@@ -48,10 +52,12 @@ impl StepTypes {
         self.outputs.iter().find(|(n, _)| n == name).map(|(_, ty)| ty)
     }
 
-    /// The input names a value could be meant for, `when:` included.
+    /// The input names a value could be meant for, the reserved ones
+    /// included.
     pub fn input_names(&self) -> Vec<String> {
         let mut v: Vec<String> = self.inputs.iter().map(|(n, _)| n.clone()).collect();
         v.push(WHEN.to_string());
+        v.push(AFTER.to_string());
         v
     }
 }

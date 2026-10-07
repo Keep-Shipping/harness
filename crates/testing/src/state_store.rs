@@ -1,418 +1,315 @@
-//! Fake for the [`StateStore`] port: working data per run, in memory, with the
-//! sensitivity ratchet and a size limit.
+//! Fake for the [`StateStore`] port: an in-memory, per-run blob store whose
+//! clones share one map, plus the conformance kit every adapter must pass.
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, MutexGuard};
+use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use ks_core::ids::RunId;
 use ks_core::ports::BoxFuture;
-use ks_core::ports::state_store::{
-    Sensitivity, StateKey, StateStore, StateStoreError, StateSummary,
-};
+use ks_core::ports::state_store::{Sensitivity, StateError, StateStore, StateSummary, check_key};
 
-/// The default cap on a single stored value: 1 MiB.
-///
-/// State is working data meant to be short — step scratch, caches, saved
-/// plans. A long-lived record belongs in the [run log](ks_core::ports::run_log),
-/// so the store refuses to become one. Change it per test with
-/// [`max_value_bytes`](FakeStateStore::max_value_bytes).
-pub const MAX_VALUE_BYTES: usize = 1024 * 1024;
-
-/// What the fake holds, keyed by run then key.
-#[derive(Default)]
-struct StoreState {
-    /// run → key → (sensitivity it was written under, the bytes).
-    runs: BTreeMap<RunId, BTreeMap<StateKey, (Sensitivity, Vec<u8>)>>,
-    /// Set by [`failing`](FakeStateStore::failing): every call fails with it.
-    failure: Option<String>,
-    /// The per-value size limit, in bytes.
-    max_value_bytes: usize,
+/// One stored value, with the classification its `put` recorded. No derived
+/// `Debug`: `ks-testing` is published, and a store must not be a way to print
+/// the secretish bytes it was handed.
+#[derive(Clone)]
+struct Stored {
+    bytes: Vec<u8>,
+    sensitivity: Sensitivity,
 }
 
-/// A [`StateStore`] held entirely in process memory, one `BTreeMap` per run.
+/// Every run's blobs, keyed by run id then key. Two `BTreeMap`s rather than one,
+/// so `list` is sorted by the map's own order rather than by a sort the fake has
+/// to remember to do — the fake must not be the reason conformance could pass a
+/// store that does not sort.
+type Contents = Arc<Mutex<BTreeMap<String, BTreeMap<String, Stored>>>>;
+
+/// An in-memory [`StateStore`] — the stand-in for the local `.keepshipping/`
+/// adapter in tests. `Clone` shares one store, so a test can hand the clone to
+/// the "job 2" half of a resume the way a fresh process gets a fresh
+/// `LocalStateStore` over the same directory. Nothing is written to disk.
 ///
-/// It models the port's working-data semantics — overwrite in place, absent
-/// is `Ok(None)`, one run's keys invisible to another, the sensitivity
-/// ratchet, [`delete_run`](StateStore::delete_run) touching exactly one run —
-/// and refuses a value over [`MAX_VALUE_BYTES`], because state is working
-/// data meant to be short.
+/// `Debug` prints how much the store holds, never what: a failing assertion or
+/// a `dbg!` over a fake must not put a `Secretish` plan into a CI log.
 ///
 /// ```
 /// use ks_core::ids::RunId;
-/// use ks_core::ports::state_store::{Sensitivity, StateKey, StateStore, StateStoreError};
-/// use ks_testing::{block_on, state_store::FakeStateStore};
+/// use ks_core::ports::state_store::{Sensitivity, StateStore};
+/// use ks_testing::{block_on, state_store::MemoryStateStore};
 ///
-/// let store = FakeStateStore::new();
-/// let run = RunId::from_parts(1_700_000_000_000, 7);
-/// let plan = StateKey::new("plan").expect("printable key");
-/// block_on(store.put(&run, &plan, b"{}", Sensitivity::Secretish)).expect("put");
-/// assert_eq!(
-///     block_on(store.get(&run, &plan)).expect("get"),
-///     Some(b"{}".to_vec())
-/// );
-///
-/// // Sensitivity only ratchets up: an Ordinary write over Secretish data is
-/// // refused, and the old bytes are still there.
-/// match block_on(store.put(&run, &plan, b"tampered", Sensitivity::Ordinary)) {
-///     Err(StateStoreError::WouldDowngrade { .. }) => {}
-///     other => panic!("expected WouldDowngrade, got {other:?}"),
-/// }
-/// assert_eq!(store.sensitivity_of(&run, &plan), Some(Sensitivity::Secretish));
+/// let store = MemoryStateStore::new();
+/// let run = RunId::from_parts(0, 1);
+/// block_on(store.put(&run, "state.json", b"{}", Sensitivity::Plain)).expect("the write lands");
+/// assert_eq!(block_on(store.get(&run, "state.json")).unwrap(), Some(b"{}".to_vec()));
+/// assert_eq!(format!("{store:?}"), "MemoryStateStore { runs: 1, keys: 1 }");
 /// ```
-///
-/// # What this fake does not model
-///
-/// - **Encryption at rest.** `Secretish` bytes sit in plain `Vec<u8>` in the
-///   process heap, exactly as written. The fake is **not** a model for a real
-///   adapter's encryption, and [`conformance`] asserts nothing about it — an
-///   adapter that is not the customer's own local storage must encrypt
-///   `Secretish` at rest, and only that adapter can be tested for it.
-/// - **Durability, sharing and concurrency.** Nothing survives the process,
-///   nothing is shared between processes, and the mutex makes every call
-///   atomic within one test.
-pub struct FakeStateStore {
-    state: Mutex<StoreState>,
+#[derive(Clone, Default)]
+pub struct MemoryStateStore {
+    runs: Contents,
 }
 
-impl Default for FakeStateStore {
-    fn default() -> FakeStateStore {
-        FakeStateStore {
-            state: Mutex::new(StoreState {
-                max_value_bytes: MAX_VALUE_BYTES,
-                ..StoreState::default()
-            }),
-        }
-    }
-}
-
-impl FakeStateStore {
-    /// Creates an empty store with the default [`MAX_VALUE_BYTES`] limit.
-    pub fn new() -> FakeStateStore {
-        FakeStateStore::default()
+impl MemoryStateStore {
+    /// Creates an empty store.
+    pub fn new() -> MemoryStateStore {
+        MemoryStateStore::default()
     }
 
-    /// Scripts every call to fail with [`StateStoreError::Backend`].
-    pub fn failing(mut self, message: impl Into<String>) -> Self {
-        self.lock_mut().failure = Some(message.into());
-        self
-    }
-
-    /// Caps a single value at `max` bytes instead of [`MAX_VALUE_BYTES`].
-    pub fn max_value_bytes(mut self, max: usize) -> Self {
-        self.lock_mut().max_value_bytes = max;
-        self
-    }
-
-    /// The runs holding at least one key, sorted.
-    pub fn runs(&self) -> Vec<RunId> {
-        self.lock().runs.keys().cloned().collect()
-    }
-
-    /// The sensitivity `run`'s `key` was written under, if it is stored.
-    pub fn sensitivity_of(&self, run: &RunId, key: &StateKey) -> Option<Sensitivity> {
-        self.lock().runs.get(run)?.get(key).map(|(sensitivity, _)| *sensitivity)
-    }
-
-    fn lock(&self) -> MutexGuard<'_, StoreState> {
-        self.state.lock().expect("fake state store")
-    }
-
-    fn lock_mut(&mut self) -> &mut StoreState {
-        self.state.get_mut().expect("fake state store")
-    }
-
-    fn backend(state: &StoreState) -> Option<StateStoreError> {
-        state.failure.clone().map(|message| StateStoreError::Backend { message })
+    /// The classification recorded for `key`, or `None` if nothing is stored
+    /// there. A test asserting on the ratchet directly, where [`StateStore`]
+    /// deliberately offers no way to read a sensitivity back without listing.
+    pub fn sensitivity_of(&self, run: &RunId, key: &str) -> Option<Sensitivity> {
+        self.runs
+            .lock()
+            .expect("memory state store")
+            .get(run.as_str())?
+            .get(key)
+            .map(|stored| stored.sensitivity)
     }
 }
 
-impl StateStore for FakeStateStore {
+impl fmt::Debug for MemoryStateStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let runs = self.runs.lock().expect("memory state store");
+        let keys: usize = runs.values().map(|held| held.len()).sum();
+        f.debug_struct("MemoryStateStore").field("runs", &runs.len()).field("keys", &keys).finish()
+    }
+}
+
+/// Key failures come from the port's own validator, so a fake that accepted a
+/// key would disagree with every real adapter.
+fn validate(key: &str) -> Result<(), StateError> {
+    check_key(key).map_err(|reason| StateError::InvalidKey { key: key.to_string(), reason })
+}
+
+impl StateStore for MemoryStateStore {
     fn put<'a>(
         &'a self,
         run: &'a RunId,
-        key: &'a StateKey,
+        key: &'a str,
         bytes: &'a [u8],
         sensitivity: Sensitivity,
-    ) -> BoxFuture<'a, Result<(), StateStoreError>> {
-        let result = {
-            let mut state = self.lock();
-            if let Some(error) = FakeStateStore::backend(&state) {
-                Err(error)
-            } else if bytes.len() > state.max_value_bytes {
-                Err(StateStoreError::TooLarge {
-                    key: key.clone(),
-                    len: bytes.len(),
-                    max: state.max_value_bytes,
-                })
-            } else {
-                let stored = state.runs.entry(run.clone()).or_default();
-                let held = stored.get(key).map(|(held, _)| *held);
-                // Sensitivity ratchets up and never down: a later write cannot
-                // quietly strip the classification off bytes written earlier.
-                if held == Some(Sensitivity::Secretish) && sensitivity == Sensitivity::Ordinary {
-                    Err(StateStoreError::WouldDowngrade {
-                        key: key.clone(),
-                        from: Sensitivity::Secretish,
-                        to: Sensitivity::Ordinary,
-                    })
-                } else {
-                    let effective = match held {
-                        Some(Sensitivity::Secretish) => Sensitivity::Secretish,
-                        _ => sensitivity,
-                    };
-                    stored.insert(key.clone(), (effective, bytes.to_vec()));
-                    Ok(())
-                }
+    ) -> BoxFuture<'a, Result<(), StateError>> {
+        let result = validate(key).and_then(|()| {
+            let mut runs = self.runs.lock().expect("memory state store");
+            let held = runs.entry(run.to_string()).or_default();
+            // The ratchet, refused before anything is written: the stored bytes
+            // and their classification must both survive a refused downgrade.
+            if held.get(key).is_some_and(|stored| stored.sensitivity.is_secretish())
+                && !sensitivity.is_secretish()
+            {
+                return Err(StateError::Downgrade { key: key.to_string() });
             }
-        };
+            held.insert(key.to_string(), Stored { bytes: bytes.to_vec(), sensitivity });
+            Ok(())
+        });
         Box::pin(std::future::ready(result))
     }
 
     fn get<'a>(
         &'a self,
         run: &'a RunId,
-        key: &'a StateKey,
-    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, StateStoreError>> {
-        let result = {
-            let state = self.lock();
-            match FakeStateStore::backend(&state) {
-                Some(error) => Err(error),
-                None => {
-                    Ok(state.runs.get(run).and_then(|keys| keys.get(key)).map(|(_, b)| b.clone()))
-                }
-            }
-        };
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, StateError>> {
+        let result = validate(key).map(|()| {
+            self.runs
+                .lock()
+                .expect("memory state store")
+                .get(run.as_str())?
+                .get(key)
+                .map(|stored| stored.bytes.clone())
+        });
         Box::pin(std::future::ready(result))
     }
 
-    fn list<'a>(
-        &'a self,
-        run: &'a RunId,
-    ) -> BoxFuture<'a, Result<Vec<StateSummary>, StateStoreError>> {
-        let result = {
-            let state = self.lock();
-            match FakeStateStore::backend(&state) {
-                Some(error) => Err(error),
-                None => {
-                    // BTreeMap iteration is already ascending by StateKey.
-                    Ok(state
-                        .runs
-                        .get(run)
-                        .map(|keys| {
-                            keys.iter()
-                                .map(|(key, (sensitivity, bytes))| StateSummary {
-                                    key: key.clone(),
-                                    sensitivity: *sensitivity,
-                                    len: bytes.len(),
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default())
-                }
-            }
-        };
-        Box::pin(std::future::ready(result))
+    fn list<'a>(&'a self, run: &'a RunId) -> BoxFuture<'a, Result<Vec<StateSummary>, StateError>> {
+        let result = self
+            .runs
+            .lock()
+            .expect("memory state store")
+            .get(run.as_str())
+            .map(|held| {
+                held.iter()
+                    .map(|(key, stored)| StateSummary {
+                        key: key.clone(),
+                        sensitivity: stored.sensitivity,
+                        len: stored.bytes.len(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Box::pin(std::future::ready(Ok(result)))
     }
 
-    fn delete_run<'a>(&'a self, run: &'a RunId) -> BoxFuture<'a, Result<(), StateStoreError>> {
-        let result = {
-            let mut state = self.lock();
-            match FakeStateStore::backend(&state) {
-                Some(error) => Err(error),
-                None => {
-                    // Absent is not an error: deleting a run with nothing
-                    // stored is the same as deleting nothing.
-                    state.runs.remove(run);
-                    Ok(())
-                }
-            }
-        };
-        Box::pin(std::future::ready(result))
+    fn delete_run<'a>(&'a self, run: &'a RunId) -> BoxFuture<'a, Result<(), StateError>> {
+        let _ = self.runs.lock().expect("memory state store").remove(run.as_str());
+        Box::pin(std::future::ready(Ok(())))
     }
 }
 
-/// The `StateStore` conformance kit: every adapter — [`FakeStateStore`] here,
-/// real adapters later
-/// ([#55](https://github.com/Keep-Shipping/harness/issues/55)) — must pass
-/// this.
-///
-/// `run` and `other` must be two run ids nothing else in the test is using;
-/// the kit writes under both, so give it ids of its own when sharing a store
-/// across suites.
-///
-/// Checks, in order: an absent key reads `Ok(None)` rather than an error;
-/// `put`/`get` round-trips the exact bytes, including empty and non-UTF-8
-/// ones; one run's keys are invisible in another run's `list`; `list` is
-/// sorted by key and reports each key's sensitivity and byte length; the
-/// sensitivity ratchet refuses `Ordinary` over `Secretish` and leaves the old
-/// bytes in place; the *same* sensitivity overwrites in place, keeping one
-/// entry; and `delete_run` removes exactly one run — twice is still `Ok`.
-///
-/// This kit says nothing about encryption at rest. It runs against a
-/// `&dyn StateStore`, and [`FakeStateStore`] stores `Secretish` bytes in
-/// plaintext, so asserting it here would be asserting something only a real
-/// adapter can honour.
+/// The `StateStore` conformance kit: this fake and the local
+/// `.keepshipping/runs/<id>/` one must both pass it. A round-trip, a missing key
+/// as `Ok(None)`, an overwrite, two runs that cannot see each other's objects,
+/// the key rules that keep a blob inside its own run directory, a recorded
+/// sensitivity that `list` reports and the ratchet that refuses to drop it,
+/// `list`'s sorted order, and a `delete_run` that takes exactly one run.
 pub async fn conformance(store: &dyn StateStore) {
-    let run = RunId::from_parts(1_700_000_000_000, 0x00c0_ffee_0000_0003);
-    let other = RunId::from_parts(1_700_000_000_000, 0x00c0_ffee_0000_0004);
-    let key = |text: &str| StateKey::new(text).unwrap_or_else(|error| panic!("{error}"));
-
-    let absent = key("state.conformance.absent");
-    assert_eq!(
-        store.get(&run, &absent).await,
-        Ok(None),
-        "state store conformance: get of an absent key is Ok(None), not an error"
-    );
-
-    // Byte-exact round-trips: empty, plain ASCII, and bytes that are not
-    // valid UTF-8 at all.
-    for (name, bytes) in [
-        ("state.conformance.empty", Vec::new()),
-        ("state.conformance.text", b"a saved plan".to_vec()),
-        ("state.conformance.binary", vec![0u8, 159, 146, 150]),
-    ] {
-        let key = key(name);
-        store
-            .put(&run, &key, &bytes, Sensitivity::Ordinary)
-            .await
-            .unwrap_or_else(|error| panic!("state store conformance: put must succeed: {error}"));
-        assert_eq!(
-            store.get(&run, &key).await,
-            Ok(Some(bytes)),
-            "state store conformance: get returns the exact bytes that were put"
-        );
-        assert_eq!(
-            store.get(&other, &key).await,
-            Ok(None),
-            "state store conformance: another run's key is absent, never another run's data"
-        );
-        assert!(
-            !store
-                .list(&other)
-                .await
-                .expect("state store conformance: list must succeed")
-                .iter()
-                .any(|summary| summary.key == key),
-            "state store conformance: another run's keys do not appear in its list"
-        );
-    }
-
-    let alpha = key("state.conformance.a");
-    let middle = key("state.conformance.m");
-    let zeta = key("state.conformance.z");
-    store
-        .put(&run, &alpha, b"aaa", Sensitivity::Ordinary)
+    let run = RunId::from_parts(1_700_000_000_000, 1);
+    let other = RunId::from_parts(1_700_000_000_000, 2);
+    let get = async |key: &str, run: &RunId| match store.get(run, key).await {
+        Ok(found) => found,
+        Err(error) => panic!("state_store conformance: get {key:?} failed: {error}"),
+    };
+    let put_as = async |key: &str, bytes: &[u8], sensitivity: Sensitivity| match store
+        .put(&run, key, bytes, sensitivity)
         .await
-        .unwrap_or_else(|error| panic!("state store conformance: put must succeed: {error}"));
-    store
-        .put(&run, &middle, b"bb", Sensitivity::Secretish)
-        .await
-        .unwrap_or_else(|error| panic!("state store conformance: put must succeed: {error}"));
-    store
-        .put(&run, &zeta, b"c", Sensitivity::Ordinary)
-        .await
-        .unwrap_or_else(|error| panic!("state store conformance: put must succeed: {error}"));
-    let listed = store
-        .list(&run)
-        .await
-        .unwrap_or_else(|error| panic!("state store conformance: list must succeed: {error}"));
-    let keys: Vec<&StateKey> = listed.iter().map(|summary| &summary.key).collect();
-    let mut sorted = keys.clone();
-    sorted.sort();
-    assert_eq!(keys, sorted, "state store conformance: list returns summaries sorted by key");
-    for summary in &listed {
-        let bytes = store
-            .get(&run, &summary.key)
-            .await
-            .unwrap_or_else(|error| panic!("state store conformance: get must succeed: {error}"))
-            .unwrap_or_else(|| {
-                panic!("state store conformance: listed {} is readable", summary.key)
-            });
-        assert_eq!(
-            summary.len,
-            bytes.len(),
-            "state store conformance: the summary's len is the value's byte length"
-        );
-    }
-    let middle_summary =
-        listed.iter().find(|summary| summary.key == middle).expect("the secretish key is listed");
-    assert_eq!(
-        middle_summary.sensitivity,
-        Sensitivity::Secretish,
-        "state store conformance: the summary reports the sensitivity the value was written under"
-    );
-    let alpha_summary =
-        listed.iter().find(|summary| summary.key == alpha).expect("the ordinary key is listed");
-    assert_eq!(
-        alpha_summary.sensitivity,
-        Sensitivity::Ordinary,
-        "state store conformance: the summary reports the sensitivity the value was written under"
-    );
-
-    // The ratchet: a key that holds Secretish data cannot be written back as
-    // Ordinary, and the refused write leaves the bytes alone.
-    let token = key("state.conformance.token");
-    store
-        .put(&run, &token, b"x", Sensitivity::Secretish)
-        .await
-        .unwrap_or_else(|error| panic!("state store conformance: put must succeed: {error}"));
-    match store.put(&run, &token, b"y", Sensitivity::Ordinary).await {
-        Err(StateStoreError::WouldDowngrade { key: refused, from, to }) => {
-            assert_eq!(refused, token, "state store conformance: WouldDowngrade names the key");
-            assert_eq!(from, Sensitivity::Secretish);
-            assert_eq!(to, Sensitivity::Ordinary);
+    {
+        Ok(()) => {}
+        Err(error) => {
+            panic!("state_store conformance: put {key:?} as {sensitivity} failed: {error}")
         }
-        other => panic!(
-            "state store conformance: Ordinary over Secretish must be WouldDowngrade, got {other:?}"
-        ),
+    };
+    let list = async |run: &RunId| match store.list(run).await {
+        Ok(found) => found,
+        Err(error) => panic!("state_store conformance: list {} failed: {error}", run.as_str()),
+    };
+    let sensitivity_of = |found: &[StateSummary], key: &str| {
+        found
+            .iter()
+            .find(|summary| summary.key == key)
+            .unwrap_or_else(|| panic!("state_store conformance: {key:?} is not in the listing"))
+            .sensitivity
+    };
+
+    for stored in [b"{\"version\":1}", b"{\"version\":2}"] {
+        put_as("state.json", stored, Sensitivity::Plain).await;
+        assert_eq!(
+            get("state.json", &run).await,
+            Some(stored.to_vec()),
+            "must round-trip, and a put replaces"
+        );
     }
+    assert_eq!(get("missing", &run).await, None, "an absent key is None, not an error");
+    assert_eq!(get("state.json", &other).await, None, "keys are scoped per run");
+
+    for bad in ["", "../escape", "dir/file", ".hidden"] {
+        let written = store.put(&run, bad, b"x", Sensitivity::Plain).await;
+        assert!(
+            matches!(written, Err(StateError::InvalidKey { .. })),
+            "state_store conformance: {bad:?} must be refused, got {written:?}"
+        );
+        // A read is refused the same way: a key `put` will not accept is not a
+        // key `get` may report on either, and an adapter that let one through
+        // could read out of its own run directory.
+        let read = store.get(&run, bad).await;
+        assert!(
+            matches!(read, Err(StateError::InvalidKey { .. })),
+            "state_store conformance: get {bad:?} must be refused, got {read:?}"
+        );
+    }
+
+    // ---- sensitivity: recorded, reported, and a ratchet that only climbs ---
+    put_as("plan-aaaa", b"a plan", Sensitivity::Secretish).await;
+    let found = list(&run).await;
     assert_eq!(
-        store.get(&run, &token).await,
-        Ok(Some(b"x".to_vec())),
-        "state store conformance: the refused downgrade must not have changed the stored value"
+        sensitivity_of(&found, "plan-aaaa"),
+        Sensitivity::Secretish,
+        "list must report the classification put recorded, not a default"
+    );
+    assert_eq!(
+        found.iter().find(|s| s.key == "plan-aaaa").expect("listed").len,
+        6,
+        "the summary reports the stored length, and never the bytes"
+    );
+    assert_eq!(
+        sensitivity_of(&found, "state.json"),
+        Sensitivity::Plain,
+        "a plain write is recorded as plain"
     );
 
-    // Same sensitivity overwrites in place: still one entry, new bytes.
-    store
-        .put(&run, &alpha, b"aaaaaa", Sensitivity::Ordinary)
-        .await
-        .unwrap_or_else(|error| panic!("state store conformance: put must succeed: {error}"));
-    assert_eq!(
-        store.get(&run, &alpha).await,
-        Ok(Some(b"aaaaaa".to_vec())),
-        "state store conformance: put overwrites the value in place"
+    let downgraded = store.put(&run, "plan-aaaa", b"a different plan", Sensitivity::Plain).await;
+    assert!(
+        matches!(downgraded, Err(StateError::Downgrade { .. })),
+        "state_store conformance: writing plain over secretish must be refused, got {downgraded:?}"
     );
-    let listed = store
-        .list(&run)
-        .await
-        .unwrap_or_else(|error| panic!("state store conformance: list must succeed: {error}"));
     assert_eq!(
-        listed.iter().filter(|summary| summary.key == alpha).count(),
-        1,
-        "state store conformance: an overwritten key is still exactly one entry"
+        get("plan-aaaa", &run).await,
+        Some(b"a plan".to_vec()),
+        "a refused downgrade must leave the stored bytes alone"
+    );
+    let after = list(&run).await;
+    assert_eq!(
+        sensitivity_of(&after, "plan-aaaa"),
+        Sensitivity::Secretish,
+        "a refused downgrade must leave the recorded classification alone"
+    );
+    // Secretish over Secretish is not a downgrade — it is the same promise again.
+    put_as("plan-aaaa", b"a longer plan", Sensitivity::Secretish).await;
+    assert_eq!(get("plan-aaaa", &run).await, Some(b"a longer plan".to_vec()));
+
+    // ---- writing one key is never the reason another one is lost -----------
+    // The same-key case above is the ratchet; this is the one a whole-file
+    // rewrite of a shared index gets wrong. Two keys are stored, one is
+    // rewritten, and the other must read back *and* still be listed as what it
+    // was — an adapter that keeps one map per run and rewrites it per write
+    // passes everything else in this kit and still fails here.
+    put_as("plan-bbbb", b"the other plan", Sensitivity::Secretish).await;
+    put_as("plan-cccc", b"a third plan", Sensitivity::Secretish).await;
+    put_as("plan-cccc", b"the third plan, rewritten", Sensitivity::Secretish).await;
+    assert_eq!(
+        get("plan-bbbb", &run).await,
+        Some(b"the other plan".to_vec()),
+        "rewriting one key must not disturb another's bytes"
+    );
+    assert_eq!(
+        sensitivity_of(&list(&run).await, "plan-bbbb"),
+        Sensitivity::Secretish,
+        "rewriting one key must not drop another's recorded classification"
     );
 
-    // delete_run removes one run and nothing else; doing it twice is fine.
-    store.delete_run(&run).await.unwrap_or_else(|error| {
-        panic!("state store conformance: delete_run must succeed: {error}")
-    });
-    assert_eq!(
-        store.list(&run).await,
-        Ok(Vec::new()),
-        "state store conformance: delete_run removes the run's keys"
-    );
+    // ---- list is sorted, so a caller may diff or hash what it returns -----
+    put_as("zzz-last", b"z", Sensitivity::Plain).await;
+    let found = list(&run).await;
+    let keys: Vec<&str> = found.iter().map(|summary| summary.key.as_str()).collect();
+    let mut sorted = keys.clone();
+    sorted.sort_unstable();
+    assert_eq!(keys, sorted, "list must return its keys in sorted order");
+
+    // ---- delete_run takes exactly one run, and is fine with an empty one ---
     store
-        .put(&other, &alpha, b"another run", Sensitivity::Ordinary)
+        .put(&other, "state.json", b"{}", Sensitivity::Plain)
         .await
-        .unwrap_or_else(|error| panic!("state store conformance: put must succeed: {error}"));
-    store.delete_run(&run).await.unwrap_or_else(|error| {
-        panic!("state store conformance: a second delete_run must succeed: {error}")
-    });
+        .unwrap_or_else(|error| panic!("state_store conformance: put for {other}: {error}"));
+    store
+        .delete_run(&run)
+        .await
+        .unwrap_or_else(|error| panic!("state_store conformance: delete_run: {error}"));
+    assert_eq!(list(&run).await, Vec::new(), "delete_run must empty exactly that run");
+    assert_eq!(get("plan-aaaa", &run).await, None, "the deleted run's blobs are gone");
     assert_eq!(
-        store.get(&other, &alpha).await,
-        Ok(Some(b"another run".to_vec())),
-        "state store conformance: delete_run leaves every other run untouched"
+        get("state.json", &other).await,
+        Some(b"{}".to_vec()),
+        "delete_run must not touch another run's blobs"
     );
+    assert!(
+        !list(&other).await.is_empty(),
+        "the run that was not deleted still lists what it holds"
+    );
+    // Deleting a run takes what was declared about it too. A store that kept a
+    // key's classification anywhere outside that run's own directory would still
+    // be holding the promise after the bytes were gone, and would refuse this
+    // write as a downgrade of a run that no longer exists.
+    put_as("plan-aaaa", b"plain again", Sensitivity::Plain).await;
+    assert_eq!(
+        get("plan-aaaa", &run).await,
+        Some(b"plain again".to_vec()),
+        "delete_run must take the recorded classification with it, so a deleted run's keys can \
+         be written plain again"
+    );
+    for run in [&run, &other, &RunId::from_parts(1_700_000_000_000, 999)] {
+        store.delete_run(run).await.unwrap_or_else(|error| {
+            panic!("state_store conformance: deleting an empty run: {error}")
+        });
+    }
 }
 
 #[cfg(test)]
@@ -420,129 +317,48 @@ mod tests {
     use super::*;
     use crate::block_on;
 
-    fn run(seed: u128) -> RunId {
-        RunId::from_parts(1_700_000_000_000, seed)
-    }
-
-    fn key(text: &str) -> StateKey {
-        StateKey::new(text).expect("valid key")
+    #[test]
+    fn clones_share_one_store() {
+        let run = RunId::from_parts(0, 1);
+        let store = MemoryStateStore::new();
+        let other_handle = store.clone();
+        block_on(store.put(&run, "plan-a", b"one", Sensitivity::Secretish))
+            .expect("the write lands");
+        assert_eq!(
+            block_on(other_handle.get(&run, "plan-a")).expect("the read lands"),
+            Some(b"one".to_vec())
+        );
+        assert_eq!(
+            other_handle.sensitivity_of(&run, "plan-a"),
+            Some(Sensitivity::Secretish),
+            "the clone sees what the other handle recorded"
+        );
     }
 
     #[test]
-    fn a_fresh_fake_stores_nothing() {
-        let store = FakeStateStore::new();
-        let run = run(1);
+    fn a_fresh_fake_holds_nothing() {
+        let run = RunId::from_parts(0, 1);
+        let store = MemoryStateStore::new();
         assert_eq!(block_on(store.list(&run)).expect("list"), Vec::new());
-        assert_eq!(store.runs(), Vec::new());
-        assert_eq!(store.sensitivity_of(&run, &key("k")), None);
+        assert_eq!(store.sensitivity_of(&run, "plan-a"), None);
+        assert!(block_on(store.delete_run(&run)).is_ok(), "deleting an unknown run is fine");
     }
 
     #[test]
-    fn values_persist_across_independent_reads() {
-        let store = FakeStateStore::new();
-        let run = run(2);
-        block_on(store.put(&run, &key("cache"), b"hello", Sensitivity::Ordinary)).expect("put");
-        // Two separate calls, each taking and releasing the mutex.
-        assert_eq!(block_on(store.get(&run, &key("cache"))).expect("get"), Some(b"hello".to_vec()));
-        assert_eq!(block_on(store.get(&run, &key("cache"))).expect("get"), Some(b"hello".to_vec()));
-        assert_eq!(store.sensitivity_of(&run, &key("cache")), Some(Sensitivity::Ordinary));
-    }
-
-    #[test]
-    fn non_utf8_secretish_bytes_round_trip_exactly() {
-        let store = FakeStateStore::new();
-        let run = run(3);
-        let bytes = vec![0u8, 159, 146, 150];
-        block_on(store.put(&run, &key("blob"), &bytes, Sensitivity::Secretish)).expect("put");
-        assert_eq!(block_on(store.get(&run, &key("blob"))).expect("get"), Some(bytes));
-        assert_eq!(store.sensitivity_of(&run, &key("blob")), Some(Sensitivity::Secretish));
-    }
-
-    #[test]
-    fn a_refused_downgrade_leaves_the_value_alone() {
-        let store = FakeStateStore::new();
-        let run = run(4);
-        let key = key("token");
-        block_on(store.put(&run, &key, b"x", Sensitivity::Secretish)).expect("put");
+    fn a_refused_downgrade_leaves_both_the_bytes_and_the_classification() {
+        let run = RunId::from_parts(0, 2);
+        let store = MemoryStateStore::new();
+        block_on(store.put(&run, "plan-a", b"secret", Sensitivity::Secretish)).expect("put");
         assert_eq!(
-            block_on(store.put(&run, &key, b"y", Sensitivity::Ordinary)),
-            Err(StateStoreError::WouldDowngrade {
-                key: key.clone(),
-                from: Sensitivity::Secretish,
-                to: Sensitivity::Ordinary,
-            })
+            block_on(store.put(&run, "plan-a", b"plain", Sensitivity::Plain)).expect_err("refused"),
+            StateError::Downgrade { key: "plan-a".to_string() }
         );
-        assert_eq!(block_on(store.get(&run, &key)).expect("get"), Some(b"x".to_vec()));
-        // Writing Secretish again over Secretish is not a downgrade.
-        block_on(store.put(&run, &key, b"z", Sensitivity::Secretish)).expect("put");
-        assert_eq!(block_on(store.get(&run, &key)).expect("get"), Some(b"z".to_vec()));
-    }
-
-    #[test]
-    fn an_ordinary_write_may_be_upgraded_to_secretish() {
-        let store = FakeStateStore::new();
-        let run = run(5);
-        let key = key("plan");
-        block_on(store.put(&run, &key, b"v1", Sensitivity::Ordinary)).expect("put");
-        block_on(store.put(&run, &key, b"v2", Sensitivity::Secretish))
-            .expect("upgrading is allowed");
-        assert_eq!(store.sensitivity_of(&run, &key), Some(Sensitivity::Secretish));
-    }
-
-    #[test]
-    fn values_over_the_limit_are_refused_and_the_limit_is_inclusive() {
-        let store = FakeStateStore::new().max_value_bytes(8);
-        let run = run(6);
-        let key = key("big");
-        block_on(store.put(&run, &key, b"12345678", Sensitivity::Ordinary)).expect("at the limit");
-        assert_eq!(
-            block_on(store.put(&run, &key, b"123456789", Sensitivity::Ordinary)),
-            Err(StateStoreError::TooLarge { key: key.clone(), len: 9, max: 8 })
-        );
-        assert_eq!(block_on(store.get(&run, &key)).expect("get"), Some(b"12345678".to_vec()));
-        // The documented default, so a later change to it is deliberate.
-        assert_eq!(MAX_VALUE_BYTES, 1024 * 1024);
-        let default_store = FakeStateStore::new();
-        let big = vec![b'x'; MAX_VALUE_BYTES];
-        assert!(
-            matches!(block_on(default_store.put(&run, &key, &big, Sensitivity::Ordinary)), Ok(())),
-            "a megabyte is under the default cap, so this test's eight-byte limit is the only limit in play"
-        );
-    }
-
-    #[test]
-    fn delete_run_removes_exactly_one_run() {
-        let store = FakeStateStore::new();
-        let kept = run(7);
-        let dropped = run(8);
-        block_on(store.put(&kept, &key("k"), b"kept", Sensitivity::Ordinary)).expect("put");
-        block_on(store.put(&dropped, &key("k"), b"dropped", Sensitivity::Ordinary)).expect("put");
-        assert_eq!(store.runs(), vec![kept.clone(), dropped.clone()]);
-        block_on(store.delete_run(&dropped)).expect("delete_run");
-        assert_eq!(block_on(store.list(&dropped)).expect("list"), Vec::new());
-        assert_eq!(block_on(store.get(&kept, &key("k"))).expect("get"), Some(b"kept".to_vec()));
-        // A run with nothing stored, deleted twice, is not an error.
-        block_on(store.delete_run(&dropped)).expect("a second delete_run");
-        block_on(store.delete_run(&run(9))).expect("deleting an unknown run");
-    }
-
-    #[test]
-    fn a_failing_fake_fails_every_method() {
-        let store = FakeStateStore::new().failing("EACCES");
-        let run = run(10);
-        let key = key("k");
-        let backend = StateStoreError::Backend { message: "EACCES".to_string() };
-        assert_eq!(
-            block_on(store.put(&run, &key, b"v", Sensitivity::Ordinary)),
-            Err(backend.clone())
-        );
-        assert_eq!(block_on(store.get(&run, &key)), Err(backend.clone()));
-        assert_eq!(block_on(store.list(&run)), Err(backend.clone()));
-        assert_eq!(block_on(store.delete_run(&run)), Err(backend));
+        assert_eq!(block_on(store.get(&run, "plan-a")).expect("get"), Some(b"secret".to_vec()));
+        assert_eq!(store.sensitivity_of(&run, "plan-a"), Some(Sensitivity::Secretish));
     }
 
     #[test]
     fn the_fake_passes_conformance() {
-        block_on(conformance(&FakeStateStore::new()));
+        block_on(conformance(&MemoryStateStore::new()));
     }
 }
