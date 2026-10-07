@@ -63,7 +63,7 @@ Order matters. Steps 1–3 are what the gate actually checks; step 4 only rewrit
 
 `docs/COMPATIBILITY.md` is generated — **do not edit it by hand**; `KS_BLESS=1` is the command that rewrites it. That test is the gate: it compares the port-contract fingerprint against `PINNED_PORT_CONTRACT`, checks `Port` and `define_ports!` agree in order, and checks `docs/PORTS.md` has a heading for the current `STEP_API`.
 
-A tag matching `v*` runs [`.github/workflows/release.yml`](.github/workflows/release.yml): `keepshipping` for macOS arm64/x86_64 and Linux x86_64/arm64, a cosign-keyless-signed `SHA256SUMS`, and a GitHub Release whose notes come from GitHub's own release-notes generator over the conventional commits. Crates are **not** published to crates.io — `publish = false` is set workspace-wide until the licensing decision lands (ADR-0006, not written yet) — so a release is binaries only.
+A tag matching `v*` runs [`.github/workflows/release.yml`](.github/workflows/release.yml): `keepshipping` for macOS arm64/x86_64 and Linux x86_64/arm64, a cosign-keyless-signed `SHA256SUMS`, and a GitHub Release whose notes come from GitHub's own release-notes generator over the conventional commits. Crates are **not** published to crates.io — `publish = false` is set workspace-wide and stays set while the repository is private, which [ADR 0006](docs/adr/0006-licence-and-open-source-model.md) holds until M1 exits — so a release is binaries only.
 
 ## ADRs
 
@@ -85,4 +85,4 @@ The ADR guard test enforces this: `cargo test -p ks-testing --test adr_guard`.
 
 ## Licence
 
-All rights reserved pending the licensing decision (ADR-0006). See [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](LICENSE) and [ADR 0006](docs/adr/0006-licence-and-open-source-model.md). Contributions are accepted under the same terms (Apache-2.0 section 5: inbound is outbound); there is no CLA and no DCO. Copyright is Factory Zero Pte. Ltd.
