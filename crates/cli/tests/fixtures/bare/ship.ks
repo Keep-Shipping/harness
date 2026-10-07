@@ -7,4 +7,3 @@ steps:
 
   deploy:  k8s.rollout
     image: build.digest
-    to:    cluster

@@ -41,6 +41,7 @@ pub mod ports;
 pub mod registry;
 pub mod repro;
 pub mod step;
+pub mod tf;
 mod types;
 pub mod version;
 mod workflow;
