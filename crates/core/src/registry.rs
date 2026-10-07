@@ -188,21 +188,27 @@ steps:
                 new one to `returns:`.",
             bad: "\
 steps:
+  plan: tofu.plan
+    dir: ./infra
   risk: decide
     model: typesafe/jev
     ask: \"How risky is the plan?\"
     returns: low | medium | high
   gate: approval
     auto: risk is huge
+         and plan.destroys == 0
 ",
             good: "\
 steps:
+  plan: tofu.plan
+    dir: ./infra
   risk: decide
     model: typesafe/jev
     ask: \"How risky is the plan?\"
     returns: low | medium | high
   gate: approval
     auto: risk is low
+         and plan.destroys == 0
 ",
         },
         Code::UnknownAction => Explanation {
@@ -214,22 +220,28 @@ steps:
                 knows.",
             bad: "\
 steps:
+  plan: tofu.plan
+    dir: ./infra
   risk: decide
     model: typesafe/jev
     ask: \"How risky is the plan?\"
     returns: low | high
   gate: approval
     auto: risk is low
+         and plan.destroys == 0
     else: notify ops
 ",
             good: "\
 steps:
+  plan: tofu.plan
+    dir: ./infra
   risk: decide
     model: typesafe/jev
     ask: \"How risky is the plan?\"
     returns: low | high
   gate: approval
     auto: risk is low
+         and plan.destroys == 0
     else: show risk.reason
 ",
         },
@@ -459,6 +471,41 @@ steps:
     returns: yes | no
 ",
         },
+        Code::AutoDestroys => Explanation {
+            code,
+            title: "`auto:` could destroy",
+            severity: Severity::Warning,
+            summary: "The `auto:` rule of an `approval` step approves without asking anyone, \
+                and it does not say what happens to a plan that destroys. Destroy goes to a \
+                human, always — the engine conjoins `and plan.destroys == 0` whatever the \
+                file says — so this is a warning about the file reading as more permissive \
+                than the run is. Write the clause: a guard inside an `or` does not count.",
+            bad: "\
+steps:
+  plan: tofu.plan
+    dir: ./infra
+  risk: decide
+    model: typesafe/jev
+    ask: \"How risky is this plan?\"
+    input: plan.changes
+    returns: low | medium | high
+  review: approval
+    auto: risk is low \u{2265} 0.95
+",
+            good: "\
+steps:
+  plan: tofu.plan
+    dir: ./infra
+  risk: decide
+    model: typesafe/jev
+    ask: \"How risky is this plan?\"
+    input: plan.changes
+    returns: low | medium | high
+  review: approval
+    auto: risk is low \u{2265} 0.95
+         and plan.destroys == 0
+",
+        },
         Code::SecretShown => Explanation {
             code,
             title: "secret shown",
@@ -535,7 +582,8 @@ Every diagnostic the `ks` parser and checker emit carries exactly one code,
 stable forever: tools and agents match on the code, not on the message. Codes
 are grouped by block — `KS00xx` syntax, `KS01xx` types, `KS02xx` names and
 references, `KS03xx` workflow structure, `KS04xx` policy, `KS05xx` secrets,
-`KS06xx` environment and CI warnings — with gaps left for growth.
+`KS06xx` environment and CI warnings, `KS07xx` approval safety — with gaps
+left for growth.
 
 This file is generated from the registry in `crates/core/src/registry.rs`;
 edit the registry, never this file. Regenerate with:

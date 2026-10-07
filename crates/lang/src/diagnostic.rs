@@ -75,7 +75,8 @@ impl fmt::Display for Severity {
 /// tools can match on. Codes are grouped by block — `KS00xx` syntax,
 /// `KS01xx` types, `KS02xx` names and references, `KS03xx` workflow
 /// structure, `KS04xx` policy, `KS05xx` secrets, `KS06xx` environment and CI
-/// warnings — and are never renumbered: gaps stay free for new codes.
+/// warnings, `KS07xx` approval safety — and are never renumbered: gaps stay
+/// free for new codes.
 ///
 /// The meaning, a bad and a good example of every code are documented in
 /// `docs/ERRORS.md`, generated from the registry in `ks-core`.
@@ -125,6 +126,8 @@ pub enum Code {
     SecretShown,
     /// An optional context value used where it may be absent.
     OptionalAbsent,
+    /// An `auto:` approval rule that could approve a destructive plan.
+    AutoDestroys,
 }
 
 impl Code {
@@ -154,6 +157,7 @@ impl Code {
             Code::SecretInString => "KS0501",
             Code::SecretShown => "KS0502",
             Code::OptionalAbsent => "KS0601",
+            Code::AutoDestroys => "KS0701",
         }
     }
 
@@ -182,6 +186,7 @@ impl Code {
         Code::SecretInString,
         Code::SecretShown,
         Code::OptionalAbsent,
+        Code::AutoDestroys,
     ];
 }
 
@@ -199,6 +204,28 @@ pub struct Label {
     pub message: String,
 }
 
+/// A suggested edit: the bytes at `span` replaced by `replacement`.
+///
+/// `machine_applicable` marks an edit a tool may apply on its own —
+/// `keepshipping check --fix` takes exactly those. A suggestion the checker
+/// cannot prove unambiguous carries `false`: it is advice for a person, not
+/// an instruction for a machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fix {
+    /// The bytes to replace.
+    pub span: Span,
+    /// What to put in their place.
+    pub replacement: String,
+    /// Whether the edit is unambiguous enough to apply without a human.
+    pub machine_applicable: bool,
+}
+
+impl Fix {
+    pub fn new(span: Span, replacement: impl Into<String>, machine_applicable: bool) -> Self {
+        Self { span, replacement: replacement.into(), machine_applicable }
+    }
+}
+
 /// A parse or check finding. `ks-lang` produces errors only; `ks-core` emits
 /// the same type, including warnings. `code` names the kind of problem,
 /// `subject` — when the checker knows it — the dotted thing the finding is
@@ -212,6 +239,8 @@ pub struct Diagnostic {
     pub subject: Option<String>,
     pub labels: Vec<Label>,
     pub hints: Vec<String>,
+    /// Edits that would resolve the finding, in the order they apply.
+    pub fixes: Vec<Fix>,
 }
 
 impl Diagnostic {
@@ -224,6 +253,7 @@ impl Diagnostic {
             subject: None,
             labels: Vec::new(),
             hints: Vec::new(),
+            fixes: Vec::new(),
         }
     }
 
@@ -236,6 +266,7 @@ impl Diagnostic {
             subject: None,
             labels: Vec::new(),
             hints: Vec::new(),
+            fixes: Vec::new(),
         }
     }
 
@@ -254,6 +285,13 @@ impl Diagnostic {
     /// Adds a secondary span with a one-line explanation.
     pub fn with_label(mut self, span: Span, message: impl Into<String>) -> Self {
         self.labels.push(Label { span, message: message.into() });
+        self
+    }
+
+    /// Attaches a suggested edit — a did-you-mean rewrite, or the type-
+    /// directed output that would satisfy this value.
+    pub fn with_fix(mut self, fix: Fix) -> Self {
+        self.fixes.push(fix);
         self
     }
 }

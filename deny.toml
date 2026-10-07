@@ -18,9 +18,9 @@ allow = [
   "Zlib",
 ]
 
-# Workspace crates are proprietary (LicenseRef-KeepShipping-Proprietary) and
-# unpublished (publish = false), so licence checks skip them entirely.
-private = { ignore = true }
+# Workspace crates are Apache-2.0 (ADR 0006) and unpublished
+# (publish = false), so they are checked against the allow list above too.
+private = { ignore = false }
 
 confidence-threshold = 0.93
 

@@ -2,7 +2,7 @@
 
 **Deploys you can read.** One typed workflow file per repo (`ship.ks`). It builds your images, plans and applies your infrastructure, waits for a human and deploys. It's checked before anything runs, and it runs the same on your laptop as in CI.
 
-This repository will hold the engine, the checker, the `keepshipping` CLI, the language server and the built-in steps. **Nothing here runs yet.** The workspace skeleton is in place — crates with no product logic, the CI gates, the contributor docs and the ADR index — next to a placeholder licence and the first architecture decision record. The plan is in the issues, starting with the master plan, [#1](https://github.com/Keep-Shipping/harness/issues/1). The site, [keepshipping.run](https://keepshipping.run), shows the planned design: its workflow files, CLI output and timings aren't measurements.
+This repository will hold the engine, the checker, the `keepshipping` CLI, the language server and the built-in steps. **Nothing here runs yet.** The workspace skeleton is in place — crates with no product logic, the CI gates, the contributor docs and the ADR index — next to the licence and the first architecture decision record. The plan is in the issues, starting with the master plan, [#1](https://github.com/Keep-Shipping/harness/issues/1). The site, [keepshipping.run](https://keepshipping.run), shows the planned design: its workflow files, CLI output and timings aren't measurements.
 
 ## How it will be built
 
@@ -67,7 +67,7 @@ Start with [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Licence
 
-All rights reserved for now. See [LICENSE](LICENSE) and the licensing decision, [#7](https://github.com/Keep-Shipping/harness/issues/7).
+Apache-2.0. Everything here is open: the harness, the CLI, the language server, the built-in steps and adapters. The hosted control plane and team-only features live in private repositories. See [LICENSE](LICENSE) and [ADR 0006](docs/adr/0006-licence-and-open-source-model.md).
 
 ---
 
