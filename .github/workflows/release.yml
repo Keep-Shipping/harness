@@ -1,0 +1,246 @@
+name: Release
+
+# A tag matching `v*` is the release trigger. ADR 0014:
+# https://github.com/Keep-Shipping/harness/blob/main/docs/adr/0014-release-and-contract-versioning.md
+# There is deliberately no workflow_dispatch: a dry run would build and
+# sign artifacts that no tag names, and cosign keyless binds a signature to
+# a workflow run rather than to a version. To rehearse a release, tag a
+# commit on a scratch branch.
+on:
+  push:
+    tags: ['v*']
+
+# Two tags in a row: let the first finish rather than cancelling it halfway
+# through a signing step.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# The one elevation over ci.yml: a release creates a GitHub Release, so this
+# workflow needs `contents: write`. Every other gate is `contents: read`.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: keepshipping (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Mach-O cannot be cross-linked from Linux without an Apple SDK, so
+          # the darwin targets are built on a real macOS runner. `macos-latest`
+          # is arm64 and `rustup target add` covers x86_64-apple-darwin from
+          # it, which is the native toolchain on both.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          # The two Linux targets cross-compile from Linux with `cross`.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.xz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive: tar.xz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain pinned in rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - name: Restore the cargo build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cross for the Linux cross builds
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Install the target toolchain for ${{ matrix.target }}
+        run: |
+          rustup target add ${{ matrix.target }} \
+            || { echo "::error::could not install the ${{ matrix.target }} std. Fix: check that the triple is spelled correctly and that 'rustup target add ${{ matrix.target }}' succeeds on a ${{ matrix.os }} runner."; exit 1; }
+
+      - name: Build keepshipping
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `cross` builds and runs the target's linker in a container, so it
+          # drives the Linux builds; the darwin builds use plain cargo.
+          build=(cargo build --release --locked -p ks-cli --bin keepshipping --target "${{ matrix.target }}")
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            build=(cross "${build[@]}")
+          fi
+          "${build[@]}" \
+            || { echo "::error::the release build failed for ${{ matrix.target }}. Fix: run 'cargo build --release --locked -p ks-cli --bin keepshipping --target ${{ matrix.target }}' locally (with 'cross' for Linux targets) and fix the build before tagging."; exit 1; }
+
+      - name: Archive keepshipping-${{ matrix.target }}
+        id: archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          bin="target/${{ matrix.target }}/release/keepshipping"
+          [ -x "$bin" ] \
+            || { echo "::error::no keepshipping binary at '$bin'. Fix: check the '--bin keepshipping' name in crates/cli/Cargo.toml matches the build step."; exit 1; }
+          out="keepshipping-${VERSION}-${{ matrix.target }}.${{ matrix.archive }}"
+          mkdir -p stage/keepshipping-${VERSION}
+          cp "$bin" "stage/keepshipping-${VERSION}/keepshipping"
+          # Keep Shipping ships LICENSE and README next to the binary so the
+          # licence travels with it (ADR-0006 is still open).
+          cp LICENSE README.md "stage/keepshipping-${VERSION}/" \
+            || echo "::notice::LICENSE or README.md is missing from the tag; the archive carries the binary only."
+          # .tar.gz on macOS, .tar.xz on Linux: the two platforms disagree about
+          # which is native, and each platform should not need a foreign tool
+          # to unpack its own release.
+          tar -C stage -czf "$out" "keepshipping-${VERSION}" \
+            || { echo "::error::could not build the tar.gz for ${{ matrix.target }}. Fix: check that 'tar -czf' works on a ${{ matrix.os }} runner."; exit 1; }
+          if [ "${{ matrix.archive }}" = "tar.xz" ]; then
+            rm -f "$out"
+            tar -C stage -cJf "$out" "keepshipping-${VERSION}" \
+              || { echo "::error::could not build the tar.xz for ${{ matrix.target }}. Fix: check that 'tar -cJf' works on a ${{ matrix.os }} runner."; exit 1; }
+          fi
+          # `path:` in the upload step is expanded by Actions, not by the shell,
+          # so the version has to cross the step boundary as a step output
+          # rather than as a shell variable.
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "archive=$out" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: keepshipping-${{ matrix.target }}
+          # The exact name the Archive step wrote, for every matrix entry:
+          # keepshipping-<version>-<target>.<archive>.
+          path: keepshipping-${{ steps.archive.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  checksums-and-sign:
+    name: SHA256SUMS and cosign signature
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      # `cosign sign-blob` with no key is keyless: it mints an OIDC identity for
+      # this run, and minting that token requires `id-token: write`. It is
+      # granted here and not at the top level so no other job gets an OIDC
+      # token it does not need. This job needs nothing else than read access.
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download every archive
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: keepshipping-*
+          merge-multiple: true
+
+      - name: Write one SHA256SUMS, sorted by filename
+        run: |
+          shopt -s nullglob
+          files=(dist/*.tar.gz dist/*.tar.xz)
+          ((${#files[@]} == 4)) \
+            || { echo "::error::expected 4 archives, found ${#files[@]}: ${files[*]}. Fix: check the release matrix covers every target and that each 'Upload the archive' step ran."; exit 1; }
+          ( cd dist && sha256sum $(printf '%s\n' "${files[@]}" | sed 's|dist/||' | sort) > SHA256SUMS ) \
+            || { echo "::error::could not write SHA256SUMS. Fix: check that 'sha256sum' is on PATH on ubuntu-latest."; exit 1; }
+          cat dist/SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the checksums with cosign keyless
+        # Keyless: the signature carries the OIDC identity of this workflow
+        # run, so the release needs no long-lived cosign key and a user
+        # verifies with 'cosign verify-blob --certificate-identity ...'.
+        # Both outputs: the .sig/.pem pair for `cosign verify-blob`, and the
+        # .bundle (signature + certificate + transparency-log proof) for
+        # `cosign verify-blob --bundle`.
+        # An SBOM per artifact is not here yet;
+        # https://github.com/Keep-Shipping/harness/issues/116 tracks it.
+        run: |
+          cosign sign-blob --yes \
+            --output-signature dist/SHA256SUMS.sig \
+            --output-certificate dist/SHA256SUMS.pem \
+            --bundle dist/SHA256SUMS.bundle \
+            dist/SHA256SUMS \
+            || { echo "::error::cosign keyless signing failed. Fix: check that the 'checksums-and-sign' job still has 'id-token: write' in its permissions block (without it GitHub mints no OIDC token and cosign cannot sign), and that the sigstore Fulcio/Rekor endpoints are reachable from the runner."; exit 1; }
+
+      - name: Upload the checksums and the signature
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: |
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sig
+            dist/SHA256SUMS.pem
+            dist/SHA256SUMS.bundle
+          if-no-files-found: error
+
+  publish:
+    name: GitHub Release
+    needs: [release, checksums-and-sign]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # release-plz reads the conventional commits since the last tag.
+          fetch-depth: 0
+
+      - name: Install release-plz
+        # release-plz, from the repository that publishes it. The action has no
+        # major-version tag: it ships `v0.5.x` and no `v0` floating tag, so the
+        # pin is the exact release tag, which is how ci.yml pins too (there is
+        # no `v4` to float on).
+        #
+        # Today this step is a no-op at tag time — every package is
+        # `publish = false`, so release-plz has nothing to release — but the
+        # pin is here and correct so that the day ADR-0006 unblocks publishing,
+        # this is not a workflow that fails on a reference that never existed.
+        uses: release-plz/action@v0.5.139
+
+      - name: Download every archive plus the signed checksums
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: 'keepshipping-*'
+          merge-multiple: true
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: keepshipping ${{ github.ref_name }}
+          # The notes come from GitHub's own release-notes generator, which
+          # summarises the merged pull requests and conventional commits since
+          # the previous tag — the same source release-plz would read.
+          #
+          # release-plz cannot write them here. Its `release` command writes no
+          # changelog file and its JSON output carries only `package_name`,
+          # `prs`, `tag` and `version` — no notes — and its action outputs
+          # (`prs`, `releases`, `releases_created`) carry no notes either. And
+          # it would have nothing to release anyway: `publish = false` is set
+          # workspace-wide until ADR-0006 lands, so every package is
+          # non-publishable and `release-plz release` reports nothing to
+          # release. `body_path` is deliberately absent rather than pointing at
+          # a file nothing writes.
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.xz
+            dist/SHA256SUMS
+            dist/SHA256SUMS.bundle
+          fail_on_unmatched_files: true

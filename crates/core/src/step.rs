@@ -15,10 +15,7 @@ use crate::ports::clock::Clock;
 use crate::ports::run_context::NetworkScope;
 use crate::ports::script_host::{Value, ValueType, Values};
 use crate::ports::secrets::Redactor;
-
-/// The version of the [`StepKind`] contract a step was built against; `build` refuses a step
-/// whose `step_api` differs.
-pub const STEP_API: u32 = 1;
+pub use crate::version::STEP_API;
 
 /// A step contract's semantic version. Hand-rolled: the harness only displays and orders
 /// versions, which does not warrant a dependency.
