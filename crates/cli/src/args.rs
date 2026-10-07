@@ -1,5 +1,5 @@
 //! Command-line parsing: one hand-rolled pass over the arguments, shared by
-//! `check`, `run`, `graph` and `blocks search`. Anything unrecognizable —
+//! `check`, `run`, `graph`, `fmt` and `blocks search`. Anything unrecognizable —
 //! flag, value or format — is a usage error, never a silently swallowed
 //! option.
 
@@ -25,6 +25,8 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
                         [--only STEP]... [--skip STEP]... [--allow-partial]
                         [--dry-run] [-v]
        keepshipping graph [FILE] [--env NAME] [--event \"push main\"] [--format text|dot|json]
+       keepshipping fmt [PATH...] [--check]
+       keepshipping fmt -
        keepshipping fmt --upgrade [PATH...]
        keepshipping blocks search <QUERY> [--index URL] [--limit N] [--format human|json]
        keepshipping log [RUN-ID] [--format human|json]
@@ -38,9 +40,9 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
 /// `blocks search` has its own `--format` (human or json, no github
 /// annotations), `--index` and `--limit`. `graph` has its own `--format` —
 /// `text|dot|json`, not the diagnostic formats, so `check --format dot` stays
-/// the usage error it has always been. `fmt` takes only `--upgrade` today:
-/// the formatter is not written yet, and every other flag it might grow is
-/// still a usage error.
+/// the usage error it has always been. `fmt` takes `--check`, the `-` stdin
+/// positional, and `--upgrade`; it rejects `--env`, `--event`, `--actor` and
+/// `--non-interactive`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Check,
@@ -99,10 +101,14 @@ pub struct Options {
     /// The `--limit` of `blocks search`, at least one.
     pub limit: u32,
     /// `--upgrade` on `fmt`: rewrite each file to the format this build
-    /// writes. Without it there is no formatter to run.
+    /// writes, rather than laying it out.
     pub upgrade: bool,
-    /// The paths `fmt --upgrade` was given: files, or directories to walk
-    /// for `ship.ks`. Empty means `ship.ks` in the working directory.
+    /// `fmt --check`: report what would change instead of rewriting.
+    pub check: bool,
+    /// `fmt -`: read the source from stdin, write the result to stdout.
+    pub stdin: bool,
+    /// The files and directories `fmt` was given, in order. Empty means
+    /// `ship.ks` in the working directory.
     pub paths: Vec<String>,
 }
 
@@ -131,6 +137,8 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
         index: None,
         limit: DEFAULT_SEARCH_LIMIT,
         upgrade: false,
+        check: false,
+        stdin: false,
         paths: Vec::new(),
     };
     let mut rest = args.iter();
@@ -147,10 +155,10 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
             "--secrets" if command == Command::Check => o.secrets = true,
             "--fix" if command == Command::Check => o.fix = true,
             "--repro" if command == Command::Check => o.repro = true,
-            "--env" => o.env = Some(flag_value(&mut rest)?),
-            "--event" => o.event = Some(flag_value(&mut rest)?),
-            "--actor" => o.actor = actor_kind(&flag_value(&mut rest)?)?,
-            "--non-interactive" => o.non_interactive = true,
+            "--env" if command != Command::Fmt => o.env = Some(flag_value(&mut rest)?),
+            "--event" if command != Command::Fmt => o.event = Some(flag_value(&mut rest)?),
+            "--actor" if command != Command::Fmt => o.actor = actor_kind(&flag_value(&mut rest)?)?,
+            "--non-interactive" if command != Command::Fmt => o.non_interactive = true,
             "--context" if matches!(command, Command::Check | Command::Run) => {
                 o.context = Some(ContextName::parse(&flag_value(&mut rest)?)?)
             }
@@ -161,12 +169,25 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
             "--dry-run" if command == Command::Run => o.dry_run = true,
             "-v" | "--verbose" if command == Command::Run => o.verbose = true,
             "--upgrade" if command == Command::Fmt => o.upgrade = true,
+            "--check" if command == Command::Fmt => o.check = true,
+            // A lone `-` is stdin, the way every Unix filter spells it; it is
+            // the one positional that may look like a flag.
+            "-" if command == Command::Fmt => o.stdin = true,
             "--index" if command == Command::BlocksSearch => o.index = Some(flag_value(&mut rest)?),
             "--limit" if command == Command::BlocksSearch => {
                 let value = flag_value(&mut rest)?;
                 o.limit = value.parse().ok().filter(|limit| *limit > 0)?;
             }
+            // Everything after `--` is a path, even when it starts with a dash: the
+            // one way to name a file called `-weird.ks`.
+            "--" if command == Command::Fmt => {
+                o.paths.extend(rest.by_ref().cloned());
+                break;
+            }
             flag if flag.starts_with('-') => return None,
+            // `fmt` is the one command that takes a list: a file, a tree, or
+            // several of each.
+            file if command == Command::Fmt => o.paths.push(file.to_string()),
             // One positional: the site file, the tree with `--all`, or the
             // search text. A second is almost always a typo, not a list to
             // check.
@@ -176,9 +197,6 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
             text if o.query.is_none() && command == Command::BlocksSearch => {
                 o.query = Some(text.to_string())
             }
-            // `fmt` takes a list: it rewrites files, and rewriting several
-            // in one run is the whole reason it walks a tree at all.
-            path if command == Command::Fmt => o.paths.push(path.to_string()),
             _ => return None,
         }
     }
