@@ -1,0 +1,142 @@
+name: Editors
+
+# The editor packages only move when `editors/**`, a shared fixture or the
+# association rule in docs/LANGUAGE.md moves, so those are the only triggers: a
+# Rust-only change must not spend a Node runner's minutes. A `vscode-v*` tag
+# publishes instead. GitHub does not evaluate `paths` against a tag push, so
+# the tag filter is what scopes that run.
+on:
+  pull_request:
+    paths:
+      - 'editors/**'
+      - 'crates/lang/tests/fixtures/**'
+      - 'crates/cli/tests/fixtures/**'
+      - 'docs/LANGUAGE.md'
+      - '.github/workflows/editors.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'editors/**'
+      - 'crates/lang/tests/fixtures/**'
+      - 'crates/cli/tests/fixtures/**'
+      - 'docs/LANGUAGE.md'
+      - '.github/workflows/editors.yml'
+    tags: ['vscode-v*']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  TREE_SITTER_VERSION: '0.25.10'
+
+jobs:
+  tree-sitter:
+    name: grammar parses every shared fixture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned tree-sitter CLI
+        run: |
+          curl -fsSL -o tree-sitter.gz \
+            "https://github.com/tree-sitter/tree-sitter/releases/download/v${TREE_SITTER_VERSION}/tree-sitter-linux-x64.gz"
+          gunzip tree-sitter.gz
+          sudo mv tree-sitter /usr/local/bin/tree-sitter
+          tree-sitter --version
+
+      - name: Generate the parser and parse every fixture
+        working-directory: editors/tree-sitter-keepshipping
+        run: |
+          tree-sitter generate \
+            || { echo "::error::'tree-sitter generate' failed. Fix: run it in editors/tree-sitter-keepshipping locally and fix grammar.js."; exit 1; }
+          # `find`, not a glob: a fixture added in a new directory must be
+          # covered the day it lands. `-path '*/tests/fixtures/*'` keeps
+          # `editors/vscode/test/kickstart.ks` out — that one is Kickstart,
+          # and parsing it as a site file is the bug docs/LANGUAGE.md forbids.
+          mapfile -t fixtures < <(find ../../crates -path '*/tests/fixtures/*' -name '*.ks' | sort)
+          ((${#fixtures[@]} > 0)) \
+            || { echo "::error::no fixtures found. Fix: check the find expression still matches crates/*/tests/fixtures."; exit 1; }
+          printf 'parsing %d fixtures\n' "${#fixtures[@]}"
+          # `parse` exits non-zero on any ERROR or MISSING node.
+          tree-sitter parse --quiet --stat "${fixtures[@]}" \
+            || { echo "::error::the grammar does not parse every fixture cleanly. Fix: run 'tree-sitter parse <file>' in editors/tree-sitter-keepshipping and repair grammar.js — no fixture may need an error node to highlight."; exit 1; }
+
+  vscode:
+    name: package the extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Build the .vsix
+        working-directory: editors/vscode
+        run: |
+          npm ci
+          npx vsce package --pre-release \
+            || { echo "::error::vsce could not package the extension. Fix: run 'npm ci && npx vsce package --pre-release' in editors/vscode locally."; exit 1; }
+
+      - name: Upload the .vsix
+        uses: actions/upload-artifact@v4
+        with:
+          name: keepshipping-vsix
+          path: editors/vscode/*.vsix
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-vscode:
+    name: publish the pre-release extension
+    needs: [tree-sitter, vscode]
+    # A tag is the only way in, and the extension stays pre-release until M2
+    # exits: no version may be offered as the supported one before the language
+    # server behind it is.
+    if: startsWith(github.ref, 'refs/tags/vscode-v')
+    runs-on: ubuntu-latest
+    # The marketplace protection rule lives on this environment, so the PAT is
+    # not reachable from a branch.
+    environment: marketplace
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      # Marketplace versions are immutable, so a tag that disagrees with
+      # package.json is unpublishable: catch it before `vsce publish`.
+      - name: The tag must be the version in package.json
+        working-directory: editors/vscode
+        run: |
+          npm ci
+          test "${GITHUB_REF_NAME#vscode-v}" = "$(node -p "require('./package.json').version")" \
+            || { echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version. Fix: rename the tag to vscode-v\$(node -p "require('./package.json').version")."; exit 1; }
+
+      - name: Download the .vsix the `vscode` job built
+        uses: actions/download-artifact@v4
+        with:
+          name: keepshipping-vsix
+          path: editors/vscode
+
+      - name: Publish to the marketplace
+        working-directory: editors/vscode
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          shopt -s nullglob
+          vsix=(./*.vsix)
+          ((${#vsix[@]} == 1)) \
+            || { echo "::error::expected exactly 1 .vsix, found ${#vsix[@]}. Fix: check the 'vscode' job's upload step ran and uploaded one file."; exit 1; }
+          npx vsce publish --pre-release --packagePath "${vsix[0]}" \
+            || { echo "::error::vsce publish failed. Fix: check secrets.VSCE_PAT is set, the 'marketplace' environment still has its protection rule, and the publisher in editors/vscode/package.json matches the marketplace account."; exit 1; }

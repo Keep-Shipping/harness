@@ -28,7 +28,7 @@ Association is therefore by file name, never by extension:
 - Editor grammars, the tree-sitter grammar and Linguist must register
   `ship.ks` and `*.ship.ks`, and nothing else. A grammar that claims
   `*.ks` is wrong: it would take Kickstart files away from the people who
-  own them.
+  own them. The per-editor setup is in [EDITORS.md](EDITORS.md).
 - Parsing does not depend on the name. Any path given to `--file` is
   parsed the same way; the name selects highlighting and discovery, not
   meaning.

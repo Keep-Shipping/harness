@@ -1,0 +1,90 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Keep Shipping",
+  "scopeName": "source.keepshipping",
+  "patterns": [
+    { "include": "#block-string" },
+    { "include": "#comment" },
+    { "include": "#key" },
+    { "include": "#string" },
+    { "include": "#keyword" },
+    { "include": "#operator" },
+    { "include": "#interpolation" },
+    { "include": "#handle" },
+    { "include": "#bool" },
+    { "include": "#duration" },
+    { "include": "#number" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "block-string": {
+      "name": "meta.block-string.keepshipping",
+      "begin": "^(\\s*)([\\w-]+)(:)[ \\t]*(\\|)[ \\t]*$",
+      "beginCaptures": {
+        "2": { "name": "variable.other.key.keepshipping" },
+        "3": { "name": "punctuation.separator.key-value.keepshipping" },
+        "4": { "name": "punctuation.definition.block-string.begin.keepshipping" }
+      },
+      "end": "^(?:#|\\s*[\\w-]+:)",
+      "contentName": "string.unquoted.block.keepshipping"
+    },
+    "comment": {
+      "name": "comment.line.number-sign.keepshipping",
+      "match": "(?:^|(?<=\\s))#.*$"
+    },
+    "key": {
+      "match": "^(\\s*)([A-Za-z_][\\w-]*)(:)(?=[ \\t]|$|#)",
+      "captures": {
+        "2": { "name": "variable.other.key.keepshipping" },
+        "3": { "name": "punctuation.separator.key-value.keepshipping" }
+      }
+    },
+    "string": {
+      "name": "string.quoted.double.keepshipping",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [{ "include": "#escape" }, { "include": "#interpolation" }]
+    },
+    "escape": {
+      "name": "constant.character.escape.keepshipping",
+      "match": "\\\\(?:[\"\\\\])"
+    },
+    "keyword": {
+      "name": "keyword.control.keepshipping",
+      "match": "(?<![\\w-])(?:and|or|not|is)(?![\\w-])"
+    },
+    "operator": {
+      "name": "keyword.operator.keepshipping",
+      "match": "(?<=\\s)(?:==|!=|>=|<=|≥|≤|<|>|=)(?=\\s)|(?<=\\s)\\|(?=\\s)"
+    },
+    "interpolation": {
+      "begin": "\\{",
+      "end": "\\}",
+      "name": "meta.interpolation.keepshipping",
+      "beginCaptures": { "0": { "name": "punctuation.definition.interpolation.begin.keepshipping" } },
+      "endCaptures": { "0": { "name": "punctuation.definition.interpolation.end.keepshipping" } },
+      "contentName": "variable.other.interpolated.keepshipping",
+      "patterns": [{ "match": "[A-Za-z_][\\w-]*", "name": "support.constant.dotted-name.keepshipping" }]
+    },
+    "handle": {
+      "name": "entity.name.function.handle.keepshipping",
+      "match": "(?<![\\w-])@[\\w./-]+"
+    },
+    "bool": {
+      "name": "constant.language.boolean.keepshipping",
+      "match": "(?<![\\w-])(?:true|false)(?![\\w-])"
+    },
+    "duration": {
+      "name": "constant.numeric.duration.keepshipping",
+      "match": "(?<![\\w-])[0-9]+(?:\\.[0-9]+)?(?:ms|s|m|h|d)(?![\\w-])"
+    },
+    "number": {
+      "name": "constant.numeric.keepshipping",
+      "match": "(?<![\\w./-])-?[0-9]+(?:\\.[0-9]+)?(?![\\w.])"
+    },
+    "punctuation": {
+      "name": "punctuation.separator.keepshipping",
+      "match": "[,()|]"
+    }
+  }
+}
