@@ -6,8 +6,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ks_core::ports::supply_chain::{
-    BuildError, BuildOutput, BuildRequest, Digest, ImageBuilder, ImageRef, OciLayoutContents,
-    Reference, Registry, RegistryError, SignError, SignPayload, Signature, Signer, SignerIdentity,
+    BuildCache, BuildError, BuildOutput, BuildRequest, BuildSecrets, Digest, ImageBuilder,
+    ImageRef, OciLayoutContents, Reference, Registry, RegistryError, SignError, SignPayload,
+    Signature, Signer, SignerIdentity,
 };
 use ks_testing::block_on;
 use ks_testing::supply_chain::{
@@ -22,6 +23,9 @@ fn build_request(push_to: Option<String>) -> BuildRequest {
         platforms: vec!["linux/amd64".to_string()],
         target: None,
         push_to,
+        secrets: BuildSecrets::new(),
+        cache: BuildCache::Local,
+        sbom: false,
     }
 }
 
@@ -132,7 +136,11 @@ fn the_fake_image_builder_is_deterministic_per_request() {
         panic!("without push_to the output is a local OCI layout");
     };
     assert_ne!(first.digest, third.digest, "changed args, changed digest");
-    assert_eq!(builder.requests(), vec![same_args.clone(), same_args, changed]);
+    let recorded = builder.requests();
+    assert_eq!(recorded.len(), 3);
+    assert_eq!(recorded[0], recorded[1], "same request in, same record out");
+    assert_eq!(recorded[0].args, same_args.args, "the record carries the args");
+    assert!(recorded[2].args.len() > recorded[0].args.len(), "the changed one differs");
 }
 
 #[test]

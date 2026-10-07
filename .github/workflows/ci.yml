@@ -136,7 +136,7 @@ jobs:
             echo "::error::expected exit 1 (the fixtures' diagnostics), got $rc. Fix: keep 'keepshipping check' free of network access and store reads; it may only read the files it checks."
             exit 1
           fi
-          grep -q "expected oci.Digest, got string" /tmp/offline-check.out \
+          grep -q "expected oci.Digest, got oci.Tag" /tmp/offline-check.out \
             || { echo "::error::the fixtures were not actually checked."; exit 1; }
 
   registry-conformance:

@@ -120,11 +120,24 @@ impl Catalog {
             "oci.image",
             &[
                 ("from", Type::Path),
+                ("context", Type::Optional(Box::new(Type::Path))),
+                ("args", Type::Optional(Box::new(Type::Map(Box::new(Type::Any))))),
+                ("secrets", Type::Optional(Box::new(Type::Map(Box::new(Type::Any))))),
+                ("platforms", Type::Optional(Box::new(Type::List(Box::new(Type::Any))))),
+                ("target", Type::Optional(Box::new(Type::String))),
                 ("push", named("oci.Tag")),
-                ("sign", Type::Bool),
-                ("sbom", Type::Bool),
+                ("sign", Type::Optional(Box::new(Type::Bool))),
+                ("sbom", Type::Optional(Box::new(Type::Bool))),
+                ("cache", Type::Optional(Box::new(Type::String))),
             ],
-            &[("digest", named("oci.Digest")), ("tag", Type::String), ("signed", Type::Bool)],
+            &[
+                ("digest", named("oci.Digest")),
+                ("ref", named("oci.Ref")),
+                ("tag", named("oci.Tag")),
+                ("signed", Type::Bool),
+                ("sbom", named("oci.Artifact")),
+                ("platforms", Type::List(Box::new(Type::Any))),
+            ],
             false,
             false,
         );
@@ -243,6 +256,9 @@ impl Catalog {
                             field.name
                         )));
                     }
+                    inputs.push((field.name.to_string(), Type::Optional(Box::new(ty))));
+                }
+                None if field.optional => {
                     inputs.push((field.name.to_string(), Type::Optional(Box::new(ty))));
                 }
                 None => inputs.push((field.name.to_string(), ty)),

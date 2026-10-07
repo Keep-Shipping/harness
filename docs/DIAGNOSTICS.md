@@ -52,7 +52,7 @@ by path.
 ## `--format human` (default)
 
 ```
-✗ ship.ks:21  deploy.image  expected oci.Digest, got string
+✗ ship.ks:21  deploy.image  expected oci.Digest, got oci.Tag
   │
 21 │     image: build.tag
   │            ^^^^^^^^^
@@ -83,7 +83,7 @@ One self-contained object per diagnostic, one per line, stable key order,
 nothing else on stdout — no footer, no listing:
 
 ```json
-{"version":1,"code":"KS0101","severity":"error","file":"ship.ks","subject":"deploy.image","message":"expected oci.Digest, got string","span":{"start":363,"end":372,"line":21,"column":12,"end_line":21,"end_column":21},"labels":[],"hints":["use build.digest so prod runs exactly the image you built"],"fixes":[{"span":{"start":369,"end":372,"line":21,"column":18,"end_line":21,"end_column":21},"replacement":"digest","machine_applicable":true}]}
+{"version":1,"code":"KS0101","severity":"error","file":"ship.ks","subject":"deploy.image","message":"expected oci.Digest, got oci.Tag","span":{"start":363,"end":372,"line":21,"column":12,"end_line":21,"end_column":21},"labels":[],"hints":["use build.digest so prod runs exactly the image you built"],"fixes":[{"span":{"start":369,"end":372,"line":21,"column":18,"end_line":21,"end_column":21},"replacement":"digest","machine_applicable":true}]}
 ```
 
 - `file` is the path as printed — relative to the `--all` walk root there.
@@ -126,7 +126,7 @@ GitHub Actions workflow commands, one annotation per diagnostic, so findings
 show up on the pull request:
 
 ```
-::error file=ship.ks,line=21,col=12,endLine=21,endColumn=21,title=KS0101 deploy.image::expected oci.Digest, got string%0Ahint: use build.digest so prod runs exactly the image you built
+::error file=ship.ks,line=21,col=12,endLine=21,endColumn=21,title=KS0101 deploy.image::expected oci.Digest, got oci.Tag%0Ahint: use build.digest so prod runs exactly the image you built
 ```
 
 `line`/`col`/`endLine`/`endColumn` follow the JSON rules; warnings are
