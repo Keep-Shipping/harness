@@ -24,6 +24,8 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
                         [--dry-run] [-v]
        keepshipping fmt --upgrade [PATH...]
        keepshipping blocks search <QUERY> [--index URL] [--limit N] [--format human|json]
+       keepshipping log [RUN-ID] [--format human|json]
+       keepshipping log verify [RUN-ID]
        keepshipping lsp";
 
 /// Which subcommand's flags `parse_args` accepts. `--format`, `--all`,

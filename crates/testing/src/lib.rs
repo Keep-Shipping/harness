@@ -20,6 +20,7 @@ pub mod http;
 pub mod iac;
 pub mod id_gen;
 pub mod run_context;
+pub mod run_log;
 pub mod script_host;
 pub mod secrets;
 pub mod step;

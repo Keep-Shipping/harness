@@ -40,3 +40,7 @@ Newest first, one heading per contract version, dated.
   single home for the three public contract versions; `ks_core::step::STEP_API`
   still resolves. Any later change to a port trait adds a `## STEP_API 2`
   heading above this one and bumps the constant.
+- **2026-10-07** — `RunLog` ([#46](https://github.com/Keep-Shipping/harness/issues/46))
+  added, engine-only: steps never receive it, so it is not in `Port` nor in
+  `define_ports!`, and it does not move `STEP_API`. The fingerprint covers
+  every trait in `ports/`, so the digest is re-pinned here without a bump.
