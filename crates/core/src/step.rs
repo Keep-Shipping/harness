@@ -7,6 +7,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -496,6 +497,47 @@ impl fmt::Debug for StepCtx {
     }
 }
 
+/// Whether — and by what — a step's work may be skipped when nothing changed
+/// ([#43](https://github.com/Keep-Shipping/harness/issues/43)).
+///
+/// The default everywhere is [`Caching::Never`]: opting in is a step's own statement that its
+/// output is a pure function of the inputs the cache key covers. `oci.image` does (a build of
+/// the same context is the same bytes); `tofu.plan` and `deploy` do not — the world they read
+/// can change between runs, so they never participate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Caching {
+    /// Never skip this step's work.
+    Never,
+    /// The work may be skipped when the key matches; these are the extra inputs the key covers
+    /// beyond the resolved inputs the engine already hashes.
+    Keyed(Vec<CacheInput>),
+}
+
+/// One thing a step's cache key covers, on top of the resolved inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheInput {
+    /// A file or directory whose contents the engine hashes — e.g. an image build context. The
+    /// path itself is not hashed: the same context at two checkouts is the same input.
+    File(PathBuf),
+    /// A tool and the version that will run — e.g. the tofu binary. The step supplies the
+    /// version, so it should take it from its pinned toolchain: a version that does not match
+    /// the tool actually used is a wrong hit.
+    Tool { name: String, version: String },
+    /// Any other named value the step depends on, e.g. the base image ref.
+    Value { name: String, value: String },
+}
+
+/// Whether a cache entry may still be trusted. The `String` is the human evidence the skip (or
+/// the rebuild) rests on, e.g. `"sha256:… present in ghcr.io/acme/api"` — it goes into the run
+/// log, so it must never carry a secret value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheCheck {
+    /// The cached outputs are still there and usable: skip the work.
+    Valid(String),
+    /// They are not: run the step again.
+    Stale(String),
+}
+
 /// A step kind: the unit a workflow composes. Everything but [`run`](StepKind::run) is
 /// declaration, checked for free: the harness refuses a composition whose steps need ports
 /// nobody provides, and the engine checks every run's inputs and outputs against
@@ -533,6 +575,27 @@ pub trait StepKind: Send + Sync + 'static {
     /// What the step needs from its environment. Defaults to local-safe.
     fn capabilities(&self) -> StepCapabilities {
         StepCapabilities::default()
+    }
+
+    /// Whether this step's work may be skipped when nothing changed
+    /// ([#43](https://github.com/Keep-Shipping/harness/issues/43)). Defaults to
+    /// [`Caching::Never`]: a step participates only by saying so, and only for a run whose work
+    /// is a pure function of what the key covers.
+    fn caching(&self, _inputs: &Inputs) -> Caching {
+        Caching::Never
+    }
+
+    /// Checks cached outputs are still true before the engine skips the work — e.g. that the
+    /// image the key stands for is still in the registry. Defaults to [`CacheCheck::Stale`], so
+    /// a step that opts into caching but forgets verification never skips.
+    fn verify_cached<'a>(
+        &'a self,
+        _ctx: StepCtx,
+        _outputs: &'a Outputs,
+    ) -> BoxFuture<'a, Result<CacheCheck, StepError>> {
+        Box::pin(std::future::ready(Ok(CacheCheck::Stale(
+            "step does not verify cached outputs".to_string(),
+        ))))
     }
 
     /// Runs the step. Inputs arrive prepared against the schema (present, typed, defaults
