@@ -37,6 +37,7 @@ mod env;
 pub mod format;
 pub mod harness;
 pub mod ids;
+pub mod lock;
 pub mod plan_summary;
 pub mod policy;
 pub mod ports;
