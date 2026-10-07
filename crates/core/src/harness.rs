@@ -454,7 +454,8 @@ mod tests {
         schema: StepSchema,
     }
 
-    /// A default-shaped [`TestStep`], for struct-update literals: `TestStep { api: 2, ..step("x") }`.
+    /// A default-shaped [`TestStep`], for struct-update literals:
+    /// `TestStep { api: STEP_API + 1, ..step("x") }`.
     fn step(name: &'static str) -> TestStep {
         TestStep {
             name,
@@ -692,7 +693,7 @@ mod tests {
                 },
                 CompositionError::StepApiMismatch {
                     step: "oci.image".to_string(),
-                    found: STEP_API + 1
+                    found: STEP_API + 1,
                 },
                 CompositionError::UnknownType {
                     step: "oci.image".to_string(),

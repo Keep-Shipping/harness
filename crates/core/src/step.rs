@@ -58,6 +58,8 @@ pub enum Port {
     Clock,
     IdGen,
     ScriptHost,
+    ApprovalChannel,
+    Directory,
 }
 
 impl fmt::Display for Port {
@@ -73,6 +75,8 @@ impl fmt::Display for Port {
             Port::Clock => "Clock",
             Port::IdGen => "IdGen",
             Port::ScriptHost => "ScriptHost",
+            Port::ApprovalChannel => "ApprovalChannel",
+            Port::Directory => "Directory",
         };
         f.write_str(name)
     }
@@ -144,6 +148,8 @@ define_ports! {
     (clock, Clock, clock, with_clock),
     (id_gen, IdGen, id_gen, with_id_gen),
     (script_host, ScriptHost, script_host, with_script_host),
+    (approval, ApprovalChannel, approval_channel, with_approval_channel),
+    (approval, Directory, directory, with_directory),
 }
 
 /// What a step run *is*, for policy purposes

@@ -5,6 +5,7 @@
 //! outside this crate) answers. That is what lets the same workflow run on a
 //! laptop and in CI — only the adapters change. The ports defined here:
 //!
+//! - [`approval`] — asking a team, and the two rules that bind the answer to the artifacts ([#53](https://github.com/Keep-Shipping/harness/issues/53));
 //! - [`run_context`] — who and where a run is (actor, repo, environment);
 //! - [`secrets`] — resolving named secrets and redacting their values ([#49](https://github.com/Keep-Shipping/harness/issues/49));
 //! - [`supply_chain`] — signing, attestations and digests ([#50](https://github.com/Keep-Shipping/harness/issues/50));
@@ -41,6 +42,7 @@ use core::pin::Pin;
 /// documentation](self) for why the ports box instead of using `async-trait`.
 pub type BoxFuture<'a, T> = Pin<Box<dyn core::future::Future<Output = T> + Send + 'a>>;
 
+pub mod approval;
 pub mod blocks;
 pub mod clock;
 pub mod decision_model;

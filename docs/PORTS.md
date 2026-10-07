@@ -55,6 +55,26 @@ Newest first, one heading per contract version, dated.
   a harness cannot hand one to a step. The trait is versioned now so that adding
   the variant later is not itself a contract change.
 
+- **2026-10-07** — Added the `ApprovalChannel` and `Directory` ports
+  ([#53](https://github.com/Keep-Shipping/harness/issues/53)), so a run can ask
+  a team and the engine can tell who was on it. `ApprovalChannel` requests,
+  polls and waits; `Directory` answers membership. No existing trait signature
+  changed — the ten ports from `STEP_API 1` are untouched, and `BlocksIndex`
+  still is. The new `Port` variants `ApprovalChannel` and `Directory` are the
+  only additions to the enum.
+
+  The rule they encode: an approval is bound to the exact artifacts it was
+  asked about, and a run can never approve itself. `ApprovalRequest::accepts`
+  refuses an approver who proposed the run, an approver who is not human, and
+  a verdict whose `bound_artifacts` differ by one digest — enforced in the
+  engine, not in each adapter, so the same rule holds for every channel.
+  Membership is checked separately, asynchronously, through `Directory` —
+  and it is the verdict's own `approver` that gets looked up, never the
+  approver the caller hoped for. The adapter conformance kit in `ks-testing`
+  checks exactly that: an adapter that answers with somebody else's verdict,
+  or binds a verdict to different artifacts, fails the kit rather than
+  shipping.
+
 ## STEP_API 1
 
 - **2026-10-07** — The initial port contract
