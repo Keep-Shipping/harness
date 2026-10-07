@@ -22,8 +22,9 @@ cancelled), is in [CLI.md](CLI.md).
 ## `fmt --upgrade`
 
 `keepshipping fmt --upgrade [PATH...]` brings each file to the format this
-build writes, and is the only thing `fmt` does yet — `fmt` on its own is a
-usage error (exit 2), because there is no formatter to run. Each path is a
+build writes. `fmt` on its own lays files out canonically instead (see
+[LANGUAGE.md](LANGUAGE.md)); `--upgrade` with `--check` or `-` is a usage
+error (exit 2), because an upgrade always rewrites in place. Each path is a
 file or a directory to walk for `ship.ks`, on the same terms `check --all`
 walks; no path at all means `ship.ks` in the working directory.
 
