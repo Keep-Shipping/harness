@@ -443,7 +443,7 @@ fn transport(error: HttpError) -> RunContextError {
 mod tests {
     use super::*;
     use crate::http_client::TcpHttpClient;
-    use crate::http_client::test_server::spawn as spawn_server;
+    use crate::test_server::spawn as spawn_server;
     use ks_core::ports::http::{HttpPolicy, HttpResponse};
     use ks_testing::block_on;
     use ks_testing::http::FakeHttpClient;

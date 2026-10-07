@@ -142,7 +142,7 @@ fn check_prints_diagnostics_to_stdout_and_exits_1() {
     assert_eq!(code, 1);
     assert!(stderr.is_empty(), "{stderr}");
     assert!(stdout.contains(&format!("✗ {}:6  deploy.image", path.display())), "{stdout}");
-    assert!(stdout.contains("expected oci.Digest, got string"), "{stdout}");
+    assert!(stdout.contains("expected oci.Digest, got oci.Tag"), "{stdout}");
     assert!(stdout.contains("hint: use build.digest so prod runs"), "{stdout}");
     assert!(stdout.ends_with("0 steps ran. Nothing was touched.\n"), "{stdout}");
 }

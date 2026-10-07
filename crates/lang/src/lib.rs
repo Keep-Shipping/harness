@@ -35,6 +35,7 @@
 
 mod ast;
 mod diagnostic;
+mod fmt;
 mod lexer;
 mod parser;
 mod syntax;
@@ -44,6 +45,7 @@ pub use ast::{
     Value, Word, WordPart, classify_scalar,
 };
 pub use diagnostic::{Code, Diagnostic, Fix, Label, Severity, Span};
+pub use fmt::{FormatError, format, format_range};
 pub use syntax::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken};
 
 /// The result of parsing: a lossless tree, the source it came from, and the

@@ -52,6 +52,15 @@ pub enum RunEvent {
         threshold: f64,
         outcome: String,
     },
+    /// An attestation (provenance or an SBOM) was pushed against an image.
+    /// `subject` is the image's digest and `attestation` the pushed envelope's; both are
+    /// hashes, not references.
+    AttestationAttached {
+        step: String,
+        subject: String,
+        predicate_type: String,
+        attestation: String,
+    },
     /// A policy rule refused the run; `step` is `None` before any step ran.
     PolicyRefused { step: Option<String>, rule: String },
     /// The run ended, with the digests of what it shipped.
@@ -70,6 +79,7 @@ impl RunEvent {
             RunEvent::ApprovalGranted { .. } => "approval.granted",
             RunEvent::ApprovalDenied { .. } => "approval.denied",
             RunEvent::DecideAnswered { .. } => "decide.answered",
+            RunEvent::AttestationAttached { .. } => "attestation.attached",
             RunEvent::PolicyRefused { .. } => "policy.refused",
             RunEvent::RunFinished { .. } => "run.finished",
         }
@@ -118,6 +128,12 @@ impl RunEvent {
                 *outcome = r.redact(outcome);
                 *probabilities =
                     probabilities.iter().map(|(label, p)| (r.redact(label), *p)).collect();
+            }
+            RunEvent::AttestationAttached { step, subject, predicate_type, attestation } => {
+                *step = r.redact(step);
+                *subject = r.redact(subject);
+                *predicate_type = r.redact(predicate_type);
+                *attestation = r.redact(attestation);
             }
             RunEvent::PolicyRefused { step, rule } => {
                 *step = step.as_deref().map(|name| r.redact(name));
@@ -226,6 +242,15 @@ mod tests {
                     probabilities: vec![(s(), 0.5)],
                     threshold: 0.5,
                     outcome: s(),
+                },
+            ),
+            (
+                "attestation.attached",
+                RunEvent::AttestationAttached {
+                    step: s(),
+                    subject: s(),
+                    predicate_type: s(),
+                    attestation: s(),
                 },
             ),
             ("policy.refused", RunEvent::PolicyRefused { step: Some(s()), rule: s() }),

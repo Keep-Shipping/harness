@@ -1,0 +1,53 @@
+{
+  "format_version": "1.2",
+  "terraform_version": "1.9.0",
+  "resource_changes": [
+    {
+      "address": "aws_lb.api",
+      "mode": "managed", "type": "aws_lb", "name": "api",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "change": {
+        "actions": ["create"], "before": null,
+        "after": { "name": "api-alb", "internal": true, "subnets": ["subnet-0a1b2c3d"] }
+      }
+    },
+    {
+      "address": "aws_ecs_service.api",
+      "mode": "managed", "type": "aws_ecs_service", "name": "api",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "change": {
+        "actions": ["update"],
+        "before": { "desired_count": 2, "launch_type": "FARGATE" },
+        "after": { "desired_count": 4, "launch_type": "FARGATE" }
+      }
+    },
+    {
+      "address": "aws_route53_record.api",
+      "mode": "managed", "type": "aws_route53_record", "name": "api",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "change": {
+        "actions": ["create"], "before": null,
+        "after": { "zone_id": "Z0234567890ABC", "name": "api.keep-shipping.example", "records": ["203.0.113.10"] }
+      }
+    },
+    {
+      "address": "aws_s3_bucket.assets",
+      "mode": "managed", "type": "aws_s3_bucket", "name": "assets",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "change": {
+        "actions": ["no-op"],
+        "before": { "bucket": "site-assets", "force_destroy": false },
+        "after": { "bucket": "site-assets", "force_destroy": false }
+      }
+    },
+    {
+      "address": "data.aws_vpc.main",
+      "mode": "data", "type": "aws_vpc", "name": "main",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "change": {
+        "actions": ["read"], "before": null,
+        "after": { "id": "vpc-0abc123def456", "cidr_block": "10.20.0.0/16" }
+      }
+    }
+  ]
+}

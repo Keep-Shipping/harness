@@ -136,8 +136,62 @@ jobs:
             echo "::error::expected exit 1 (the fixtures' diagnostics), got $rc. Fix: keep 'keepshipping check' free of network access and store reads; it may only read the files it checks."
             exit 1
           fi
-          grep -q "expected oci.Digest, got string" /tmp/offline-check.out \
+          grep -q "expected oci.Digest, got oci.Tag" /tmp/offline-check.out \
             || { echo "::error::the fixtures were not actually checked."; exit 1; }
+
+  registry-conformance:
+    name: registry conformance (zot, distribution)
+    runs-on: ubuntu-latest
+    services:
+      # zot v2.1.22 — native `/v2/<name>/referrers`, exercised on the native path.
+      zot:
+        image: ghcr.io/project-zot/zot-linux-amd64:v2.1.22@sha256:46f688dc26315a35a247e1784368829e66a67bf91de94c7d8d1645044fac1d5b
+        ports:
+          - "5001:5000"
+      # distribution 2.8.3 — no `/v2/<name>/referrers`, so the adapter falls
+      # back to the `sha256-<hex>` tag schema.
+      distribution:
+        image: registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports:
+          - "5002:5000"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain pinned in rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - name: Restore the cargo build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Wait for both registries to answer the v2 API
+        run: |
+          # Both images serve plain HTTP on :5000 out of the box, anonymous.
+          # `/v2/` answering 200 is the readiness signal; give each one a
+          # bounded window rather than a fixed sleep.
+          for port in 5001 5002; do
+            ready=0
+            for _ in $(seq 1 60); do
+              if curl -sf "http://localhost:${port}/v2/" > /dev/null; then
+                ready=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$ready" -ne 1 ]; then
+              echo "::error::the registry on localhost:${port} never answered /v2/ within 60s. Fix: check the service image, or the ports mapped above."
+              exit 1
+            fi
+            echo "localhost:${port} is answering /v2/"
+          done
+
+      - name: Run the Registry conformance kit against both
+        env:
+          KS_OCI_CONFORMANCE_REGISTRIES: localhost:5001,localhost:5002
+        run: |
+          cargo test -p ks-oci-distribution --test conformance -- --nocapture \
+            || { echo "::error::the Registry conformance kit failed. Fix: run 'KS_OCI_CONFORMANCE_REGISTRIES=localhost:5001,localhost:5002 cargo test -p ks-oci-distribution --test conformance' against local zot and distribution, make it pass, and commit."; exit 1; }
 
   bench:
     name: check budget (cold 1 s, warm p95 100 ms)

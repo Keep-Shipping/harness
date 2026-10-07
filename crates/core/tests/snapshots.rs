@@ -58,7 +58,7 @@ fn the_tagged_hero_snapshot_is_exactly_the_mismatch_and_its_hint() {
     assert_eq!(dump, expected, "golden mismatch; re-run with UPDATE_GOLDEN=1");
     assert_eq!(
         expected,
-        "22:12: error: expected oci.Digest, got string\n  \
+        "22:12: error: expected oci.Digest, got oci.Tag\n  \
          hint: use build.digest so prod runs exactly the image you built\n",
         "the committed snapshot must be exactly the digest mismatch"
     );

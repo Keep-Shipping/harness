@@ -447,7 +447,8 @@ fn collect(o: &Options) -> Result<Vec<Site>, ExitCode> {
 
 /// Every `ship.ks` under `dir`, recursively. Hidden (`.git`), build
 /// (`target`) and package-manager (`node_modules`) trees never hold one.
-fn walk(dir: &Path, found: &mut Vec<PathBuf>) -> io::Result<()> {
+/// Shared with `fmt`, so both commands find the same files the same way.
+pub fn walk(dir: &Path, found: &mut Vec<PathBuf>) -> io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();

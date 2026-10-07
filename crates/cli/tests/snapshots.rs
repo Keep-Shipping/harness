@@ -54,7 +54,7 @@ fn human_output_is_the_documented_example() {
     // Not just the golden: the headline and the promise must be exactly the
     // site's example, so a stray UPDATE_GOLDEN cannot redefine them.
     assert!(
-        stdout.starts_with("✗ ship.ks:21  deploy.image  expected oci.Digest, got string\n"),
+        stdout.starts_with("✗ ship.ks:21  deploy.image  expected oci.Digest, got oci.Tag\n"),
         "{stdout}"
     );
     assert_eq!(stdout, read_or_update(&golden("check.human"), &stdout));
@@ -95,7 +95,7 @@ fn github_output_is_one_annotation() {
     assert!(
         stdout.starts_with(concat!(
             "::error file=ship.ks,line=21,col=12,endLine=21,endColumn=21,",
-            "title=KS0101 deploy.image::expected oci.Digest, got string"
+            "title=KS0101 deploy.image::expected oci.Digest, got oci.Tag"
         )),
         "{stdout}"
     );

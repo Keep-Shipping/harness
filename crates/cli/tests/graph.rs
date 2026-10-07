@@ -137,7 +137,7 @@ fn a_file_with_errors_is_reported_and_exits_one() {
     let (code, stdout, stderr) = graph(SITE, &[]);
     assert_eq!(code, 1, "{stderr}");
     assert!(
-        stdout.starts_with("✗ ship.ks:21  deploy.image  expected oci.Digest, got string\n"),
+        stdout.starts_with("✗ ship.ks:21  deploy.image  expected oci.Digest, got oci.Tag\n"),
         "{stdout}"
     );
     assert!(!stdout.contains("route:"), "a file that does not check has no plan: {stdout}");

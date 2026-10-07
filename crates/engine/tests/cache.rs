@@ -127,6 +127,7 @@ impl StepKind for BuildImageStep {
                     platforms: vec!["linux/amd64".to_string()],
                     target: None,
                     push_to: Some(text("push")),
+                    ..BuildRequest::default()
                 })
                 .await
                 .map_err(|error| StepError::Failed(error.to_string()))?;

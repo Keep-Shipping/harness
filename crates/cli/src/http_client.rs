@@ -16,7 +16,9 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use ks_core::ports::BoxFuture;
-use ks_core::ports::http::{HttpClient, HttpError, HttpPolicy, HttpRequest, HttpResponse};
+use ks_core::ports::http::{
+    HttpClient, HttpError, HttpMethod, HttpPolicy, HttpRequest, HttpResponse,
+};
 
 /// How many response-header bytes the adapter will read before giving up.
 const MAX_HEADER_BYTES: usize = 32 * 1024;
@@ -116,7 +118,7 @@ impl TcpHttpClient {
         let mut stream = connect(&host, port, self.policy.timeout)?;
         let deadline = Instant::now() + self.policy.timeout;
         write_request(&mut stream, &req, &host, port, &target, self.policy.timeout)?;
-        read_response(&mut stream, &self.policy, deadline)
+        read_response(&mut stream, &self.policy, deadline, req.method)
     }
 }
 
@@ -173,7 +175,13 @@ fn write_request(
     for (name, value) in &req.headers {
         request.push_str(&format!("{name}: {value}\r\n"));
     }
-    if !req.body.is_empty() {
+    // A body-carrying verb says how long its body is even when that body is
+    // empty: a registry waiting on a `Content-Length` before it answers the
+    // `PUT` that commits an upload never gets one otherwise. GET and HEAD
+    // have no body to frame.
+    let framed = !req.body.is_empty()
+        || matches!(req.method, HttpMethod::Post | HttpMethod::Put | HttpMethod::Patch);
+    if framed {
         request.push_str(&format!("Content-Length: {}\r\n", req.body.len()));
     }
     request.push_str("Connection: close\r\n\r\n");
@@ -189,6 +197,7 @@ fn read_response(
     stream: &mut TcpStream,
     policy: &HttpPolicy,
     deadline: Instant,
+    method: HttpMethod,
 ) -> Result<HttpResponse, HttpError> {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
@@ -210,6 +219,13 @@ fn read_response(
     let headers = std::str::from_utf8(&buf[..header_end])
         .map_err(|_| HttpError::Transport { message: "response headers are not utf-8".into() })?;
     let (status, fields) = parse_head(headers)?;
+    // A HEAD response carries the headers the matching GET would and no body
+    // at all — including the `Content-Length` of that body, and the
+    // `Transfer-Encoding` that framed it. Reading to either would wait for
+    // bytes the server is never going to send.
+    if method == HttpMethod::Head {
+        return Ok(HttpResponse { status, headers: fields, body: Vec::new() });
+    }
     if fields.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("transfer-encoding")
             && value.to_ascii_lowercase().contains("chunked")
@@ -311,79 +327,10 @@ fn content_length(fields: &[(String, String)]) -> Option<usize> {
         .and_then(|(_, value)| value.trim().parse().ok())
 }
 
-/// A test-only HTTP/1.1 server fixture, shared by this module's tests and
-/// `github_actions_run_context`'s: both drive the real [`TcpHttpClient`] over a
-/// real socket, so one fixture serves both.
-#[cfg(test)]
-pub(crate) mod test_server {
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::{SocketAddr, TcpListener};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-
-    /// What the server received: the request line plus headers, as text.
-    pub(crate) type Captured = Arc<Mutex<Vec<String>>>;
-
-    /// A one-response HTTP server on a random port: answers every connection
-    /// with `status` + a content-length-framed `body`, recording the request
-    /// lines it saw. `hold` keeps connections unanswered (for the timeout
-    /// test). The third tuple member counts accepted connections.
-    pub(crate) fn spawn(
-        status: &str,
-        body: &str,
-        hold: bool,
-    ) -> (SocketAddr, Captured, Arc<AtomicUsize>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let address = listener.local_addr().expect("addr");
-        let captured: Captured = Arc::new(Mutex::new(Vec::new()));
-        let connections = Arc::new(AtomicUsize::new(0));
-        let captured_clone = Arc::clone(&captured);
-        let connections_clone = Arc::clone(&connections);
-        let status = status.to_string();
-        let body = body.to_string();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else { break };
-                connections_clone.fetch_add(1, Ordering::SeqCst);
-                let captured = Arc::clone(&captured_clone);
-                let status = status.clone();
-                let body = body.clone();
-                std::thread::spawn(move || {
-                    let mut reader = BufReader::new(stream.try_clone().expect("clone"));
-                    let mut lines = Vec::new();
-                    let mut line = String::new();
-                    while let Ok(n) = reader.read_line(&mut line) {
-                        if n == 0 || line == "\r\n" {
-                            break;
-                        }
-                        lines.push(line.trim_end().to_string());
-                        line.clear();
-                    }
-                    captured.lock().expect("capture").extend(lines);
-                    if hold {
-                        // Never answer; the client must time out.
-                        std::thread::sleep(Duration::from_secs(5));
-                        return;
-                    }
-                    let mut stream = stream;
-                    let _ = write!(
-                        stream,
-                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
-                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                });
-            }
-        });
-        (address, captured, connections)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::test_server::spawn as spawn_server;
     use super::*;
+    use crate::test_server::{spawn as spawn_server, spawn_raw as spawn_server_raw};
     use ks_core::ports::http::HttpMethod;
     use std::sync::atomic::Ordering;
 
@@ -398,7 +345,15 @@ mod tests {
     }
 
     fn get(client: &TcpHttpClient, url: &str) -> Result<HttpResponse, HttpError> {
-        let mut future = Box::pin(client.send(HttpRequest::new(HttpMethod::Get, url)));
+        send(client, HttpMethod::Get, url)
+    }
+
+    fn send(
+        client: &TcpHttpClient,
+        method: HttpMethod,
+        url: &str,
+    ) -> Result<HttpResponse, HttpError> {
+        let mut future = Box::pin(client.send(HttpRequest::new(method, url)));
         let waker = std::task::Waker::noop();
         let mut context = std::task::Context::from_waker(waker);
         loop {
@@ -423,6 +378,32 @@ mod tests {
         );
         assert!(sent.iter().any(|line| line == &format!("Host: {address}")), "{sent:?}");
         assert!(sent.iter().any(|line| line == "Connection: close"), "{sent:?}");
+    }
+
+    #[test]
+    fn a_body_carrying_verb_frames_an_empty_body() {
+        let (address, captured, _) = spawn_server("201 Created", "", false);
+        let client = client("127.0.0.1", 1024, Duration::from_secs(5));
+        send(&client, HttpMethod::Put, &format!("http://{address}/v2/app/blobs/uploads/1"))
+            .expect("the scripted response");
+        let sent = captured.lock().expect("capture").clone();
+        assert!(sent.iter().any(|line| line == "Content-Length: 0"), "{sent:?}");
+    }
+
+    #[test]
+    fn a_head_survives_a_chunked_answer_it_never_reads() {
+        // A registry is free to frame a HEAD the way it frames the GET; the
+        // client must not refuse the request over a body it is not reading.
+        let (address, _, _) = spawn_server_raw(
+            "HTTP/1.1 200 OK\r\nDocker-Content-Digest: sha256:\
+             abc\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            false,
+        );
+        let client = client("127.0.0.1", 1024, Duration::from_secs(5));
+        let response = send(&client, HttpMethod::Head, &format!("http://{address}/v2/app"))
+            .expect("a HEAD has no body to frame");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, Vec::<u8>::new());
     }
 
     #[test]
