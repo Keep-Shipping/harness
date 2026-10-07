@@ -132,6 +132,25 @@ impl Journal {
         self.emit(e).await
     }
 
+    /// Records that an attestation was pushed against an image: the digest of
+    /// the image it describes, the predicate the attestation carries, and the
+    /// digest of the pushed envelope.
+    pub async fn attestation_attached(
+        &self,
+        step: &str,
+        subject: &str,
+        predicate_type: &str,
+        attestation: &str,
+    ) -> Result<(), RunLogError> {
+        let e = RunEvent::AttestationAttached {
+            step: step.into(),
+            subject: subject.into(),
+            predicate_type: predicate_type.into(),
+            attestation: attestation.into(),
+        };
+        self.emit(e).await
+    }
+
     /// Records that a policy rule refused the run; `step` is `None` before any step ran.
     pub async fn policy_refused(&self, step: Option<&str>, rule: &str) -> Result<(), RunLogError> {
         let e = RunEvent::PolicyRefused { step: step.map(str::to_string), rule: rule.into() };

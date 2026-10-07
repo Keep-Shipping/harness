@@ -240,7 +240,7 @@ fn completion_offers_kinds_inputs_and_outputs() {
     // A key inside a step is one of that kind's inputs.
     client.change(HERO_URI, "steps:\n  build: oci.image\n    ");
     let answer = client.request("textDocument/completion", at(HERO_URI, 2, 4));
-    assert_eq!(labels(&answer), ["from", "push", "sign", "when"]);
+    assert_eq!(labels(&answer), ["from", "push", "sign", "sbom", "when"]);
 
     // `build.` is one of that step's outputs.
     client.change(HERO_URI, "steps:\n  build: oci.image\n  deploy: k8s.rollout\n    image: build.");

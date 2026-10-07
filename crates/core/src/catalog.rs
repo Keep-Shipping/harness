@@ -118,7 +118,12 @@ impl Catalog {
         };
         add(
             "oci.image",
-            &[("from", Type::Path), ("push", named("oci.Tag")), ("sign", Type::Bool)],
+            &[
+                ("from", Type::Path),
+                ("push", named("oci.Tag")),
+                ("sign", Type::Bool),
+                ("sbom", Type::Bool),
+            ],
             &[("digest", named("oci.Digest")), ("tag", Type::String), ("signed", Type::Bool)],
             false,
             false,

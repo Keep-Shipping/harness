@@ -254,6 +254,12 @@ fn event_fields(event: &RunEvent) -> Result<Map<String, Value>, RunLogError> {
             put("threshold", number(*threshold));
             put("outcome", text(outcome));
         }
+        RunEvent::AttestationAttached { step, subject, predicate_type, attestation } => {
+            put("step", text(step));
+            put("subject", text(subject));
+            put("predicate_type", text(predicate_type));
+            put("attestation", text(attestation));
+        }
         RunEvent::PolicyRefused { step, rule } => {
             if let Some(step) = step {
                 put("step", text(step));
@@ -502,6 +508,29 @@ mod tests {
         assert!(!bytes.contains(SECRET), "a secret reached the log bytes: {bytes}");
         assert!(bytes.contains("***"), "it was redacted, not dropped: {bytes}");
         assert_eq!(verify(&bytes).expect("chain intact"), 2);
+    }
+
+    /// An attestation that was attached has a wire form like any other event: the step, the image
+    /// it describes, the predicate, and where the envelope landed.
+    #[test]
+    fn an_attestation_attached_renders_as_one_line() {
+        let (log, run) = log("attestation");
+        block_on(log.append(
+            &run,
+            RunEvent::AttestationAttached {
+                step: "build".into(),
+                subject: "sha256:ee".into(),
+                predicate_type: "https://slsa.dev/provenance/v1".into(),
+                attestation: "sha256:ff".into(),
+            },
+        ))
+        .expect("append");
+
+        let bytes = written(&log, &run);
+        assert_eq!(verify(&bytes).expect("chain intact"), 1);
+        for field in ["attestation.attached", "\"step\":\"build\"", "\"subject\":\"sha256:ee\""] {
+            assert!(bytes.contains(field), "{field} is missing from {bytes}");
+        }
     }
 
     #[test]

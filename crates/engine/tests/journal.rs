@@ -156,6 +156,14 @@ fn each_transition_emits_exactly_one_event() {
             ))
         }),
         ("policy.refused", |j| Box::pin(j.policy_refused(Some("d"), "no-prod"))),
+        ("attestation.attached", |j| {
+            Box::pin(j.attestation_attached(
+                "build",
+                "sha256:aa",
+                "https://slsa.dev/provenance/v1",
+                "sha256:bb",
+            ))
+        }),
         ("run.finished", |j| Box::pin(j.run_finished("ok", hashes()))),
     ];
 

@@ -612,7 +612,7 @@ steps:
     #[test]
     fn a_key_inside_a_step_offers_that_kinds_inputs() {
         let (doc, at) = typing("steps:\n  build: oci.image\n    fr", "    fr");
-        assert_eq!(labels(&doc, at), ["from", "push", "sign", "when"]);
+        assert_eq!(labels(&doc, at), ["from", "push", "sign", "sbom", "when"]);
     }
 
     #[test]
