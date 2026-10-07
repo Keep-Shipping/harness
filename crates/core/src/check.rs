@@ -2,11 +2,12 @@
 //! reference, type and declaration problem it finds — never just the first.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 
 use ks_lang::{Atom, Code, Diagnostic, Entry, Expr, Fix, Span, StrPart, Word};
 
 use crate::auto_rule::{self, MISSING_GUARD_HINT, MISSING_GUARD_MESSAGE};
+use crate::block::{self, BLOCK_KEY, BlockInput, BlockSignature};
 use crate::catalog::{AFTER, Catalog, StepTypes, WHEN};
 use crate::context::{CheckContext, unmet_steps};
 use crate::format::{self, Formats, Header};
@@ -157,6 +158,11 @@ pub struct CheckOptions<'a> {
     /// by the caller — keyed by the `dir:` text as the file spells it, then
     /// by output name. Without it every run-time output stays unchecked.
     pub(crate) iac_outputs: Option<&'a BTreeMap<String, BTreeMap<String, Type>>>,
+    /// The blocks this check may use, resolved by the caller
+    /// ([`block_signatures`](crate::block::block_signatures)) — keyed by the
+    /// use's kind exactly as the file spells it (`acme/web-service@v3`). A
+    /// use is checked against its signature and nothing else.
+    pub(crate) blocks: Option<&'a BTreeMap<String, BlockSignature>>,
 }
 
 impl<'a> CheckOptions<'a> {
@@ -169,6 +175,7 @@ impl<'a> CheckOptions<'a> {
             context: None,
             in_ci: false,
             iac_outputs: None,
+            blocks: None,
         }
     }
 
@@ -227,6 +234,17 @@ impl<'a> CheckOptions<'a> {
         self.iac_outputs = Some(outputs);
         self
     }
+
+    /// Checks against the blocks this run may use, as resolved by the
+    /// caller ([`block::block_signatures`](crate::block::block_signatures)).
+    /// `blocks` is keyed by the use's kind exactly as the file spells it
+    /// (`acme/web-service@v3`); a use of a kind it does not name checks no
+    /// inputs, as an unknown step kind always has.
+    #[must_use]
+    pub fn blocks(mut self, blocks: &'a BTreeMap<String, BlockSignature>) -> CheckOptions<'a> {
+        self.blocks = Some(blocks);
+        self
+    }
 }
 
 /// Type-check `parse` and build its [`Workflow`], against `options`.
@@ -238,6 +256,7 @@ pub fn check_with(parse: &ks_lang::Parse, options: &CheckOptions<'_>) -> Checked
         options.context.clone(),
         options.in_ci,
         options.iac_outputs,
+        options.blocks,
         parse.diagnostics().to_vec(),
     );
     c.file(parse.file());
@@ -247,6 +266,10 @@ pub fn check_with(parse: &ks_lang::Parse, options: &CheckOptions<'_>) -> Checked
 /// Context namespaces a reference's first segment may name. `env` is also
 /// the `is` subject of `when: env is prod`.
 const NAMESPACES: [&str; 6] = ["git", "pr", "run", "env", "ci", "secrets"];
+
+/// The namespace a block file's declared inputs answer to. It is a
+/// namespace in block files only, so no workflow has to give the name up.
+const INPUTS: &str = "inputs";
 
 const POLICY_VERBS: [&str; 10] =
     ["check", "build", "test", "plan", "apply", "deploy", "destroy", "publish", "read", "run"];
@@ -295,6 +318,13 @@ struct Ctx<'a> {
     in_ci: bool,
     /// What the IaC behind each `dir:` declares, when the caller read it.
     iac_outputs: Option<&'a BTreeMap<String, BTreeMap<String, Type>>>,
+    /// The blocks a use may be checked against, when the caller resolved
+    /// them: keyed by the use's kind exactly as the file spells it.
+    blocks: Option<&'a BTreeMap<String, BlockSignature>>,
+    /// The `block:` this file declares, when it is a block file: the inputs
+    /// its internal steps read as `inputs.<name>`. `None` in every other
+    /// file, so `inputs.` names nothing a workflow could have spelled.
+    block: Option<BlockScope>,
     diags: Vec<Diagnostic>,
     /// The dotted path of the entry being checked (`deploy.image`), attached
     /// to every diagnostic raised while it is checked.
@@ -325,6 +355,13 @@ struct Ctx<'a> {
     types: Vec<(Span, Type)>,
 }
 
+/// The `block:` a block file declares: its name and the inputs in scope for
+/// its internal steps.
+struct BlockScope {
+    name: String,
+    inputs: BTreeMap<String, Type>,
+}
+
 struct StepInfo<'a> {
     name: String,
     span: Span,
@@ -343,6 +380,16 @@ struct StepInfo<'a> {
     /// file says it holds, or `None` when the spelling is not a type at
     /// all (reported in the second pass).
     outputs: Vec<(String, Option<Type>)>,
+    /// The block this step uses, when its kind names one. Its signature is
+    /// the step's `spec`, its actions the step's, and its outputs answer
+    /// for `<step>.out.<name>`.
+    block: Option<&'a BlockSignature>,
+    /// What the step does, for policy, with the kind that performs it.
+    actions: Vec<(ActionClass, String)>,
+    /// A block use's inputs, with the signature's defaults filled in — what
+    /// the run will get whether the file spelled it or the block declared
+    /// it.
+    block_inputs: BTreeMap<String, String>,
     /// The `when:` condition, for the planner.
     when: Option<Condition>,
 }
@@ -356,6 +403,7 @@ struct Edge {
 }
 
 impl<'a> Ctx<'a> {
+    #[allow(clippy::too_many_arguments)] // the check options, one field for one
     fn new(
         catalog: &'a Catalog,
         formats: &'a Formats<'a>,
@@ -363,6 +411,7 @@ impl<'a> Ctx<'a> {
         context: Option<CheckContext>,
         in_ci: bool,
         iac_outputs: Option<&'a BTreeMap<String, BTreeMap<String, Type>>>,
+        blocks: Option<&'a BTreeMap<String, BlockSignature>>,
         diags: Vec<Diagnostic>,
     ) -> Ctx<'a> {
         Ctx {
@@ -373,6 +422,8 @@ impl<'a> Ctx<'a> {
             in_ci,
             iac_outputs,
             diags,
+            blocks,
+            block: None,
             subject: None,
             env_names: Vec::new(),
             env_vars: Vec::new(),
@@ -435,18 +486,24 @@ impl<'a> Ctx<'a> {
         // declaring a format this build cannot read should say so before it
         // says anything else.
         self.check_format(file);
+        let entries: Vec<Entry<'_>> = file.entries().collect();
+        // A block's inputs are in scope for its internal steps, so they are
+        // declared before the first pass reads any reference.
+        if let Some(block) = entries.iter().find(|e| e.key_name() == Some(BLOCK_KEY)) {
+            self.declare_block(&entries, *block);
+        }
         // First pass: declare the steps and environments, so a reference
         // resolves no matter where in the file its target sits.
-        for e in file.entries() {
+        for e in &entries {
             match e.key_name() {
-                Some("steps") => self.declare_steps(e),
-                Some("envs") => self.declare_envs(e),
+                Some("steps") => self.declare_steps(*e),
+                Some("envs") => self.declare_envs(*e),
                 _ => {}
             }
         }
         // Second pass: check everything.
         let mut saw_envs = false;
-        for e in file.entries() {
+        for e in entries {
             match e.key_name() {
                 Some("name") => self.name = self.scalar_text(e),
                 Some(format::HEADER_KEY) => {} // read by `check_format`
@@ -463,6 +520,9 @@ impl<'a> Ctx<'a> {
                 Some("policy") => {
                     self.policy_spans.push(e.node().span());
                     self.check_policy(e);
+                }
+                Some(BLOCK_KEY | "inputs" | "outputs") if self.block.is_some() => {
+                    self.check_block_entry(e);
                 }
                 _ => {} // other top-level keys carry no meaning here yet
             }
@@ -587,7 +647,12 @@ impl<'a> Ctx<'a> {
                 }
                 _ => (None, span),
             };
-            let spec = kind_name.as_deref().and_then(|n| self.catalog.step(n));
+            let block = kind_name.as_deref().and_then(|n| self.blocks.and_then(|b| b.get(n)));
+            // A block the caller resolved answers as a step kind, so a use
+            // flows through the same `spec` path every catalog step takes.
+            let spec = kind_name
+                .as_deref()
+                .and_then(|n| self.catalog.step(n).or_else(|| block.map(|b| b.as_step_types())));
             let ci_only = self.step_ci_only(s);
             let variants = match spec.filter(|sp| sp.decision) {
                 Some(_) => s
@@ -597,6 +662,22 @@ impl<'a> Ctx<'a> {
                     .map(|e| union_words(&e))
                     .unwrap_or_default(),
                 None => Vec::new(),
+            };
+            // What the step does, for policy: a block contributes the
+            // actions of every step inside it, so a use cannot hide an
+            // apply from the rules.
+            let actions = match block {
+                Some(b) => b.actions.clone(),
+                None => match kind_name.as_deref() {
+                    Some(k) if self.catalog.step(k).is_some() => {
+                        let class = match env_gate(s) {
+                            Some(env) => ActionClass::new(ActionKind::of_kind(k)).in_env(env),
+                            None => ActionClass::new(ActionKind::of_kind(k)),
+                        };
+                        vec![(class, k.to_string())]
+                    }
+                    _ => Vec::new(),
+                },
             };
             self.steps.push(StepInfo {
                 name: name.into(),
@@ -609,6 +690,9 @@ impl<'a> Ctx<'a> {
                 dir: literal_input(s, "dir"),
                 plan: plan_step(s),
                 outputs: outputs_mapping(s, spec),
+                block,
+                actions,
+                block_inputs: block.map(|b| block_input_values(s, b)).unwrap_or_default(),
                 when: None,
             });
             self.index.insert(name.to_string(), self.steps.len() - 1);
@@ -641,6 +725,38 @@ impl<'a> Ctx<'a> {
                 self.subject = Some(format!("{}.{}", self.steps[idx].name, iname));
                 self.check_input(idx, iname, input);
                 self.subject = None;
+            }
+            self.check_block_use(idx, s);
+        }
+    }
+
+    /// A block use that leaves out a required input: named at the step's
+    /// kind, with the block's own inputs offered as the near misses. An
+    /// input with a default may be left out, which is the point of one.
+    fn check_block_use(&mut self, idx: usize, step: Entry<'_>) {
+        let Some(block) = self.steps[idx].block else { return };
+        let given: Vec<String> =
+            step.children().filter_map(|c| c.key_name().map(String::from)).collect();
+        let names: Vec<String> = block.inputs.iter().map(|i| i.name.clone()).collect();
+        for BlockInput { name, ty: _, default } in &block.inputs {
+            if default.is_some() {
+                continue;
+            }
+            if given.iter().any(|g| g == name) {
+                continue;
+            }
+            let msg = format!("block `{}` requires input `{name}`", block.name);
+            // The name itself is no use as a suggestion for what it is.
+            let others: Vec<&str> =
+                names.iter().map(String::as_str).filter(|n| *n != name).collect();
+            match suggest(name, &others) {
+                Some(s) => self.err_hint(
+                    Code::MissingInput,
+                    self.steps[idx].kind_span,
+                    msg,
+                    format!("did you mean `{s}`?"),
+                ),
+                None => self.err(Code::MissingInput, self.steps[idx].kind_span, msg),
             }
         }
     }
@@ -960,8 +1076,21 @@ impl<'a> Ctx<'a> {
     /// A bare word in a typed input position.
     fn word_typed(&mut self, idx: usize, w: &Word<'_>, want: Type) {
         let span = w.node.span();
-        if w.scalar() == ks_lang::Scalar::DottedName {
-            let Some((target, got)) = self.resolve_ref(idx, w.text(), span) else { return };
+        // A `string` input takes text, and text has dots in it: `domain:
+        // api.acme.dev` is a value, not a reference. A dotted name that
+        // does name a step or a context value still is one — `model:
+        // secrets.db_url` is a secret, and errors as one — and so does one
+        // a keystroke or two from such a name: `type: biuld.digest` is a
+        // misspelled reference, not text.
+        if w.scalar() == ks_lang::Scalar::DottedName && matches!(want, Type::String) {
+            let text = w.text();
+            match self.soft_ref(idx, text, span) {
+                Some(got) => self.demand(span, want, got, None, None),
+                None if self.near_miss(text) => self.unknown_ref(text, span),
+                None => self.demand_literal(span, want, Type::String, Some(text)),
+            }
+        } else if w.scalar() == ks_lang::Scalar::DottedName {
+            let Some((target, got)) = self.resolve_ref(Some(idx), w.text(), span) else { return };
             // The output of the wanted type, when the step has exactly one:
             // rewriting just that segment makes the value fit.
             let mut fix = None;
@@ -1024,7 +1153,7 @@ impl<'a> Ctx<'a> {
 
     /// A `{name}` interpolation: always a reference; never a secret.
     fn interp(&mut self, idx: usize, name: &str, span: Span) {
-        if let Some((_, ty)) = self.resolve_ref(idx, name, span) {
+        if let Some((_, ty)) = self.resolve_ref(Some(idx), name, span) {
             if ty == Type::Secret {
                 self.err_hint(
                     Code::SecretInString,
@@ -1164,10 +1293,20 @@ impl<'a> Ctx<'a> {
 
     /// Resolve a dotted or interpolated name that must be a reference.
     /// Returns the step it names (when not a context value) and its type.
-    fn resolve_ref(&mut self, cur: usize, text: &str, span: Span) -> Option<(Option<usize>, Type)> {
+    /// `cur` is the step reading it, or `None` where no step is being
+    /// checked — a block's `outputs:` mapping, which types against the
+    /// block's own steps and orders nothing.
+    fn resolve_ref(
+        &mut self,
+        cur: Option<usize>,
+        text: &str,
+        span: Span,
+    ) -> Option<(Option<usize>, Type)> {
         let (first, rest) = split_first(text);
         if let Some(i) = self.step_index(first) {
-            self.edge(cur, i, span, true);
+            if let Some(cur) = cur {
+                self.edge(cur, i, span, true);
+            }
             return Some((Some(i), self.step_ref(i, rest, span)));
         }
         if let Some(t) = self.context(first, rest, span) {
@@ -1177,16 +1316,35 @@ impl<'a> Ctx<'a> {
             if first == "secrets"
                 && let Some(name) = rest
             {
-                self.secret_uses.push(SecretUse {
-                    key: name.to_string(),
-                    span,
-                    step: self.steps[cur].name.clone(),
-                });
+                let step = match cur {
+                    Some(cur) => self.steps[cur].name.clone(),
+                    None => self.block.as_ref().map_or_else(String::new, |b| b.name.clone()),
+                };
+                self.secret_uses.push(SecretUse { key: name.to_string(), span, step });
             }
             return Some((None, t));
         }
+        self.unknown_ref(text, span);
+        None
+    }
+
+    /// The names a reference's first segment may be: the file's own steps,
+    /// the context namespaces, and — in a block file — its inputs.
+    fn ref_candidates(&self) -> Vec<&str> {
         let mut cands: Vec<&str> = self.steps.iter().map(|s| s.name.as_str()).collect();
         cands.extend_from_slice(&NAMESPACES);
+        if self.block.is_some() {
+            cands.push(INPUTS);
+        }
+        cands
+    }
+
+    /// `unknown step or context value`, with the near miss when the head
+    /// segment is a keystroke or two from one of the names it could have
+    /// been.
+    fn unknown_ref(&mut self, text: &str, span: Span) {
+        let (first, _) = split_first(text);
+        let cands = self.ref_candidates();
         let msg = format!("unknown step or context value `{first}`");
         match suggestion(first, &cands) {
             Some((s, unique)) => self.err_hint_fix(
@@ -1198,17 +1356,26 @@ impl<'a> Ctx<'a> {
             ),
             None => self.err(Code::UnknownRef, span, msg),
         }
-        None
     }
 
     /// A dotted name in a String/untyped position: a reference only when its
     /// first segment names a step or a context namespace.
     fn soft_ref(&mut self, cur: usize, text: &str, span: Span) -> Option<Type> {
         let (first, _) = split_first(text);
-        if self.step_index(first).is_some() || NAMESPACES.contains(&first) {
-            return self.resolve_ref(cur, text, span).map(|(_, t)| t);
+        if self.step_index(first).is_some()
+            || NAMESPACES.contains(&first)
+            || (first == INPUTS && self.block.is_some())
+        {
+            return self.resolve_ref(Some(cur), text, span).map(|(_, t)| t);
         }
         None
+    }
+
+    /// Whether a dotted name's first segment is close enough to one of the
+    /// names it could have been that it reads as a misspelled reference.
+    fn near_miss(&self, text: &str) -> bool {
+        let (first, _) = split_first(text);
+        suggestion(first, &self.ref_candidates()).is_some()
     }
 
     fn step_ref(&mut self, i: usize, rest: Option<&str>, span: Span) -> Type {
@@ -1270,6 +1437,32 @@ impl<'a> Ctx<'a> {
         if let Some(ty) = mapped {
             return Self::field_of(ty, deeper);
         }
+        // A block use: its `outputs:` mapping answers, and a name it does
+        // not declare is the same unknown output it is anywhere else.
+        if let Some(block) = self.steps[i].block {
+            let Some(ty) = block.outputs.iter().find(|(n, _)| n == name).map(|(_, ty)| ty.clone())
+            else {
+                let step = self.steps[i].name.clone();
+                let names: Vec<String> = block.outputs.iter().map(|(n, _)| n.clone()).collect();
+                let msg = format!("block `{}` has no output `{name}`", block.name);
+                match suggestion(name, &names) {
+                    Some((s, unique)) => {
+                        let at = segment_span(rest, span.end - rest.len() as u32, 1);
+                        let fix = Fix::new(at, s.clone(), unique);
+                        self.err_hint_fix(
+                            Code::UnknownOutput,
+                            span,
+                            msg,
+                            format!("step `{step}` could read `{step}.{s}`; did you mean `{s}`?"),
+                            fix,
+                        );
+                    }
+                    None => self.err(Code::UnknownOutput, span, msg),
+                }
+                return Type::Any;
+            };
+            return Self::field_of(ty, deeper);
+        }
         let (Some(dir), Some(declared)) = (self.iac_dir(i), self.iac_outputs) else {
             return Type::Any;
         };
@@ -1328,6 +1521,22 @@ impl<'a> Ctx<'a> {
     fn context(&mut self, ns: &str, rest: Option<&str>, span: Span) -> Option<Type> {
         let Some(rest) = rest else { return Some(Type::Any) }; // a bare namespace
         let (name, _more) = split_first(rest);
+        // `inputs.<name>` names a block's own input, and only inside the
+        // block file that declares it — in a workflow `inputs` is no
+        // namespace at all, so the step below says it is unknown.
+        if ns == INPUTS && self.block.is_some() {
+            let Some(ty) = self.block.as_ref().and_then(|b| b.inputs.get(name)).cloned() else {
+                let names: Vec<String> = self
+                    .block
+                    .as_ref()
+                    .map(|b| b.inputs.keys().cloned().collect())
+                    .unwrap_or_default();
+                let names: Vec<&str> = names.iter().map(String::as_str).collect();
+                member_error(self, INPUTS, name, &names, span);
+                return None;
+            };
+            return Some(ty);
+        }
         let ty = match (ns, name) {
             ("git", "sha" | "ref" | "branch") => Type::String,
             ("git", "tag") => Type::Optional(Box::new(Type::String)),
@@ -1610,7 +1819,7 @@ impl<'a> Ctx<'a> {
                         || w.scalar() == ks_lang::Scalar::Ident =>
                 {
                     let span = w.node.span();
-                    if let Some((target, ty)) = self.resolve_ref(idx, w.text(), span) {
+                    if let Some((target, ty)) = self.resolve_ref(Some(idx), w.text(), span) {
                         self.record(span, ty.clone());
                         if ty == Type::Secret {
                             self.cannot_show_secret(span, w.text());
@@ -1829,6 +2038,158 @@ impl<'a> Ctx<'a> {
         out
     }
 
+    // --- blocks ------------------------------------------------------------
+
+    /// The `block:` this file declares, with the inputs its internal steps
+    /// read as `inputs.<name>`. Declared before the steps, so a step may
+    /// name any input whatever its order in the file.
+    fn declare_block(&mut self, entries: &[Entry<'_>], block: Entry<'_>) {
+        let Some(name) = block.expr().as_ref().and_then(value_text) else { return };
+        let inputs = entries
+            .iter()
+            .find(|e| e.key_name() == Some("inputs"))
+            .map(|declared| {
+                declared
+                    .children()
+                    .filter_map(|i| {
+                        let name = i.key_name()?.to_string();
+                        let expr = i.expr()?;
+                        // `domain: string`, or the annotation of `replicas:
+                        // int = 2`: either way the declared type is the
+                        // annotation.
+                        let ty = match annotation_default(&expr) {
+                            Some((_, ty, _)) => ty,
+                            None => Type::parse(&value_text(&expr)?)?,
+                        };
+                        Some((name, ty))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.block = Some(BlockScope { name, inputs });
+    }
+
+    /// A block file's `block:`, `inputs:` and `outputs:`, each checked
+    /// against what the language spells. A block file is a file like any
+    /// other: what it declares is checked where it is declared, so the
+    /// block alone says whether it is sound.
+    fn check_block_entry(&mut self, e: Entry<'_>) {
+        match e.key_name() {
+            Some("inputs") => self.check_block_inputs(e),
+            Some("outputs") => self.check_block_outputs(e),
+            _ => {}
+        }
+    }
+
+    /// `inputs:`: `name: <type>`, or `name: <type> = <literal>` for a
+    /// default. The type must parse, and a default must be a literal of it
+    /// — a default that fits nothing is a lie about what a use may leave
+    /// out.
+    fn check_block_inputs(&mut self, inputs: Entry<'_>) {
+        for i in inputs.children() {
+            let (Some(name), Some(expr)) = (i.key_name(), i.expr()) else { continue };
+            self.subject = Some(format!("inputs.{name}"));
+            // `when:`, `after:` and `outputs:` are read off a use whatever
+            // its kind, so an input of that name would be shadowed by the
+            // step property rather than reach the block.
+            if !block::input_allowed(name) {
+                self.err_hint(
+                    Code::ReservedStepName,
+                    i.key_span(),
+                    format!("`{name}` is a step property, not an input name"),
+                    format!("rename the input; a use spells `{name}` as the step's own"),
+                );
+                self.subject = None;
+                continue;
+            }
+            match annotation_default(&expr) {
+                Some((_, ty, rhs)) => {
+                    let span = rhs.span();
+                    let Some(text) = value_text(rhs) else {
+                        self.err_hint(
+                            Code::TypeMismatch,
+                            span,
+                            "a default is a single literal",
+                            "`replicas: int = 2`",
+                        );
+                        continue;
+                    };
+                    if let LiteralFit::Err = self.literal_fit(&ty, &text) {
+                        self.err_hint(
+                            Code::TypeMismatch,
+                            span,
+                            format!("expected {ty}, got `{text}`"),
+                            "the default must be a literal of the type it declares",
+                        );
+                    }
+                }
+                None => {
+                    let Some(text) = value_text(&expr) else {
+                        self.err_hint(
+                            Code::TypeMismatch,
+                            expr.span(),
+                            "an input declares a type",
+                            "`domain: string`",
+                        );
+                        continue;
+                    };
+                    if Type::parse(&text).is_none() {
+                        let hint = "spell it as `k8s.Cluster`, `string` or `{name: type}`";
+                        self.err_hint(
+                            Code::TypeMismatch,
+                            expr.span(),
+                            format!("`{text}` is not a type"),
+                            hint,
+                        );
+                    }
+                }
+            }
+            self.subject = None;
+        }
+    }
+
+    /// `outputs:`: `name: <type> = <an internal step's output>`. The right
+    /// side is a reference like any other, so it types against the steps
+    /// the block declares and must fit the type written beside it — the
+    /// output a use reads back is exactly what this says it is.
+    fn check_block_outputs(&mut self, outputs: Entry<'_>) {
+        for o in outputs.children() {
+            let (Some(name), Some(expr)) = (o.key_name(), o.expr()) else { continue };
+            self.subject = Some(format!("outputs.{name}"));
+            let hint = "spell it as `url: string = ship.url`";
+            let Some((_, ty, rhs)) = annotation_default(&expr) else {
+                let spelled = value_text(&expr).unwrap_or_default();
+                self.err_hint(
+                    Code::TypeMismatch,
+                    expr.span(),
+                    format!("`{spelled}` is not a `name: type = step.output` mapping"),
+                    hint,
+                );
+                self.subject = None;
+                continue;
+            };
+            let span = rhs.span();
+            match subject_word(rhs) {
+                Some(w) if w.scalar() == ks_lang::Scalar::DottedName => {
+                    if let Some((_, got)) = self.resolve_ref(None, w.text(), w.node.span()) {
+                        self.demand(w.node.span(), ty, got, None, None);
+                    }
+                }
+                Some(w) => {
+                    let text = w.text();
+                    self.demand_literal(w.node.span(), ty, types::literal_type(text), Some(text));
+                }
+                None => self.err_hint(
+                    Code::TypeMismatch,
+                    span,
+                    "an output maps one of the block's own step outputs",
+                    hint,
+                ),
+            }
+            self.subject = None;
+        }
+    }
+
     fn check_policy(&mut self, policy: Entry<'_>) {
         for actor in policy.children() {
             let kind = match actor.key_name() {
@@ -2034,21 +2395,37 @@ impl<'a> Ctx<'a> {
     /// the run needs is refused once, at its first reference, so the run
     /// stops before it starts.
     fn enforce_actor_policy(&mut self) {
-        if self.actor != Some(ActorKind::Agent)
-            || !self.policy.forbids(ActorKind::Agent, "read", "secrets")
-        {
+        if self.actor != Some(ActorKind::Agent) {
             return;
         }
-        // One refusal per distinct key, at its first reference span. The
-        // keys are collected owned so the loop below can borrow `self`
-        // mutably without cloning `secret_uses`.
+        self.forbid_agent_secrets();
+        self.forbid_agent_actions();
+    }
+
+    /// `agents: never: read secrets` over the secrets this run needs: every
+    /// distinct one is refused once, at its first reference, so the run
+    /// stops before it starts. A block use is judged by the secrets the
+    /// steps inside it read, so a block cannot hide one behind its name.
+    fn forbid_agent_secrets(&mut self) {
+        if !self.policy.forbids(ActorKind::Agent, "read", "secrets") {
+            return;
+        }
+        // One refusal per distinct key, at its first reference span. Both
+        // sources are collected owned so the loop below can borrow `self`
+        // mutably without cloning either.
         let mut seen: HashSet<&str> = HashSet::new();
-        let firsts: Vec<(String, Span)> = self
-            .secret_uses
-            .iter()
-            .filter(|u| seen.insert(u.key.as_str()))
-            .map(|u| (u.key.clone(), u.span))
-            .collect();
+        let mut firsts: Vec<(String, Span)> = Vec::new();
+        let mut seen_keys: HashSet<String> = HashSet::new();
+        for u in &self.secret_uses {
+            if seen.insert(u.key.as_str()) {
+                firsts.push((u.key.clone(), u.span));
+            }
+        }
+        for (key, span) in self.block_secrets() {
+            if seen_keys.insert(key.clone()) {
+                firsts.push((key, span));
+            }
+        }
         if firsts.is_empty() {
             return; // the rule binds, but this run needs no secrets
         }
@@ -2178,6 +2555,74 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// The `secrets.<name>` keys every block use needs, at the use's own
+    /// kind — the file being checked never spells them, so the use is where
+    /// they can be pointed at.
+    fn block_secrets(&self) -> Vec<(String, Span)> {
+        let mut out = Vec::new();
+        for s in &self.steps {
+            let Some(block) = s.block else { continue };
+            for key in &block.secrets {
+                out.push((key.clone(), s.kind_span));
+            }
+        }
+        out
+    }
+
+    /// Every step's actions against the agents' `never:` rules. A block
+    /// use is judged by what the steps inside it do, so a use cannot hide
+    /// an apply behind a name the policy does not know. A plain step that
+    /// [`Self::enforce_step_policy`] already refuses is not reported twice.
+    fn forbid_agent_actions(&mut self) {
+        for i in 0..self.steps.len() {
+            let what = match self.block_name(&self.steps[i]) {
+                Some(block) => format!("block `{block}`"),
+                None => {
+                    if let Some(spec) = self.steps[i].spec {
+                        let refused =
+                            policy::decide(&self.policy, None, ActorKind::Agent, &spec.action())
+                                .is_some_and(|d| d.disposition == Disposition::Never);
+                        if refused {
+                            continue;
+                        }
+                    }
+                    format!("step `{}`", self.steps[i].name)
+                }
+            };
+            self.forbid_actions_of(i, &what);
+        }
+    }
+
+    /// The actions of step `i` against the agents' rules, named `what`: a
+    /// plain step by its own name, a block use by the block's, since the use
+    /// only says which block it wants.
+    fn forbid_actions_of(&mut self, i: usize, what: &str) {
+        for (action, origin) in self.steps[i].actions.clone() {
+            let Some(env) = action.env.clone() else { continue };
+            let verb = action.kind.as_str();
+            if !self.policy.forbids(ActorKind::Agent, verb, &env) {
+                continue;
+            }
+            let span = self.steps[i].kind_span;
+            // The kind that does the work, so a refusal names the step
+            // inside the block rather than the name the use spells.
+            let d = Diagnostic::error(
+                Code::PolicyForbidden,
+                span,
+                format!(
+                    "{what} runs `{action}` ({origin}); policy forbids agents from \
+                         running `{action}`"
+                ),
+            );
+            self.push(d.with_hint(format!("the rule is `policy: agents: never: {verb} {env}`")));
+        }
+    }
+
+    /// The block a step uses, when it uses one.
+    fn block_name(&self, step: &StepInfo<'_>) -> Option<String> {
+        step.block.map(|b| b.name.clone())
+    }
+
     fn finish_all(mut self) -> Checked {
         self.enforce_actor_policy();
         self.enforce_step_policy();
@@ -2251,6 +2696,8 @@ impl<'a> Ctx<'a> {
                 span: s.span,
                 kind_span: s.kind_span,
                 ci_only: s.ci_only,
+                actions: s.actions.iter().map(|(a, _)| a.clone()).collect(),
+                block_inputs: s.block_inputs.clone(),
                 when: s.when.clone(),
             })
             .collect();
@@ -2367,10 +2814,41 @@ fn secret_hint(want: &Type, got: &Type) -> Option<String> {
         .then(|| "secrets flow only into inputs typed Secret".to_string())
 }
 
+/// The environment a step's `when: env is <name>` binds it to: the one
+/// environment the step runs in, which is what an action acts on for policy.
+/// `None` for every other `when:`, and for a step that names no environment.
+pub(crate) fn env_gate(step: Entry<'_>) -> Option<String> {
+    let e = step.children().find(|c| c.key_name() == Some("when"))?.expr()?;
+    match context_test(&e)? {
+        ContextTest::EnvIs { env } => Some(env),
+        _ => None,
+    }
+}
+
+/// The `secrets.<name>` keys one step's own children read, sorted and
+/// distinct — what a block's signature carries so a use is judged against
+/// what the block needs.
+pub(crate) fn secret_keys(step: Entry<'_>) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    let exprs = step.expr().into_iter().chain(step.children().filter_map(|c| c.expr()));
+    for e in exprs {
+        for e in e.refs() {
+            if e.kind == ks_lang::NameKind::Dotted
+                && let Some(name) = e.text.strip_prefix("secrets.")
+            {
+                keys.insert(name.to_string());
+            }
+        }
+    }
+    keys
+}
+
 /// `key: annotation = literal`: an inline type annotation with a default.
 /// Yields the annotation word (for its span), the type it spells and the
 /// default; `None` when the left side is no word that spells a type.
-fn annotation_default<'a>(e: &'a Expr<'a>) -> Option<(&'a Word<'a>, Type, &'a Expr<'a>)> {
+pub(crate) fn annotation_default<'a>(
+    e: &'a Expr<'a>,
+) -> Option<(&'a Word<'a>, Type, &'a Expr<'a>)> {
     let Expr::Default { lhs, rhs, .. } = e else { return None };
     let Expr::Atom { atom: Atom::Word(w), .. } = lhs.as_ref() else { return None };
     Type::parse(w.text()).map(|ty| (w, ty, rhs.as_ref()))
@@ -2397,6 +2875,38 @@ fn value_word(e: &Expr<'_>) -> Option<String> {
         Expr::Atom { atom: Atom::Word(w), .. } => Some(w.text().to_string()),
         _ => None,
     }
+}
+
+/// The text a value spells: a bare word, or a quoted string unquoted. Every
+/// other shape spells no single value, so it has no text.
+pub(crate) fn value_text(e: &Expr<'_>) -> Option<String> {
+    match e {
+        Expr::Atom { atom: Atom::Word(w), .. } => Some(w.text().to_string()),
+        Expr::Atom { atom: Atom::Str(s), .. } => Some(s.value()),
+        _ => None,
+    }
+}
+
+/// What a use passes a block, with the signature's defaults filled in: what
+/// the run will get, whether the file spelled it or the block declared it.
+/// Only declared inputs appear, so a use's typo is not an input.
+fn block_input_values(step: Entry<'_>, sig: &BlockSignature) -> BTreeMap<String, String> {
+    let given: BTreeMap<&str, String> = step
+        .children()
+        .filter(|c| !STEP_PROPERTIES.contains(&c.key_name().unwrap_or_default()))
+        .filter_map(|c| {
+            let name = c.key_name()?;
+            let expr = c.expr()?;
+            Some((name, value_text(&expr)?))
+        })
+        .collect();
+    sig.inputs
+        .iter()
+        .filter_map(|i| {
+            let value = given.get(i.name.as_str()).or(i.default.as_ref())?;
+            Some((i.name.clone(), value.clone()))
+        })
+        .collect()
 }
 
 /// A step's literal input value, when it has one: `dir: ./infra/prod`.

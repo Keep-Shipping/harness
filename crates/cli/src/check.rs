@@ -260,6 +260,45 @@ fn iac_outputs(site_dir: &Path, src: &str) -> BTreeMap<String, BTreeMap<String, 
     out
 }
 
+/// The blocks in the `blocks/` directory beside `path`, keyed by the name
+/// `block:` declares, so a use written `deploy: web-service` finds its
+/// definition. A file inside `blocks/` sees its siblings. Reading files is
+/// all this adds: no step runs and nothing outside the directory is read.
+///
+/// `None` when there is no `blocks/` directory or it holds no `.ks` file —
+/// the check then reads as it did before, with no block definitions.
+fn local_blocks(
+    path: &Path,
+    catalog: &ks_core::Catalog,
+) -> Option<(BTreeMap<String, ks_core::block::BlockSignature>, Vec<Diagnostic>)> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let dir =
+        if dir.file_name() == Some("blocks".as_ref()) { dir.parent().unwrap_or(dir) } else { dir };
+    let blocks = dir.join("blocks");
+    let entries = std::fs::read_dir(&blocks).ok()?;
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "ks"))
+        .collect();
+    files.sort();
+    let parsed: Vec<(String, ks_lang::Parse)> = files
+        .iter()
+        .filter_map(|file| {
+            let src = std::fs::read_to_string(file).ok()?;
+            let shown = file.strip_prefix(dir).unwrap_or(file).display().to_string();
+            Some((shown, ks_lang::parse(&src)))
+        })
+        .collect();
+    if parsed.is_empty() {
+        return None;
+    }
+    let by_path: BTreeMap<String, &ks_lang::Parse> =
+        parsed.iter().map(|(shown, parse)| (shown.clone(), parse)).collect();
+    let (signatures, problems) = ks_core::block::block_signatures(&by_path, catalog);
+    Some((signatures, problems.into_iter().map(|p| p.diagnostic()).collect()))
+}
+
 /// Every literal `dir:` of a `tofu.plan` / `terraform.plan` step in `src`.
 fn plan_dirs(src: &str) -> Vec<String> {
     let parse = ks_lang::parse(src);
@@ -508,12 +547,24 @@ pub fn load(
     // output is typed before anything runs — reading files is all this adds:
     // no tofu, no network, no store.
     let outputs = iac_outputs(path.parent().unwrap_or(Path::new(".")), &src);
+    let blocks = local_blocks(path, &catalog);
     let options = ks_core::CheckOptions::new(&catalog)
         .actor(actor)
         .context(ctx.clone())
         .ci(in_ci_env())
         .iac_outputs(&outputs);
-    let checked = ks_core::check_with(&ks_lang::parse(&src), &options);
+    let options = match &blocks {
+        Some((signatures, _)) => options.blocks(signatures),
+        None => options,
+    };
+    let mut checked = ks_core::check_with(&ks_lang::parse(&src), &options);
+    // A block file that cannot be resolved is a finding about that file, and
+    // says which one it is. They are the definitions this site builds on, so
+    // they report alongside the site rather than only when checked.
+    if let Some((_, problems)) = &blocks {
+        checked.diagnostics.extend(problems.iter().cloned());
+        checked.diagnostics.sort_by_key(|d| d.span.start);
+    }
     // From the same catalog and context the warnings came from, so `run`
     // gates on exactly what `check` said rather than a second opinion.
     let unmet = ks_core::unmet_steps(&checked.workflow, &catalog, &ctx);

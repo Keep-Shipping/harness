@@ -104,6 +104,9 @@ pub enum Code {
     UnknownAnswer,
     /// An `else:` action other than `ask` or `show`.
     UnknownAction,
+    /// A block use leaving out an input the block requires
+    /// ([#80](https://github.com/Keep-Shipping/harness/issues/80)).
+    MissingInput,
     /// A step name declared twice.
     DuplicateStep,
     /// A step named like a context namespace (`git`, `secrets`, ...).
@@ -114,6 +117,9 @@ pub enum Code {
     EnvProblem,
     /// Steps depend on each other in a circle.
     Cycle,
+    /// Blocks nested deeper than the language allows
+    /// ([#80](https://github.com/Keep-Shipping/harness/issues/80)).
+    BlockDepth,
     /// A `policy:` subject or property the language does not know.
     PolicyDecl,
     /// A `policy:` action the language does not know.
@@ -158,11 +164,13 @@ impl Code {
             Code::UnknownOutput => "KS0203",
             Code::UnknownAnswer => "KS0204",
             Code::UnknownAction => "KS0205",
+            Code::MissingInput => "KS0206",
             Code::DuplicateStep => "KS0301",
             Code::ReservedStepName => "KS0302",
             Code::BadTrigger => "KS0303",
             Code::EnvProblem => "KS0304",
             Code::Cycle => "KS0305",
+            Code::BlockDepth => "KS0306",
             Code::PolicyDecl => "KS0401",
             Code::PolicyAction => "KS0402",
             Code::PolicyForbidden => "KS0403",
@@ -194,11 +202,13 @@ impl Code {
         Code::UnknownOutput,
         Code::UnknownAnswer,
         Code::UnknownAction,
+        Code::MissingInput,
         Code::DuplicateStep,
         Code::ReservedStepName,
         Code::BadTrigger,
         Code::EnvProblem,
         Code::Cycle,
+        Code::BlockDepth,
         Code::PolicyDecl,
         Code::PolicyAction,
         Code::PolicyForbidden,

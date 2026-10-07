@@ -1,13 +1,24 @@
 //! The diagnostics registry: every code documented, every example real, and
 //! `docs/ERRORS.md` in sync with what the registry renders.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+use ks_core::block::{self, BlockProblem, BlockSignature};
 use ks_core::registry::{errors_md, explain};
 use ks_core::repro::scan_dockerfile;
 use ks_core::{Catalog, CheckOptions, Checked, check, check_with};
 use ks_lang::{Code, Diagnostic, Severity};
+
+/// The block the `web-service` examples below use, as it is declared.
+const BLOCK: &str = "\
+block: web-service
+inputs:
+  image: oci.Digest
+  domain: string
+  replicas: int = 2
+";
 
 fn check_src(src: &str) -> Checked {
     check(&ks_lang::parse(src))
@@ -26,10 +37,12 @@ const PREVIOUS: ks_core::format::Formats<'static> = ks_core::format::Formats {
 };
 
 /// The codes that only fire under options the default check does not use: one
-/// bound to an actor (`agents: never: read secrets`), one only under CI, and
-/// one only against a format table with a format behind the current one.
+/// bound to an actor (`agents: never: read secrets`), one only under CI, one
+/// only against a format table with a format behind the current one, and one
+/// checked against a block's signature.
 fn check_explained(src: &str, code: Code) -> Checked {
     let catalog = Catalog::builtin();
+    let blocks = web_service();
     let options = match code {
         Code::PolicyForbidden => {
             CheckOptions::new(&catalog).actor(ks_core::ports::run_context::ActorKind::Agent)
@@ -40,17 +53,39 @@ fn check_explained(src: &str, code: Code) -> Checked {
             CheckOptions::new(&catalog).actor(ks_core::ports::run_context::ActorKind::Ci)
         }
         Code::FormatDeprecated => CheckOptions::new(&catalog).formats(&PREVIOUS),
+        // A block use is checked against the signature the caller resolved.
+        Code::MissingInput => CheckOptions::new(&catalog).blocks(&blocks),
         _ => return check_src(src),
     };
     check_with(&ks_lang::parse(src), &options)
 }
 
+/// The signature a use of `acme/web-service@v3` is checked against: the
+/// block of the name, keyed by the kind as the file spells it.
+fn web_service() -> BTreeMap<String, BlockSignature> {
+    let catalog = Catalog::builtin();
+    let parse = ks_lang::parse(BLOCK);
+    let sig = block::signature(&parse, &catalog, &BTreeMap::new()).expect("a block file");
+    BTreeMap::from([("acme/web-service@v3".to_string(), sig)])
+}
+
 /// KS0801 is the one code the checker never emits: `keepshipping check
 /// --repro` scans the Dockerfiles an `oci.image` step names, so its examples
-/// are Dockerfiles and its findings come from the scanner.
+/// are Dockerfiles and its findings come from the scanner. KS0306 is the one
+/// no single file can produce: it is found resolving a nest of block files,
+/// so its examples spell several, separated by `---`.
 fn explained_diagnostics(src: &str, code: Code) -> Vec<Diagnostic> {
     if code == Code::NonReproducible {
         scan_dockerfile(src)
+    } else if code == Code::BlockDepth {
+        let parses: Vec<ks_lang::Parse> = src.split("\n---\n").map(ks_lang::parse).collect();
+        let files: BTreeMap<String, &ks_lang::Parse> =
+            parses.iter().enumerate().map(|(i, p)| (format!("block{i}.ks"), p)).collect();
+        block::block_signatures(&files, &Catalog::builtin())
+            .1
+            .iter()
+            .map(BlockProblem::diagnostic)
+            .collect()
     } else {
         check_explained(src, code).diagnostics
     }

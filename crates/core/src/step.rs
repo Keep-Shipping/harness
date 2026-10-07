@@ -248,6 +248,22 @@ impl ActionKind {
             ActionKind::Other => "other",
         }
     }
+
+    /// The action a step *kind* is, from its name alone: what the checker
+    /// reads before a step runs, and what a block's signature carries for
+    /// the steps it hides ([#80](https://github.com/Keep-Shipping/harness/issues/80)).
+    /// Anything the catalog does not name is `Other`, so an unknown kind
+    /// asserts nothing policy can forbid.
+    #[must_use]
+    pub fn of_kind(kind: &str) -> ActionKind {
+        match kind {
+            "oci.image" | "oci.artifact" => ActionKind::Build,
+            "tofu.plan" => ActionKind::Plan,
+            "tofu.apply" => ActionKind::Apply,
+            "k8s.rollout" => ActionKind::Deploy,
+            _ => ActionKind::Other,
+        }
+    }
 }
 
 /// What a step *needs* from its environment — as the step declares it. Distinct from

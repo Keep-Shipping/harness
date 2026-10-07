@@ -29,6 +29,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auto_rule;
+pub mod block;
 mod catalog;
 mod check;
 pub mod context;
