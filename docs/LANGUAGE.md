@@ -220,6 +220,26 @@ and suggests `--skip <step>` or `--until <earlier step>`; checked with
 such a step unless `--allow-partial` is passed. This warning covers the step
 property; an environment's `ci-only:` is not part of it.
 
+**Ordering without data.** `after:` is a reserved input on every step, like
+`when:`. It takes one step name or a list of them, bare or quoted (`after:
+review`, `after: "review"`, `after: build, apply`), and adds the edges
+`name → this step` — the same edges a reference adds, so a name that does
+not exist gets a did-you-mean, `after: <itself>` and a loop report the
+cycle, and a value that is not a name at all is a type error rather than an
+edge that quietly orders nothing. Nothing else about the file changes: an
+`after:` edge carries no data, so it does not make a consumer of what it
+names — an `approval` that shows a step gates the steps that *read* that
+step's outputs, not the steps that merely follow it. Use it when two steps
+must not overlap but neither reads the other's output.
+
+**The order is a function of the file.** Steps are numbered 1..n in a
+topological order of those edges, ties broken by position in the file
+(declaration order, not the order the edges were discovered). Independent
+steps may run in parallel, but a run's sequence numbers, the run log and the
+outputs are the same whatever the timing was: a step's records are only
+written once every lower-numbered step has finished
+([#40](https://github.com/Keep-Shipping/harness/issues/40)).
+
 ## Triggers and environments
 
 `on:` is a tuple of `push [<branch-glob>]` | `pr` | `tag [<glob>]` |
@@ -240,6 +260,15 @@ implicit environment `default`.
 
 `when: env is prod` is the one non-decision `is` test: `prod` must be a
 declared environment.
+
+**When a `when:` is settled.** A condition that reads only context — a
+boolean literal, `env is <name>`, `not` over either — is settled before the
+run starts: a false one takes the step out of the plan for this environment,
+and everything that waits on it. A condition that reads a step's output
+(`when: build.signed`) can only be settled once that step has run, so the
+plan marks it as settled at run time and the run log says so. Nothing is
+guessed: a context-only condition the language has no shape for is treated
+as run-time rather than assumed false.
 
 **Selection.** An explicit request wins; otherwise the run's event selects
 the unique environment whose `on:` matches (simple `*` globs); otherwise a
@@ -369,12 +398,15 @@ revisit:
 - Run-time outputs are namespaced under `<step>.out.`; statically declared
   outputs are read directly (`<step>.<output>`).
 - An approval that shows a step's outputs gates every other consumer of that
-  step (approval gating adds graph edges).
+  step (approval gating adds graph edges). A step that only follows another
+  with `after:` is not one of those consumers.
 - A file without `envs:` has one implicit environment `default`, so a hero
   file keeps running unchanged.
 - `env` as an `is` subject tests the selected environment
   (`when: env is prod`); every other `is` subject is a decision.
 - `when:` is a reserved input on every step; its expression must type `Bool`.
+- `after:` is reserved too: it names the step(s) that must run before this
+  one, ordering without data, and adds exactly the edges a reference would.
 - Interpolation is allowed only in `String` and `oci.Tag` positions;
   interpolating a secret is an error everywhere.
 - Environment selection order: explicit request → event matches one `on:` →

@@ -275,3 +275,48 @@ a good chain is still a good chain, and telling that from a run that genuinely
 ended needs a signature over the tip ([#112]). It needs nothing but the file — no
 network, no store — so a CI job can fetch the log as an artifact and verify it
 there.
+
+## `keepshipping graph`
+
+`keepshipping graph [FILE] [--env NAME] [--event "push main"]` prints the
+plan — the steps in sequence order with their dependencies, what this
+environment would skip and why — and runs nothing. It reads the file exactly
+as `check` does, so the exit codes are the same: 1 when the file has errors,
+2 for usage, environment-selection and event problems, 0 otherwise. The
+diagnostics are `check`'s, in the human format: on stdout for `text`, and on
+stderr for the machine formats, which leave stdout parseable. Its `--format`
+names the plan, not a diagnostic, so they are its own:
+
+```
+ship.ks — 5 steps, env: default
+seq  step    kind         deps          gate
+  1  build   oci.image    —             run
+  2  plan    tofu.plan    —             run
+  3  review  approval     plan          run
+  4  apply   tofu.apply   plan, review  run
+  5  deploy  k8s.rollout  build, apply  run
+
+route: push → build → plan → review → apply → deploy
+0 steps ran. Nothing was touched.
+```
+
+- `text` (the default) is the report above. `gate` is `run`, `skip: …` with
+  the reason the step is out for this environment, or
+  `when: … (at run time)` for a condition only the run can settle. The route
+  line is the event the plan is for — `--event` if one was given, otherwise
+  the file's triggers joined by `|` because they are alternatives, not a
+  chain — and then the steps that would run, in sequence order. A file that
+  declares no `on:` has no event to lead with, so the line is the steps
+  alone.
+- `dot` is a `digraph` with one node per step (numbered, dashed when skipped)
+  and one edge per dependency, for Graphviz.
+- `json` is the same plan with a stable key order — `version`, `file`,
+  `env`, `triggers`, and `steps` (`seq`, `name`, `kind`, `deps`, `gate`) —
+  and nothing else on stdout, no footer. The dependencies are on the steps;
+  there is no second copy of them.
+
+An unknown `--format` value is a usage error (exit 2), for `graph` and
+`check` alike: `check --format dot` is not a thing. So is an `--event` no
+`on:` in the file reaches: a route no trigger can enter is not a plan, and
+`graph` says which triggers the file declares instead of printing one.
+
