@@ -5,7 +5,7 @@
 //! additionally rewrites the machine-applicable fixes it proposes.
 
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 use ks_core::ContextName;
@@ -64,10 +64,17 @@ pub fn check(args: &[String]) -> ExitCode {
     let mut failed = false;
     for site in &sites {
         let diags = &site.checked.diagnostics;
+        // `--repro` reports against a second file: the Dockerfile the step
+        // names, rendered through the same formats with its own path and
+        // source, so a snippet and its carets point at the right lines.
+        let extra: Vec<Report> = if o.repro { repro_of(site) } else { Vec::new() };
         match o.format {
             Format::Human => {
                 let _ = render::human(&mut out, &site.path, &site.src, diags, color);
-                if !fails(&o, diags) {
+                for r in &extra {
+                    let _ = render::human(&mut out, &r.path, &r.src, &r.diags, color);
+                }
+                if !fails(&o, diags) && extra.iter().all(|r| !fails(&o, &r.diags)) {
                     let _ = render::ok_line(&mut out, &site.path, color);
                     if o.secrets {
                         let _ = print_secrets(&mut out, &site.checked);
@@ -76,12 +83,18 @@ pub fn check(args: &[String]) -> ExitCode {
             }
             Format::Json => {
                 let _ = render::json(&mut out, &site.path, &site.src, diags);
+                for r in &extra {
+                    let _ = render::json(&mut out, &r.path, &r.src, &r.diags);
+                }
             }
             Format::Github => {
                 let _ = render::github(&mut out, &site.path, &site.src, diags);
+                for r in &extra {
+                    let _ = render::github(&mut out, &r.path, &r.src, &r.diags);
+                }
             }
         }
-        failed |= fails(&o, diags);
+        failed |= fails(&o, diags) || extra.iter().any(|r| fails(&o, &r.diags));
     }
     // The listing comes after the diagnostics and does not soften the exit
     // code: a file with errors is still a failed check.
@@ -89,6 +102,125 @@ pub fn check(args: &[String]) -> ExitCode {
         let _ = render::footer(&mut out);
     }
     if failed { ExitCode::from(1) } else { ExitCode::SUCCESS }
+}
+
+/// What `--repro` found beyond the site file: one report per Dockerfile an
+/// `oci.image` step names.
+struct Report {
+    /// The path as printed, relative to the `--all` walk root like the
+    /// site file's own path.
+    path: String,
+    /// The Dockerfile's own text: its diagnostics' spans index this.
+    src: String,
+    diags: Vec<Diagnostic>,
+}
+
+/// The reproducibility warnings for the Dockerfiles `site` names, read from
+/// disk. A `from:` that is not a literal path — a reference, an
+/// interpolation — belongs to no file we can open, so it is skipped; a
+/// Dockerfile that cannot be read is reported against the `from:` itself,
+/// since an image nobody can scan is not one we can call reproducible.
+///
+/// Reading files is all `--repro` adds: no network, no builder, no store.
+fn repro_of(site: &Site) -> Vec<Report> {
+    let mut out = Vec::new();
+    // Two steps can build from one Dockerfile; its findings are reported once,
+    // not once per step that names it.
+    let mut seen: Vec<String> = Vec::new();
+    for from in dockerfiles(&site.src) {
+        if seen.contains(&from.path) {
+            continue;
+        }
+        seen.push(from.path.clone());
+        // `from:` names a file beside the site file, not beside wherever
+        // `check` happened to run, and it prints the same way: relative to
+        // the `--all` root where the site file's own path is.
+        let dir = site.file.parent().unwrap_or(Path::new("."));
+        let src = match std::fs::read_to_string(dir.join(&from.path)) {
+            Ok(src) => src,
+            Err(e) => {
+                out.push(unreadable(site, &from, &e));
+                continue;
+            }
+        };
+        let diags = ks_core::repro::scan_dockerfile(&src);
+        if diags.is_empty() {
+            continue;
+        }
+        let shown = shown_path(&site.path, &from.path);
+        out.push(Report { path: shown, src, diags });
+    }
+    out
+}
+
+/// The finding for a `from:` that names a file the check cannot open,
+/// reported in the site file: an image nobody can scan is not one we can
+/// call reproducible, and silence there would read as the opposite.
+fn unreadable(site: &Site, from: &Dockerfile, e: &io::Error) -> Report {
+    let finding = Diagnostic::warning(
+        ks_lang::Code::NonReproducible,
+        from.span,
+        format!("`{}` cannot be read for a reproducibility scan", from.path),
+    )
+    .with_hint(format!("{e}; an image nobody can scan is not one we can call reproducible"));
+    Report { path: site.path.clone(), src: site.src.clone(), diags: vec![finding] }
+}
+
+/// The path `from:` prints as, relative to the `--all` root where the site
+/// file's own path is. The `.` of a `./Dockerfile` is dropped, so it prints as
+/// `Dockerfile`, never `api/./Dockerfile`.
+fn shown_path(site: &str, from: &str) -> String {
+    Path::new(site)
+        .parent()
+        .unwrap_or(Path::new(""))
+        .join(from)
+        .components()
+        .filter(|p| *p != Component::CurDir)
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// One `from:` an `oci.image` step names literally.
+struct Dockerfile {
+    path: String,
+    /// Where the value sits in the site file, so an unreadable Dockerfile is
+    /// reported against the input that names it.
+    span: Span,
+}
+
+/// Every literal `from:` of an `oci.image` step in `src`. A `from:` that is
+/// not a literal path — a reference, an interpolation, a bare word — belongs
+/// to no file the check can open, and is skipped.
+fn dockerfiles(src: &str) -> Vec<Dockerfile> {
+    let parse = ks_lang::parse(src);
+    let file = parse.file();
+    let mut out = Vec::new();
+    for entry in file.entries().filter(|e| e.key_name() == Some("steps")) {
+        for step in entry.children() {
+            if step.expr().as_ref().is_none_or(|e| word(e) != Some("oci.image")) {
+                continue;
+            }
+            let Some(from) = step.children().find(|i| i.key_name() == Some("from")) else {
+                continue;
+            };
+            let Some(expr) = from.expr() else { continue };
+            let Some(path) = word(&expr) else { continue };
+            if ks_lang::classify_scalar(path) != ks_lang::Scalar::Path {
+                continue;
+            }
+            out.push(Dockerfile { path: path.to_string(), span: expr.span() });
+        }
+    }
+    out
+}
+
+/// The one word a bare-value expression is, if that is all it is.
+fn word<'a>(expr: &'a ks_lang::Expr<'a>) -> Option<&'a str> {
+    match expr {
+        ks_lang::Expr::Atom { atom: ks_lang::Atom::Word(w), .. } => Some(w.text()),
+        _ => None,
+    }
 }
 
 /// `--fix`: apply the machine-applicable edits the checker proposed, then

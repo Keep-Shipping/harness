@@ -5,8 +5,9 @@ use std::fs;
 use std::path::Path;
 
 use ks_core::registry::{errors_md, explain};
+use ks_core::repro::scan_dockerfile;
 use ks_core::{Catalog, CheckOptions, Checked, check, check_with};
-use ks_lang::{Code, Severity};
+use ks_lang::{Code, Diagnostic, Severity};
 
 fn check_src(src: &str) -> Checked {
     check(&ks_lang::parse(src))
@@ -44,6 +45,17 @@ fn check_explained(src: &str, code: Code) -> Checked {
     check_with(&ks_lang::parse(src), &options)
 }
 
+/// KS0801 is the one code the checker never emits: `keepshipping check
+/// --repro` scans the Dockerfiles an `oci.image` step names, so its examples
+/// are Dockerfiles and its findings come from the scanner.
+fn explained_diagnostics(src: &str, code: Code) -> Vec<Diagnostic> {
+    if code == Code::NonReproducible {
+        scan_dockerfile(src)
+    } else {
+        check_explained(src, code).diagnostics
+    }
+}
+
 #[test]
 fn all_lists_the_codes_in_ascending_order() {
     let nums: Vec<u32> =
@@ -57,28 +69,28 @@ fn every_documented_bad_example_emits_its_code_and_good_example_does_not() {
         let e = explain(*code);
         assert_eq!(e.code, *code, "the explanation must carry the code it explains");
 
-        let bad = check_explained(e.bad, *code);
+        let bad = explained_diagnostics(e.bad, *code);
         assert!(
-            bad.diagnostics.iter().any(|d| d.code == *code),
+            bad.iter().any(|d| d.code == *code),
             "{}: the bad example must emit the code, got {:#?}",
             e.code,
-            bad.diagnostics
+            bad
         );
-        let hit = bad.diagnostics.iter().find(|d| d.code == *code).expect("checked above");
+        let hit = bad.iter().find(|d| d.code == *code).expect("checked above");
         assert_eq!(hit.severity, e.severity, "{}: severity must match the docs", e.code);
 
-        let good = check_explained(e.good, *code);
+        let good = explained_diagnostics(e.good, *code);
         assert!(
-            good.diagnostics.iter().all(|d| d.code != *code),
+            good.iter().all(|d| d.code != *code),
             "{}: the good example must not emit the code, got {:#?}",
             e.code,
-            good.diagnostics
+            good
         );
         assert!(
-            good.diagnostics.iter().all(|d| d.severity != Severity::Error),
+            good.iter().all(|d| d.severity != Severity::Error),
             "{}: the good example must not error at all, got {:#?}",
             e.code,
-            good.diagnostics
+            good
         );
     }
 }

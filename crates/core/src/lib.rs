@@ -39,6 +39,7 @@ pub mod ids;
 pub mod plan_summary;
 pub mod ports;
 pub mod registry;
+pub mod repro;
 pub mod step;
 mod types;
 pub mod version;
