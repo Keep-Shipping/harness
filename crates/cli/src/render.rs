@@ -38,6 +38,12 @@ impl Format {
     }
 }
 
+/// The 1-based line a byte offset falls on, for a command that prints a
+/// position without printing the file around it.
+pub fn line_at(src: &str, offset: u32) -> usize {
+    Lines::new(src).line_col(src, offset).0
+}
+
 /// Colour is for terminals: on when stdout is one and `NO_COLOR` is unset or
 /// empty — any non-empty value disables it, per no-color.org.
 pub fn use_color() -> bool {

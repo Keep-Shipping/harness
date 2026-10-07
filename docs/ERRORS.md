@@ -4,8 +4,8 @@ Every diagnostic the `ks` parser and checker emit carries exactly one code,
 stable forever: tools and agents match on the code, not on the message. Codes
 are grouped by block — `KS00xx` syntax, `KS01xx` types, `KS02xx` names and
 references, `KS03xx` workflow structure, `KS04xx` policy, `KS05xx` secrets,
-`KS06xx` environment and CI warnings, `KS07xx` approval safety — with gaps
-left for growth.
+`KS06xx` environment, file format and CI warnings, `KS07xx` approval safety — with
+gaps left for growth.
 
 This file is generated from the registry in `crates/core/src/registry.rs`;
 edit the registry, never this file. Regenerate with:
@@ -20,6 +20,7 @@ UPDATE_GOLDEN=1 cargo test -p ks-core --test registry
 - [KS0002 — unclosed string or interpolation](#ks0002-unclosed-string-or-interpolation)
 - [KS0003 — invalid interpolation](#ks0003-invalid-interpolation)
 - [KS0004 — tab in indentation](#ks0004-tab-in-indentation)
+- [KS0005 — unsupported file format](#ks0005-unsupported-file-format)
 - [KS0101 — type mismatch](#ks0101-type-mismatch)
 - [KS0102 — digest pinned by value](#ks0102-digest-pinned-by-value)
 - [KS0201 — unknown reference](#ks0201-unknown-reference)
@@ -39,6 +40,8 @@ UPDATE_GOLDEN=1 cargo test -p ks-core --test registry
 - [KS0502 — secret shown](#ks0502-secret-shown)
 - [KS0601 — optional value may be absent](#ks0601-optional-value-may-be-absent)
 - [KS0602 — step needs more than this context has](#ks0602-step-needs-more-than-this-context-has)
+- [KS0610 — file format is one behind](#ks0610-file-format-is-one-behind)
+- [KS0611 — file format not declared](#ks0611-file-format-not-declared)
 - [KS0701 — `auto:` could destroy](#ks0701-auto-could-destroy)
 
 ## KS0001: unexpected syntax
@@ -124,6 +127,30 @@ steps:
 Ok:
 
 ```ks
+steps:
+  build: oci.image
+    from: ./Dockerfile
+```
+
+## KS0005: unsupported file format
+
+Severity: error.
+
+The file declares a `keepshipping:` format this keepshipping does not read, or the header is not a format version or is not the file's first entry. A file whose meaning moved on is refused rather than reinterpreted: raise the file to a format this build reads.
+
+Not ok:
+
+```ks
+keepshipping: 0.9
+steps:
+  build: oci.image
+    from: ./Dockerfile
+```
+
+Ok:
+
+```ks
+keepshipping: 0.1
 steps:
   build: oci.image
     from: ./Dockerfile
@@ -675,6 +702,53 @@ steps:
     from: ./Dockerfile
   deploy: k8s.rollout
     image: build.digest
+```
+
+## KS0610: file format is one behind
+
+Severity: warning.
+
+The file declares the format before the one this keepshipping writes. It still checks — the previous format stays readable until the format after next drops it — but `keepshipping fmt --upgrade` rewrites it mechanically, comments and all.
+
+Not ok:
+
+```ks
+keepshipping: 0.1
+steps:
+  build: oci.image
+    from: ./Dockerfile
+```
+
+Ok:
+
+```ks
+keepshipping: 0.2
+steps:
+  build: oci.image
+    from: ./Dockerfile
+```
+
+## KS0611: file format not declared
+
+Severity: warning.
+
+The file declares no `keepshipping:` header, so it is read as the latest format this keepshipping knows. Pin it: a declared format is what tells the next breaking change what it has to migrate.
+
+Not ok:
+
+```ks
+steps:
+  build: oci.image
+    from: ./Dockerfile
+```
+
+Ok:
+
+```ks
+keepshipping: 0.1
+steps:
+  build: oci.image
+    from: ./Dockerfile
 ```
 
 ## KS0701: `auto:` could destroy
