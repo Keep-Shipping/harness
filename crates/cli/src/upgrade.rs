@@ -5,8 +5,8 @@
 //! What a migration cannot rewrite is never guessed at: it is printed for a
 //! person, and the run exits 1. So is a file this build refuses to migrate
 //! from, which is left byte-for-byte untouched rather than half-upgraded.
-//! Without `--upgrade` there is no formatter to run, and the command says so
-//! rather than printing a file unchanged and exiting 0.
+//! Plain `fmt` (no `--upgrade`) is the layout formatter in `fmt.rs`; `main`
+//! routes a `fmt` command line here only when it carries `--upgrade`.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -27,11 +27,10 @@ pub fn fmt(args: &[String]) -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    if !o.upgrade {
-        eprintln!("error: fmt --upgrade rewrites files to the current format");
-        eprintln!(
-            "       the formatter itself is not available yet, so `fmt` on its own has nothing to do"
-        );
+    // `--check` and `-` belong to the layout formatter; an upgrade always
+    // rewrites files in place.
+    if !o.upgrade || o.check || o.stdin {
+        eprintln!("error: fmt --upgrade rewrites files in place; it takes neither --check nor -");
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     }

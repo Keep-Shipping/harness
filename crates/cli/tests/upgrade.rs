@@ -118,13 +118,14 @@ fn upgrade_refuses_a_format_it_cannot_migrate_from_and_writes_nothing() {
 }
 
 #[test]
-fn fmt_without_upgrade_is_a_usage_error() {
-    let (path, _dir) = site_file("noflag", &site("keepshipping: 0.1\n"));
-    let (code, stdout, stderr) = run(&["fmt", path.to_str().unwrap()], &[]);
+fn upgrade_with_check_is_a_usage_error() {
+    // Plain `fmt` is the layout formatter now; `--upgrade` always rewrites in
+    // place, so pairing it with `--check` is refused, and the file is untouched.
+    let (path, _dir) = site_file("withcheck", &site("keepshipping: 0.1\n"));
+    let (code, stdout, stderr) = run(&["fmt", "--upgrade", "--check", path.to_str().unwrap()], &[]);
     assert_eq!(code, 2, "{stdout}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("error: fmt --upgrade"), "{stderr}");
-    assert!(stderr.contains("the formatter itself is not available yet"), "{stderr}");
     assert!(stderr.contains("keepshipping fmt --upgrade [PATH...]"), "{stderr}");
     assert_eq!(std::fs::read_to_string(&path).expect("reread"), site("keepshipping: 0.1\n"));
 }

@@ -1,8 +1,9 @@
 //! The `keepshipping` command-line interface: `check` type-checks a site
 //! file (or, with `--all`, every `ship.ks` in a tree); `run` picks an
 //! environment and hands off to the engine; `graph` prints the plan the file
-//! would follow, without running it. Output formats, exit codes and colour
-//! rules are pinned in `docs/DIAGNOSTICS.md`.
+//! would follow, without running it; `fmt` rewrites files into their canonical
+//! form. Output formats, exit codes and colour rules are pinned in
+//! `docs/DIAGNOSTICS.md`.
 
 #![forbid(unsafe_code)]
 
@@ -11,6 +12,7 @@ mod blocks;
 mod blocks_index;
 mod check;
 mod drive;
+mod fmt;
 // The GitHub Actions run context (#150) is built and tested here, but the
 // command dispatch still has no run context to hand it: wiring CI-versus-local
 // selection into `run` waits for the local adapter. Until then nothing in the
@@ -56,7 +58,10 @@ fn dispatch() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("check") => check::check(&args[1..]),
         Some("run") => run(&args[1..]),
-        Some("fmt") => upgrade::fmt(&args[1..]),
+        // `fmt --upgrade` migrates a file to the current format version;
+        // plain `fmt` (and `fmt --check`, `fmt -`) lays it out canonically.
+        Some("fmt") if args[1..].iter().any(|a| a == "--upgrade") => upgrade::fmt(&args[1..]),
+        Some("fmt") => fmt::fmt(&args[1..]),
         Some("graph") => graph::graph(&args[1..]),
         Some("blocks") => blocks::blocks(&args[1..]),
         Some("lsp") => ks_lsp::serve(),
