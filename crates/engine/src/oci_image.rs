@@ -77,9 +77,12 @@ impl StepKind for OciImage {
                 Field::new(
                     "platforms",
                     TypeRef::Builtin(ValueType::List),
-                    "platforms to build for; more than one produces an image index",
+                    "platforms to build for; more than one produces an image index. Empty means the platform the build runs on",
                 )
-                .with_default(Value::List(vec![Value::from(host_platform())])),
+                // Empty rather than `host_platform()`: the schema is rendered into
+                // `docs/STEPS.md`, which must read the same on every machine. The host
+                // platform is filled in when the step runs.
+                .with_default(Value::List(Vec::new())),
                 Field::new("target", TypeRef::Builtin(ValueType::String), "the stage to build")
                     .with_default(Value::from("")),
                 Field::new("push", TypeRef::Named("oci.Tag"), "the image reference to push"),
@@ -194,7 +197,10 @@ impl StepKind for OciImage {
             let tag = image.tag().unwrap_or("latest").to_string();
             let context = context_of(&inputs);
             let dockerfile = PathBuf::from(text(&inputs, "from"));
-            let platforms = list(&inputs, "platforms");
+            let mut platforms = list(&inputs, "platforms");
+            if platforms.is_empty() {
+                platforms.push(host_platform());
+            }
             let cache = BuildCache::parse(text(&inputs, "cache")).map_err(|offered| {
                 StepError::InvalidInput {
                     field: "cache".to_string(),
