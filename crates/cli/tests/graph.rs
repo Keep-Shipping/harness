@@ -22,6 +22,9 @@ fn graph(dir: &str, extra: &[&str]) -> (i32, String, String) {
         .arg("graph")
         .args(extra)
         .current_dir(dir)
+        // The ambient `CI` widens the "no format declared" warning, which
+        // these tests are not about.
+        .env_remove("CI")
         .output()
         .expect("run keepshipping");
     (
@@ -195,6 +198,7 @@ fn an_unknown_format_is_a_usage_error() {
     let out = Command::new(env!("CARGO_BIN_EXE_keepshipping"))
         .args(["check", "--format", "dot"])
         .current_dir(HERO)
+        .env_remove("CI")
         .output()
         .expect("run keepshipping");
     assert_eq!(out.status.code(), Some(2));

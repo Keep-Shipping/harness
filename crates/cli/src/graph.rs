@@ -47,7 +47,13 @@ pub fn graph(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     let path = o.path.as_deref().unwrap_or("ship.ks");
-    let site = match check::load(Path::new(path), path, o.actor, o.path.is_none()) {
+    let site = match check::load(
+        Path::new(path),
+        path,
+        o.actor,
+        o.path.is_none(),
+        crate::args::context_of(&o),
+    ) {
         Ok(site) => site,
         Err(code) => return code,
     };
