@@ -7,6 +7,10 @@ license.workspace = true
 publish.workspace = true
 repository.workspace = true
 
+[lib]
+name = "ks_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "keepshipping"
 path = "src/main.rs"

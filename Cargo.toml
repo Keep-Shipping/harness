@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "ventures/keepshipping"]
+members = ["adapters/*", "crates/*", "ventures/keepshipping"]
 
 [workspace.package]
 version = "0.0.0"
@@ -17,6 +17,7 @@ ks-engine = { path = "crates/engine", version = "0.0.0" }
 ks-cli = { path = "crates/cli", version = "0.0.0" }
 ks-lsp = { path = "crates/lsp", version = "0.0.0" }
 ks-testing = { path = "crates/testing", version = "0.0.0" }
+ks-oci-distribution = { path = "adapters/oci-distribution", version = "0.0.0" }
 sha2 = "0.10"
 serde_json = "1"
 

@@ -525,6 +525,35 @@ impl Signer for FakeSigner {
     }
 }
 
+/// The layout [`registry_conformance`] pushes: a real OCI image manifest over
+/// the empty config `{}` and one layer, with both blobs handed to
+/// `push_layout` alongside it.
+///
+/// The bytes are a manifest a registry would accept on purpose. Real
+/// registries validate what is pushed against the OCI image schema and reject
+/// an incomplete manifest outright (zot and distribution both answer 400 to
+/// `{"schemaVersion":2,"config":{}}`), so a fixture that is merely *a* JSON
+/// object would test nothing against one.
+fn conformance_layout() -> OciLayoutContents {
+    let config = b"{}";
+    let layer = b"conformance-layer";
+    let manifest = format!(
+        "{{\"schemaVersion\":2,\"mediaType\":\"{OCI_MANIFEST}\",\"config\":{{\"mediaType\":\
+         \"application/vnd.oci.empty.v1+json\",\"digest\":\"{}\",\"size\":{}}},\"layers\":[{{\
+         \"mediaType\":\"{OCI_LAYER}\",\"digest\":\"{}\",\"size\":{}}}]}}",
+        digest_of(config),
+        config.len(),
+        digest_of(layer),
+        layer.len(),
+    )
+    .into_bytes();
+    OciLayoutContents {
+        media_type: OCI_MANIFEST.to_string(),
+        manifest,
+        blobs: vec![config.to_vec(), layer.to_vec()],
+    }
+}
+
 /// The `Registry` conformance kit: every registry adapter — including
 /// [`FakeRegistry`] — must pass this on `repository`. It later runs
 /// unchanged against zot in the adapter job
@@ -538,11 +567,7 @@ impl Signer for FakeSigner {
 /// subject and nothing under an unused digest; a tagged reference resolves to
 /// the tagged digest, an unknown tag is `NotFound`.
 pub async fn registry_conformance(registry: &dyn Registry, repository: &str) {
-    let layout = OciLayoutContents {
-        media_type: OCI_MANIFEST.to_string(),
-        manifest: b"{\"schemaVersion\":2,\"config\":{}}".to_vec(),
-        blobs: vec![b"conformance-layer".to_vec()],
-    };
+    let layout = conformance_layout();
     let subject = registry
         .push_layout(repository, &layout)
         .await
