@@ -41,6 +41,51 @@ Newest first, one heading per contract version, dated.
   engine uses the store directly, so `Port` and `define_ports!` are
   untouched. The remaining ports are as declared above.
 
+- **2026-10-07** — Added the `DecisionModel` trait
+  ([#54](https://github.com/Keep-Shipping/harness/issues/54)), in
+  [`crates/core/src/ports/decision_model.rs`](../crates/core/src/ports/decision_model.rs).
+  One `ask` call carries one `RedactedState` and a `BTreeMap<String, Question>`,
+  and answers with `BTreeMap<String, Answer>` — so the model sees one picture and
+  the answers are consistent with each other. `DecisionModel` also declares
+  `profile()`, returning a `ModelProfile` naming the model, its pinned version,
+  its calibration family and its `max_state_bytes` truncation bound.
+
+  Like `BlocksIndex` before it, this is a trait plus fakes and a conformance
+  kit: there is **no `Port` enum variant yet**, so a step cannot declare it and
+  a harness cannot hand one to a step. The trait is versioned now so that adding
+  the variant later is not itself a contract change.
+
+- **2026-10-07** — Added the `ApprovalChannel` and `Directory` ports
+  ([#53](https://github.com/Keep-Shipping/harness/issues/53)), so a run can ask
+  a team and the engine can tell who was on it. `ApprovalChannel` requests,
+  polls and waits; `Directory` answers membership. No existing trait signature
+  changed — the ten ports from `STEP_API 1` are untouched, and `BlocksIndex`
+  still is. The new `Port` variants `ApprovalChannel` and `Directory` are the
+  only additions to the enum.
+
+  The rule they encode: an approval is bound to the exact artifacts it was
+  asked about, and a run can never approve itself. `ApprovalRequest::accepts`
+  refuses an approver who proposed the run, an approver who is not human, and
+  a verdict whose `bound_artifacts` differ by one digest — enforced in the
+  engine, not in each adapter, so the same rule holds for every channel.
+  Membership is checked separately, asynchronously, through `Directory` —
+  and it is the verdict's own `approver` that gets looked up, never the
+  approver the caller hoped for. The adapter conformance kit in `ks-testing`
+  checks exactly that: an adapter that answers with somebody else's verdict,
+  or binds a verdict to different artifacts, fails the kit rather than
+  shipping.
+
+- **2026-10-07** — The deploy-target ports
+  ([#52](https://github.com/Keep-Shipping/harness/issues/52),
+  [#78](https://github.com/Keep-Shipping/harness/issues/78)). Four modules land:
+  the `Cluster` port (`apply`, `upgrade`, `rollout`, `health`, `rollback`,
+  `handle`), the `RemoteShell` port (`run`, `copy`, `probe`, `host`), the
+  `FunctionHost` port (`publish`, `shift`, `health`, `keep_warm`, `rollback`,
+  `pinned`, `pin_is_detectable`), and the shared `Health` / `HealthReport`
+  vocabulary they all report in. The three traits added to the port contract
+  are `Cluster`, `RemoteShell` and `FunctionHost`; `health` adds no trait, only
+  the value types every health call returns.
+
 ## STEP_API 1
 
 - **2026-10-07** — The initial port contract
