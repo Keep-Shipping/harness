@@ -1,0 +1,61 @@
+{
+  "name": "keepshipping",
+  "displayName": "Keep Shipping",
+  "description": "Keep Shipping site files: highlighting and language-server support.",
+  "publisher": "Keep-Shipping",
+  "version": "0.0.1",
+  "preview": true,
+  "license": "SEE LICENSE IN LICENSE",
+  "categories": ["Programming Languages"],
+  "engines": { "vscode": "^1.91.0" },
+  "main": "./extension.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Keep-Shipping/harness",
+    "directory": "editors/vscode"
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "keepshipping",
+        "aliases": ["Keep Shipping", "keepshipping"],
+        "filenames": ["ship.ks"],
+        "filenamePatterns": ["*.ship.ks"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "keepshipping",
+        "scopeName": "source.keepshipping",
+        "path": "./syntaxes/keepshipping.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Keep Shipping",
+      "properties": {
+        "keepshipping.server.path": {
+          "type": "string",
+          "default": "keepshipping",
+          "description": "Path to the `keepshipping` binary that provides `keepshipping lsp`."
+        },
+        "keepshipping.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Trace the communication between VS Code and the language server."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "package": "vsce package --pre-release",
+    "publish": "vsce publish --pre-release"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^10.1.2"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^4.0.0"
+  }
+}
