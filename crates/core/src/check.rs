@@ -4,7 +4,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use ks_lang::{Atom, Code, Diagnostic, Entry, Expr, Span, StrPart, Word};
+use ks_lang::{Atom, Code, Diagnostic, Entry, Expr, Fix, Span, StrPart, Word};
 
 use crate::catalog::{Catalog, StepTypes};
 use crate::format::{self, Formats, Header};
@@ -27,6 +27,11 @@ pub struct Checked {
     /// Every `secrets.<name>` reference, in source order.
     /// [`secret_requirements`] turns these into per-environment listings.
     pub secret_uses: Vec<SecretUse>,
+    /// Every `policy:` entry the file declares — one per block, since the
+    /// grammar allows more than one. `check --fix` refuses every edit
+    /// overlapping any of them: policy changes need a human ([ADR
+    /// 0012](https://github.com/Keep-Shipping/harness/blob/main/docs/adr/0012-policy-authority.md)).
+    pub policy_spans: Vec<Span>,
 }
 
 impl Checked {
@@ -225,6 +230,8 @@ struct Ctx<'a> {
     /// scan made checking quadratic on files with many steps.
     index: HashMap<String, usize>,
     edges: Vec<Edge>,
+    /// The `policy:` entries' spans, so `--fix` can refuse to edit them.
+    policy_spans: Vec<Span>,
     shown: Vec<(usize, usize)>, // (approval step, step it shows)
     name: Option<String>,
     triggers: Vec<Trigger>,
@@ -275,6 +282,7 @@ impl<'a> Ctx<'a> {
             steps: Vec::new(),
             index: HashMap::new(),
             edges: Vec::new(),
+            policy_spans: Vec::new(),
             shown: Vec::new(),
             name: None,
             triggers: Vec::new(),
@@ -305,6 +313,18 @@ impl<'a> Ctx<'a> {
         hint: impl Into<String>,
     ) {
         self.push(Diagnostic::error(code, span, message).with_hint(hint));
+    }
+
+    /// [`err_hint`], plus the edit that would resolve the finding.
+    fn err_hint_fix(
+        &mut self,
+        code: Code,
+        span: Span,
+        message: impl Into<String>,
+        hint: impl Into<String>,
+        fix: Fix,
+    ) {
+        self.push(Diagnostic::error(code, span, message).with_hint(hint).with_fix(fix));
     }
 
     fn record(&mut self, span: Span, ty: Type) {
@@ -341,7 +361,10 @@ impl<'a> Ctx<'a> {
                     self.envs = self.check_envs(e);
                     saw_envs = true;
                 }
-                Some("policy") => self.check_policy(e),
+                Some("policy") => {
+                    self.policy_spans.push(e.node().span());
+                    self.check_policy(e);
+                }
                 _ => {} // other top-level keys carry no meaning here yet
             }
         }
@@ -521,10 +544,15 @@ impl<'a> Ctx<'a> {
         let Some(ty) = spec.input(iname) else {
             let span = input.key_span();
             let msg = format!("unknown input `{iname}` for step kind `{}`", spec.name);
-            match suggest(iname, &spec.input_names()) {
-                Some(s) => {
-                    self.err_hint(Code::UnknownInput, span, msg, format!("did you mean `{s}`?"))
-                }
+            let names = spec.input_names();
+            match suggestion(iname, &names) {
+                Some((s, unique)) => self.err_hint_fix(
+                    Code::UnknownInput,
+                    span,
+                    msg,
+                    format!("did you mean `{s}`?"),
+                    Fix::new(span, s, unique),
+                ),
                 None => self.err(Code::UnknownInput, span, msg),
             }
             return;
@@ -542,7 +570,7 @@ impl<'a> Ctx<'a> {
         // A typed default (`replicas: int = 2`): the annotation types the
         // value, and the default must be a literal of it.
         if let Some((word, ann, rhs)) = annotation_default(e) {
-            self.demand(word.node.span(), want, ann.clone(), None);
+            self.demand(word.node.span(), want, ann.clone(), None, None);
             self.demand_input(idx, ann.clone(), rhs);
             self.record(e.span(), ann);
             return;
@@ -573,7 +601,7 @@ impl<'a> Ctx<'a> {
             Expr::Tuple { items, .. } => self.tuple_input(idx, items, want, e.span()),
             other => {
                 let got = self.ty_of(idx, other);
-                self.demand(other.span(), want, got, None);
+                self.demand(other.span(), want, got, None, None);
             }
         }
     }
@@ -615,7 +643,7 @@ impl<'a> Ctx<'a> {
                     };
                 }
                 let got = Type::List(Box::new(same.unwrap_or(Type::Any)));
-                self.demand(span, want, got, None);
+                self.demand(span, want, got, None, None);
             }
         }
     }
@@ -642,13 +670,13 @@ impl<'a> Ctx<'a> {
             }
             // The word spells no literal of `want`: name what it does spell.
             Some((text, LiteralFit::Err)) if untyped => {
-                self.demand(span, want, types::literal_type(text), None);
+                self.demand(span, want, types::literal_type(text), None, None);
             }
             _ => {
                 if types::coerce(&want, &got) {
                     self.record(span, if got == Type::Any { want } else { got });
                 } else {
-                    self.demand(span, want, got, None);
+                    self.demand(span, want, got, None, None);
                 }
             }
         }
@@ -669,12 +697,19 @@ impl<'a> Ctx<'a> {
         let span = w.node.span();
         if w.scalar() == ks_lang::Scalar::DottedName {
             let Some((target, got)) = self.resolve_ref(idx, w.text(), span) else { return };
+            // The output of the wanted type, when the step has exactly one:
+            // rewriting just that segment makes the value fit.
+            let mut fix = None;
             let hint = if types::coerce(&want, &got) {
                 None
             } else {
-                target.and_then(|t| self.mismatch_hint(t, &want))
+                target.and_then(|t| {
+                    let (hint, out, unique) = self.mismatch_hint(t, &want)?;
+                    fix = Some(Fix::new(segment_span(w.text(), span.start, 1), out, unique));
+                    Some(hint)
+                })
             };
-            self.demand(span, want, got, hint);
+            self.demand(span, want, got, hint, fix);
         } else {
             let text = w.text();
             let got = self.word_untyped(idx, w);
@@ -760,43 +795,64 @@ impl<'a> Ctx<'a> {
         if want.is_named("oci.Tag") { Type::Named("oci.Tag".to_string()) } else { Type::String }
     }
 
-    fn demand(&mut self, span: Span, want: Type, got: Type, hint: Option<String>) {
+    /// A value against the type its input declares. `fix`, when the checker
+    /// has one, is the edit that would make it fit.
+    fn demand(
+        &mut self,
+        span: Span,
+        want: Type,
+        got: Type,
+        hint: Option<String>,
+        fix: Option<Fix>,
+    ) {
         if types::coerce(&want, &got) {
             self.record(span, if got == Type::Any { want } else { got });
             return;
         }
         let message = format!("expected {want}, got {got}");
         let hint = hint.or_else(|| secret_hint(&want, &got));
-        match hint {
-            Some(h) => self.err_hint(Code::TypeMismatch, span, message, h),
-            None => self.err(Code::TypeMismatch, span, message),
-        }
+        let d = match hint {
+            Some(h) => Diagnostic::error(Code::TypeMismatch, span, message).with_hint(h),
+            None => Diagnostic::error(Code::TypeMismatch, span, message),
+        };
+        self.push(match fix {
+            Some(fix) => d.with_fix(fix),
+            None => d,
+        });
     }
 
     /// The did-you-mean for a type mismatch: another output of the same
-    /// step that has the wanted type. The hint quotes the wanted type's
-    /// rationale when the catalog declares one
-    /// (`use build.digest so prod runs exactly the image you built`).
-    fn mismatch_hint(&self, target: usize, want: &Type) -> Option<String> {
+    /// step that has the wanted type. Yields the hint, the output it names
+    /// and whether that output is the step's only one of the wanted type.
+    /// The hint quotes the wanted type's rationale when the catalog declares
+    /// one (`use build.digest so prod runs exactly the image you built`).
+    fn mismatch_hint(&self, target: usize, want: &Type) -> Option<(String, String, bool)> {
         let spec = self.steps[target].spec?;
-        let out = self.alt_output(spec, want)?;
+        let (out, unique) = self.alt_output(spec, want)?;
         let name = &self.steps[target].name;
-        Some(match self.catalog.rationale(want) {
+        let hint = match self.catalog.rationale(want) {
             Some(r) => format!("use {name}.{out} {r}"),
             None => format!("use {name}.{out}, which is {} {want}", article(&want.to_string())),
-        })
+        };
+        Some((hint, out, unique))
     }
 
-    /// Another output of `spec` with the wanted type; for a `decide`, the
-    /// `answer` output for one of its declared answers.
-    fn alt_output(&self, spec: &StepTypes, want: &Type) -> Option<String> {
-        spec.outputs
+    /// Another output of `spec` with the wanted type, with whether it is the
+    /// only one; for a `decide`, the `answer` output for one of its declared
+    /// answers.
+    fn alt_output(&self, spec: &StepTypes, want: &Type) -> Option<(String, bool)> {
+        let mut fits = spec
+            .outputs
             .iter()
-            .find(|(_, ty)| !matches!(ty, Type::Any) && types::coerce(want, ty))
-            .map(|(n, _)| n.clone())
-            .or_else(|| {
-                (spec.decision && matches!(want, Type::Decision(_))).then(|| "answer".to_string())
-            })
+            .filter(|(_, ty)| !matches!(ty, Type::Any) && types::coerce(want, ty));
+        match fits.next() {
+            Some((n, _)) => Some((n.clone(), fits.next().is_none())),
+            // A `decide` types its `answer` output from the declared returns:.
+            None if spec.decision && matches!(want, Type::Decision(_)) => {
+                Some(("answer".to_string(), true))
+            }
+            None => None,
+        }
     }
 
     /// A same-workflow output of the wanted nominal type — where a pasted
@@ -860,8 +916,14 @@ impl<'a> Ctx<'a> {
         let mut cands: Vec<&str> = self.steps.iter().map(|s| s.name.as_str()).collect();
         cands.extend_from_slice(&NAMESPACES);
         let msg = format!("unknown step or context value `{first}`");
-        match suggest(first, &cands) {
-            Some(s) => self.err_hint(Code::UnknownRef, span, msg, format!("did you mean `{s}`?")),
+        match suggestion(first, &cands) {
+            Some((s, unique)) => self.err_hint_fix(
+                Code::UnknownRef,
+                span,
+                msg,
+                format!("did you mean `{s}`?"),
+                Fix::new(segment_span(text, span.start, 0), s, unique),
+            ),
             None => self.err(Code::UnknownRef, span, msg),
         }
         None
@@ -907,13 +969,13 @@ impl<'a> Ctx<'a> {
                     let outs: Vec<String> = spec
                         .map(|sp| sp.outputs.iter().map(|(n, _)| n.to_string()).collect())
                         .unwrap_or_default();
-                    match suggest(out, &outs) {
-                        Some(s) => self.err_hint(
-                            Code::UnknownOutput,
-                            span,
-                            msg,
-                            format!("did you mean `{s}`?"),
-                        ),
+                    match suggestion(out, &outs) {
+                        Some((s, unique)) => {
+                            let hint = format!("did you mean `{s}`?");
+                            let at = segment_span(rest, span.end - rest.len() as u32, 0);
+                            let fix = Fix::new(at, s, unique);
+                            self.err_hint_fix(Code::UnknownOutput, span, msg, hint, fix)
+                        }
                         None => self.err(Code::UnknownOutput, span, msg),
                     }
                 }
@@ -1526,15 +1588,16 @@ impl<'a> Ctx<'a> {
             let text = verb.text();
             if !POLICY_VERBS.contains(&text) {
                 let msg = format!("unknown action `{text}`");
-                match suggest(text, &POLICY_VERBS) {
-                    Some(s) => self.err_hint(
-                        Code::PolicyAction,
-                        verb.node.span(),
-                        msg,
-                        format!("did you mean `{s}`?"),
-                    ),
-                    None => self.err(Code::PolicyAction, verb.node.span(), msg),
-                }
+                let span = verb.node.span();
+                let d = Diagnostic::error(Code::PolicyAction, span, msg);
+                // `policy:` fixes are real edits, and `--fix` refuses them
+                // by span: the edit is right, the decision is a human's.
+                self.push(match suggestion(text, &POLICY_VERBS) {
+                    Some((s, unique)) => d
+                        .with_hint(format!("did you mean `{s}`?"))
+                        .with_fix(Fix::new(span, s, unique)),
+                    None => d,
+                });
                 continue;
             }
             if text == "read" {
@@ -1699,7 +1762,13 @@ impl<'a> Ctx<'a> {
         let mut diagnostics = self.diags;
         diagnostics.sort_by_key(|d| (d.span.start, d.span.end));
         self.secret_uses.sort_by_key(|u| u.span.start);
-        Checked { workflow, diagnostics, types: self.types, secret_uses: self.secret_uses }
+        Checked {
+            workflow,
+            diagnostics,
+            types: self.types,
+            secret_uses: self.secret_uses,
+            policy_spans: self.policy_spans,
+        }
     }
 }
 
@@ -1722,6 +1791,20 @@ fn split_first(text: &str) -> (&str, Option<&str>) {
         Some((a, b)) => (a, Some(b)),
         None => (text, None),
     }
+}
+
+/// The span of the `n`th dot-separated segment of `text`, which starts at
+/// `start`. Fixes rewrite the one misspelled segment — `tag` in
+/// `build.tag`, not the whole reference.
+fn segment_span(text: &str, start: u32, n: usize) -> Span {
+    let mut at = start;
+    for (i, seg) in text.split('.').enumerate() {
+        if i == n {
+            return Span::new(at, at + seg.len() as u32);
+        }
+        at += seg.len() as u32 + 1;
+    }
+    Span::new(start, start) // a name without that segment: nothing to rewrite
 }
 
 /// A type without its `Optional` wrapper, so `git.tag?` compares against
@@ -1807,18 +1890,56 @@ const MAX_SUGGEST_CANDIDATES: usize = 512;
 
 /// The closest candidate within a small threshold, if any.
 pub(crate) fn suggest<S: AsRef<str>>(name: &str, candidates: &[S]) -> Option<String> {
+    suggestion(name, candidates).map(|(best, _)| best)
+}
+
+/// [`suggest`]'s name together with whether it is unambiguous — nothing else
+/// ties it. One pass, so the hint a person reads and the fix `--fix` applies
+/// can never name different candidates: a tie is shown but not applied.
+pub(crate) fn suggestion<S: AsRef<str>>(name: &str, candidates: &[S]) -> Option<(String, bool)> {
+    let (best, second) = closest(name, candidates)?;
+    Some((best.1.to_string(), second.is_none_or(|(sd, _)| sd > best.0)))
+}
+
+/// A candidate within the threshold, with its distance: `(distance, name)`.
+type Ranked<'c> = (usize, &'c str);
+
+/// The nearest candidate within the threshold and the runner-up, if any.
+/// Ties keep the earlier candidate, exactly as `min_by_key` did.
+fn closest<'c, S: AsRef<str>>(
+    name: &str,
+    candidates: &'c [S],
+) -> Option<(Ranked<'c>, Option<Ranked<'c>>)> {
     if candidates.len() > MAX_SUGGEST_CANDIDATES {
         return None;
     }
     let limit = if name.len() < 4 { 1 } else { 2 };
-    candidates
-        .iter()
+    let mut best: Option<(usize, &str)> = None;
+    let mut second: Option<(usize, &str)> = None;
+    for c in candidates {
         // A length difference alone already exceeds the threshold.
-        .filter(|c| c.as_ref().len().abs_diff(name.len()) <= limit)
-        .map(|c| (bounded_levenshtein(name, c.as_ref(), limit), c))
-        .filter(|(d, _)| *d <= limit)
-        .min_by_key(|(d, _)| *d)
-        .map(|(_, c)| c.as_ref().to_string())
+        if c.as_ref().len().abs_diff(name.len()) > limit {
+            continue;
+        }
+        let d = bounded_levenshtein(name, c.as_ref(), limit);
+        if d > limit {
+            continue;
+        }
+        let c = c.as_ref();
+        match best {
+            // No nearer than what we hold, so it can only be the runner-up.
+            Some((bd, _)) if bd <= d => {
+                if second.is_none_or(|(sd, _)| d < sd) {
+                    second = Some((d, c));
+                }
+            }
+            _ => {
+                second = best;
+                best = Some((d, c));
+            }
+        }
+    }
+    best.map(|b| (b, second))
 }
 
 /// Edit distance on bytes, two-row DP, abandoned as soon as a row proves the

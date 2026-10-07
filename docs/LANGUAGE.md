@@ -288,6 +288,11 @@ Every value has a type, and types never convert implicitly
   needed; `[no \`secrets:\` resolver]` when the environment declares none).
   It is a pure projection of the checked file: no resolver is constructed
   and no store is read.
+- `keepshipping check --fix` applies the edits the checker is sure of — a
+  misspelled input, output or step name, or the output of the wanted type —
+  and re-checks. It never edits `policy:`: a policy change needs a human
+  ([ADR 0012](adr/0012-policy-authority.md)). See
+  [DIAGNOSTICS.md](DIAGNOSTICS.md) for the `fixes` shape in `--format json`.
 
 ## Format version and stability
 

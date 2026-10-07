@@ -244,12 +244,25 @@ pub fn json(w: &mut impl Write, path: &str, src: &str, diags: &[Diagnostic]) -> 
             }
             write!(w, "{}", json_str(hint))?;
         }
-        // Reserved for machine-applicable fixes; nothing emits them yet.
-        writeln!(w, "],\"fixes\":[]}}")?;
+        // A suggested edit, in the same span encoding as the diagnostic's own.
+        write!(w, "],\"fixes\":[")?;
+        for (n, fix) in d.fixes.iter().enumerate() {
+            if n > 0 {
+                write!(w, ",")?;
+            }
+            write!(w, "{{\"span\":")?;
+            json_span(w, &lines, src, fix.span)?;
+            write!(
+                w,
+                ",\"replacement\":{},\"machine_applicable\":{}}}",
+                json_str(&fix.replacement),
+                fix.machine_applicable
+            )?;
+        }
+        writeln!(w, "]}}")?;
     }
     Ok(())
 }
-
 fn json_span(w: &mut impl Write, lines: &Lines, src: &str, span: Span) -> io::Result<()> {
     let (line, column) = lines.line_col(src, span.start);
     let (end_line, end_column) = lines.line_col(src, span.end);

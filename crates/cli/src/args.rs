@@ -16,14 +16,14 @@ pub const INDEX_ENV: &str = "KEEPSSHIPPING_BLOCKS_INDEX";
 pub const USAGE: &str = "\
 usage: keepshipping check [FILE] [--all] [--format human|json|github]
                           [--warnings-as-errors] [--env NAME] [--event \"push main\"]
-                          [--actor human|agent|ci] [--secrets]
+                          [--actor human|agent|ci] [--secrets] [--fix]
        keepshipping run [FILE] [--env NAME] [--event \"push main\"] [--actor human|agent|ci]
                         [--non-interactive]
        keepshipping fmt --upgrade [PATH...]
        keepshipping blocks search <QUERY> [--index URL] [--limit N] [--format human|json]";
 
 /// Which subcommand's flags `parse_args` accepts. `--format`, `--all`,
-/// `--warnings-as-errors` and `--secrets` belong to `check` alone; `run`
+/// `--warnings-as-errors`, `--secrets` and `--fix` belong to `check` alone; `run`
 /// rejects them like any other unrecognized option. `blocks search` has its
 /// own `--format` (human or json, no github annotations), `--index` and
 /// `--limit`. `fmt` takes only `--upgrade` today: the formatter is not
@@ -46,6 +46,9 @@ pub struct Options {
     pub format: Format,
     pub all: bool,
     pub warnings_as_errors: bool,
+    /// `--fix`: apply the machine-applicable fixes and re-check. Never
+    /// applied to `policy:`, where the change needs a human.
+    pub fix: bool,
     pub env: Option<String>,
     pub event: Option<String>,
     /// The actor the command would run as; a human unless `--actor` says
@@ -74,6 +77,7 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
         format: Format::Human,
         all: false,
         warnings_as_errors: false,
+        fix: false,
         env: None,
         event: None,
         actor: ActorKind::Human,
@@ -93,6 +97,7 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
             "--all" if command == Command::Check => o.all = true,
             "--warnings-as-errors" if command == Command::Check => o.warnings_as_errors = true,
             "--secrets" if command == Command::Check => o.secrets = true,
+            "--fix" if command == Command::Check => o.fix = true,
             "--env" => o.env = Some(flag_value(&mut rest)?),
             "--event" => o.event = Some(flag_value(&mut rest)?),
             "--actor" => o.actor = actor_kind(&flag_value(&mut rest)?)?,

@@ -70,7 +70,16 @@ fn json_output_is_schema_v1() {
         stdout.contains("\"line\":21,\"column\":12,\"end_line\":21,\"end_column\":21"),
         "{stdout}"
     );
-    assert!(stdout.ends_with("\"fixes\":[]}\n"), "{stdout}");
+    // The type-directed fix: rewrite `tag` (the output segment, not the
+    // whole reference) to `digest`, machine-applicable.
+    assert!(
+        stdout.ends_with(
+            "\"fixes\":[{\"span\":{\"start\":369,\"end\":372,\"line\":21,\"column\":18,\
+             \"end_line\":21,\"end_column\":21},\"replacement\":\"digest\",\
+             \"machine_applicable\":true}]}\n"
+        ),
+        "{stdout}"
+    );
     assert_eq!(stdout, read_or_update(&golden("check.json"), &stdout));
 }
 
