@@ -17,6 +17,10 @@ fn check(extra: &[&str]) -> (i32, String, String) {
         .arg("check")
         .args(extra)
         .current_dir(SITE)
+        // Check now has a context, and it is detected from the environment:
+        // these bytes are the same on a laptop and on a CI runner.
+        .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
         .output()
         .expect("run keepshipping");
     (

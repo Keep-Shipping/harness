@@ -8,10 +8,11 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use ks_core::ContextName;
 use ks_core::ports::run_context::ActorKind;
 use ks_lang::{Diagnostic, Fix, Severity, Span};
 
-use crate::args::{Command, Options, USAGE, parse_args};
+use crate::args::{Command, Options, USAGE, context_of, parse_args};
 use crate::render::{self, Format};
 
 /// One checked file: what was read and what the checker said about it.
@@ -24,6 +25,8 @@ pub struct Site {
     pub file: PathBuf,
     pub src: String,
     pub checked: ks_core::Checked,
+    /// The steps this context cannot run, as the warnings above named them.
+    pub unmet: Vec<ks_core::UnmetStep>,
 }
 
 pub fn check(args: &[String]) -> ExitCode {
@@ -142,7 +145,7 @@ fn fix(sites: Vec<Site>, o: &Options) -> Result<Vec<Site>, ExitCode> {
         // Re-check the bytes we just wrote, so the report and the exit code
         // describe the file as it now stands.
         let shown = site.path.clone();
-        fixed.push(load(&site.file, &shown, o.actor, false)?);
+        fixed.push(load(&site.file, &shown, o.actor, false, context_of(o))?);
     }
     Ok(fixed)
 }
@@ -221,7 +224,7 @@ pub fn fails(o: &Options, diags: &[Diagnostic]) -> bool {
 fn collect(o: &Options) -> Result<Vec<Site>, ExitCode> {
     if !o.all {
         let given = o.path.as_deref().unwrap_or("ship.ks");
-        return Ok(vec![load(Path::new(given), given, o.actor, o.path.is_none())?]);
+        return Ok(vec![load(Path::new(given), given, o.actor, o.path.is_none(), context_of(o))?]);
     }
     let root = PathBuf::from(o.path.as_deref().unwrap_or("."));
     let mut found = Vec::new();
@@ -242,7 +245,7 @@ fn collect(o: &Options) -> Result<Vec<Site>, ExitCode> {
         .iter()
         .map(|path| {
             let shown = path.strip_prefix(&root).unwrap_or(path);
-            load(path, &shown.to_string_lossy(), o.actor, false)
+            load(path, &shown.to_string_lossy(), o.actor, false, context_of(o))
         })
         .collect();
     sites
@@ -271,7 +274,13 @@ fn walk(dir: &Path, found: &mut Vec<PathBuf>) -> io::Result<()> {
 /// usage errors the caller can fix — the default `ship.ks` may simply not
 /// exist yet; anything else is internal: the checker only ever reads, so it
 /// cannot recover.
-pub fn load(path: &Path, shown: &str, actor: ActorKind, default: bool) -> Result<Site, ExitCode> {
+pub fn load(
+    path: &Path,
+    shown: &str,
+    actor: ActorKind,
+    default: bool,
+    context: ContextName,
+) -> Result<Site, ExitCode> {
     let src = match std::fs::read_to_string(path) {
         Ok(src) => src,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -299,9 +308,13 @@ pub fn load(path: &Path, shown: &str, actor: ActorKind, default: bool) -> Result
         }
     };
     let catalog = ks_core::Catalog::builtin();
-    let options = ks_core::CheckOptions::new(&catalog).actor(actor);
+    let ctx = context.context();
+    let options = ks_core::CheckOptions::new(&catalog).actor(actor).context(ctx.clone());
     let checked = ks_core::check_with(&ks_lang::parse(&src), &options);
-    Ok(Site { path: shown.to_string(), file: path.to_path_buf(), src, checked })
+    // From the same catalog and context the warnings came from, so `run`
+    // gates on exactly what `check` said rather than a second opinion.
+    let unmet = ks_core::unmet_steps(&checked.workflow, &catalog, &ctx);
+    Ok(Site { path: shown.to_string(), file: path.to_path_buf(), src, checked, unmet })
 }
 
 /// The `--secrets` listing: per environment, the secret references its

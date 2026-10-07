@@ -7,7 +7,7 @@ use std::fmt;
 
 use crate::harness::Harness;
 use crate::ports::script_host::{Value, ValueType};
-use crate::step::{StepSchema, TypeRef};
+use crate::step::{StepCapabilities, StepSchema, TypeRef};
 use crate::types::{self, Type};
 
 /// One step kind's contract as the checker reads it: the input types values
@@ -25,6 +25,10 @@ pub struct StepTypes {
     /// `decide`: the bare step name and its `answer` output type as the
     /// declared `returns:` variants.
     pub decision: bool,
+    /// What the kind needs from its environment, as its
+    /// [`StepKind::capabilities`](crate::step::StepKind::capabilities) declares
+    /// it — checked against the context a run would have.
+    pub capabilities: StepCapabilities,
 }
 
 /// `when:` is a reserved input on every step: a boolean expression.
@@ -102,6 +106,7 @@ impl Catalog {
                     outputs: owned(outputs),
                     runtime_outputs,
                     decision,
+                    capabilities: StepCapabilities::default(),
                 },
             );
         };
@@ -165,11 +170,16 @@ impl Catalog {
     /// when `name` is already in the catalog, or when the schema declares an
     /// output of type `Secret`: a secret output would invite exactly the
     /// leaks the type system exists to prevent.
+    ///
+    /// A schema registered this way declares no capabilities, so its steps
+    /// need nothing beyond a laptop. Only [`Catalog::from_harness`], which has
+    /// the [`StepKind`](crate::step::StepKind) that owns the schema, records
+    /// what they really need.
     pub fn add_schema(&mut self, name: &str, schema: &StepSchema) -> Result<(), CatalogError> {
         if self.steps.contains_key(name) {
             return Err(CatalogError::new(format!("step `{name}` is already in the catalog")));
         }
-        self.insert_schema(name, schema)
+        self.insert_schema(name, schema, StepCapabilities::default())
     }
 
     /// Builds a catalog from a harness: the built-in step kinds plus every
@@ -180,12 +190,17 @@ impl Catalog {
         for step in harness.steps() {
             let name = step.name();
             catalog.steps.remove(name);
-            catalog.insert_schema(name, &step.schema())?;
+            catalog.insert_schema(name, &step.schema(), step.capabilities())?;
         }
         Ok(catalog)
     }
 
-    fn insert_schema(&mut self, name: &str, schema: &StepSchema) -> Result<(), CatalogError> {
+    fn insert_schema(
+        &mut self,
+        name: &str,
+        schema: &StepSchema,
+        capabilities: StepCapabilities,
+    ) -> Result<(), CatalogError> {
         let mut inputs = Vec::new();
         for field in &schema.inputs {
             let ty = ty_of_ref(field.ty);
@@ -218,6 +233,7 @@ impl Catalog {
                 outputs,
                 runtime_outputs: false,
                 decision: false,
+                capabilities,
             },
         );
         Ok(())

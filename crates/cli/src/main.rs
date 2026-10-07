@@ -22,9 +22,9 @@ use std::io::{IsTerminal, Write as _};
 use std::path::Path;
 use std::process::ExitCode;
 
-use ks_core::{Trigger, TriggerKind};
+use ks_core::{ContextName, Trigger, TriggerKind};
 
-use crate::args::{Command, Options, USAGE, parse_args};
+use crate::args::{Command, Options, USAGE, context_of, parse_args};
 
 fn main() -> ExitCode {
     // A panic is a bug in keepshipping, not a problem with the user's file:
@@ -56,7 +56,8 @@ fn run(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     let path = o.path.as_deref().unwrap_or("ship.ks");
-    let site = match check::load(Path::new(path), path, o.actor, o.path.is_none()) {
+    let context = context_of(&o);
+    let site = match check::load(Path::new(path), path, o.actor, o.path.is_none(), context) {
         Ok(site) => site,
         Err(code) => return code,
     };
@@ -67,6 +68,11 @@ fn run(args: &[String]) -> ExitCode {
     }
     if check::fails(&o, diags) {
         return ExitCode::from(1);
+    }
+    // A run bound to fail at a step the context cannot run is refused here,
+    // before the environment is even chosen.
+    if let Err(code) = refuses_to_run(&site, &o, context) {
+        return code;
     }
     let event = match o.event.as_deref().map(parse_event) {
         Some(Ok(t)) => Some(t),
@@ -109,6 +115,67 @@ fn selected(name: &str) -> ExitCode {
     println!("environment: {name}");
     println!("execution is not implemented yet (ks-engine)");
     ExitCode::SUCCESS
+}
+
+/// The steps a run would take, in run order: up to and including `--until`,
+/// less every `--skip`. A name the file does not declare is a usage error —
+/// a typo must not quietly widen the run.
+fn selection(site: &check::Site, o: &Options) -> Result<Vec<String>, Box<str>> {
+    let steps = ks_core::run_order(&site.checked.workflow);
+    for name in o.skip.iter().chain(o.until.iter()) {
+        if !steps.contains(&name.as_str()) {
+            return Err(format!("no step named `{name}`").into());
+        }
+    }
+    let until = o
+        .until
+        .as_deref()
+        .and_then(|name| steps.iter().position(|s| *s == name))
+        .map(|at| at + 1)
+        .unwrap_or(steps.len());
+    Ok(steps[..until]
+        .iter()
+        .filter(|s| !o.skip.iter().any(|k| k == *s))
+        .map(|s| (*s).to_string())
+        .collect())
+}
+
+/// The context gate ([#34](https://github.com/Keep-Shipping/harness/issues/34)):
+/// a run bound to fail at a step this context cannot run does not start
+/// unless `--allow-partial` says the caller knows that.
+fn refuses_to_run(site: &check::Site, o: &Options, context: ContextName) -> Result<(), ExitCode> {
+    let selected = match selection(site, o) {
+        Ok(steps) => steps,
+        Err(why) => {
+            eprintln!("error: {why}");
+            eprintln!("{USAGE}");
+            return Err(ExitCode::from(2));
+        }
+    };
+    let ctx = context.context();
+    // `site.unmet` came from the check that already printed the warnings, so
+    // the gate agrees with them rather than re-asking the catalog.
+    let Some(step) = site.unmet.iter().find(|s| selected.contains(&s.name)) else {
+        return Ok(());
+    };
+    // Counted in run order, like `--until` and the warning's own stop point.
+    let order = ks_core::run_order(&site.checked.workflow);
+    let at = order.iter().position(|n| *n == step.name).unwrap_or(order.len()) + 1;
+    if o.allow_partial {
+        eprintln!(
+            "note: continuing with --allow-partial; step `{}` will be skipped or fail",
+            step.name
+        );
+        return Ok(());
+    }
+    eprintln!(
+        "refusing to start: step `{}` ({at} of {}) {}; pass --allow-partial, or {}",
+        step.name,
+        order.len(),
+        step.reason(&ctx),
+        step.hint()
+    );
+    Err(ExitCode::from(1))
 }
 
 /// A terminal to ask, the user having allowed it, and no CI in charge.

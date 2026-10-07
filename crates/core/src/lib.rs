@@ -31,6 +31,7 @@
 pub mod auto_rule;
 mod catalog;
 mod check;
+pub mod context;
 mod env;
 pub mod harness;
 pub mod ids;
@@ -48,6 +49,7 @@ pub use check::{
     CheckOptions, Checked, EnvSecrets, SecretRequirement, SecretUse, check, check_with,
     secret_requirements,
 };
+pub use context::{CheckContext, ContextName, UnmetStep, run_order, unmet_steps};
 pub use env::{EnvChoice, select_env};
 pub use registry::{Explanation, explain};
 pub use types::{LiteralFit, Type, coerce, literal, literal_type};

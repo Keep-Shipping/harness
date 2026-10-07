@@ -20,6 +20,11 @@ fn check_explained(src: &str, code: Code) -> Checked {
         let options =
             CheckOptions::new(&catalog).actor(ks_core::ports::run_context::ActorKind::Agent);
         check_with(&ks_lang::parse(src), &options)
+    } else if code == Code::NeedsContext {
+        // Checked as a laptop, where a `ci-only` step cannot run.
+        let catalog = Catalog::builtin();
+        let options = CheckOptions::new(&catalog).context(ks_core::CheckContext::local());
+        check_with(&ks_lang::parse(src), &options)
     } else {
         check_src(src)
     }
