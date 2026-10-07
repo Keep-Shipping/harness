@@ -75,6 +75,17 @@ Newest first, one heading per contract version, dated.
   or binds a verdict to different artifacts, fails the kit rather than
   shipping.
 
+- **2026-10-07** — The deploy-target ports
+  ([#52](https://github.com/Keep-Shipping/harness/issues/52),
+  [#78](https://github.com/Keep-Shipping/harness/issues/78)). Four modules land:
+  the `Cluster` port (`apply`, `upgrade`, `rollout`, `health`, `rollback`,
+  `handle`), the `RemoteShell` port (`run`, `copy`, `probe`, `host`), the
+  `FunctionHost` port (`publish`, `shift`, `health`, `keep_warm`, `rollback`,
+  `pinned`, `pin_is_detectable`), and the shared `Health` / `HealthReport`
+  vocabulary they all report in. The three traits added to the port contract
+  are `Cluster`, `RemoteShell` and `FunctionHost`; `health` adds no trait, only
+  the value types every health call returns.
+
 ## STEP_API 1
 
 - **2026-10-07** — The initial port contract
