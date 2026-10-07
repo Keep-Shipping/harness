@@ -97,7 +97,7 @@ jobs:
           mkdir -p stage/keepshipping-${VERSION}
           cp "$bin" "stage/keepshipping-${VERSION}/keepshipping"
           # Keep Shipping ships LICENSE and README next to the binary so the
-          # licence travels with it (ADR-0006 is still open).
+          # Apache-2.0 licence (ADR 0006) travels with it.
           cp LICENSE README.md "stage/keepshipping-${VERSION}/" \
             || echo "::notice::LICENSE or README.md is missing from the tag; the archive carries the binary only."
           # .tar.gz on macOS, .tar.xz on Linux: the two platforms disagree about
@@ -208,7 +208,7 @@ jobs:
         #
         # Today this step is a no-op at tag time — every package is
         # `publish = false`, so release-plz has nothing to release — but the
-        # pin is here and correct so that the day ADR-0006 unblocks publishing,
+        # pin is here and correct so that the day publishing is switched on,
         # this is not a workflow that fails on a reference that never existed.
         uses: release-plz/action@v0.5.139
 
@@ -233,10 +233,10 @@ jobs:
           # `prs`, `tag` and `version` — no notes — and its action outputs
           # (`prs`, `releases`, `releases_created`) carry no notes either. And
           # it would have nothing to release anyway: `publish = false` is set
-          # workspace-wide until ADR-0006 lands, so every package is
-          # non-publishable and `release-plz release` reports nothing to
-          # release. `body_path` is deliberately absent rather than pointing at
-          # a file nothing writes.
+          # workspace-wide while the repository is private (ADR 0006), so
+          # every package is non-publishable and `release-plz release` reports
+          # nothing to release. `body_path` is deliberately absent rather than
+          # pointing at a file nothing writes.
           generate_release_notes: true
           files: |
             dist/*.tar.gz

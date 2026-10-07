@@ -16,6 +16,11 @@ pub enum EnvChoice {
 /// Pick the environment: an explicit request wins, then an event matching
 /// exactly one environment's `on:` triggers, then a single declared
 /// environment (a file without `envs:` has the implicit `default`).
+#[expect(
+    clippy::result_large_err,
+    reason = "a `Diagnostic` is the error type across the checker; boxing it costs an \
+              allocation on every one the checker pushes"
+)]
 pub fn select_env(
     wf: &Workflow,
     requested: Option<&str>,
