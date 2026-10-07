@@ -1,14 +1,15 @@
 //! The `check` subcommand: parse and type-check the site file — or, with
 //! `--all`, every `ship.ks` under a directory — print what it finds, and
 //! exit by the documented code. Checking reads files and nothing else: it
-//! never runs a step, touches a store or opens a socket.
+//! never runs a step, touches a store or opens a socket. With `--fix` it
+//! additionally rewrites the machine-applicable fixes it proposes.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use ks_core::ports::run_context::ActorKind;
-use ks_lang::{Diagnostic, Severity};
+use ks_lang::{Diagnostic, Fix, Severity, Span};
 
 use crate::args::{Command, Options, USAGE, parse_args};
 use crate::render::{self, Format};
@@ -18,6 +19,9 @@ pub struct Site {
     /// The path as printed: as given on the command line, or relative to
     /// the `--all` walk root.
     pub path: String,
+    /// The file to write back to — `--fix` edits the file on disk, and the
+    /// printed path need not be one you can open.
+    pub file: PathBuf,
     pub src: String,
     pub checked: ks_core::Checked,
 }
@@ -40,6 +44,16 @@ pub fn check(args: &[String]) -> ExitCode {
     let sites = match collect(&o) {
         Ok(sites) => sites,
         Err(code) => return code,
+    };
+    // Fix, then report what the fixed files check like: the exit code is
+    // the re-check's, never the pre-fix one's.
+    let sites = if o.fix {
+        match fix(sites, &o) {
+            Ok(sites) => sites,
+            Err(code) => return code,
+        }
+    } else {
+        sites
     };
 
     let color = render::use_color();
@@ -72,6 +86,124 @@ pub fn check(args: &[String]) -> ExitCode {
         let _ = render::footer(&mut out);
     }
     if failed { ExitCode::from(1) } else { ExitCode::SUCCESS }
+}
+
+/// `--fix`: apply the machine-applicable edits the checker proposed, then
+/// re-check each file it rewrote. Two things are never applied — an edit
+/// that overlaps another (the second would land on bytes the first moved),
+/// and any edit inside `policy:`, where widening or narrowing what a run
+/// may do is a human's decision ([ADR
+/// 0012](https://github.com/Keep-Shipping/harness/blob/main/docs/adr/0012-policy-authority.md)).
+/// Both stay as diagnostics in the re-check output, and are named on
+/// stderr: `--fix` writes files, so it says which ones and what it left.
+fn fix(sites: Vec<Site>, o: &Options) -> Result<Vec<Site>, ExitCode> {
+    let mut fixed = Vec::with_capacity(sites.len());
+    for site in sites {
+        let plan = plan(&site);
+        if !plan.apply.is_empty() {
+            let src = apply(&site.src, &plan.apply);
+            match std::fs::write(&site.file, &src) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("error: {}: cannot be written: {e}", site.path);
+                    return Err(ExitCode::from(2));
+                }
+            }
+            eprintln!(
+                "{}: applied {} fix{}",
+                site.path,
+                plan.apply.len(),
+                plural(plan.apply.len())
+            );
+        }
+        if !plan.policy.is_empty() {
+            eprintln!(
+                "{}: {} fix{} inside `policy:` need{} a human and {} not applied",
+                site.path,
+                plan.policy.len(),
+                plural(plan.policy.len()),
+                if plan.policy.len() == 1 { "s" } else { "" },
+                if plan.policy.len() == 1 { "was" } else { "were" },
+            );
+        }
+        if plan.overlapping > 0 {
+            eprintln!(
+                "{}: {} fix{} overlapped an edit already applied and {} not applied",
+                site.path,
+                plan.overlapping,
+                plural(plan.overlapping),
+                if plan.overlapping == 1 { "was" } else { "were" },
+            );
+        }
+        if plan.apply.is_empty() {
+            fixed.push(site);
+            continue;
+        }
+        // Re-check the bytes we just wrote, so the report and the exit code
+        // describe the file as it now stands.
+        let shown = site.path.clone();
+        fixed.push(load(&site.file, &shown, o.actor, false)?);
+    }
+    Ok(fixed)
+}
+
+/// What `--fix` will do to one file: the edits to splice in, those inside
+/// `policy:` a human has to decide on, and the count of edits that lost a
+/// race with an overlapping one.
+#[derive(Default)]
+struct Plan {
+    apply: Vec<Fix>,
+    policy: Vec<Fix>,
+    overlapping: usize,
+}
+
+fn plan(site: &Site) -> Plan {
+    let mut fixes: Vec<Fix> = site
+        .checked
+        .diagnostics
+        .iter()
+        .flat_map(|d| d.fixes.iter())
+        .filter(|f| f.machine_applicable)
+        .cloned()
+        .collect();
+    // A fix only ever names bytes inside its own diagnostic's span, so
+    // source order of the diagnostics is not span order of the fixes:
+    // sort before deciding what overlaps what, and the splices below can
+    // rely on ascending spans.
+    fixes.sort_by_key(|f| (f.span.start, f.span.end));
+    let mut plan = Plan::default();
+    for fix in fixes {
+        if site.checked.policy_spans.iter().any(|p| overlaps(fix.span, *p)) {
+            plan.policy.push(fix);
+        } else if plan.apply.iter().any(|a| overlaps(a.span, fix.span)) {
+            plan.overlapping += 1;
+        } else {
+            plan.apply.push(fix);
+        }
+    }
+    plan
+}
+
+/// Half-open ranges that share a byte cannot both be rewritten: applying
+/// one moves the bytes the other names.
+fn overlaps(a: Span, b: Span) -> bool {
+    a.start < b.end && b.start < a.end
+}
+
+/// `src` with every fix spliced in. The fixes arrive in source order, and
+/// are applied back to front so each span still names the same bytes.
+fn apply(src: &str, fixes: &[Fix]) -> String {
+    let mut out = src.to_string();
+    for f in fixes.iter().rev() {
+        let start = (f.span.start as usize).min(out.len());
+        let end = (f.span.end as usize).clamp(start, out.len());
+        out.replace_range(start..end, &f.replacement);
+    }
+    out
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "es" }
 }
 
 /// A file fails the check when it carries an error, or — with
@@ -169,7 +301,7 @@ pub fn load(path: &Path, shown: &str, actor: ActorKind, default: bool) -> Result
     let catalog = ks_core::Catalog::builtin();
     let options = ks_core::CheckOptions::new(&catalog).actor(actor);
     let checked = ks_core::check_with(&ks_lang::parse(&src), &options);
-    Ok(Site { path: shown.to_string(), src, checked })
+    Ok(Site { path: shown.to_string(), file: path.to_path_buf(), src, checked })
 }
 
 /// The `--secrets` listing: per environment, the secret references its
