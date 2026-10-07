@@ -25,5 +25,6 @@ A guard test (`cargo test -p ks-testing --test adr_guard`) checks every ADR belo
 | [0010](0010-image-build-backend.md) | Image build backend | Proposed |
 | [0011](0011-block-distribution.md) | Block distribution | Accepted |
 | [0013](0013-rust-workspace.md) | Rust workspace | Accepted |
+| [0014](0014-release-and-contract-versioning.md) | Release and contract versioning | Accepted |
 | [0100](0100-step-contract-and-composition-checks.md) | Step contract and composition checks | Accepted |
 | [0200](0200-hosted-venture-on-the-cratefield-harness.md) | Hosted venture on the Cratefield harness | Accepted |
