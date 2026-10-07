@@ -212,6 +212,14 @@ what turns the hero file into `build → deploy`, `plan → review → apply →
 deploy` (plus the direct data edge `plan → apply`). A cycle, self-reference
 included, is an error that shows the path: `cycle: review → risk → review`.
 
+**`ci-only:` under a step** marks a step that refuses to run off CI. It is
+the one property a step takes that is not an input. Checked with
+`--context local` it warns (`KS0602`) that the step will be skipped or fail,
+and suggests `--skip <step>` or `--until <earlier step>`; checked with
+`--context ci` it is silent. `run` refuses to start a run that would reach
+such a step unless `--allow-partial` is passed. This warning covers the step
+property; an environment's `ci-only:` is not part of it.
+
 ## Triggers and environments
 
 `on:` is a tuple of `push [<branch-glob>]` | `pr` | `tag [<glob>]` |

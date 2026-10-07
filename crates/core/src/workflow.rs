@@ -41,6 +41,9 @@ pub struct Step {
     pub kind: Option<String>,
     pub span: Span,
     pub kind_span: Span,
+    /// `ci-only: true`: the step refuses to run off CI
+    /// ([#34](https://github.com/Keep-Shipping/harness/issues/34)).
+    pub ci_only: bool,
 }
 
 /// An environment: per-target overrides.

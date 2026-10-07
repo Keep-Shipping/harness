@@ -126,6 +126,8 @@ pub enum Code {
     SecretShown,
     /// An optional context value used where it may be absent.
     OptionalAbsent,
+    /// A step needs more than the context it would run in has.
+    NeedsContext,
     /// An `auto:` approval rule that could approve a destructive plan.
     AutoDestroys,
 }
@@ -157,6 +159,7 @@ impl Code {
             Code::SecretInString => "KS0501",
             Code::SecretShown => "KS0502",
             Code::OptionalAbsent => "KS0601",
+            Code::NeedsContext => "KS0602",
             Code::AutoDestroys => "KS0701",
         }
     }
@@ -186,6 +189,7 @@ impl Code {
         Code::SecretInString,
         Code::SecretShown,
         Code::OptionalAbsent,
+        Code::NeedsContext,
         Code::AutoDestroys,
     ];
 }

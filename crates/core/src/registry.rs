@@ -552,6 +552,30 @@ steps:
     returns: yes | no
 ",
         },
+        Code::NeedsContext => Explanation {
+            code,
+            title: "step needs more than this context has",
+            severity: Severity::Warning,
+            summary: "The step asks for something the context it would run in cannot give: \
+                CI itself, an OIDC token, or network access. Checked with `--context local` \
+                a `ci-only: true` step warns here; checked with `--context ci` it is clean. \
+                Run it on CI, or bound the run before the step with `--until` or `--skip`.",
+            bad: "\
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  deploy: k8s.rollout
+    image: build.digest
+    ci-only: true
+",
+            good: "\
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  deploy: k8s.rollout
+    image: build.digest
+",
+        },
     }
 }
 

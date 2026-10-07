@@ -8,6 +8,7 @@ use ks_lang::{Atom, Code, Diagnostic, Entry, Expr, Fix, Span, StrPart, Word};
 
 use crate::auto_rule::{self, MISSING_GUARD_HINT, MISSING_GUARD_MESSAGE};
 use crate::catalog::{Catalog, StepTypes};
+use crate::context::{CheckContext, unmet_steps};
 use crate::ports::run_context::ActorKind;
 use crate::ports::secrets::SecretRef;
 use crate::types::{self, LiteralFit, Type};
@@ -141,12 +142,13 @@ pub fn check(parse: &ks_lang::Parse) -> Checked {
 pub struct CheckOptions<'a> {
     pub(crate) catalog: &'a Catalog,
     pub(crate) actor: Option<ActorKind>,
+    pub(crate) context: Option<CheckContext>,
 }
 
 impl<'a> CheckOptions<'a> {
     /// Checks against `catalog` instead of the built-in one.
     pub fn new(catalog: &'a Catalog) -> CheckOptions<'a> {
-        CheckOptions { catalog, actor: None }
+        CheckOptions { catalog, actor: None, context: None }
     }
 
     /// Checks the file as `actor` running it: a policy rule that binds the
@@ -158,11 +160,26 @@ impl<'a> CheckOptions<'a> {
         self.actor = Some(actor);
         self
     }
+
+    /// Checks the file as a run in `context` would: a step needing more than
+    /// the context has — CI, an OIDC token, network — warns, so nothing that
+    /// cannot work here goes unnoticed. Without a context nothing is said
+    /// about what a step needs.
+    #[must_use]
+    pub fn context(mut self, context: CheckContext) -> CheckOptions<'a> {
+        self.context = Some(context);
+        self
+    }
 }
 
 /// Type-check `parse` and build its [`Workflow`], against `options`.
 pub fn check_with(parse: &ks_lang::Parse, options: &CheckOptions<'_>) -> Checked {
-    let mut c = Ctx::new(options.catalog, options.actor, parse.diagnostics().to_vec());
+    let mut c = Ctx::new(
+        options.catalog,
+        options.actor,
+        options.context.clone(),
+        parse.diagnostics().to_vec(),
+    );
     c.file(parse.file());
     c.finish_all()
 }
@@ -178,11 +195,18 @@ const TRIGGER_KINDS: [&str; 5] = ["push", "pr", "tag", "manual", "schedule"];
 
 const ENV_PROPERTIES: [&str; 5] = ["secrets", "ci-only", "approvers", "on", "vars"];
 
+/// The reserved keys under a step: read with the declaration, never checked
+/// as inputs.
+const STEP_PROPERTIES: [&str; 1] = ["ci-only"];
+
 struct Ctx<'a> {
     catalog: &'a Catalog,
     /// The actor the run would start under, when the caller knows it; policy
     /// rules that bind it are enforced.
     actor: Option<ActorKind>,
+    /// The context the run would have, when the caller knows it; steps
+    /// needing more than it has warn.
+    context: Option<CheckContext>,
     diags: Vec<Diagnostic>,
     /// The dotted path of the entry being checked (`deploy.image`), attached
     /// to every diagnostic raised while it is checked.
@@ -214,6 +238,8 @@ struct StepInfo<'a> {
     kind_name: Option<String>,
     kind_span: Span,
     spec: Option<&'a StepTypes>,
+    /// `ci-only: true`: the step refuses to run off CI.
+    ci_only: bool,
     /// `decide` only: the answers declared under `returns:`.
     variants: Vec<String>,
 }
@@ -227,10 +253,16 @@ struct Edge {
 }
 
 impl<'a> Ctx<'a> {
-    fn new(catalog: &'a Catalog, actor: Option<ActorKind>, diags: Vec<Diagnostic>) -> Ctx<'a> {
+    fn new(
+        catalog: &'a Catalog,
+        actor: Option<ActorKind>,
+        context: Option<CheckContext>,
+        diags: Vec<Diagnostic>,
+    ) -> Ctx<'a> {
         Ctx {
             catalog,
             actor,
+            context,
             diags,
             subject: None,
             env_names: Vec::new(),
@@ -366,6 +398,7 @@ impl<'a> Ctx<'a> {
                 _ => (None, span),
             };
             let spec = kind_name.as_deref().and_then(|n| self.catalog.step(n));
+            let ci_only = self.step_ci_only(s);
             let variants = match spec.filter(|sp| sp.decision) {
                 Some(_) => s
                     .children()
@@ -381,6 +414,7 @@ impl<'a> Ctx<'a> {
                 kind_name,
                 kind_span,
                 spec,
+                ci_only,
                 variants,
             });
             self.index.insert(name.to_string(), self.steps.len() - 1);
@@ -405,9 +439,45 @@ impl<'a> Ctx<'a> {
             let Some(idx) = s.key_name().and_then(|n| self.step_index(n)) else { continue };
             for input in s.children() {
                 let Some(iname) = input.key_name() else { continue };
+                // Reserved properties are read with the declaration, not as
+                // an input the step kind would have to declare.
+                if STEP_PROPERTIES.contains(&iname) {
+                    continue;
+                }
                 self.subject = Some(format!("{}.{}", self.steps[idx].name, iname));
                 self.check_input(idx, iname, input);
                 self.subject = None;
+            }
+        }
+    }
+
+    /// A step's reserved `ci-only` property, `false` when it declares none.
+    /// It is not an input: the step kind need not declare it.
+    fn step_ci_only(&mut self, step: Entry<'_>) -> bool {
+        let Some(p) = step.children().find(|c| c.key_name() == Some("ci-only")) else {
+            return false;
+        };
+        self.subject = step.key_name().map(|n| format!("{n}.ci-only"));
+        let value = self.ci_only(p, Code::TypeMismatch);
+        self.subject = None;
+        value
+    }
+
+    /// The `true`/`false` under a `ci-only` property; a value that is
+    /// neither is `code`'s error, worded the same way for an environment and
+    /// for a step.
+    fn ci_only(&mut self, p: Entry<'_>, code: Code) -> bool {
+        match p.expr().as_ref().and_then(value_word).as_deref() {
+            Some("true") => true,
+            Some("false") => false,
+            _ => {
+                self.err_hint(
+                    code,
+                    p.key_span(),
+                    "`ci-only` takes `true` or `false`",
+                    "`ci-only: true`",
+                );
+                false
             }
         }
     }
@@ -1344,16 +1414,7 @@ impl<'a> Ctx<'a> {
                 self.subject = Some(format!("{name}.{prop}"));
                 match prop {
                     "on" => env.triggers = self.triggers_of(p),
-                    "ci-only" => match p.expr().as_ref().and_then(value_word).as_deref() {
-                        Some("true") => env.ci_only = true,
-                        Some("false") => {}
-                        _ => self.err_hint(
-                            Code::EnvProblem,
-                            p.key_span(),
-                            "`ci-only` takes `true` or `false`",
-                            "`ci-only: true`",
-                        ),
-                    },
+                    "ci-only" => env.ci_only = self.ci_only(p, Code::EnvProblem),
                     "secrets" => env.secrets = self.scalar_text(p),
                     "approvers" => {
                         if let Some(v) = p.expr() {
@@ -1659,14 +1720,30 @@ impl<'a> Ctx<'a> {
                 kind: s.kind_name.clone(),
                 span: s.span,
                 kind_span: s.kind_span,
+                ci_only: s.ci_only,
             })
             .collect();
         let edges = edges.into_iter().map(|e| (e.from, e.to)).collect();
         let workflow =
             Workflow::new(self.name, self.triggers, self.envs, steps, edges, order, self.policy);
+        // Context warnings, once the workflow exists: what a step needs
+        // against what a run in this context has. Collected into `diags`
+        // rather than pushed, as `self` has been drained into `workflow`.
+        let context_warnings: Vec<Diagnostic> = self
+            .context
+            .iter()
+            .flat_map(|ctx| {
+                unmet_steps(&workflow, self.catalog, ctx).into_iter().map(|step| {
+                    Diagnostic::warning(Code::NeedsContext, step.span, step.message(ctx))
+                        .with_subject(step.name.clone())
+                        .with_hint(step.hint())
+                })
+            })
+            .collect();
         // One file, one order: parser and checker findings interleaved in
         // source order, so CLI and editor output line up.
         let mut diagnostics = self.diags;
+        diagnostics.extend(context_warnings);
         diagnostics.sort_by_key(|d| (d.span.start, d.span.end));
         self.secret_uses.sort_by_key(|u| u.span.start);
         Checked {

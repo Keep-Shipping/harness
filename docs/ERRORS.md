@@ -38,6 +38,7 @@ UPDATE_GOLDEN=1 cargo test -p ks-core --test registry
 - [KS0501 — secret in a string](#ks0501-secret-in-a-string)
 - [KS0502 — secret shown](#ks0502-secret-shown)
 - [KS0601 — optional value may be absent](#ks0601-optional-value-may-be-absent)
+- [KS0602 — step needs more than this context has](#ks0602-step-needs-more-than-this-context-has)
 - [KS0701 — `auto:` could destroy](#ks0701-auto-could-destroy)
 
 ## KS0001: unexpected syntax
@@ -647,6 +648,33 @@ steps:
     model: typesafe/jev
     ask: "Deploy commit {git.sha}?"
     returns: yes | no
+```
+
+## KS0602: step needs more than this context has
+
+Severity: warning.
+
+The step asks for something the context it would run in cannot give: CI itself, an OIDC token, or network access. Checked with `--context local` a `ci-only: true` step warns here; checked with `--context ci` it is clean. Run it on CI, or bound the run before the step with `--until` or `--skip`.
+
+Not ok:
+
+```ks
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  deploy: k8s.rollout
+    image: build.digest
+    ci-only: true
+```
+
+Ok:
+
+```ks
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  deploy: k8s.rollout
+    image: build.digest
 ```
 
 ## KS0701: `auto:` could destroy
