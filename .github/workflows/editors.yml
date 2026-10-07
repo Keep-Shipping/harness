@@ -45,6 +45,7 @@ jobs:
           curl -fsSL -o tree-sitter.gz \
             "https://github.com/tree-sitter/tree-sitter/releases/download/v${TREE_SITTER_VERSION}/tree-sitter-linux-x64.gz"
           gunzip tree-sitter.gz
+          chmod +x tree-sitter
           sudo mv tree-sitter /usr/local/bin/tree-sitter
           tree-sitter --version
 
