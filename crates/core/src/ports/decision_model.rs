@@ -154,7 +154,7 @@ pub struct Answer {
     /// The id of the chosen option — always one the question offered.
     pub choice: String,
     /// A probability for every option the question offered, and for no others,
-    /// summing to 1 to within [`PROBABILITY_SLACK`] (1e-6) — enough to absorb
+    /// summing to 1 to within `PROBABILITY_SLACK` (1e-6) — enough to absorb
     /// `f64` rounding, too little for a sum of 0.99.
     pub probabilities: BTreeMap<String, f64>,
     /// How well calibrated the distribution above is, in `0..=1`.
