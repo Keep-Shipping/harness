@@ -1,0 +1,6 @@
+▸ build   sha256:9f2c…e1  signed    38s
+▸ plan    +2 ~1 -0                  11s
+▸ review  approve 3 changes? y
+▸ apply   3 resources               42s
+▸ deploy  4/4 pods healthy          27s
+✓ shipped api@a41c9e in 2m 18s

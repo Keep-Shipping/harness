@@ -13,10 +13,11 @@ Every finding carries a stable `KSxxxx` code — what each one means lives in
 | 2 | usage: an unknown flag or format, a missing value, a file that cannot be checked (missing, a directory, not UTF-8, permission denied), or no `ship.ks` to check |
 | 3 | internal: an unexpected I/O error, or a panic — a bug in keepshipping, never in your file |
 
-`run` keeps the same scale: 1 when the file fails the check, 2 for usage and
-environment-selection problems. The full list, including the codes a *run*
-will add once `run` is wired to the engine (4 waiting for an approval, 5
-policy refused, 130 cancelled), is in [CLI.md](CLI.md).
+`run` keeps the same scale: 1 when the file fails the check, when a step
+fails, or when an approval is declined; 2 for usage and environment-selection
+problems. The full list, including the codes a *run* will add once `run` is
+wired to the engine (4 waiting for an approval, 5 policy refused, 130
+cancelled), is in [CLI.md](CLI.md).
 
 ## `fmt --upgrade`
 
@@ -132,6 +133,71 @@ show up on the pull request:
 `::warning`. Escaping follows GitHub's rules: message data escapes `%`,
 `\r` and `\n`; property values additionally `:` and `,`. Hints are appended
 as `%0Ahint: …`.
+
+## `run`
+
+`keepshipping run` picks an environment and then runs the steps the file
+declares, one line per step:
+
+```
+▸ build   sha256:9f2c…e1  signed    38s
+▸ plan    +2 ~1 -0                  11s
+▸ review  approve 3 changes? y
+▸ apply   3 resources               42s
+▸ deploy  4/4 pods healthy          27s
+✓ shipped api@a41c9e in 2m 18s
+```
+
+- A step line is `▸ {step:<8}{summary:<25} {duration}`; widths count
+  characters, so a `…` in a summary is one column, and a summary past its
+  column is cut with an `…` rather than pushing the time out of line. A
+  duration is `38s` under a minute and `2m 18s` from a minute on, in whole
+  seconds.
+- The closing line is `✓ shipped {what} in {duration}`, where `what` is the
+  workflow's `name:` or, for a file that declares none, its name without the
+  extension.
+- An approval writes its question on the step's own line and waits for `y` or
+  `yes`. The approver's name, from `$USER` or `$USERNAME` and falling back to
+  `local`, is carried on the run's answer for the run log to record. A
+  declined approval writes `✗ declined at {step}` and nothing after it runs.
+  A run with nobody to ask — a pipe, `--non-interactive`, CI, a closed
+  stdin — always declines, and writes the answer itself so the prompt is not
+  left open.
+- A failing step writes `✗ {step:<8}{error}` and the run stops there.
+
+One renderer reads the events, and the same lines come out either way. At a
+terminal, the step in flight gets a spinner and a running clock, redrawn in
+place and replaced by its summary and its real duration. Anywhere else — a
+pipe, a CI log, `TERM=dumb` — the same lines are written once each, with no
+escape codes and no cursor movement. `-v` adds each step's own output,
+indented four spaces; the default shows summaries only. The plain stream
+writes the approval's answer itself, since input is not echoed into a log, so
+a captured run reads like a terminal's.
+
+| Flag | Meaning |
+|---|---|
+| `--until STEP` | run `STEP` and everything it depends on |
+| `--only STEP` | run `STEP` and the steps it depends on; repeatable |
+| `--skip STEP` | drop `STEP` and everything downstream of it; repeatable |
+| `--dry-run` | graph the run and check it; run nothing |
+| `-v` | stream each step's own output |
+
+`--skip` takes the consumers with the step: skipping an approval can never
+leave a step running on a plan nobody approved. `--only` is the flag that
+could, so it refuses. Naming a step whose dependency you left out exits 2,
+naming the missing step and the way through: `apply` waits on approval
+`review`; use --until apply`, or `deploy` needs `build`; use --until deploy`
+where there is no approval in the way. An unknown step name exits 2 naming
+it, and a selection nothing is left of (`--only plan --skip plan`) exits 2
+with `nothing left to run` rather than shipping a run of no steps.
+
+`--dry-run` prints one `▸ {step:<8}{kind}` line per selected step in
+topological order, closes with the same `0 steps ran. Nothing was touched.`
+footer `check` uses, and exits 0.
+
+No step kind is executable yet, so a run stops on its first step with
+`` `{kind}` steps are not built in yet `` and exits 1. Nothing is built and
+nothing is touched until the engine has steps.
 
 ## Colour
 
