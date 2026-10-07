@@ -1,0 +1,25 @@
+{
+  "format_version": "1.2",
+  "terraform_version": "1.9.0",
+  "resource_changes": [
+    {
+      "address": "aws_security_group.legacy_api",
+      "mode": "managed", "type": "aws_security_group", "name": "legacy_api",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "change": {
+        "actions": ["delete", "create"], "action_reason": "replace_by_request",
+        "before": { "name": "legacy-api", "description": "the old ingress" },
+        "after": { "name": "api", "description": "the ingress the site needs" }
+      }
+    },
+    {
+      "address": "module.net.aws_subnet.a[\"eu-west-1a\"]",
+      "mode": "managed", "type": "aws_subnet", "name": "a",
+      "provider_name": "registry.terraform.io/hashicorp/aws",
+      "change": {
+        "actions": ["create"], "before": null,
+        "after": { "cidr_block": "10.20.1.0/24", "availability_zone": "eu-west-1a" }
+      }
+    }
+  ]
+}

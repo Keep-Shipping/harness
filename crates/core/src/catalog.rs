@@ -137,12 +137,20 @@ impl Catalog {
         );
         add(
             "tofu.plan",
-            &[("dir", Type::Path)],
+            &[
+                ("dir", Type::Path),
+                ("backend", Type::Optional(Box::new(Type::String))),
+                ("backend_config", Type::Optional(Box::new(Type::Map(Box::new(Type::String))))),
+                ("vars", Type::Optional(Box::new(Type::Map(Box::new(Type::String))))),
+            ],
             &[
                 ("file", named("tofu.PlanFile")),
                 ("changes", named("tofu.Changes")),
                 ("adds", Type::Int),
+                ("changes_count", Type::Int),
                 ("destroys", Type::Int),
+                ("empty", Type::Bool),
+                ("summary", Type::String),
             ],
             false,
             false,
