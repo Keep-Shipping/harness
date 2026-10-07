@@ -29,3 +29,31 @@ Outputs:
 | --- | --- | --- |
 | `digest` | string | the verified digest |
 | `identity` | string | the identity the signature was made as |
+
+## `tofu.plan` (v1.0.0)
+
+Plans an infrastructure directory, and reports what it would change.
+
+- Action: plan
+- Requires: IacTool
+
+Inputs:
+
+| Name | Type | Default | Description |
+| --- | --- | --- | --- |
+| `dir` | path | - | the directory to plan |
+| `backend` | string | `local` | the backend kind |
+| `backend_config` | map | {} | backend settings for `tofu init` |
+| `vars` | map | {} | the input variables the plan is made with |
+
+Outputs:
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `file` | map | the saved plan as `{ path, sha256 }` |
+| `changes` | map | the plan's resources, and the three counts |
+| `adds` | int | how many it creates, replacements included |
+| `changes_count` | int | how many it updates in place |
+| `destroys` | int | how many it destroys, replacements included |
+| `empty` | bool | whether it changes nothing |
+| `summary` | string | the plan in plain terms |
