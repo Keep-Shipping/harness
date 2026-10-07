@@ -20,7 +20,8 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
                           [--actor human|agent|ci] [--context local|ci] [--secrets] [--fix]
        keepshipping run [FILE] [--env NAME] [--event \"push main\"] [--actor human|agent|ci]
                         [--context local|ci] [--non-interactive] [--until STEP]
-                        [--skip STEP] [--allow-partial]
+                        [--only STEP]... [--skip STEP]... [--allow-partial]
+                        [--dry-run] [-v]
        keepshipping fmt --upgrade [PATH...]
        keepshipping blocks search <QUERY> [--index URL] [--limit N] [--format human|json]
        keepshipping lsp";
@@ -65,13 +66,19 @@ pub struct Options {
     /// `--context local|ci`: what a run here could do. `None` means
     /// detected from the environment (see [`detect_context`]).
     pub context: Option<ContextName>,
-    /// `--until STEP`: stop after this step, in run order (dependencies
-    /// first).
+    /// `run --until STEP`: the step and everything it depends on.
     pub until: Option<String>,
-    /// `--skip STEP`, repeatable: steps to leave out of the run.
+    /// `run --only STEP`: exactly these steps, repeatable.
+    pub only: Vec<String>,
+    /// `run --skip STEP`: drop these steps and everything downstream,
+    /// repeatable.
     pub skip: Vec<String>,
     /// `--allow-partial`: start a run whose steps the context cannot run.
     pub allow_partial: bool,
+    /// `run --dry-run`: graph the run and check it, run nothing.
+    pub dry_run: bool,
+    /// `-v`: stream each step's own output instead of its summaries.
+    pub verbose: bool,
     /// The base URL of the blocks index, from `--index`. Absent means the
     /// command falls back to `INDEX_ENV`, and fails when neither is set.
     pub index: Option<String>,
@@ -100,8 +107,11 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
         non_interactive: false,
         context: None,
         until: None,
+        only: Vec::new(),
         skip: Vec::new(),
         allow_partial: false,
+        dry_run: false,
+        verbose: false,
         index: None,
         limit: DEFAULT_SEARCH_LIMIT,
         upgrade: false,
@@ -125,8 +135,11 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
                 o.context = Some(ContextName::parse(&flag_value(&mut rest)?)?)
             }
             "--until" if command == Command::Run => o.until = Some(flag_value(&mut rest)?),
+            "--only" if command == Command::Run => o.only.push(flag_value(&mut rest)?),
             "--skip" if command == Command::Run => o.skip.push(flag_value(&mut rest)?),
             "--allow-partial" if command == Command::Run => o.allow_partial = true,
+            "--dry-run" if command == Command::Run => o.dry_run = true,
+            "-v" | "--verbose" if command == Command::Run => o.verbose = true,
             "--upgrade" if command == Command::Fmt => o.upgrade = true,
             "--index" if command == Command::BlocksSearch => o.index = Some(flag_value(&mut rest)?),
             "--limit" if command == Command::BlocksSearch => {

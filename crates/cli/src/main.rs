@@ -9,6 +9,7 @@ mod args;
 mod blocks;
 mod blocks_index;
 mod check;
+mod drive;
 // The GitHub Actions run context (#150) is built and tested here, but the
 // command dispatch still has no run context to hand it: wiring CI-versus-local
 // selection into `run` waits for the local adapter. Until then nothing in the
@@ -16,16 +17,21 @@ mod check;
 #[allow(dead_code)]
 mod github_actions_run_context;
 mod http_client;
+mod progress;
 mod render;
 mod upgrade;
 
 use std::io::{IsTerminal, Write as _};
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Mutex;
+use std::time::Instant;
 
-use ks_core::{ContextName, Trigger, TriggerKind};
+use ks_core::{ContextName, Step, Trigger, TriggerKind};
 
 use crate::args::{Command, Options, USAGE, context_of, parse_args};
+use crate::drive::{Done, Outcome, StepRunner};
+use crate::progress::Renderer;
 
 fn main() -> ExitCode {
     // A panic is a bug in keepshipping, not a problem with the user's file:
@@ -85,12 +91,12 @@ fn run(args: &[String]) -> ExitCode {
         None => None,
     };
     match ks_core::select_env(&site.checked.workflow, o.env.as_deref(), event.as_ref()) {
-        Ok(ks_core::EnvChoice::Selected(name)) => selected(&name),
+        Ok(ks_core::EnvChoice::Selected(name)) => selected(&o, &site, &name),
         Ok(ks_core::EnvChoice::Ambiguous(names)) => {
             let offered = names.join(", ");
             if interactive(&o) {
                 match prompt(&offered, &names) {
-                    Some(name) => selected(&name),
+                    Some(name) => selected(&o, &site, &name),
                     None => {
                         eprintln!("error: no environment chosen (expected one of {offered})");
                         ExitCode::from(2)
@@ -113,33 +119,91 @@ fn run(args: &[String]) -> ExitCode {
     }
 }
 
-fn selected(name: &str) -> ExitCode {
-    println!("environment: {name}");
-    println!("execution is not implemented yet (ks-engine)");
-    ExitCode::SUCCESS
+/// The environment is chosen: print the run the file describes, and run it.
+fn selected(o: &Options, site: &check::Site, env: &str) -> ExitCode {
+    println!("environment: {env}");
+    let workflow = &site.checked.workflow;
+    let only: Vec<&str> = o.only.iter().map(String::as_str).collect();
+    let skip: Vec<&str> = o.skip.iter().map(String::as_str).collect();
+    let steps = match drive::select(workflow, o.until.as_deref(), &only, &skip) {
+        Ok(steps) => steps,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return ExitCode::from(2);
+        }
+    };
+    if o.dry_run {
+        // The graph and the check, and nothing else: the promise `check`
+        // makes still holds, so it closes the report.
+        let mut out = std::io::stdout().lock();
+        for step in &steps {
+            let _ = writeln!(
+                out,
+                "{}",
+                progress::kind_line(&step.name, step.kind.as_deref().unwrap_or("step"))
+            );
+        }
+        let _ = render::footer(&mut out);
+        return ExitCode::SUCCESS;
+    }
+
+    let what = workflow.name().map(str::to_string).unwrap_or_else(|| stem(&site.file));
+    let tty = std::io::stdout().is_terminal() && std::env::var("TERM").is_ok_and(|t| t != "dumb");
+    let shared = Mutex::new(renderer(tty, o.verbose));
+    let mut approver: Box<dyn drive::Approver> = if interactive(o) {
+        Box::new(drive::TtyApprover::new(std::io::stdin().lock()))
+    } else {
+        Box::new(drive::Declines)
+    };
+    let started = Instant::now();
+    let outcome = drive::with_spinner(tty, &shared, |renderer| {
+        drive::drive(
+            &steps,
+            &mut Unbuilt,
+            approver.as_mut(),
+            renderer,
+            &mut || started.elapsed(),
+            &what,
+        )
+    });
+    if outcome == Outcome::Shipped { ExitCode::SUCCESS } else { ExitCode::from(1) }
 }
 
-/// The steps a run would take, in run order: up to and including `--until`,
-/// less every `--skip`. A name the file does not declare is a usage error —
-/// a typo must not quietly widen the run.
-fn selection(site: &check::Site, o: &Options) -> Result<Vec<String>, Box<str>> {
-    let steps = ks_core::run_order(&site.checked.workflow);
-    for name in o.skip.iter().chain(o.until.iter()) {
-        if !steps.contains(&name.as_str()) {
-            return Err(format!("no step named `{name}`").into());
-        }
+/// The renderer the run's lines go through: animated at a terminal, plain
+/// everywhere else.
+fn renderer(tty: bool, verbose: bool) -> Box<dyn Renderer + Send> {
+    // `Stdout` is `Send`, `StdoutLock` is not: the ticker thread holds the
+    // renderer behind a lock of its own.
+    Box::new(progress::Run::new(std::io::stdout(), verbose, tty))
+}
+
+/// The file's name without its extension, for a file that names no workflow.
+fn stem(file: &Path) -> String {
+    file.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file.to_string_lossy().into_owned())
+}
+
+/// No step kind is executable yet: the engine's built-in steps are still
+/// empty, so a run stops on its first step and says why. That is the honest
+/// report — a run that claimed to have shipped would not have.
+struct Unbuilt;
+
+impl StepRunner for Unbuilt {
+    fn run(&mut self, step: &Step, _log: &mut dyn FnMut(&str)) -> Result<Done, String> {
+        let kind = step.kind.as_deref().unwrap_or("steps");
+        Err(format!("`{kind}` steps are not built in yet"))
     }
-    let until = o
-        .until
-        .as_deref()
-        .and_then(|name| steps.iter().position(|s| *s == name))
-        .map(|at| at + 1)
-        .unwrap_or(steps.len());
-    Ok(steps[..until]
-        .iter()
-        .filter(|s| !o.skip.iter().any(|k| k == *s))
-        .map(|s| (*s).to_string())
-        .collect())
+}
+
+/// The steps a run would take, in run order, narrowed by `--until`, `--only`
+/// and `--skip` the way the run itself narrows them. A name the file does not
+/// declare is a usage error — a typo must not quietly widen the run.
+fn selection(site: &check::Site, o: &Options) -> Result<Vec<String>, Box<str>> {
+    let only: Vec<&str> = o.only.iter().map(String::as_str).collect();
+    let skip: Vec<&str> = o.skip.iter().map(String::as_str).collect();
+    let steps = drive::select(&site.checked.workflow, o.until.as_deref(), &only, &skip)?;
+    Ok(steps.iter().map(|s| s.name.to_string()).collect())
 }
 
 /// The context gate ([#34](https://github.com/Keep-Shipping/harness/issues/34)):

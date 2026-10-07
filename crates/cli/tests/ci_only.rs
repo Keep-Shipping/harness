@@ -81,6 +81,14 @@ fn run(args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// A run the gate lets through has started: no step kind is executable yet,
+/// so it stops at its first step (exit 1), but it was neither refused nor a
+/// usage error.
+fn assert_started(code: i32, err: &str, what: &str) {
+    assert!(code == 0 || code == 1, "{what}: exit {code}: {err}");
+    assert!(!err.contains("refusing to start"), "{what}: {err}");
+}
+
 #[test]
 fn check_warns_locally_and_is_clean_on_ci() {
     let file = temp_site(SITE).to_string_lossy().into_owned();
@@ -149,7 +157,7 @@ fn a_run_that_stops_before_the_step_starts() {
         let mut args = vec!["run", file.as_str()];
         args.extend(&tail);
         let (code, _, err) = run(&args);
-        assert_eq!(code, 0, "{tail:?} should start: {err}");
+        assert_started(code, &err, &format!("{tail:?} should start"));
     }
 }
 
@@ -163,7 +171,7 @@ fn one_stop_point_serves_every_unmet_step() {
     assert!(!out.contains("--until sign"), "nothing after a step that cannot run: {out}");
 
     let (code, _, err) = run(&["run", &file, "--context", "local", "--until", "build"]);
-    assert_eq!(code, 0, "the suggested stop point starts the run: {err}");
+    assert_started(code, &err, "the suggested stop point starts the run");
 }
 
 /// Run order is not file order: `deploy` is written first, and the refusal
@@ -179,14 +187,14 @@ fn the_gate_counts_in_run_order_not_file_order() {
     assert!(err.contains("step `deploy` (2 of 2)"), "{err}");
 
     let (code, _, err) = run(&["run", &file, "--context", "local", "--until", "build"]);
-    assert_eq!(code, 0, "the suggested stop point starts the run: {err}");
+    assert_started(code, &err, "the suggested stop point starts the run");
 }
 
 #[test]
 fn allow_partial_starts_the_run_anyway_saying_what_will_happen() {
     let file = temp_site(SITE).to_string_lossy().into_owned();
     let (code, _, err) = run(&["run", &file, "--context", "local", "--allow-partial"]);
-    assert_eq!(code, 0, "{err}");
+    assert_started(code, &err, "--allow-partial starts the run");
     assert!(
         err.contains(
             "note: continuing with --allow-partial; step `deploy` will be skipped or fail"

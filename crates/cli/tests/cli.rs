@@ -411,9 +411,64 @@ fn run_with_env_selects_it() {
     let path = temp_site("env.ks", TWO_ENVS);
     let (code, stdout, stderr) = keepshipping(&["run", "--env", "prod", path.to_str().unwrap()]);
     let _ = std::fs::remove_file(&path);
-    assert_eq!(code, 0, "{stderr}");
+    // No step kind is executable yet, so the run stops on its first step and
+    // says so: a run that claimed to have shipped would not have.
+    assert_eq!(code, 1, "{stderr}");
     assert!(stdout.contains("environment: prod"), "{stdout}");
-    assert!(stdout.contains("not implemented yet"), "{stdout}");
+    assert!(stdout.contains("`oci.image` steps are not built in yet"), "{stdout}");
+}
+
+/// `--dry-run` is the graph and the check: what the run would cover, in the
+/// order it would run, and the promise that nothing was touched.
+#[test]
+fn run_dry_run_graphs_the_steps_without_running_one() {
+    let path = temp_site("dry.ks", HERO);
+    let (code, stdout, stderr) = keepshipping(&["run", "--dry-run", path.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    assert_eq!(
+        stdout,
+        concat!(
+            "environment: default\n",
+            "▸ build   oci.image\n",
+            "▸ plan    tofu.plan\n",
+            "▸ review  approval\n",
+            "▸ apply   tofu.apply\n",
+            "▸ deploy  k8s.rollout\n",
+            "0 steps ran. Nothing was touched.\n",
+        ),
+        "{stdout}"
+    );
+}
+
+/// A run may never cover a step whose approval it left out: `--only apply`
+/// is refused, and the way through is named.
+#[test]
+fn run_only_refuses_to_run_a_step_past_its_approval() {
+    let path = temp_site("gated-only.ks", HERO);
+    let (code, stdout, stderr) =
+        keepshipping(&["run", "--dry-run", "--only", "apply", path.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 2, "{stdout}");
+    assert!(stderr.contains("`apply` waits on approval `review`; use --until apply"), "{stderr}");
+
+    // And the way it names works.
+    let path = temp_site("until.ks", HERO);
+    let (code, stdout, stderr) =
+        keepshipping(&["run", "--dry-run", "--until", "apply", path.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("▸ review  approval\n"), "{stdout}");
+    assert!(!stdout.contains("▸ deploy"), "until apply stops there: {stdout}");
+
+    // An unknown step is a usage error, not an empty run.
+    let path = temp_site("unknown.ks", HERO);
+    let (code, _, stderr) =
+        keepshipping(&["run", "--dry-run", "--until", "nope", path.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("no step `nope` in this file"), "{stderr}");
 }
 
 #[test]
