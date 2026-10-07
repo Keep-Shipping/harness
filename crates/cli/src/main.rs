@@ -42,6 +42,7 @@ fn dispatch() -> ExitCode {
         Some("check") => check::check(&args[1..]),
         Some("run") => run(&args[1..]),
         Some("blocks") => blocks::blocks(&args[1..]),
+        Some("lsp") => ks_lsp::serve(),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)

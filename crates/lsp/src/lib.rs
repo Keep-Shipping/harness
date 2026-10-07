@@ -1,8 +1,23 @@
-//! The Keep Shipping language server: exposes `ks-lang` and the `ks-core`
-//! checker to editors. Pure functions only — the LSP transport is a host
-//! concern.
+//! The Keep Shipping language server: what `keepshipping lsp` speaks, and
+//! the checker behind every answer.
+//!
+//! The transport ([`server`]) is the only part that does I/O, over stdio
+//! with hand-rolled JSON-RPC framing ([`rpc`]). Everything else — the
+//! features ([`analysis`]), the byte-offset/LSP-position arithmetic and the
+//! prose on hover — is a pure function of a document, so it can be tested
+//! without a client.
 
 #![forbid(unsafe_code)]
+
+pub mod analysis;
+mod docs;
+pub mod rpc;
+pub mod server;
+mod text;
+
+pub use analysis::{Doc, SOURCE};
+pub use server::{serve, serve_stream};
+pub use text::{Encoding, LineIndex, Position, Range};
 
 use ks_lang::Span;
 
@@ -58,5 +73,15 @@ steps:
     fn hovering_where_nothing_is_typed_answers_nothing() {
         assert!(hover(DEPLOY, 0).is_none(), "`steps:` names no type");
         assert!(hover(DEPLOY, DEPLOY.len() as u32 + 10).is_none(), "past the end");
+    }
+
+    #[test]
+    fn the_document_hover_adds_what_the_plain_hover_leaves_out() {
+        let at = (DEPLOY.find("build.digest").expect("the reference") + 3) as u32;
+        let doc = Doc::new(DEPLOY.to_string(), Encoding::Utf16);
+        let hover = analysis::hover(&doc, at).expect("a hover");
+        let text = hover["contents"]["value"].as_str().expect("markdown");
+        assert!(text.contains("build.digest: oci.Digest"), "{text}");
+        assert!(text.contains("container image"), "{text}");
     }
 }
