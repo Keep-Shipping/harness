@@ -2,6 +2,7 @@
 //! `check`, `run` and `blocks search`. Anything unrecognizable — flag, value
 //! or format — is a usage error, never a silently swallowed option.
 
+use ks_core::ContextName;
 use ks_core::ports::run_context::ActorKind;
 
 use crate::render::Format;
@@ -16,20 +17,28 @@ pub const INDEX_ENV: &str = "KEEPSSHIPPING_BLOCKS_INDEX";
 pub const USAGE: &str = "\
 usage: keepshipping check [FILE] [--all] [--format human|json|github]
                           [--warnings-as-errors] [--env NAME] [--event \"push main\"]
-                          [--actor human|agent|ci] [--secrets]
+                          [--actor human|agent|ci] [--context local|ci] [--secrets] [--fix]
        keepshipping run [FILE] [--env NAME] [--event \"push main\"] [--actor human|agent|ci]
-                        [--non-interactive]
-       keepshipping blocks search <QUERY> [--index URL] [--limit N] [--format human|json]";
+                        [--context local|ci] [--non-interactive] [--until STEP]
+                        [--only STEP]... [--skip STEP]... [--allow-partial]
+                        [--dry-run] [-v]
+       keepshipping fmt --upgrade [PATH...]
+       keepshipping blocks search <QUERY> [--index URL] [--limit N] [--format human|json]
+       keepshipping lsp";
 
 /// Which subcommand's flags `parse_args` accepts. `--format`, `--all`,
-/// `--warnings-as-errors` and `--secrets` belong to `check` alone; `run`
-/// rejects them like any other unrecognized option. `blocks search` has its
-/// own `--format` (human or json, no github annotations), `--index` and
-/// `--limit`.
+/// `--warnings-as-errors`, `--secrets` and `--fix` belong to `check` alone; `run`
+/// rejects them like any other unrecognized option. `--until`, `--skip` and
+/// `--allow-partial` belong to `run` alone, and `--context` to both.
+/// `blocks search` has its own `--format` (human or json, no github
+/// annotations), `--index` and `--limit`. `fmt` takes only `--upgrade` today:
+/// the formatter is not written yet, and every other flag it might grow is
+/// still a usage error.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Check,
     Run,
+    Fmt,
     BlocksSearch,
 }
 
@@ -43,6 +52,9 @@ pub struct Options {
     pub format: Format,
     pub all: bool,
     pub warnings_as_errors: bool,
+    /// `--fix`: apply the machine-applicable fixes and re-check. Never
+    /// applied to `policy:`, where the change needs a human.
+    pub fix: bool,
     pub env: Option<String>,
     pub event: Option<String>,
     /// The actor the command would run as; a human unless `--actor` says
@@ -51,11 +63,33 @@ pub struct Options {
     pub actor: ActorKind,
     pub secrets: bool,
     pub non_interactive: bool,
+    /// `--context local|ci`: what a run here could do. `None` means
+    /// detected from the environment (see [`detect_context`]).
+    pub context: Option<ContextName>,
+    /// `run --until STEP`: the step and everything it depends on.
+    pub until: Option<String>,
+    /// `run --only STEP`: exactly these steps, repeatable.
+    pub only: Vec<String>,
+    /// `run --skip STEP`: drop these steps and everything downstream,
+    /// repeatable.
+    pub skip: Vec<String>,
+    /// `--allow-partial`: start a run whose steps the context cannot run.
+    pub allow_partial: bool,
+    /// `run --dry-run`: graph the run and check it, run nothing.
+    pub dry_run: bool,
+    /// `-v`: stream each step's own output instead of its summaries.
+    pub verbose: bool,
     /// The base URL of the blocks index, from `--index`. Absent means the
     /// command falls back to `INDEX_ENV`, and fails when neither is set.
     pub index: Option<String>,
     /// The `--limit` of `blocks search`, at least one.
     pub limit: u32,
+    /// `--upgrade` on `fmt`: rewrite each file to the format this build
+    /// writes. Without it there is no formatter to run.
+    pub upgrade: bool,
+    /// The paths `fmt --upgrade` was given: files, or directories to walk
+    /// for `ship.ks`. Empty means `ship.ks` in the working directory.
+    pub paths: Vec<String>,
 }
 
 pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
@@ -65,27 +99,48 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
         format: Format::Human,
         all: false,
         warnings_as_errors: false,
+        fix: false,
         env: None,
         event: None,
         actor: ActorKind::Human,
         secrets: false,
         non_interactive: false,
+        context: None,
+        until: None,
+        only: Vec::new(),
+        skip: Vec::new(),
+        allow_partial: false,
+        dry_run: false,
+        verbose: false,
         index: None,
         limit: DEFAULT_SEARCH_LIMIT,
+        upgrade: false,
+        paths: Vec::new(),
     };
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
-            "--format" if command != Command::Run => {
+            "--format" if matches!(command, Command::Check | Command::BlocksSearch) => {
                 o.format = Format::parse(&flag_value(&mut rest)?)?
             }
             "--all" if command == Command::Check => o.all = true,
             "--warnings-as-errors" if command == Command::Check => o.warnings_as_errors = true,
             "--secrets" if command == Command::Check => o.secrets = true,
+            "--fix" if command == Command::Check => o.fix = true,
             "--env" => o.env = Some(flag_value(&mut rest)?),
             "--event" => o.event = Some(flag_value(&mut rest)?),
             "--actor" => o.actor = actor_kind(&flag_value(&mut rest)?)?,
             "--non-interactive" => o.non_interactive = true,
+            "--context" if matches!(command, Command::Check | Command::Run) => {
+                o.context = Some(ContextName::parse(&flag_value(&mut rest)?)?)
+            }
+            "--until" if command == Command::Run => o.until = Some(flag_value(&mut rest)?),
+            "--only" if command == Command::Run => o.only.push(flag_value(&mut rest)?),
+            "--skip" if command == Command::Run => o.skip.push(flag_value(&mut rest)?),
+            "--allow-partial" if command == Command::Run => o.allow_partial = true,
+            "--dry-run" if command == Command::Run => o.dry_run = true,
+            "-v" | "--verbose" if command == Command::Run => o.verbose = true,
+            "--upgrade" if command == Command::Fmt => o.upgrade = true,
             "--index" if command == Command::BlocksSearch => o.index = Some(flag_value(&mut rest)?),
             "--limit" if command == Command::BlocksSearch => {
                 let value = flag_value(&mut rest)?;
@@ -95,12 +150,15 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
             // One positional: the site file, the tree with `--all`, or the
             // search text. A second is almost always a typo, not a list to
             // check.
-            file if o.path.is_none() && command != Command::BlocksSearch => {
+            file if o.path.is_none() && matches!(command, Command::Check | Command::Run) => {
                 o.path = Some(file.to_string())
             }
             text if o.query.is_none() && command == Command::BlocksSearch => {
                 o.query = Some(text.to_string())
             }
+            // `fmt` takes a list: it rewrites files, and rewriting several
+            // in one run is the whole reason it walks a tree at all.
+            path if command == Command::Fmt => o.paths.push(path.to_string()),
             _ => return None,
         }
     }
@@ -119,6 +177,27 @@ fn actor_kind(text: &str) -> Option<ActorKind> {
         "ci" => Some(ActorKind::Ci),
         _ => None,
     }
+}
+
+/// The context a command would run in when `--context` says nothing: CI when
+/// the environment says so, a laptop otherwise. GitHub Actions names itself
+/// outright; every other CI system sets `CI`, and any value but `false` or `0`
+/// means one is in charge — a system that says "not CI" should not have to
+/// unset the variable.
+pub fn detect_context() -> ContextName {
+    let ci = |name: &str| {
+        std::env::var(name).ok().is_some_and(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "false" && v != "0"
+        })
+    };
+    if ci("GITHUB_ACTIONS") || ci("CI") { ContextName::Ci } else { ContextName::Local }
+}
+
+/// The context this command line asks for, detected when `--context` is
+/// absent.
+pub fn context_of(o: &Options) -> ContextName {
+    o.context.unwrap_or_else(detect_context)
 }
 
 /// The value after `--env`/`--event`/`--actor`/`--format`. A missing value,

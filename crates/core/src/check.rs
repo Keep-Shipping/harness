@@ -4,9 +4,12 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use ks_lang::{Atom, Code, Diagnostic, Entry, Expr, Span, StrPart, Word};
+use ks_lang::{Atom, Code, Diagnostic, Entry, Expr, Fix, Span, StrPart, Word};
 
+use crate::auto_rule::{self, MISSING_GUARD_HINT, MISSING_GUARD_MESSAGE};
 use crate::catalog::{Catalog, StepTypes};
+use crate::context::{CheckContext, unmet_steps};
+use crate::format::{self, Formats, Header};
 use crate::ports::run_context::ActorKind;
 use crate::ports::secrets::SecretRef;
 use crate::types::{self, LiteralFit, Type};
@@ -26,6 +29,11 @@ pub struct Checked {
     /// Every `secrets.<name>` reference, in source order.
     /// [`secret_requirements`] turns these into per-environment listings.
     pub secret_uses: Vec<SecretUse>,
+    /// Every `policy:` entry the file declares — one per block, since the
+    /// grammar allows more than one. `check --fix` refuses every edit
+    /// overlapping any of them: policy changes need a human ([ADR
+    /// 0012](https://github.com/Keep-Shipping/harness/blob/main/docs/adr/0012-policy-authority.md)).
+    pub policy_spans: Vec<Span>,
 }
 
 impl Checked {
@@ -129,18 +137,30 @@ pub fn check(parse: &ks_lang::Parse) -> Checked {
     check_with(parse, &CheckOptions::new(&builtin))
 }
 
-/// Options for [`check_with`]: the catalog to check against, and — when the
-/// caller knows it — the actor the run would start under, so policy rules
-/// that bind that actor are enforced.
+/// Options for [`check_with`]: the catalog to check against, the file
+/// formats this build reads, and — when the caller knows it — the actor the
+/// run would start under, so policy rules that bind that actor are enforced.
 pub struct CheckOptions<'a> {
     pub(crate) catalog: &'a Catalog,
+    pub(crate) formats: &'a Formats<'a>,
     pub(crate) actor: Option<ActorKind>,
+    pub(crate) context: Option<CheckContext>,
+    /// Whether this check is in CI, which the caller knows and the file
+    /// cannot. Advisory only: it widens the warnings, never what is
+    /// enforced.
+    pub(crate) in_ci: bool,
 }
 
 impl<'a> CheckOptions<'a> {
     /// Checks against `catalog` instead of the built-in one.
     pub fn new(catalog: &'a Catalog) -> CheckOptions<'a> {
-        CheckOptions { catalog, actor: None }
+        CheckOptions {
+            catalog,
+            formats: &format::BUILTIN,
+            actor: None,
+            context: None,
+            in_ci: false,
+        }
     }
 
     /// Checks the file as `actor` running it: a policy rule that binds the
@@ -152,11 +172,48 @@ impl<'a> CheckOptions<'a> {
         self.actor = Some(actor);
         self
     }
+
+    /// Checks the file as a run in `context` would: a step needing more than
+    /// the context has — CI, an OIDC token, network — warns, so nothing that
+    /// cannot work here goes unnoticed. Without a context nothing is said
+    /// about what a step needs.
+    #[must_use]
+    pub fn context(mut self, context: CheckContext) -> CheckOptions<'a> {
+        self.context = Some(context);
+        self
+    }
+
+    /// Checks against a different set of file formats, so a build with a
+    /// migration can be tested against a file written for the format before
+    /// it.
+    #[must_use]
+    pub fn formats(mut self, formats: &'a Formats<'a>) -> CheckOptions<'a> {
+        self.formats = formats;
+        self
+    }
+
+    /// Checks as a CI run would: an undeclared file format fires here too.
+    ///
+    /// The caller decides this, never the environment — `CI` is as
+    /// spoofable as any other variable, and the actor, which policy binds,
+    /// is never inferred from it.
+    #[must_use]
+    pub fn ci(mut self, in_ci: bool) -> CheckOptions<'a> {
+        self.in_ci = in_ci;
+        self
+    }
 }
 
 /// Type-check `parse` and build its [`Workflow`], against `options`.
 pub fn check_with(parse: &ks_lang::Parse, options: &CheckOptions<'_>) -> Checked {
-    let mut c = Ctx::new(options.catalog, options.actor, parse.diagnostics().to_vec());
+    let mut c = Ctx::new(
+        options.catalog,
+        options.formats,
+        options.actor,
+        options.context.clone(),
+        options.in_ci,
+        parse.diagnostics().to_vec(),
+    );
     c.file(parse.file());
     c.finish_all()
 }
@@ -172,11 +229,23 @@ const TRIGGER_KINDS: [&str; 5] = ["push", "pr", "tag", "manual", "schedule"];
 
 const ENV_PROPERTIES: [&str; 5] = ["secrets", "ci-only", "approvers", "on", "vars"];
 
+/// The reserved keys under a step: read with the declaration, never checked
+/// as inputs.
+const STEP_PROPERTIES: [&str; 1] = ["ci-only"];
+
 struct Ctx<'a> {
     catalog: &'a Catalog,
+    /// The file formats this build reads, and what each is called.
+    formats: &'a Formats<'a>,
     /// The actor the run would start under, when the caller knows it; policy
     /// rules that bind it are enforced.
     actor: Option<ActorKind>,
+    /// The context the run would have, when the caller knows it; steps
+    /// needing more than it has warn.
+    context: Option<CheckContext>,
+    /// That the caller is running in CI, which widens advisory warnings
+    /// only and never what is enforced.
+    in_ci: bool,
     diags: Vec<Diagnostic>,
     /// The dotted path of the entry being checked (`deploy.image`), attached
     /// to every diagnostic raised while it is checked.
@@ -188,6 +257,8 @@ struct Ctx<'a> {
     /// scan made checking quadratic on files with many steps.
     index: HashMap<String, usize>,
     edges: Vec<Edge>,
+    /// The `policy:` entries' spans, so `--fix` can refuse to edit them.
+    policy_spans: Vec<Span>,
     shown: Vec<(usize, usize)>, // (approval step, step it shows)
     name: Option<String>,
     triggers: Vec<Trigger>,
@@ -206,6 +277,8 @@ struct StepInfo<'a> {
     kind_name: Option<String>,
     kind_span: Span,
     spec: Option<&'a StepTypes>,
+    /// `ci-only: true`: the step refuses to run off CI.
+    ci_only: bool,
     /// `decide` only: the answers declared under `returns:`.
     variants: Vec<String>,
 }
@@ -219,10 +292,20 @@ struct Edge {
 }
 
 impl<'a> Ctx<'a> {
-    fn new(catalog: &'a Catalog, actor: Option<ActorKind>, diags: Vec<Diagnostic>) -> Ctx<'a> {
+    fn new(
+        catalog: &'a Catalog,
+        formats: &'a Formats<'a>,
+        actor: Option<ActorKind>,
+        context: Option<CheckContext>,
+        in_ci: bool,
+        diags: Vec<Diagnostic>,
+    ) -> Ctx<'a> {
         Ctx {
             catalog,
+            formats,
             actor,
+            context,
+            in_ci,
             diags,
             subject: None,
             env_names: Vec::new(),
@@ -230,6 +313,7 @@ impl<'a> Ctx<'a> {
             steps: Vec::new(),
             index: HashMap::new(),
             edges: Vec::new(),
+            policy_spans: Vec::new(),
             shown: Vec::new(),
             name: None,
             triggers: Vec::new(),
@@ -262,11 +346,27 @@ impl<'a> Ctx<'a> {
         self.push(Diagnostic::error(code, span, message).with_hint(hint));
     }
 
+    /// [`err_hint`], plus the edit that would resolve the finding.
+    fn err_hint_fix(
+        &mut self,
+        code: Code,
+        span: Span,
+        message: impl Into<String>,
+        hint: impl Into<String>,
+        fix: Fix,
+    ) {
+        self.push(Diagnostic::error(code, span, message).with_hint(hint).with_fix(fix));
+    }
+
     fn record(&mut self, span: Span, ty: Type) {
         self.types.push((span, ty));
     }
 
     fn file(&mut self, file: ks_lang::File<'_>) {
+        // The format header, read first: it gates nothing else, but a file
+        // declaring a format this build cannot read should say so before it
+        // says anything else.
+        self.check_format(file);
         // First pass: declare the steps and environments, so a reference
         // resolves no matter where in the file its target sits.
         for e in file.entries() {
@@ -281,6 +381,7 @@ impl<'a> Ctx<'a> {
         for e in file.entries() {
             match e.key_name() {
                 Some("name") => self.name = self.scalar_text(e),
+                Some(format::HEADER_KEY) => {} // read by `check_format`
                 Some("on") => {
                     self.subject = Some("on".to_string());
                     self.triggers = self.triggers_of(e);
@@ -291,12 +392,89 @@ impl<'a> Ctx<'a> {
                     self.envs = self.check_envs(e);
                     saw_envs = true;
                 }
-                Some("policy") => self.check_policy(e),
+                Some("policy") => {
+                    self.policy_spans.push(e.node().span());
+                    self.check_policy(e);
+                }
                 _ => {} // other top-level keys carry no meaning here yet
             }
         }
         if !saw_envs {
             self.envs.push(implicit_default());
+        }
+    }
+
+    /// The `keepshipping:` header: which file format the file is written in,
+    /// and whether this build reads it. The format before the current one
+    /// still checks, with a warning naming the upgrade; anything this build
+    /// has no migration out of, or a header that is not a version or not the
+    /// first entry, is refused. No header is the current format — silent
+    /// except under CI, where the pipeline's owner should hear that nobody
+    /// has pinned it.
+    fn check_format(&mut self, file: ks_lang::File<'_>) {
+        match format::header(file) {
+            Header::Absent => {
+                if self.actor != Some(ActorKind::Ci) && !self.in_ci {
+                    return;
+                }
+                // A file with entries points at its first; an empty one at
+                // the start of the file.
+                let span = file.entries().next().map_or_else(|| Span::point(0), |e| e.key_span());
+                self.push(
+                    Diagnostic::warning(
+                        Code::FormatUndeclared,
+                        span,
+                        "this file declares no format version",
+                    )
+                    .with_hint(format!(
+                        "add `{}: {}` as the first line, or run `keepshipping fmt --upgrade`",
+                        format::HEADER_KEY,
+                        format::spelling(self.formats.current)
+                    )),
+                );
+            }
+            Header::Declared { version, span } if !self.formats.supports(version) => {
+                self.err_hint(
+                    Code::FormatUnsupported,
+                    span,
+                    format!("this keepshipping does not read format {}", format::spelling(version)),
+                    format!("it reads {}", self.formats.reads()),
+                );
+            }
+            Header::Declared { version, .. } if version == self.formats.current => {}
+            Header::Declared { version, span } => {
+                self.push(
+                    Diagnostic::warning(
+                        Code::FormatDeprecated,
+                        span,
+                        format!(
+                            "written for format {}; this keepshipping reads {}",
+                            format::spelling(version),
+                            format::spelling(self.formats.current)
+                        ),
+                    )
+                    .with_hint(format!(
+                        "run `keepshipping fmt --upgrade` to rewrite it for {}",
+                        format::spelling(self.formats.current)
+                    )),
+                );
+            }
+            Header::Malformed { span } => self.err_hint(
+                Code::FormatUnsupported,
+                span,
+                format!("the `{}:` value is not a format version", format::HEADER_KEY),
+                format!(
+                    "a format version is spelled `0.N`, e.g. `{}: {}`",
+                    format::HEADER_KEY,
+                    format::spelling(self.formats.current)
+                ),
+            ),
+            Header::NotFirst { span } => self.err_hint(
+                Code::FormatUnsupported,
+                span,
+                format!("`{}:` is not the file's first entry", format::HEADER_KEY),
+                "the header must come before every other entry, so it is the first thing read",
+            ),
         }
     }
 
@@ -342,6 +520,7 @@ impl<'a> Ctx<'a> {
                 _ => (None, span),
             };
             let spec = kind_name.as_deref().and_then(|n| self.catalog.step(n));
+            let ci_only = self.step_ci_only(s);
             let variants = match spec.filter(|sp| sp.decision) {
                 Some(_) => s
                     .children()
@@ -357,6 +536,7 @@ impl<'a> Ctx<'a> {
                 kind_name,
                 kind_span,
                 spec,
+                ci_only,
                 variants,
             });
             self.index.insert(name.to_string(), self.steps.len() - 1);
@@ -381,9 +561,45 @@ impl<'a> Ctx<'a> {
             let Some(idx) = s.key_name().and_then(|n| self.step_index(n)) else { continue };
             for input in s.children() {
                 let Some(iname) = input.key_name() else { continue };
+                // Reserved properties are read with the declaration, not as
+                // an input the step kind would have to declare.
+                if STEP_PROPERTIES.contains(&iname) {
+                    continue;
+                }
                 self.subject = Some(format!("{}.{}", self.steps[idx].name, iname));
                 self.check_input(idx, iname, input);
                 self.subject = None;
+            }
+        }
+    }
+
+    /// A step's reserved `ci-only` property, `false` when it declares none.
+    /// It is not an input: the step kind need not declare it.
+    fn step_ci_only(&mut self, step: Entry<'_>) -> bool {
+        let Some(p) = step.children().find(|c| c.key_name() == Some("ci-only")) else {
+            return false;
+        };
+        self.subject = step.key_name().map(|n| format!("{n}.ci-only"));
+        let value = self.ci_only(p, Code::TypeMismatch);
+        self.subject = None;
+        value
+    }
+
+    /// The `true`/`false` under a `ci-only` property; a value that is
+    /// neither is `code`'s error, worded the same way for an environment and
+    /// for a step.
+    fn ci_only(&mut self, p: Entry<'_>, code: Code) -> bool {
+        match p.expr().as_ref().and_then(value_word).as_deref() {
+            Some("true") => true,
+            Some("false") => false,
+            _ => {
+                self.err_hint(
+                    code,
+                    p.key_span(),
+                    "`ci-only` takes `true` or `false`",
+                    "`ci-only: true`",
+                );
+                false
             }
         }
     }
@@ -397,10 +613,15 @@ impl<'a> Ctx<'a> {
         let Some(ty) = spec.input(iname) else {
             let span = input.key_span();
             let msg = format!("unknown input `{iname}` for step kind `{}`", spec.name);
-            match suggest(iname, &spec.input_names()) {
-                Some(s) => {
-                    self.err_hint(Code::UnknownInput, span, msg, format!("did you mean `{s}`?"))
-                }
+            let names = spec.input_names();
+            match suggestion(iname, &names) {
+                Some((s, unique)) => self.err_hint_fix(
+                    Code::UnknownInput,
+                    span,
+                    msg,
+                    format!("did you mean `{s}`?"),
+                    Fix::new(span, s, unique),
+                ),
                 None => self.err(Code::UnknownInput, span, msg),
             }
             return;
@@ -408,8 +629,38 @@ impl<'a> Ctx<'a> {
         match iname {
             "show" => self.check_refs(idx, &e),
             "else" => self.check_actions(idx, &e),
+            "auto" => {
+                // Only `approval` gates on `auto:`; the destroys guard is its
+                // rule, not a convention every `auto:` input follows.
+                if spec.name == "approval" {
+                    self.check_auto_rule(&e);
+                }
+                self.demand_input(idx, ty, &e);
+            }
             "returns" => {} // variants were collected with the declarations
             _ => self.demand_input(idx, ty, &e),
+        }
+    }
+
+    /// An `approval` step's `auto:` may approve without a human only if it
+    /// says so: the destroys guard must be a top-level conjunct reading a
+    /// step that produces a `destroys` count. The engine adds the guard
+    /// either way (ADR 0012), so this warns about the file, not the run.
+    fn check_auto_rule(&mut self, e: &Expr<'_>) {
+        let plans: Vec<String> = self
+            .steps
+            .iter()
+            .filter(|s| s.spec.is_some_and(|sp| sp.output("destroys").is_some()))
+            .map(|s| s.name.clone())
+            .collect();
+        let is_plan_step = |name: &str| plans.iter().any(|n| n == name);
+        if !auto_rule::guards_destroys(e, &is_plan_step) {
+            self.warn_hint(
+                Code::AutoDestroys,
+                e.span(),
+                MISSING_GUARD_MESSAGE.to_string(),
+                MISSING_GUARD_HINT.to_string(),
+            );
         }
     }
 
@@ -418,7 +669,7 @@ impl<'a> Ctx<'a> {
         // A typed default (`replicas: int = 2`): the annotation types the
         // value, and the default must be a literal of it.
         if let Some((word, ann, rhs)) = annotation_default(e) {
-            self.demand(word.node.span(), want, ann.clone(), None);
+            self.demand(word.node.span(), want, ann.clone(), None, None);
             self.demand_input(idx, ann.clone(), rhs);
             self.record(e.span(), ann);
             return;
@@ -449,7 +700,7 @@ impl<'a> Ctx<'a> {
             Expr::Tuple { items, .. } => self.tuple_input(idx, items, want, e.span()),
             other => {
                 let got = self.ty_of(idx, other);
-                self.demand(other.span(), want, got, None);
+                self.demand(other.span(), want, got, None, None);
             }
         }
     }
@@ -491,7 +742,7 @@ impl<'a> Ctx<'a> {
                     };
                 }
                 let got = Type::List(Box::new(same.unwrap_or(Type::Any)));
-                self.demand(span, want, got, None);
+                self.demand(span, want, got, None, None);
             }
         }
     }
@@ -518,13 +769,13 @@ impl<'a> Ctx<'a> {
             }
             // The word spells no literal of `want`: name what it does spell.
             Some((text, LiteralFit::Err)) if untyped => {
-                self.demand(span, want, types::literal_type(text), None);
+                self.demand(span, want, types::literal_type(text), None, None);
             }
             _ => {
                 if types::coerce(&want, &got) {
                     self.record(span, if got == Type::Any { want } else { got });
                 } else {
-                    self.demand(span, want, got, None);
+                    self.demand(span, want, got, None, None);
                 }
             }
         }
@@ -545,12 +796,19 @@ impl<'a> Ctx<'a> {
         let span = w.node.span();
         if w.scalar() == ks_lang::Scalar::DottedName {
             let Some((target, got)) = self.resolve_ref(idx, w.text(), span) else { return };
+            // The output of the wanted type, when the step has exactly one:
+            // rewriting just that segment makes the value fit.
+            let mut fix = None;
             let hint = if types::coerce(&want, &got) {
                 None
             } else {
-                target.and_then(|t| self.mismatch_hint(t, &want))
+                target.and_then(|t| {
+                    let (hint, out, unique) = self.mismatch_hint(t, &want)?;
+                    fix = Some(Fix::new(segment_span(w.text(), span.start, 1), out, unique));
+                    Some(hint)
+                })
             };
-            self.demand(span, want, got, hint);
+            self.demand(span, want, got, hint, fix);
         } else {
             let text = w.text();
             let got = self.word_untyped(idx, w);
@@ -636,43 +894,64 @@ impl<'a> Ctx<'a> {
         if want.is_named("oci.Tag") { Type::Named("oci.Tag".to_string()) } else { Type::String }
     }
 
-    fn demand(&mut self, span: Span, want: Type, got: Type, hint: Option<String>) {
+    /// A value against the type its input declares. `fix`, when the checker
+    /// has one, is the edit that would make it fit.
+    fn demand(
+        &mut self,
+        span: Span,
+        want: Type,
+        got: Type,
+        hint: Option<String>,
+        fix: Option<Fix>,
+    ) {
         if types::coerce(&want, &got) {
             self.record(span, if got == Type::Any { want } else { got });
             return;
         }
         let message = format!("expected {want}, got {got}");
         let hint = hint.or_else(|| secret_hint(&want, &got));
-        match hint {
-            Some(h) => self.err_hint(Code::TypeMismatch, span, message, h),
-            None => self.err(Code::TypeMismatch, span, message),
-        }
+        let d = match hint {
+            Some(h) => Diagnostic::error(Code::TypeMismatch, span, message).with_hint(h),
+            None => Diagnostic::error(Code::TypeMismatch, span, message),
+        };
+        self.push(match fix {
+            Some(fix) => d.with_fix(fix),
+            None => d,
+        });
     }
 
     /// The did-you-mean for a type mismatch: another output of the same
-    /// step that has the wanted type. The hint quotes the wanted type's
-    /// rationale when the catalog declares one
-    /// (`use build.digest so prod runs exactly the image you built`).
-    fn mismatch_hint(&self, target: usize, want: &Type) -> Option<String> {
+    /// step that has the wanted type. Yields the hint, the output it names
+    /// and whether that output is the step's only one of the wanted type.
+    /// The hint quotes the wanted type's rationale when the catalog declares
+    /// one (`use build.digest so prod runs exactly the image you built`).
+    fn mismatch_hint(&self, target: usize, want: &Type) -> Option<(String, String, bool)> {
         let spec = self.steps[target].spec?;
-        let out = self.alt_output(spec, want)?;
+        let (out, unique) = self.alt_output(spec, want)?;
         let name = &self.steps[target].name;
-        Some(match self.catalog.rationale(want) {
+        let hint = match self.catalog.rationale(want) {
             Some(r) => format!("use {name}.{out} {r}"),
             None => format!("use {name}.{out}, which is {} {want}", article(&want.to_string())),
-        })
+        };
+        Some((hint, out, unique))
     }
 
-    /// Another output of `spec` with the wanted type; for a `decide`, the
-    /// `answer` output for one of its declared answers.
-    fn alt_output(&self, spec: &StepTypes, want: &Type) -> Option<String> {
-        spec.outputs
+    /// Another output of `spec` with the wanted type, with whether it is the
+    /// only one; for a `decide`, the `answer` output for one of its declared
+    /// answers.
+    fn alt_output(&self, spec: &StepTypes, want: &Type) -> Option<(String, bool)> {
+        let mut fits = spec
+            .outputs
             .iter()
-            .find(|(_, ty)| !matches!(ty, Type::Any) && types::coerce(want, ty))
-            .map(|(n, _)| n.clone())
-            .or_else(|| {
-                (spec.decision && matches!(want, Type::Decision(_))).then(|| "answer".to_string())
-            })
+            .filter(|(_, ty)| !matches!(ty, Type::Any) && types::coerce(want, ty));
+        match fits.next() {
+            Some((n, _)) => Some((n.clone(), fits.next().is_none())),
+            // A `decide` types its `answer` output from the declared returns:.
+            None if spec.decision && matches!(want, Type::Decision(_)) => {
+                Some(("answer".to_string(), true))
+            }
+            None => None,
+        }
     }
 
     /// A same-workflow output of the wanted nominal type — where a pasted
@@ -736,8 +1015,14 @@ impl<'a> Ctx<'a> {
         let mut cands: Vec<&str> = self.steps.iter().map(|s| s.name.as_str()).collect();
         cands.extend_from_slice(&NAMESPACES);
         let msg = format!("unknown step or context value `{first}`");
-        match suggest(first, &cands) {
-            Some(s) => self.err_hint(Code::UnknownRef, span, msg, format!("did you mean `{s}`?")),
+        match suggestion(first, &cands) {
+            Some((s, unique)) => self.err_hint_fix(
+                Code::UnknownRef,
+                span,
+                msg,
+                format!("did you mean `{s}`?"),
+                Fix::new(segment_span(text, span.start, 0), s, unique),
+            ),
             None => self.err(Code::UnknownRef, span, msg),
         }
         None
@@ -783,13 +1068,13 @@ impl<'a> Ctx<'a> {
                     let outs: Vec<String> = spec
                         .map(|sp| sp.outputs.iter().map(|(n, _)| n.to_string()).collect())
                         .unwrap_or_default();
-                    match suggest(out, &outs) {
-                        Some(s) => self.err_hint(
-                            Code::UnknownOutput,
-                            span,
-                            msg,
-                            format!("did you mean `{s}`?"),
-                        ),
+                    match suggestion(out, &outs) {
+                        Some((s, unique)) => {
+                            let hint = format!("did you mean `{s}`?");
+                            let at = segment_span(rest, span.end - rest.len() as u32, 0);
+                            let fix = Fix::new(at, s, unique);
+                            self.err_hint_fix(Code::UnknownOutput, span, msg, hint, fix)
+                        }
                         None => self.err(Code::UnknownOutput, span, msg),
                     }
                 }
@@ -1251,16 +1536,7 @@ impl<'a> Ctx<'a> {
                 self.subject = Some(format!("{name}.{prop}"));
                 match prop {
                     "on" => env.triggers = self.triggers_of(p),
-                    "ci-only" => match p.expr().as_ref().and_then(value_word).as_deref() {
-                        Some("true") => env.ci_only = true,
-                        Some("false") => {}
-                        _ => self.err_hint(
-                            Code::EnvProblem,
-                            p.key_span(),
-                            "`ci-only` takes `true` or `false`",
-                            "`ci-only: true`",
-                        ),
-                    },
+                    "ci-only" => env.ci_only = self.ci_only(p, Code::EnvProblem),
                     "secrets" => env.secrets = self.scalar_text(p),
                     "approvers" => {
                         if let Some(v) = p.expr() {
@@ -1402,15 +1678,16 @@ impl<'a> Ctx<'a> {
             let text = verb.text();
             if !POLICY_VERBS.contains(&text) {
                 let msg = format!("unknown action `{text}`");
-                match suggest(text, &POLICY_VERBS) {
-                    Some(s) => self.err_hint(
-                        Code::PolicyAction,
-                        verb.node.span(),
-                        msg,
-                        format!("did you mean `{s}`?"),
-                    ),
-                    None => self.err(Code::PolicyAction, verb.node.span(), msg),
-                }
+                let span = verb.node.span();
+                let d = Diagnostic::error(Code::PolicyAction, span, msg);
+                // `policy:` fixes are real edits, and `--fix` refuses them
+                // by span: the edit is right, the decision is a human's.
+                self.push(match suggestion(text, &POLICY_VERBS) {
+                    Some((s, unique)) => d
+                        .with_hint(format!("did you mean `{s}`?"))
+                        .with_fix(Fix::new(span, s, unique)),
+                    None => d,
+                });
                 continue;
             }
             if text == "read" {
@@ -1565,17 +1842,39 @@ impl<'a> Ctx<'a> {
                 kind: s.kind_name.clone(),
                 span: s.span,
                 kind_span: s.kind_span,
+                ci_only: s.ci_only,
             })
             .collect();
         let edges = edges.into_iter().map(|e| (e.from, e.to)).collect();
         let workflow =
             Workflow::new(self.name, self.triggers, self.envs, steps, edges, order, self.policy);
+        // Context warnings, once the workflow exists: what a step needs
+        // against what a run in this context has. Collected into `diags`
+        // rather than pushed, as `self` has been drained into `workflow`.
+        let context_warnings: Vec<Diagnostic> = self
+            .context
+            .iter()
+            .flat_map(|ctx| {
+                unmet_steps(&workflow, self.catalog, ctx).into_iter().map(|step| {
+                    Diagnostic::warning(Code::NeedsContext, step.span, step.message(ctx))
+                        .with_subject(step.name.clone())
+                        .with_hint(step.hint())
+                })
+            })
+            .collect();
         // One file, one order: parser and checker findings interleaved in
         // source order, so CLI and editor output line up.
         let mut diagnostics = self.diags;
+        diagnostics.extend(context_warnings);
         diagnostics.sort_by_key(|d| (d.span.start, d.span.end));
         self.secret_uses.sort_by_key(|u| u.span.start);
-        Checked { workflow, diagnostics, types: self.types, secret_uses: self.secret_uses }
+        Checked {
+            workflow,
+            diagnostics,
+            types: self.types,
+            secret_uses: self.secret_uses,
+            policy_spans: self.policy_spans,
+        }
     }
 }
 
@@ -1598,6 +1897,20 @@ fn split_first(text: &str) -> (&str, Option<&str>) {
         Some((a, b)) => (a, Some(b)),
         None => (text, None),
     }
+}
+
+/// The span of the `n`th dot-separated segment of `text`, which starts at
+/// `start`. Fixes rewrite the one misspelled segment — `tag` in
+/// `build.tag`, not the whole reference.
+fn segment_span(text: &str, start: u32, n: usize) -> Span {
+    let mut at = start;
+    for (i, seg) in text.split('.').enumerate() {
+        if i == n {
+            return Span::new(at, at + seg.len() as u32);
+        }
+        at += seg.len() as u32 + 1;
+    }
+    Span::new(start, start) // a name without that segment: nothing to rewrite
 }
 
 /// A type without its `Optional` wrapper, so `git.tag?` compares against
@@ -1683,18 +1996,56 @@ const MAX_SUGGEST_CANDIDATES: usize = 512;
 
 /// The closest candidate within a small threshold, if any.
 pub(crate) fn suggest<S: AsRef<str>>(name: &str, candidates: &[S]) -> Option<String> {
+    suggestion(name, candidates).map(|(best, _)| best)
+}
+
+/// [`suggest`]'s name together with whether it is unambiguous — nothing else
+/// ties it. One pass, so the hint a person reads and the fix `--fix` applies
+/// can never name different candidates: a tie is shown but not applied.
+pub(crate) fn suggestion<S: AsRef<str>>(name: &str, candidates: &[S]) -> Option<(String, bool)> {
+    let (best, second) = closest(name, candidates)?;
+    Some((best.1.to_string(), second.is_none_or(|(sd, _)| sd > best.0)))
+}
+
+/// A candidate within the threshold, with its distance: `(distance, name)`.
+type Ranked<'c> = (usize, &'c str);
+
+/// The nearest candidate within the threshold and the runner-up, if any.
+/// Ties keep the earlier candidate, exactly as `min_by_key` did.
+fn closest<'c, S: AsRef<str>>(
+    name: &str,
+    candidates: &'c [S],
+) -> Option<(Ranked<'c>, Option<Ranked<'c>>)> {
     if candidates.len() > MAX_SUGGEST_CANDIDATES {
         return None;
     }
     let limit = if name.len() < 4 { 1 } else { 2 };
-    candidates
-        .iter()
+    let mut best: Option<(usize, &str)> = None;
+    let mut second: Option<(usize, &str)> = None;
+    for c in candidates {
         // A length difference alone already exceeds the threshold.
-        .filter(|c| c.as_ref().len().abs_diff(name.len()) <= limit)
-        .map(|c| (bounded_levenshtein(name, c.as_ref(), limit), c))
-        .filter(|(d, _)| *d <= limit)
-        .min_by_key(|(d, _)| *d)
-        .map(|(_, c)| c.as_ref().to_string())
+        if c.as_ref().len().abs_diff(name.len()) > limit {
+            continue;
+        }
+        let d = bounded_levenshtein(name, c.as_ref(), limit);
+        if d > limit {
+            continue;
+        }
+        let c = c.as_ref();
+        match best {
+            // No nearer than what we hold, so it can only be the runner-up.
+            Some((bd, _)) if bd <= d => {
+                if second.is_none_or(|(sd, _)| d < sd) {
+                    second = Some((d, c));
+                }
+            }
+            _ => {
+                second = best;
+                best = Some((d, c));
+            }
+        }
+    }
+    best.map(|b| (b, second))
 }
 
 /// Edit distance on bytes, two-row DP, abandoned as soon as a row proves the

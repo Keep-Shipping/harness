@@ -38,6 +38,12 @@ impl Format {
     }
 }
 
+/// The 1-based line a byte offset falls on, for a command that prints a
+/// position without printing the file around it.
+pub fn line_at(src: &str, offset: u32) -> usize {
+    Lines::new(src).line_col(src, offset).0
+}
+
 /// Colour is for terminals: on when stdout is one and `NO_COLOR` is unset or
 /// empty — any non-empty value disables it, per no-color.org.
 pub fn use_color() -> bool {
@@ -238,12 +244,25 @@ pub fn json(w: &mut impl Write, path: &str, src: &str, diags: &[Diagnostic]) -> 
             }
             write!(w, "{}", json_str(hint))?;
         }
-        // Reserved for machine-applicable fixes; nothing emits them yet.
-        writeln!(w, "],\"fixes\":[]}}")?;
+        // A suggested edit, in the same span encoding as the diagnostic's own.
+        write!(w, "],\"fixes\":[")?;
+        for (n, fix) in d.fixes.iter().enumerate() {
+            if n > 0 {
+                write!(w, ",")?;
+            }
+            write!(w, "{{\"span\":")?;
+            json_span(w, &lines, src, fix.span)?;
+            write!(
+                w,
+                ",\"replacement\":{},\"machine_applicable\":{}}}",
+                json_str(&fix.replacement),
+                fix.machine_applicable
+            )?;
+        }
+        writeln!(w, "]}}")?;
     }
     Ok(())
 }
-
 fn json_span(w: &mut impl Write, lines: &Lines, src: &str, span: Span) -> io::Result<()> {
     let (line, column) = lines.line_col(src, span.start);
     let (end_line, end_column) = lines.line_col(src, span.end);

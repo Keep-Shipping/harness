@@ -968,6 +968,7 @@ dependencies = [
  "ks-core",
  "ks-engine",
  "ks-lang",
+ "ks-lsp",
  "ks-testing",
  "serde_json",
 ]
@@ -998,6 +999,7 @@ version = "0.0.0"
 dependencies = [
  "ks-core",
  "ks-lang",
+ "serde_json",
 ]
 
 [[package]]

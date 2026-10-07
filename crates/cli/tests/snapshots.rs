@@ -16,7 +16,15 @@ fn check(extra: &[&str]) -> (i32, String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_keepshipping"))
         .arg("check")
         .args(extra)
+        // The golden bytes are the ones from a terminal-less local run; a
+        // `CI` in the parent would add the undeclared-format warning to the
+        // fixture and rewrite the example this file pins.
+        .env_remove("CI")
         .current_dir(SITE)
+        // Check now has a context, and it is detected from the environment:
+        // these bytes are the same on a laptop and on a CI runner.
+        .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
         .output()
         .expect("run keepshipping");
     (
@@ -66,7 +74,16 @@ fn json_output_is_schema_v1() {
         stdout.contains("\"line\":21,\"column\":12,\"end_line\":21,\"end_column\":21"),
         "{stdout}"
     );
-    assert!(stdout.ends_with("\"fixes\":[]}\n"), "{stdout}");
+    // The type-directed fix: rewrite `tag` (the output segment, not the
+    // whole reference) to `digest`, machine-applicable.
+    assert!(
+        stdout.ends_with(
+            "\"fixes\":[{\"span\":{\"start\":369,\"end\":372,\"line\":21,\"column\":18,\
+             \"end_line\":21,\"end_column\":21},\"replacement\":\"digest\",\
+             \"machine_applicable\":true}]}\n"
+        ),
+        "{stdout}"
+    );
     assert_eq!(stdout, read_or_update(&golden("check.json"), &stdout));
 }
 

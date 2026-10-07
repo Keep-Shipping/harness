@@ -12,17 +12,36 @@ fn check_src(src: &str) -> Checked {
     check(&ks_lang::parse(src))
 }
 
-/// The one code that only fires when the run's actor is known: checked as an
-/// agent, so the `agents: never: read secrets` rule binds.
+/// A format table one version ahead of the built-in one, so the code that
+/// only fires on a file written for the *previous* format has one to fire on:
+/// the built-in table is format 1 with nothing behind it.
+const PREVIOUS: ks_core::format::Formats<'static> = ks_core::format::Formats {
+    current: 2,
+    migrations: &[ks_core::format::Migration {
+        from: 1,
+        summary: "test-only: nothing is rewritten",
+        rewrite: |_| ks_core::format::Rewrites::default(),
+    }],
+};
+
+/// The codes that only fire under options the default check does not use: one
+/// bound to an actor (`agents: never: read secrets`), one only under CI, and
+/// one only against a format table with a format behind the current one.
 fn check_explained(src: &str, code: Code) -> Checked {
-    if code == Code::PolicyForbidden {
-        let catalog = Catalog::builtin();
-        let options =
-            CheckOptions::new(&catalog).actor(ks_core::ports::run_context::ActorKind::Agent);
-        check_with(&ks_lang::parse(src), &options)
-    } else {
-        check_src(src)
-    }
+    let catalog = Catalog::builtin();
+    let options = match code {
+        Code::PolicyForbidden => {
+            CheckOptions::new(&catalog).actor(ks_core::ports::run_context::ActorKind::Agent)
+        }
+        // Checked as a laptop, where a `ci-only` step cannot run.
+        Code::NeedsContext => CheckOptions::new(&catalog).context(ks_core::CheckContext::local()),
+        Code::FormatUndeclared => {
+            CheckOptions::new(&catalog).actor(ks_core::ports::run_context::ActorKind::Ci)
+        }
+        Code::FormatDeprecated => CheckOptions::new(&catalog).formats(&PREVIOUS),
+        _ => return check_src(src),
+    };
+    check_with(&ks_lang::parse(src), &options)
 }
 
 #[test]
