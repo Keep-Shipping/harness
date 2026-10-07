@@ -14,7 +14,9 @@ Every finding carries a stable `KSxxxx` code — what each one means lives in
 | 3 | internal: an unexpected I/O error, or a panic — a bug in keepshipping, never in your file |
 
 `run` keeps the same scale: 1 when the file fails the check, 2 for usage and
-environment-selection problems.
+environment-selection problems. The full list, including the codes a *run*
+will add once `run` is wired to the engine (4 waiting for an approval, 5
+policy refused, 130 cancelled), is in [CLI.md](CLI.md).
 
 Diagnostics in a file are sorted by position; with `--all`, files are sorted
 by path.
