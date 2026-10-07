@@ -1,6 +1,6 @@
 # Contributing
 
-Read first: [README.md](README.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and the [ADR index](docs/adr/README.md). The plan lives in the issues, starting with the master plan, [#1](https://github.com/Keep-Shipping/harness/issues/1).
+Read first: [README.md](README.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/REPRODUCIBILITY.md](docs/REPRODUCIBILITY.md) and the [ADR index](docs/adr/README.md). The plan lives in the issues, starting with the master plan, [#1](https://github.com/Keep-Shipping/harness/issues/1).
 
 ## Rules
 

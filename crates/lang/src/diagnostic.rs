@@ -75,8 +75,8 @@ impl fmt::Display for Severity {
 /// tools can match on. Codes are grouped by block — `KS00xx` syntax,
 /// `KS01xx` types, `KS02xx` names and references, `KS03xx` workflow
 /// structure, `KS04xx` policy, `KS05xx` secrets, `KS06xx` environment, file
-/// format and CI warnings, `KS07xx` approval safety — and are never renumbered:
-/// gaps stay free for new codes.
+/// format and CI warnings, `KS07xx` approval safety, `KS08xx` build
+/// reproducibility — and are never renumbered: gaps stay free for new codes.
 ///
 /// The meaning, a bad and a good example of every code are documented in
 /// `docs/ERRORS.md`, generated from the registry in `ks-core`.
@@ -136,6 +136,8 @@ pub enum Code {
     FormatDeprecated,
     /// The file declares no format at all, where CI wants one pinned.
     FormatUndeclared,
+    /// An image build input that can move between two builds.
+    NonReproducible,
 }
 
 impl Code {
@@ -170,6 +172,7 @@ impl Code {
             Code::FormatUnsupported => "KS0005",
             Code::FormatDeprecated => "KS0610",
             Code::FormatUndeclared => "KS0611",
+            Code::NonReproducible => "KS0801",
         }
     }
 
@@ -203,6 +206,7 @@ impl Code {
         Code::FormatDeprecated,
         Code::FormatUndeclared,
         Code::AutoDestroys,
+        Code::NonReproducible,
     ];
 }
 

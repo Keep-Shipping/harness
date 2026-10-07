@@ -214,13 +214,31 @@ skipping hidden directories, `target` and `node_modules`; checks each; prints
 paths relative to the walk root; prints the footer once; and exits with the
 worst result across files. No `ship.ks` anywhere is a usage error (exit 2).
 
+## `--repro`
+
+Reads the Dockerfiles an `oci.image` step names through its `from:`, resolved
+beside the site file, and warns (KS0801) about the inputs that can move
+between two builds: a base image without a `@sha256:` digest, an `apt` index
+read without a snapshot, an `ADD` of a URL without `--checksum=`. The
+findings are reported against the Dockerfile, with its own path and source,
+in whichever format was chosen — so snippets and annotations point at the
+lines of the file that actually carries the defect.
+
+Without the flag the Dockerfiles are never opened and the check reads the
+site file alone. A `from:` naming a file that cannot be read is a warning in
+its own right, reported against the `from:` itself. What each rule counts as
+pinned is written out in
+[REPRODUCIBILITY.md](REPRODUCIBILITY.md#checking-a-dockerfile-today).
+
 ## What check reads
 
 The check path reads the files it checks and nothing else — no network, no
 store, and no environment variables beyond `NO_COLOR` (the colour switch)
 and `CI` (which only widens the advisory "no format declared" warning, never
-what is enforced) — and resolution uses the built-in step catalog. CI proves
-the no-network part by running `check` on the fixtures inside a network
+what is enforced) — and resolution uses the built-in step catalog. `--repro`
+widens "the files it checks" to the Dockerfiles those site files name, and
+opens nothing else. CI proves the no-network part by running `check` on the
+fixtures inside a network
 namespace with no interfaces (the `offline` job).
 
 `--fix` is the one exception, and it is the flag's whole purpose: it writes

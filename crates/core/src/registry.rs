@@ -517,6 +517,31 @@ steps:
          and plan.destroys == 0
 ",
         },
+        Code::NonReproducible => Explanation {
+            code,
+            title: "image build is not reproducible",
+            severity: Severity::Warning,
+            summary: "Two independent builds only produce the same image digest when every \
+                input is pinned: base images and downloaded files by digest or checksum, \
+                package indexes by snapshot date, timestamps fixed (SOURCE_DATE_EPOCH), and \
+                the same builder version. Otherwise the digest CI reports matches your local \
+                one only because CI *promotes* \u{2014} it reuses the digest it built rather \
+                than building again \u{2014} and the file is free to drift until it does. \
+                Reported by `keepshipping check --repro`, which reads the Dockerfiles an \
+                `oci.image` step names; the examples below are Dockerfiles, not `ship.ks`.",
+            bad: "\
+FROM node:20
+RUN apt-get update && apt-get install -y curl
+ADD https://example.com/tool.tar.gz /usr/local/bin/tool
+",
+            good: "\
+FROM node:20@sha256:1a79a4d60de6718e8e5b326e338ae533b95b6e5b4c7d0b6a9b0e3e6b6c5d4e3f2
+RUN sed -i s/deb.debian.org/snapshot.debian.org/ /etc/apt/sources.list \
+ && apt-get update && apt-get install -y --no-install-recommends curl
+ADD --checksum=sha256:5f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f \
+    https://example.com/tool.tar.gz /usr/local/bin/tool
+",
+        },
         Code::SecretShown => Explanation {
             code,
             title: "secret shown",
@@ -638,8 +663,8 @@ Every diagnostic the `ks` parser and checker emit carries exactly one code,
 stable forever: tools and agents match on the code, not on the message. Codes
 are grouped by block — `KS00xx` syntax, `KS01xx` types, `KS02xx` names and
 references, `KS03xx` workflow structure, `KS04xx` policy, `KS05xx` secrets,
-`KS06xx` environment, file format and CI warnings, `KS07xx` approval safety — with
-gaps left for growth.
+`KS06xx` environment, file format and CI warnings, `KS07xx` approval safety, `KS08xx`
+build reproducibility — with gaps left for growth.
 
 This file is generated from the registry in `crates/core/src/registry.rs`;
 edit the registry, never this file. Regenerate with:
@@ -659,12 +684,14 @@ UPDATE_GOLDEN=1 cargo test -p ks-core --test registry
     }
     for code in Code::ALL {
         let e = explain(*code);
+        // KS0801 is reported against a Dockerfile, not a site file.
+        let fence = if *code == Code::NonReproducible { "dockerfile" } else { "ks" };
         out.push_str(&format!("\n## {}: {}\n\n", e.code, e.title));
         out.push_str(&format!("Severity: {}.\n\n", e.severity));
         out.push_str(e.summary);
-        out.push_str("\n\nNot ok:\n\n```ks\n");
+        out.push_str(&format!("\n\nNot ok:\n\n```{fence}\n"));
         out.push_str(e.bad);
-        out.push_str("```\n\nOk:\n\n```ks\n");
+        out.push_str(&format!("```\n\nOk:\n\n```{fence}\n"));
         out.push_str(e.good);
         out.push_str("```\n");
     }

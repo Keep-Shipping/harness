@@ -17,7 +17,7 @@ pub const INDEX_ENV: &str = "KEEPSSHIPPING_BLOCKS_INDEX";
 pub const USAGE: &str = "\
 usage: keepshipping check [FILE] [--all] [--format human|json|github]
                           [--warnings-as-errors] [--env NAME] [--event \"push main\"]
-                          [--actor human|agent|ci] [--context local|ci] [--secrets] [--fix]
+                          [--actor human|agent|ci] [--context local|ci] [--secrets] [--fix] [--repro]
        keepshipping run [FILE] [--env NAME] [--event \"push main\"] [--actor human|agent|ci]
                         [--context local|ci] [--non-interactive] [--until STEP]
                         [--only STEP]... [--skip STEP]... [--allow-partial]
@@ -29,7 +29,7 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
        keepshipping lsp";
 
 /// Which subcommand's flags `parse_args` accepts. `--format`, `--all`,
-/// `--warnings-as-errors`, `--secrets` and `--fix` belong to `check` alone; `run`
+/// `--warnings-as-errors`, `--secrets`, `--fix` and `--repro` belong to `check` alone; `run`
 /// rejects them like any other unrecognized option. `--until`, `--skip` and
 /// `--allow-partial` belong to `run` alone, and `--context` to both.
 /// `blocks search` has its own `--format` (human or json, no github
@@ -57,6 +57,9 @@ pub struct Options {
     /// `--fix`: apply the machine-applicable fixes and re-check. Never
     /// applied to `policy:`, where the change needs a human.
     pub fix: bool,
+    /// `--repro`: also read the Dockerfiles an `oci.image` step names and
+    /// warn (KS0801) about inputs that can move between two builds.
+    pub repro: bool,
     pub env: Option<String>,
     pub event: Option<String>,
     /// The actor the command would run as; a human unless `--actor` says
@@ -102,6 +105,7 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
         all: false,
         warnings_as_errors: false,
         fix: false,
+        repro: false,
         env: None,
         event: None,
         actor: ActorKind::Human,
@@ -129,6 +133,7 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
             "--warnings-as-errors" if command == Command::Check => o.warnings_as_errors = true,
             "--secrets" if command == Command::Check => o.secrets = true,
             "--fix" if command == Command::Check => o.fix = true,
+            "--repro" if command == Command::Check => o.repro = true,
             "--env" => o.env = Some(flag_value(&mut rest)?),
             "--event" => o.event = Some(flag_value(&mut rest)?),
             "--actor" => o.actor = actor_kind(&flag_value(&mut rest)?)?,
