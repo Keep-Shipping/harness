@@ -9,13 +9,14 @@ use std::sync::Arc;
 use ks_core::ports::script_host::ValueType;
 use ks_core::step::{StepKind, TypeDef};
 
+use crate::oci_artifact::OciArtifactStep;
 use crate::oci_image::OciImage;
 use crate::oci_verify::OciVerify;
 use crate::tofu_plan::TofuPlan;
 
 /// Every built-in step kind, in registration order.
 pub fn builtin_steps() -> Vec<Arc<dyn StepKind>> {
-    vec![Arc::new(OciImage), Arc::new(OciVerify), Arc::new(TofuPlan)]
+    vec![Arc::new(OciImage), Arc::new(OciArtifactStep), Arc::new(OciVerify), Arc::new(TofuPlan)]
 }
 
 /// The named types the built-in steps' schemas refer to, for a
