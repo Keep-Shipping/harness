@@ -7,14 +7,15 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use ks_lang::{Atom, Code, Diagnostic, Entry, Expr, Fix, Span, StrPart, Word};
 
 use crate::auto_rule::{self, MISSING_GUARD_HINT, MISSING_GUARD_MESSAGE};
-use crate::catalog::{Catalog, StepTypes};
+use crate::catalog::{AFTER, Catalog, StepTypes, WHEN};
 use crate::context::{CheckContext, unmet_steps};
 use crate::format::{self, Formats, Header};
 use crate::ports::run_context::ActorKind;
 use crate::ports::secrets::SecretRef;
 use crate::types::{self, LiteralFit, Type};
 use crate::workflow::{
-    Env, NeverRule, Policy, Step, Trigger, TriggerKind, Workflow, implicit_default,
+    Condition, ContextTest, Env, NeverRule, Policy, Step, Trigger, TriggerKind, Workflow,
+    implicit_default,
 };
 
 /// A checked file: the workflow it declares plus every diagnostic, parser
@@ -259,6 +260,11 @@ struct Ctx<'a> {
     edges: Vec<Edge>,
     /// The `policy:` entries' spans, so `--fix` can refuse to edit them.
     policy_spans: Vec<Span>,
+    /// `(from, to)` pairs an `after:` ordered: an order, not a read.
+    after: HashSet<(String, String)>,
+    /// `(from, to)` pairs something reads across, whether or not an `after:`
+    /// orders them too.
+    read: HashSet<(String, String)>,
     shown: Vec<(usize, usize)>, // (approval step, step it shows)
     name: Option<String>,
     triggers: Vec<Trigger>,
@@ -281,6 +287,8 @@ struct StepInfo<'a> {
     ci_only: bool,
     /// `decide` only: the answers declared under `returns:`.
     variants: Vec<String>,
+    /// The `when:` condition, for the planner.
+    when: Option<Condition>,
 }
 
 /// `from` must run before `to`; `span` is the reference that asked for it.
@@ -314,6 +322,8 @@ impl<'a> Ctx<'a> {
             index: HashMap::new(),
             edges: Vec::new(),
             policy_spans: Vec::new(),
+            after: HashSet::new(),
+            read: HashSet::new(),
             shown: Vec::new(),
             name: None,
             triggers: Vec::new(),
@@ -538,6 +548,7 @@ impl<'a> Ctx<'a> {
                 spec,
                 ci_only,
                 variants,
+                when: None,
             });
             self.index.insert(name.to_string(), self.steps.len() - 1);
         }
@@ -606,6 +617,12 @@ impl<'a> Ctx<'a> {
 
     fn check_input(&mut self, idx: usize, iname: &str, input: Entry<'_>) {
         let Some(e) = input.expr() else { return }; // missing values: parse error
+        // The reserved inputs mean the same for every kind, checked or not.
+        match iname {
+            AFTER => return self.check_after(idx, &e),
+            WHEN => self.record_when(idx, &e),
+            _ => {}
+        }
         let Some(spec) = self.steps[idx].spec else {
             self.ty_of(idx, &e); // unknown kind: inputs unchecked, refs resolve
             return;
@@ -662,6 +679,56 @@ impl<'a> Ctx<'a> {
                 MISSING_GUARD_HINT.to_string(),
             );
         }
+    }
+
+    /// `after: build`, `after: "build"` or `after: build, review`: ordering
+    /// without data. Each name adds the same edge a reference would, so a name
+    /// that does not exist, this step itself, or a loop all reach the
+    /// diagnostics they reach for a reference. A value that is not a name is
+    /// reported rather than ignored: an ordering edge that quietly orders
+    /// nothing is the one mistake here nobody would notice.
+    fn check_after(&mut self, idx: usize, e: &Expr<'_>) {
+        for item in after_names(e) {
+            let (name, span) = match item {
+                AfterItem::Name(name, span) => (name, span),
+                AfterItem::NotAName(span) => {
+                    self.err(Code::TypeMismatch, span, "`after:` takes step names, bare or quoted");
+                    continue;
+                }
+            };
+            match self.step_index(&name) {
+                Some(from) => self.edge(idx, from, span, false),
+                None => {
+                    let cands: Vec<&str> = self.steps.iter().map(|s| s.name.as_str()).collect();
+                    let msg = format!("`after:` names no step `{name}`");
+                    match suggest(&name, &cands) {
+                        Some(s) => self.err_hint(
+                            Code::UnknownRef,
+                            span,
+                            msg,
+                            format!("did you mean `{s}`?"),
+                        ),
+                        None => self.err(Code::UnknownRef, span, msg),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Keep the `when:` condition on the step, in the shape the planner
+    /// reads: the steps it names, and an evaluable form when the expression
+    /// is one of the context-only shapes.
+    fn record_when(&mut self, idx: usize, e: &Expr<'_>) {
+        let steps: Vec<String> = e
+            .refs()
+            .into_iter()
+            .filter(|r| r.kind == ks_lang::NameKind::Dotted)
+            .filter_map(|r| {
+                self.step_index(split_first(r.text).0).map(|i| self.steps[i].name.clone())
+            })
+            .collect();
+        let source = e.span().slice(expr_src(e)).to_string();
+        self.steps[idx].when = Some(Condition { source, steps, test: context_test(e) });
     }
 
     /// Check a value expression against the input's declared type.
@@ -838,7 +905,7 @@ impl<'a> Ctx<'a> {
             ks_lang::Scalar::DottedName => self.soft_ref(idx, text, span).unwrap_or(Type::String),
             ks_lang::Scalar::Ident => match self.step_index(text) {
                 Some(i) => {
-                    self.edge(idx, i, span);
+                    self.edge(idx, i, span, true);
                     self.bare_step_type(i)
                 }
                 None => Type::Any, // an enum answer literal, or a plain word
@@ -973,13 +1040,20 @@ impl<'a> Ctx<'a> {
         self.index.get(name).copied()
     }
 
-    /// The referenced step must run before the referencing one.
-    fn edge(&mut self, cur: usize, target: usize, span: Span) {
-        self.edges.push(Edge {
-            from: self.steps[target].name.clone(),
-            to: self.steps[cur].name.clone(),
-            span,
-        });
+    /// Record that `cur` waits for `target`. `data` says whether anything is
+    /// read as well as ordered: an `after:` edge orders without reading, and
+    /// is remembered as such, because approval gating asks what a step reads
+    /// and following a step reads nothing. Both are remembered rather than
+    /// one folded into the other, so the answer does not depend on which of
+    /// the two the file mentions first.
+    fn edge(&mut self, cur: usize, target: usize, span: Span, data: bool) {
+        let pair = (self.steps[target].name.clone(), self.steps[cur].name.clone());
+        if data {
+            self.read.insert(pair.clone());
+        } else {
+            self.after.insert(pair.clone());
+        }
+        self.edges.push(Edge { from: pair.0, to: pair.1, span });
     }
 
     fn bare_step_type(&self, idx: usize) -> Type {
@@ -994,7 +1068,7 @@ impl<'a> Ctx<'a> {
     fn resolve_ref(&mut self, cur: usize, text: &str, span: Span) -> Option<(Option<usize>, Type)> {
         let (first, rest) = split_first(text);
         if let Some(i) = self.step_index(first) {
-            self.edge(cur, i, span);
+            self.edge(cur, i, span, true);
             return Some((Some(i), self.step_ref(i, rest, span)));
         }
         if let Some(t) = self.context(first, rest, span) {
@@ -1793,8 +1867,22 @@ impl<'a> Ctx<'a> {
         let base: Vec<Edge> = std::mem::take(&mut self.edges);
         // Consumers of each step, so an approval finds them without scanning
         // every edge (that scan made checking cubic on approval-heavy files).
+        // An `after:` edge is not one: following a step reads nothing of it,
+        // so an approval that shows it does not gate the follower — unless
+        // something else in the file does read across the same pair.
+        let read: HashSet<(&str, &str)> =
+            self.read.iter().map(|(from, to)| (from.as_str(), to.as_str())).collect();
+        let after_only: HashSet<(&str, &str)> = self
+            .after
+            .iter()
+            .map(|(from, to)| (from.as_str(), to.as_str()))
+            .filter(|pair| !read.contains(pair))
+            .collect();
         let mut consumers: HashMap<&str, Vec<&Edge>> = HashMap::new();
         for e in &base {
+            if after_only.contains(&(e.from.as_str(), e.to.as_str())) {
+                continue;
+            }
             consumers.entry(e.from.as_str()).or_default().push(e);
         }
         // Ancestors of each step, for `dependents_of`.
@@ -1843,6 +1931,7 @@ impl<'a> Ctx<'a> {
                 span: s.span,
                 kind_span: s.kind_span,
                 ci_only: s.ci_only,
+                when: s.when.clone(),
             })
             .collect();
         let edges = edges.into_iter().map(|e| (e.from, e.to)).collect();
@@ -1980,6 +2069,72 @@ fn subject_word<'a>(e: &'a Expr<'a>) -> Option<Word<'a>> {
 
 fn answer_word<'a>(e: &'a Expr<'a>) -> Option<Word<'a>> {
     subject_word(e).filter(|w| w.scalar() == ks_lang::Scalar::Ident)
+}
+
+/// The file an expression was written in; every expression carries it.
+fn expr_src<'a>(e: &'a Expr<'a>) -> &'a str {
+    match e {
+        Expr::Atom { src, .. } => src,
+        Expr::Default { src, .. }
+        | Expr::Tuple { src, .. }
+        | Expr::Or { src, .. }
+        | Expr::And { src, .. }
+        | Expr::Not { src, .. }
+        | Expr::Compare { src, .. }
+        | Expr::IsTest { src, .. }
+        | Expr::Union { src, .. }
+        | Expr::Phrase { src, .. } => src,
+    }
+}
+
+/// One element of an `after:` value.
+enum AfterItem {
+    /// A step name, and where it was written.
+    Name(String, Span),
+    /// Something that is not a step name, and where it was written.
+    NotAName(Span),
+}
+
+/// The step names an `after:` value lists: one name, or a comma-separated
+/// tuple of them, written bare or quoted. Anything else is reported.
+fn after_names(e: &Expr<'_>) -> Vec<AfterItem> {
+    let name = |e: &Expr<'_>| match e {
+        Expr::Atom { atom: Atom::Word(w), .. } if w.scalar() == ks_lang::Scalar::Ident => {
+            AfterItem::Name(w.text().to_string(), w.node.span())
+        }
+        Expr::Atom { atom: Atom::Str(s), .. } => AfterItem::Name(s.value(), s.node.span()),
+        _ => AfterItem::NotAName(e.span()),
+    };
+    match e {
+        Expr::Atom { .. } => vec![name(e)],
+        Expr::Tuple { items, .. } => items.iter().map(name).collect(),
+        other => vec![AfterItem::NotAName(other.span())],
+    }
+}
+
+/// A context-only `when:` in a form the planner can settle before the run
+/// starts: a boolean literal, or the environment test the language spells
+/// (`env is prod`), under `not` as often as not. Anything else — a `when:`
+/// reading step outputs above all — is left to the run, never guessed.
+fn context_test(e: &Expr<'_>) -> Option<ContextTest> {
+    if let Some(w) = subject_word(e) {
+        return match w.text() {
+            "true" => Some(ContextTest::Bool(true)),
+            "false" => Some(ContextTest::Bool(false)),
+            _ => None,
+        };
+    }
+    match e {
+        Expr::Not { arg, .. } => context_test(arg).map(|t| ContextTest::Not(Box::new(t))),
+        Expr::IsTest { subject, answer, threshold: None, .. } => {
+            let env = subject_word(subject)?;
+            if env.scalar() != ks_lang::Scalar::Ident || env.text() != "env" {
+                return None;
+            }
+            Some(ContextTest::EnvIs { env: answer_word(answer)?.text().to_string() })
+        }
+        _ => None,
+    }
 }
 
 fn tuple_items(e: Expr<'_>) -> Vec<Expr<'_>> {

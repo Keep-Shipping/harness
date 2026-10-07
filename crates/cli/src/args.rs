@@ -1,10 +1,12 @@
 //! Command-line parsing: one hand-rolled pass over the arguments, shared by
-//! `check`, `run` and `blocks search`. Anything unrecognizable — flag, value
-//! or format — is a usage error, never a silently swallowed option.
+//! `check`, `run`, `graph` and `blocks search`. Anything unrecognizable —
+//! flag, value or format — is a usage error, never a silently swallowed
+//! option.
 
 use ks_core::ContextName;
 use ks_core::ports::run_context::ActorKind;
 
+use crate::graph::{self, GraphFormat};
 use crate::render::Format;
 
 /// The most results `blocks search` asks the index for when `--limit` is
@@ -22,6 +24,7 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
                         [--context local|ci] [--non-interactive] [--until STEP]
                         [--only STEP]... [--skip STEP]... [--allow-partial]
                         [--dry-run] [-v]
+       keepshipping graph [FILE] [--env NAME] [--event \"push main\"] [--format text|dot|json]
        keepshipping fmt --upgrade [PATH...]
        keepshipping blocks search <QUERY> [--index URL] [--limit N] [--format human|json]
        keepshipping log [RUN-ID] [--format human|json]
@@ -33,7 +36,9 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
 /// rejects them like any other unrecognized option. `--until`, `--skip` and
 /// `--allow-partial` belong to `run` alone, and `--context` to both.
 /// `blocks search` has its own `--format` (human or json, no github
-/// annotations), `--index` and `--limit`. `fmt` takes only `--upgrade` today:
+/// annotations), `--index` and `--limit`. `graph` has its own `--format` —
+/// `text|dot|json`, not the diagnostic formats, so `check --format dot` stays
+/// the usage error it has always been. `fmt` takes only `--upgrade` today:
 /// the formatter is not written yet, and every other flag it might grow is
 /// still a usage error.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -41,6 +46,7 @@ pub enum Command {
     Check,
     Run,
     Fmt,
+    Graph,
     BlocksSearch,
 }
 
@@ -52,6 +58,9 @@ pub struct Options {
     pub path: Option<String>,
     pub query: Option<String>,
     pub format: Format,
+    /// `graph`'s `--format`: the plan is not a diagnostic, so it has its own
+    /// names. `format` above stays at its default for `graph`.
+    pub graph_format: GraphFormat,
     pub all: bool,
     pub warnings_as_errors: bool,
     /// `--fix`: apply the machine-applicable fixes and re-check. Never
@@ -102,6 +111,7 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
         path: None,
         query: None,
         format: Format::Human,
+        graph_format: graph::DEFAULT,
         all: false,
         warnings_as_errors: false,
         fix: false,
@@ -126,6 +136,9 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
+            "--format" if command == Command::Graph => {
+                o.graph_format = GraphFormat::parse(&flag_value(&mut rest)?)?
+            }
             "--format" if matches!(command, Command::Check | Command::BlocksSearch) => {
                 o.format = Format::parse(&flag_value(&mut rest)?)?
             }
