@@ -8,7 +8,7 @@
 //! test — the same lines are written once each, with no escape codes and no
 //! cursor movement. One renderer, one `tty` flag: the two agree line for
 //! line, which the tests prove by replaying the animated bytes through
-//! [`screen`].
+//! `screen`.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
