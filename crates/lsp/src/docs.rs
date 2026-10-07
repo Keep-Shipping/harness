@@ -9,6 +9,9 @@
 pub fn kind_doc(kind: &str) -> Option<&'static str> {
     Some(match kind {
         "oci.image" => "Build a container image from a Dockerfile, and publish its digest and tag.",
+        "oci.verify" => {
+            "Refuse to continue unless an image digest carries a signature from a named identity."
+        }
         "tofu.plan" => "Plan an infrastructure change, and count what it would add and destroy.",
         "approval" => "Hold the run until a human answers, showing an earlier step's outputs.",
         "tofu.apply" => {

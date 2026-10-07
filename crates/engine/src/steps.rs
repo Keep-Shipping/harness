@@ -7,8 +7,10 @@ use std::sync::Arc;
 
 use ks_core::step::StepKind;
 
+use crate::oci_verify::OciVerify;
+
 /// Every built-in step kind, in registration order. Empty until the first step family ships;
 /// `docs/STEPS.md` renders the placeholder until then.
 pub fn builtin_steps() -> Vec<Arc<dyn StepKind>> {
-    Vec::new()
+    vec![Arc::new(OciVerify)]
 }

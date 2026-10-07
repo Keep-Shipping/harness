@@ -124,6 +124,13 @@ impl Catalog {
             false,
         );
         add(
+            "oci.verify",
+            &[("image", named("oci.Digest")), ("signed_by", Type::String)],
+            &[("digest", named("oci.Digest")), ("identity", Type::String)],
+            false,
+            false,
+        );
+        add(
             "tofu.plan",
             &[("dir", Type::Path)],
             &[
@@ -150,7 +157,12 @@ impl Catalog {
         add("tofu.apply", &[("plan", named("tofu.PlanFile"))], &[], true, false);
         add(
             "k8s.rollout",
-            &[("image", named("oci.Digest")), ("to", Type::Any), ("wait", Type::Any)],
+            &[
+                ("image", named("oci.Digest")),
+                ("to", Type::Any),
+                ("wait", Type::Any),
+                ("verify", Type::String),
+            ],
             &[],
             true,
             false,
