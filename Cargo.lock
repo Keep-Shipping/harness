@@ -1005,6 +1005,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ks-oci-distribution"
+version = "0.0.0"
+dependencies = [
+ "ks-cli",
+ "ks-core",
+ "ks-testing",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "ks-testing"
 version = "0.0.0"
 dependencies = [

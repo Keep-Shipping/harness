@@ -18,7 +18,6 @@ mod drive;
 #[allow(dead_code)]
 mod github_actions_run_context;
 mod graph;
-mod http_client;
 mod log;
 mod progress;
 mod render;
@@ -32,6 +31,11 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use ks_core::{ContextName, Step, Trigger, TriggerKind};
+// The binary shares the adapter with the OCI distribution crate's tests, which
+// link this package as a library; the module is declared once, in `lib.rs`.
+use ks_cli::http_client;
+#[cfg(test)]
+use ks_cli::test_server;
 
 use crate::args::{Command, Options, USAGE, context_of, parse_args};
 use crate::drive::{Done, Outcome, StepRunner};
