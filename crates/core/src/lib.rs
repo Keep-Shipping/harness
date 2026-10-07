@@ -31,6 +31,7 @@
 mod catalog;
 mod check;
 mod env;
+pub mod format;
 pub mod harness;
 pub mod ids;
 pub mod plan_summary;
@@ -47,6 +48,7 @@ pub use check::{
     secret_requirements,
 };
 pub use env::{EnvChoice, select_env};
+pub use format::{BUILTIN as BUILTIN_FORMATS, Formats};
 pub use registry::{Explanation, explain};
 pub use types::{LiteralFit, Type, coerce, literal, literal_type};
 pub use version::{FORMAT_VERSION, SCRIPT_PROTOCOL, STEP_API};

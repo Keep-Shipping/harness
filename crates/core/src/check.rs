@@ -7,6 +7,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use ks_lang::{Atom, Code, Diagnostic, Entry, Expr, Span, StrPart, Word};
 
 use crate::catalog::{Catalog, StepTypes};
+use crate::format::{self, Formats, Header};
 use crate::ports::run_context::ActorKind;
 use crate::ports::secrets::SecretRef;
 use crate::types::{self, LiteralFit, Type};
@@ -129,18 +130,23 @@ pub fn check(parse: &ks_lang::Parse) -> Checked {
     check_with(parse, &CheckOptions::new(&builtin))
 }
 
-/// Options for [`check_with`]: the catalog to check against, and — when the
-/// caller knows it — the actor the run would start under, so policy rules
-/// that bind that actor are enforced.
+/// Options for [`check_with`]: the catalog to check against, the file
+/// formats this build reads, and — when the caller knows it — the actor the
+/// run would start under, so policy rules that bind that actor are enforced.
 pub struct CheckOptions<'a> {
     pub(crate) catalog: &'a Catalog,
+    pub(crate) formats: &'a Formats<'a>,
     pub(crate) actor: Option<ActorKind>,
+    /// Whether this check is in CI, which the caller knows and the file
+    /// cannot. Advisory only: it widens the warnings, never what is
+    /// enforced.
+    pub(crate) in_ci: bool,
 }
 
 impl<'a> CheckOptions<'a> {
     /// Checks against `catalog` instead of the built-in one.
     pub fn new(catalog: &'a Catalog) -> CheckOptions<'a> {
-        CheckOptions { catalog, actor: None }
+        CheckOptions { catalog, formats: &format::BUILTIN, actor: None, in_ci: false }
     }
 
     /// Checks the file as `actor` running it: a policy rule that binds the
@@ -152,11 +158,37 @@ impl<'a> CheckOptions<'a> {
         self.actor = Some(actor);
         self
     }
+
+    /// Checks against a different set of file formats, so a build with a
+    /// migration can be tested against a file written for the format before
+    /// it.
+    #[must_use]
+    pub fn formats(mut self, formats: &'a Formats<'a>) -> CheckOptions<'a> {
+        self.formats = formats;
+        self
+    }
+
+    /// Checks as a CI run would: an undeclared file format fires here too.
+    ///
+    /// The caller decides this, never the environment — `CI` is as
+    /// spoofable as any other variable, and the actor, which policy binds,
+    /// is never inferred from it.
+    #[must_use]
+    pub fn ci(mut self, in_ci: bool) -> CheckOptions<'a> {
+        self.in_ci = in_ci;
+        self
+    }
 }
 
 /// Type-check `parse` and build its [`Workflow`], against `options`.
 pub fn check_with(parse: &ks_lang::Parse, options: &CheckOptions<'_>) -> Checked {
-    let mut c = Ctx::new(options.catalog, options.actor, parse.diagnostics().to_vec());
+    let mut c = Ctx::new(
+        options.catalog,
+        options.formats,
+        options.actor,
+        options.in_ci,
+        parse.diagnostics().to_vec(),
+    );
     c.file(parse.file());
     c.finish_all()
 }
@@ -174,9 +206,14 @@ const ENV_PROPERTIES: [&str; 5] = ["secrets", "ci-only", "approvers", "on", "var
 
 struct Ctx<'a> {
     catalog: &'a Catalog,
+    /// The file formats this build reads, and what each is called.
+    formats: &'a Formats<'a>,
     /// The actor the run would start under, when the caller knows it; policy
     /// rules that bind it are enforced.
     actor: Option<ActorKind>,
+    /// That the caller is running in CI, which widens advisory warnings
+    /// only and never what is enforced.
+    in_ci: bool,
     diags: Vec<Diagnostic>,
     /// The dotted path of the entry being checked (`deploy.image`), attached
     /// to every diagnostic raised while it is checked.
@@ -219,10 +256,18 @@ struct Edge {
 }
 
 impl<'a> Ctx<'a> {
-    fn new(catalog: &'a Catalog, actor: Option<ActorKind>, diags: Vec<Diagnostic>) -> Ctx<'a> {
+    fn new(
+        catalog: &'a Catalog,
+        formats: &'a Formats<'a>,
+        actor: Option<ActorKind>,
+        in_ci: bool,
+        diags: Vec<Diagnostic>,
+    ) -> Ctx<'a> {
         Ctx {
             catalog,
+            formats,
             actor,
+            in_ci,
             diags,
             subject: None,
             env_names: Vec::new(),
@@ -267,6 +312,10 @@ impl<'a> Ctx<'a> {
     }
 
     fn file(&mut self, file: ks_lang::File<'_>) {
+        // The format header, read first: it gates nothing else, but a file
+        // declaring a format this build cannot read should say so before it
+        // says anything else.
+        self.check_format(file);
         // First pass: declare the steps and environments, so a reference
         // resolves no matter where in the file its target sits.
         for e in file.entries() {
@@ -281,6 +330,7 @@ impl<'a> Ctx<'a> {
         for e in file.entries() {
             match e.key_name() {
                 Some("name") => self.name = self.scalar_text(e),
+                Some(format::HEADER_KEY) => {} // read by `check_format`
                 Some("on") => {
                     self.subject = Some("on".to_string());
                     self.triggers = self.triggers_of(e);
@@ -297,6 +347,80 @@ impl<'a> Ctx<'a> {
         }
         if !saw_envs {
             self.envs.push(implicit_default());
+        }
+    }
+
+    /// The `keepshipping:` header: which file format the file is written in,
+    /// and whether this build reads it. The format before the current one
+    /// still checks, with a warning naming the upgrade; anything this build
+    /// has no migration out of, or a header that is not a version or not the
+    /// first entry, is refused. No header is the current format — silent
+    /// except under CI, where the pipeline's owner should hear that nobody
+    /// has pinned it.
+    fn check_format(&mut self, file: ks_lang::File<'_>) {
+        match format::header(file) {
+            Header::Absent => {
+                if self.actor != Some(ActorKind::Ci) && !self.in_ci {
+                    return;
+                }
+                // A file with entries points at its first; an empty one at
+                // the start of the file.
+                let span = file.entries().next().map_or_else(|| Span::point(0), |e| e.key_span());
+                self.push(
+                    Diagnostic::warning(
+                        Code::FormatUndeclared,
+                        span,
+                        "this file declares no format version",
+                    )
+                    .with_hint(format!(
+                        "add `{}: {}` as the first line, or run `keepshipping fmt --upgrade`",
+                        format::HEADER_KEY,
+                        format::spelling(self.formats.current)
+                    )),
+                );
+            }
+            Header::Declared { version, span } if !self.formats.supports(version) => {
+                self.err_hint(
+                    Code::FormatUnsupported,
+                    span,
+                    format!("this keepshipping does not read format {}", format::spelling(version)),
+                    format!("it reads {}", self.formats.reads()),
+                );
+            }
+            Header::Declared { version, .. } if version == self.formats.current => {}
+            Header::Declared { version, span } => {
+                self.push(
+                    Diagnostic::warning(
+                        Code::FormatDeprecated,
+                        span,
+                        format!(
+                            "written for format {}; this keepshipping reads {}",
+                            format::spelling(version),
+                            format::spelling(self.formats.current)
+                        ),
+                    )
+                    .with_hint(format!(
+                        "run `keepshipping fmt --upgrade` to rewrite it for {}",
+                        format::spelling(self.formats.current)
+                    )),
+                );
+            }
+            Header::Malformed { span } => self.err_hint(
+                Code::FormatUnsupported,
+                span,
+                format!("the `{}:` value is not a format version", format::HEADER_KEY),
+                format!(
+                    "a format version is spelled `0.N`, e.g. `{}: {}`",
+                    format::HEADER_KEY,
+                    format::spelling(self.formats.current)
+                ),
+            ),
+            Header::NotFirst { span } => self.err_hint(
+                Code::FormatUnsupported,
+                span,
+                format!("`{}:` is not the file's first entry", format::HEADER_KEY),
+                "the header must come before every other entry, so it is the first thing read",
+            ),
         }
     }
 

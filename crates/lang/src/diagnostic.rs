@@ -74,8 +74,9 @@ impl fmt::Display for Severity {
 /// The kind of problem a [`Diagnostic`] reports, as a stable code agents and
 /// tools can match on. Codes are grouped by block — `KS00xx` syntax,
 /// `KS01xx` types, `KS02xx` names and references, `KS03xx` workflow
-/// structure, `KS04xx` policy, `KS05xx` secrets, `KS06xx` environment and CI
-/// warnings — and are never renumbered: gaps stay free for new codes.
+/// structure, `KS04xx` policy, `KS05xx` secrets, `KS06xx` environment, file
+/// format and CI warnings — and are never renumbered: gaps stay free for new
+/// codes.
 ///
 /// The meaning, a bad and a good example of every code are documented in
 /// `docs/ERRORS.md`, generated from the registry in `ks-core`.
@@ -125,6 +126,12 @@ pub enum Code {
     SecretShown,
     /// An optional context value used where it may be absent.
     OptionalAbsent,
+    /// The file declares a format this keepshipping does not read.
+    FormatUnsupported,
+    /// The file declares the format before the current one.
+    FormatDeprecated,
+    /// The file declares no format at all, where CI wants one pinned.
+    FormatUndeclared,
 }
 
 impl Code {
@@ -154,6 +161,9 @@ impl Code {
             Code::SecretInString => "KS0501",
             Code::SecretShown => "KS0502",
             Code::OptionalAbsent => "KS0601",
+            Code::FormatUnsupported => "KS0005",
+            Code::FormatDeprecated => "KS0610",
+            Code::FormatUndeclared => "KS0611",
         }
     }
 
@@ -164,6 +174,7 @@ impl Code {
         Code::Unclosed,
         Code::BadInterp,
         Code::TabIndent,
+        Code::FormatUnsupported,
         Code::TypeMismatch,
         Code::PastedDigest,
         Code::UnknownRef,
@@ -182,6 +193,8 @@ impl Code {
         Code::SecretInString,
         Code::SecretShown,
         Code::OptionalAbsent,
+        Code::FormatDeprecated,
+        Code::FormatUndeclared,
     ];
 }
 

@@ -17,6 +17,7 @@ mod check;
 mod github_actions_run_context;
 mod http_client;
 mod render;
+mod upgrade;
 
 use std::io::{IsTerminal, Write as _};
 use std::path::Path;
@@ -41,6 +42,7 @@ fn dispatch() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("check") => check::check(&args[1..]),
         Some("run") => run(&args[1..]),
+        Some("fmt") => upgrade::fmt(&args[1..]),
         Some("blocks") => blocks::blocks(&args[1..]),
         _ => {
             eprintln!("{USAGE}");

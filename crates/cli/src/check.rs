@@ -167,9 +167,19 @@ pub fn load(path: &Path, shown: &str, actor: ActorKind, default: bool) -> Result
         }
     };
     let catalog = ks_core::Catalog::builtin();
-    let options = ks_core::CheckOptions::new(&catalog).actor(actor);
+    let options = ks_core::CheckOptions::new(&catalog).actor(actor).ci(in_ci_env());
     let checked = ks_core::check_with(&ks_lang::parse(&src), &options);
     Ok(Site { path: shown.to_string(), src, checked })
+}
+
+/// Whether the environment says this is a CI run, the way most pipelines
+/// say it. Set to anything but empty counts; an empty `CI=` says nothing.
+///
+/// This only widens advisory warnings — the actor, which policy binds, is
+/// never inferred from the environment. A spoofed warning costs the
+/// spoofer nothing, a spoofed actor would cost them the run.
+fn in_ci_env() -> bool {
+    std::env::var_os("CI").is_some_and(|v| !v.is_empty())
 }
 
 /// The `--secrets` listing: per environment, the secret references its

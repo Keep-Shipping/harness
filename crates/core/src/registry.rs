@@ -69,6 +69,17 @@ pub fn explain(code: Code) -> Explanation {
             bad: "steps:\n\tbuild: oci.image\n\t\tfrom: ./Dockerfile\n",
             good: "steps:\n  build: oci.image\n    from: ./Dockerfile\n",
         },
+        Code::FormatUnsupported => Explanation {
+            code,
+            title: "unsupported file format",
+            severity: Severity::Error,
+            summary: "The file declares a `keepshipping:` format this keepshipping does not \
+                read, or the header is not a format version or is not the file's first \
+                entry. A file whose meaning moved on is refused rather than \
+                reinterpreted: raise the file to a format this build reads.",
+            bad: "keepshipping: 0.9\nsteps:\n  build: oci.image\n    from: ./Dockerfile\n",
+            good: "keepshipping: 0.1\nsteps:\n  build: oci.image\n    from: ./Dockerfile\n",
+        },
         Code::TypeMismatch => Explanation {
             code,
             title: "type mismatch",
@@ -505,6 +516,27 @@ steps:
     returns: yes | no
 ",
         },
+        Code::FormatDeprecated => Explanation {
+            code,
+            title: "file format is one behind",
+            severity: Severity::Warning,
+            summary: "The file declares the format before the one this keepshipping writes. \
+                It still checks — the previous format stays readable until the \
+                format after next drops it — but `keepshipping fmt --upgrade` \
+                rewrites it mechanically, comments and all.",
+            bad: "keepshipping: 0.1\nsteps:\n  build: oci.image\n    from: ./Dockerfile\n",
+            good: "keepshipping: 0.2\nsteps:\n  build: oci.image\n    from: ./Dockerfile\n",
+        },
+        Code::FormatUndeclared => Explanation {
+            code,
+            title: "file format not declared",
+            severity: Severity::Warning,
+            summary: "The file declares no `keepshipping:` header, so it is read as the \
+                latest format this keepshipping knows. Pin it: a declared format \
+                is what tells the next breaking change what it has to migrate.",
+            bad: "steps:\n  build: oci.image\n    from: ./Dockerfile\n",
+            good: "keepshipping: 0.1\nsteps:\n  build: oci.image\n    from: ./Dockerfile\n",
+        },
     }
 }
 
@@ -535,7 +567,8 @@ Every diagnostic the `ks` parser and checker emit carries exactly one code,
 stable forever: tools and agents match on the code, not on the message. Codes
 are grouped by block — `KS00xx` syntax, `KS01xx` types, `KS02xx` names and
 references, `KS03xx` workflow structure, `KS04xx` policy, `KS05xx` secrets,
-`KS06xx` environment and CI warnings — with gaps left for growth.
+`KS06xx` environment, file format and CI warnings — with gaps left for
+growth.
 
 This file is generated from the registry in `crates/core/src/registry.rs`;
 edit the registry, never this file. Regenerate with:

@@ -289,6 +289,48 @@ Every value has a type, and types never convert implicitly
   It is a pure projection of the checked file: no resolver is constructed
   and no store is read.
 
+## Format version and stability
+
+A file declares the format it is written in with an optional header, which
+must be its first entry (comments and blank lines above it are fine):
+
+```
+keepshipping: 0.1
+```
+
+Before 1.0 the format version is spelled `0.N`, so the current format is
+`0.1`. A file with no header is read as the latest format this keepshipping
+knows — which works, but nobody has written down what the file was written
+for, so a CI run warns (`KS0611`) until the header is there. "CI" here is
+either `check --actor ci` or a non-empty `CI` environment variable; the
+variable only ever widens this advisory warning, because the actor — the
+thing policy binds — is never inferred from the environment.
+
+The CLI reads the current format and the one before it. A file on the
+previous format still checks, with a warning (`KS0610`) naming
+`keepshipping fmt --upgrade`; anything else — a newer format, an older one
+this build cannot migrate from, a header that is not a version, a header
+that is not first — is an error (`KS0005`) rather than a reinterpretation.
+
+`keepshipping fmt --upgrade <paths...>` rewrites a file mechanically, from
+the CST: comments, blank lines and layout survive because every byte the
+migration does not name is copied over exactly. It pins the header if there
+was none, applies the migration for the format the file declares, and prints
+what it could not rewrite instead of guessing at it; when anything is left
+over — or a file is refused — it exits 1, having left that file untouched.
+
+Versioning is per thing, not one number: built-in step schemas move with
+the CLI, while blocks and third-party steps carry versions of their own
+([#79](https://github.com/Keep-Shipping/harness/issues/79)).
+
+Before 1.0 the promise is narrow and stated: a breaking change to the
+language — a renamed key, a changed default — bumps the format, and every
+bump arrives with a migration and a fixture pair that runs it. Additive
+changes (a new key, a new step kind, a new trigger) do not bump it. A bump
+is announced in the release notes of the release *before* the one that
+breaks anything, and the previous format keeps checking until the format
+after next drops it, and for at least 90 days.
+
 ## Decisions pending ADRs
 
 The language's design is tracked by the ADRs indexed in `docs/adr/`. ADR

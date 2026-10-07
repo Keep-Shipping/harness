@@ -10,12 +10,15 @@
 //! - [`SCRIPT_PROTOCOL`] — the JSON-stdio protocol between the harness and a
 //!   TypeScript script.
 //!
-//! All three start at `1` and are bumped only for a breaking change. Only
-//! `STEP_API` is enforced today: a step built against a different one than the
-//! harness is composing is a compile error in intent and a composition error in
-//! fact — [`HarnessBuilder::build`](crate::harness::HarnessBuilder::build)
-//! refuses it. `FORMAT_VERSION` and `SCRIPT_PROTOCOL` are declared and
-//! versioned; nothing reads them at runtime yet.
+//! All three start at `1` and are bumped only for a breaking change.
+//! `FORMAT_VERSION` and `STEP_API` are enforced today: a file declaring a
+//! format this build cannot read is refused by
+//! [`check`](crate::check), and a step built against a different `STEP_API`
+//! than the harness is composing is a compile error in intent and a
+//! composition error in fact —
+//! [`HarnessBuilder::build`](crate::harness::HarnessBuilder::build) refuses
+//! it. `SCRIPT_PROTOCOL` is declared and versioned; nothing reads it at
+//! runtime yet.
 //!
 //! The rendered table lives in `docs/COMPATIBILITY.md`, and the port contract
 //! digest that guards `STEP_API` is pinned in
@@ -27,8 +30,14 @@
 /// same thing: a renamed builtin type, a changed default, a removed key. A
 /// mismatch means the workflow must be rewritten for the newer harness.
 ///
-/// Declared and versioned; `ks-lang` does not read it yet, so a mismatch is
-/// not currently a parse error. The gate lands with the parser work.
+/// Enforced by [`check`](crate::check), which reads the file's optional
+/// `keepshipping: 0.N` header: a file declaring the current format, or the
+/// one before it, is read (the previous one with a deprecation warning), and
+/// anything else is an error. A file with no header is read as the current
+/// format. [`upgrade`](crate::format::upgrade) brings an older file forward,
+/// and every bump appends a migration to
+/// [`MIGRATIONS`](crate::format::MIGRATIONS) — a format with no path out of
+/// it is a format nothing can upgrade.
 pub const FORMAT_VERSION: u32 = 1;
 
 /// The version of the [`StepKind`](crate::step::StepKind) contract a step was built against;
@@ -59,7 +68,12 @@ pub const SCRIPT_PROTOCOL: u32 = 1;
 /// for a contract that is declared and versioned but not yet read at runtime:
 /// claiming a gate that does not exist is worse than admitting the absence.
 const CONTRACTS: [(&str, u32, &str, Option<&str>); 3] = [
-    ("FORMAT_VERSION", FORMAT_VERSION, "the `ship.ks` file format", None),
+    (
+        "FORMAT_VERSION",
+        FORMAT_VERSION,
+        "the `ship.ks` file format",
+        Some("`ks_core::check`, which reads the file's `keepshipping:` header"),
+    ),
     (
         "STEP_API",
         STEP_API,
@@ -109,11 +123,10 @@ pub fn render_compatibility_markdown(port_digest: &str) -> String {
          | --- | --- | --- | --- |\n\
          {rows}\
          \n\
-         Only `STEP_API` has a runtime gate today. `FORMAT_VERSION` is read by\n\
-         nothing yet — that lands with the parser work — and `SCRIPT_PROTOCOL`\n\
-         by nothing yet either — that lands with the script host — so a step\n\
-         author bumping either is making a promise this repository has not yet\n\
-         made the tooling keep.\n\
+         `FORMAT_VERSION` and `STEP_API` have a runtime gate today.\n\
+         `SCRIPT_PROTOCOL` is read by nothing yet — that lands with the script\n\
+         host — so a step author bumping it is making a promise this\n\
+         repository has not yet made the tooling keep.\n\
          \n\
          ## Port contract digest: `{port_digest}`\n\
          \n\
@@ -170,23 +183,28 @@ mod tests {
             )),
             "STEP_API's gate must name HarnessBuilder::build: {md}"
         );
-        for name in ["FORMAT_VERSION", "SCRIPT_PROTOCOL"] {
-            let row = format!("| `{name}` | ");
-            let line = md
-                .lines()
-                .find(|line| line.starts_with(&row))
-                .unwrap_or_else(|| panic!("no row for {name}: {md}"));
-            assert!(
-                line.ends_with(
-                    "declared and versioned, not yet enforced — nothing reads it at runtime yet |"
-                ),
-                "{name} is not enforced at runtime, so its row must say so: {line}"
-            );
-            assert!(
-                !line.contains("ks-lang") && !line.contains("ScriptHost"),
-                "{name} has no runtime gate; naming one is a false claim: {line}"
-            );
-        }
+        assert!(
+            md.contains(&format!(
+                "| `FORMAT_VERSION` | {FORMAT_VERSION} | the `ship.ks` file format \
+                 | `ks_core::check`, which reads the file's `keepshipping:` header |"
+            )),
+            "FORMAT_VERSION's gate must name the checker that reads the header: {md}"
+        );
+        let row = "| `SCRIPT_PROTOCOL` | ";
+        let line = md
+            .lines()
+            .find(|line| line.starts_with(row))
+            .unwrap_or_else(|| panic!("no row for SCRIPT_PROTOCOL: {md}"));
+        assert!(
+            line.ends_with(
+                "declared and versioned, not yet enforced — nothing reads it at runtime yet |"
+            ),
+            "SCRIPT_PROTOCOL is not enforced at runtime, so its row must say so: {line}"
+        );
+        assert!(
+            !line.contains("ScriptHost"),
+            "SCRIPT_PROTOCOL has no runtime gate; naming one is a false claim: {line}"
+        );
     }
 
     #[test]

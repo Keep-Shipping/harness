@@ -16,6 +16,33 @@ Every finding carries a stable `KSxxxx` code — what each one means lives in
 `run` keeps the same scale: 1 when the file fails the check, 2 for usage and
 environment-selection problems.
 
+## `fmt --upgrade`
+
+`keepshipping fmt --upgrade [PATH...]` brings each file to the format this
+build writes, and is the only thing `fmt` does yet — `fmt` on its own is a
+usage error (exit 2), because there is no formatter to run. Each path is a
+file or a directory to walk for `ship.ks`, on the same terms `check --all`
+walks; no path at all means `ship.ks` in the working directory.
+
+```
+$ keepshipping fmt --upgrade ship.ks
+pinned ship.ks: keepshipping 0.1
+$ keepshipping fmt --upgrade ship.ks
+unchanged ship.ks: 0.1
+```
+
+- One line per file on stdout: `pinned {path}: keepshipping {version}` when
+  the header was inserted, `upgraded {path}: {from} → {to}` when a migration
+  moved it, `unchanged {path}: {version}` when neither applied — in which
+  case nothing was written.
+- What a migration could not rewrite is printed as `⚠ {path}:{line}  {message}`
+  for a person to finish, and a file this build cannot migrate from as
+  `error: {path}:{line}  {message}` on stderr. Both exit 1, and neither file
+  is written: a refusal is the run's result, not something to work around.
+- A file that cannot be read or written is exit 2, as in `check`.
+- Exit 0 when every file is done. The rewrite is its own inverse: a second
+  run writes the same bytes again.
+
 Diagnostics in a file are sorted by position; with `--all`, files are sorted
 by path.
 
@@ -97,7 +124,8 @@ worst result across files. No `ship.ks` anywhere is a usage error (exit 2).
 ## What check reads
 
 The check path reads the files it checks and nothing else — no network, no
-store, and no environment variables beyond `NO_COLOR` (the colour switch) —
-and resolution uses the built-in step catalog. CI proves the no-network part
-by running `check` on the fixtures inside a network namespace with no
-interfaces (the `offline` job).
+store, and no environment variables beyond `NO_COLOR` (the colour switch)
+and `CI` (which only widens the advisory "no format declared" warning, never
+what is enforced) — and resolution uses the built-in step catalog. CI proves
+the no-network part by running `check` on the fixtures inside a network
+namespace with no interfaces (the `offline` job).
