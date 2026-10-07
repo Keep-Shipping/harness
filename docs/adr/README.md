@@ -23,6 +23,7 @@ A guard test (`cargo test -p ks-testing --test adr_guard`) checks every ADR belo
 | [0004](0004-secrets.md) | Secrets | Accepted |
 | [0005](0005-local-first-core-with-optional-hosted-services.md) | Local-first core with optional hosted services | Accepted |
 | [0008](0008-github-actions-first.md) | GitHub Actions first | Accepted |
+| [0009](0009-typescript-escape-hatch-runtime.md) | TypeScript escape-hatch runtime | Accepted |
 | [0010](0010-image-build-backend.md) | Image build backend | Proposed |
 | [0011](0011-block-distribution.md) | Block distribution | Accepted |
 | [0012](0012-policy-authority.md) | Policy authority | Proposed |

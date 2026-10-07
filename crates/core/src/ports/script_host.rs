@@ -1,12 +1,13 @@
 //! The [`ScriptHost`] port: running the TypeScript escape-hatch steps
 //! ([#57](https://github.com/Keep-Shipping/harness/issues/57), protocol in
-//! [#10](https://github.com/Keep-Shipping/harness/issues/10) — its ADR is
-//! still open).
+//! [#10](https://github.com/Keep-Shipping/harness/issues/10) — the runtime is
+//! [ADR 0009](../../../../docs/adr/0009-typescript-escape-hatch-runtime.md)).
 //!
 //! Escape-hatch steps are scripts a repository ships next to its `ship.ks`.
 //! They speak the JSON-stdio protocol from #10: a script declares its inputs
 //! and outputs (a [`StepSchema`], which is what `check` inspects), then reads
-//! one JSON object on stdin and writes one on stdout. The adapter owns the
+//! one JSON object on stdin and writes JSON lines on stdout — any number of
+//! log frames and exactly one output frame. The adapter owns the
 //! process and the wire; the port owns the typed shapes — and the secrets:
 //! [`ScriptHost::run`] hands the adapter a [`SecretBundle`], and the adapter
 //! must pass those values to the script over a dedicated file descriptor,
@@ -319,8 +320,8 @@ impl std::error::Error for ScriptHostError {}
 /// The `ScriptHost` port: an adapter runs escape-hatch scripts as processes
 /// over the JSON-stdio protocol from #10. `schema` backs `check` (no
 /// execution), `run` backs execution — both async, both dyn-compatible, so
-/// the engine holds the host as `&dyn ScriptHost` and the Node adapter lands
-/// later without a rewrite.
+/// the engine holds the host as `&dyn ScriptHost` and the Deno adapter
+/// (ADR 0009) lands later without a rewrite.
 ///
 /// Adapters must fail with [`ScriptHostError`] rather than panicking.
 pub trait ScriptHost: Send + Sync {
