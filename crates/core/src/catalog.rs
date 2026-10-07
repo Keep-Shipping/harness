@@ -206,7 +206,7 @@ impl Catalog {
             "k8s.rollout",
             &[
                 ("image", named("oci.Digest")),
-                ("to", Type::Any),
+                ("to", named("k8s.Cluster")),
                 ("wait", Type::Any),
                 ("verify", Type::String),
             ],

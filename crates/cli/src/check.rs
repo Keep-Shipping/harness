@@ -4,6 +4,7 @@
 //! never runs a step, touches a store or opens a socket. With `--fix` it
 //! additionally rewrites the machine-applicable fixes it proposes.
 
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
@@ -221,6 +222,67 @@ fn word<'a>(expr: &'a ks_lang::Expr<'a>) -> Option<&'a str> {
         ks_lang::Expr::Atom { atom: ks_lang::Atom::Word(w), .. } => Some(w.text()),
         _ => None,
     }
+}
+
+/// What the IaC behind each literal `dir:` declares, keyed by the `dir:`
+/// text as the file spells it. A directory that is absent, holds no `.tf`
+/// file, or cannot be read contributes nothing: its outputs stay unchecked,
+/// as they were before, and a check never fails for a file it did not see.
+///
+/// Unlike `--repro`, this is on by default: it is what makes
+/// `apply.out.<name>` typed rather than unchecked.
+fn iac_outputs(site_dir: &Path, src: &str) -> BTreeMap<String, BTreeMap<String, ks_core::Type>> {
+    let mut out: BTreeMap<String, BTreeMap<String, ks_core::Type>> = BTreeMap::new();
+    for dir in plan_dirs(src) {
+        // `dir:` names a directory beside the site file, not beside
+        // wherever `check` happened to run.
+        let mut declared: BTreeMap<String, ks_core::Type> = BTreeMap::new();
+        let mut files: Vec<PathBuf> = match std::fs::read_dir(site_dir.join(&dir)) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "tf"))
+                .collect(),
+            Err(_) => continue,
+        };
+        // Sorted, so two files declaring one output read the same way twice.
+        files.sort();
+        for file in files {
+            let Ok(tf) = std::fs::read_to_string(&file) else { continue };
+            for output in ks_core::tf::scan(&tf) {
+                declared.insert(output.name, output.ty);
+            }
+        }
+        if !declared.is_empty() {
+            out.insert(dir, declared);
+        }
+    }
+    out
+}
+
+/// Every literal `dir:` of a `tofu.plan` / `terraform.plan` step in `src`.
+fn plan_dirs(src: &str) -> Vec<String> {
+    let parse = ks_lang::parse(src);
+    let file = parse.file();
+    let mut out = Vec::new();
+    for entry in file.entries().filter(|e| e.key_name() == Some("steps")) {
+        for step in entry.children() {
+            if step.expr().as_ref().is_none_or(|e| match word(e) {
+                Some(w) => !matches!(w, "tofu.plan" | "terraform.plan"),
+                None => true,
+            }) {
+                continue;
+            }
+            let Some(dir) = step.children().find(|i| i.key_name() == Some("dir")) else { continue };
+            let Some(expr) = dir.expr() else { continue };
+            let Some(path) = word(&expr) else { continue };
+            if ks_lang::classify_scalar(path) != ks_lang::Scalar::Path {
+                continue;
+            }
+            out.push(path.to_string());
+        }
+    }
+    out
 }
 
 /// `--fix`: apply the machine-applicable edits the checker proposed, then
@@ -442,8 +504,15 @@ pub fn load(
     };
     let catalog = ks_core::Catalog::builtin();
     let ctx = context.context();
-    let options =
-        ks_core::CheckOptions::new(&catalog).actor(actor).context(ctx.clone()).ci(in_ci_env());
+    // The `.tf` files behind every `dir:` this file names, read so a run-time
+    // output is typed before anything runs — reading files is all this adds:
+    // no tofu, no network, no store.
+    let outputs = iac_outputs(path.parent().unwrap_or(Path::new(".")), &src);
+    let options = ks_core::CheckOptions::new(&catalog)
+        .actor(actor)
+        .context(ctx.clone())
+        .ci(in_ci_env())
+        .iac_outputs(&outputs);
     let checked = ks_core::check_with(&ks_lang::parse(&src), &options);
     // From the same catalog and context the warnings came from, so `run`
     // gates on exactly what `check` said rather than a second opinion.

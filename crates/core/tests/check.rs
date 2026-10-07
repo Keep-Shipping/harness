@@ -1237,3 +1237,133 @@ fn a_tie_is_hinted_but_never_applied() {
     assert_eq!(fix.replacement, "cat", "the first candidate, as the hint names it");
     assert!(!fix.machine_applicable, "two names tie; --fix must not pick one");
 }
+
+// --- IaC outputs: `apply.out.<name>` typed from the .tf files ------------
+
+/// A site whose `apply.out.<name>` is checked against what the IaC behind
+/// its plan declares: `./infra/prod` exports a `cluster`.
+const IAC: &str = "\
+steps:
+  build:  oci.image
+    from:  ./Dockerfile
+  plan:   tofu.plan
+    dir:   ./infra/prod
+  apply:  tofu.apply
+    plan:  plan.file
+  deploy: k8s.rollout
+    image: build.digest
+    to:    apply.out.cluster
+";
+
+/// Checks `src` with `./infra/prod` declaring the outputs in `outputs`.
+fn check_iac(src: &str, outputs: &[(&str, ks_core::Type)]) -> ks_core::Checked {
+    let catalog = ks_core::Catalog::builtin();
+    let mut declared = std::collections::BTreeMap::new();
+    declared.insert(
+        "./infra/prod".to_string(),
+        outputs.iter().map(|(n, t)| (n.to_string(), t.clone())).collect(),
+    );
+    let options = ks_core::CheckOptions::new(&catalog).iac_outputs(&declared);
+    ks_core::check_with(&ks_lang::parse(src), &options)
+}
+
+fn iac_errors(src: &str, outputs: &[(&str, ks_core::Type)]) -> Vec<String> {
+    check_iac(src, outputs).diagnostics.iter().map(std::string::ToString::to_string).collect()
+}
+
+#[test]
+fn a_declared_output_is_typed_from_its_directory() {
+    let cluster = ks_core::Type::Named("k8s.Cluster".to_string());
+    // The .tf says `cluster` is a cluster, and `k8s.rollout` wants one.
+    let all = iac_errors(IAC, &[("cluster", cluster)]);
+    assert!(all.iter().all(|m| !m.contains("error")), "{all:?}");
+    // A string from the same directory is not a cluster.
+    let all = iac_errors(IAC, &[("cluster", ks_core::Type::String)]);
+    assert!(all.iter().any(|m| m.contains("expected k8s.Cluster, got string")), "{all:?}");
+}
+
+#[test]
+fn an_output_the_iac_does_not_declare_is_an_unknown_output() {
+    let all = iac_errors(IAC, &[("region", ks_core::Type::String)]);
+    assert!(all.iter().any(|m| m.contains("produces no output `cluster`")), "{all:?}");
+    assert!(all.iter().any(|m| m.contains("`./infra/prod` declares `region`")), "{all:?}");
+}
+
+#[test]
+fn a_directory_the_caller_could_not_read_says_nothing() {
+    // The same file, checked with no `.tf` files at all: the name is
+    // unchecked, exactly as it was before this rule.
+    assert!(errors(IAC).is_empty(), "{:?}", errors(IAC));
+}
+
+#[test]
+fn the_step_may_map_output_names_to_types_itself() {
+    let mapping = IAC.replace(
+        "    plan:  plan.file\n",
+        "    plan:  plan.file\n    outputs:\n      cluster: k8s.Cluster\n",
+    );
+    // The mapping wins over the directory, which declares something else.
+    let all = iac_errors(&mapping, &[("cluster", ks_core::Type::String)]);
+    assert!(all.iter().all(|m| !m.contains("error")), "{all:?}");
+    // A type that is not a type is a type error, where it is spelled — and
+    // names nothing, so the read of it falls back to the directory.
+    let bad = mapping.replace("cluster: k8s.Cluster", "cluster: 3");
+    let all = iac_errors(&bad, &[("cluster", ks_core::Type::String)]);
+    assert!(all.iter().any(|m| m.contains("`3` is not a type")), "{all:?}");
+    // Names nothing, so the read falls back to what the directory declares.
+    assert!(all.iter().any(|m| m.contains("expected k8s.Cluster, got string")), "{all:?}");
+}
+
+#[test]
+fn outputs_is_not_an_input_of_any_kind_but_an_apply() {
+    let step = |src: &str| errors(src);
+    // Written as a mapping and as a value, on a kind that declares neither.
+    for src in [
+        "steps:\n  build: oci.image\n    from: ./Dockerfile\n    outputs: string\n",
+        "steps:\n  build: oci.image\n    from: ./Dockerfile\n    outputs:\n      digest: string\n",
+    ] {
+        let all = step(src);
+        assert!(all.iter().any(|m| m.contains("unknown input `outputs`")), "{all:?}");
+    }
+}
+
+#[test]
+fn every_outputs_mapping_is_checked_where_it_is_written() {
+    // Two `outputs:` blocks: the second is read as itself, not as the first
+    // again, so a bad type in it is reported on its own line.
+    let src = "\
+steps:
+  build:  oci.image
+    from:  ./Dockerfile
+  plan:   tofu.plan
+    dir:   ./infra/prod
+  apply:  tofu.apply
+    plan:  plan.file
+    outputs:
+      cluster: k8s.Cluster
+    outputs:
+      cluster: 3
+  deploy: k8s.rollout
+    image: build.digest
+    to:    apply.out.cluster
+";
+    let cluster = ks_core::Type::Named("k8s.Cluster".to_string());
+    let all = iac_errors(src, &[("cluster", cluster)]);
+    assert!(all.iter().any(|m| m.contains("`3` is not a type")), "{all:?}");
+    // The second block names nothing usable, so the first still types the
+    // read and the file keeps one error rather than two.
+    assert!(!all.iter().any(|m| m.contains("expected k8s.Cluster")), "{all:?}");
+}
+
+#[test]
+fn a_field_of_an_output_keeps_the_types_it_knows() {
+    // A record's fields are known, so a field that is not a cluster fails
+    // as itself rather than as `any`.
+    let record = ks_core::Type::Record(vec![("endpoint".to_string(), ks_core::Type::Url)]);
+    let src = IAC.replace("apply.out.cluster", "apply.out.thing.endpoint");
+    let all = iac_errors(&src, &[("thing", record)]);
+    assert!(all.iter().any(|m| m.contains("expected k8s.Cluster, got url")), "{all:?}");
+    // A field nothing declares stays unchecked, as an unknown output's do.
+    let src = IAC.replace("apply.out.cluster", "apply.out.thing.nope");
+    assert!(errors(&src).is_empty(), "{:?}", errors(&src));
+}

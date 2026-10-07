@@ -2,7 +2,7 @@
 //! reference, type and declaration problem it finds — never just the first.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 
 use ks_lang::{Atom, Code, Diagnostic, Entry, Expr, Fix, Span, StrPart, Word};
 
@@ -150,6 +150,10 @@ pub struct CheckOptions<'a> {
     /// cannot. Advisory only: it widens the warnings, never what is
     /// enforced.
     pub(crate) in_ci: bool,
+    /// What the IaC behind each `dir:` declares, read from its `.tf` files
+    /// by the caller — keyed by the `dir:` text as the file spells it, then
+    /// by output name. Without it every run-time output stays unchecked.
+    pub(crate) iac_outputs: Option<&'a BTreeMap<String, BTreeMap<String, Type>>>,
 }
 
 impl<'a> CheckOptions<'a> {
@@ -161,6 +165,7 @@ impl<'a> CheckOptions<'a> {
             actor: None,
             context: None,
             in_ci: false,
+            iac_outputs: None,
         }
     }
 
@@ -203,6 +208,22 @@ impl<'a> CheckOptions<'a> {
         self.in_ci = in_ci;
         self
     }
+
+    /// Checks against what the `.tf` files behind each `dir:` declare, as
+    /// read by the caller ([`tf`](crate::tf)). `outputs` is keyed by the
+    /// `dir:` text exactly as the file spells it (`./infra/prod`), then by
+    /// output name. A `tofu.apply` step's run-time outputs are then typed,
+    /// and one that is not declared is an error here rather than at run
+    /// time; a `dir:` absent from the map says nothing, and its outputs stay
+    /// unchecked.
+    #[must_use]
+    pub fn iac_outputs(
+        mut self,
+        outputs: &'a BTreeMap<String, BTreeMap<String, Type>>,
+    ) -> CheckOptions<'a> {
+        self.iac_outputs = Some(outputs);
+        self
+    }
 }
 
 /// Type-check `parse` and build its [`Workflow`], against `options`.
@@ -213,6 +234,7 @@ pub fn check_with(parse: &ks_lang::Parse, options: &CheckOptions<'_>) -> Checked
         options.actor,
         options.context.clone(),
         options.in_ci,
+        options.iac_outputs,
         parse.diagnostics().to_vec(),
     );
     c.file(parse.file());
@@ -234,6 +256,10 @@ const ENV_PROPERTIES: [&str; 5] = ["secrets", "ci-only", "approvers", "on", "var
 /// as inputs.
 const STEP_PROPERTIES: [&str; 1] = ["ci-only"];
 
+/// The kinds that apply a plan and produce its run-time outputs, and so are
+/// the ones whose `out.` names the IaC behind their plan can answer.
+const APPLY_KINDS: [&str; 2] = ["tofu.apply", "terraform.apply"];
+
 struct Ctx<'a> {
     catalog: &'a Catalog,
     /// The file formats this build reads, and what each is called.
@@ -247,6 +273,8 @@ struct Ctx<'a> {
     /// That the caller is running in CI, which widens advisory warnings
     /// only and never what is enforced.
     in_ci: bool,
+    /// What the IaC behind each `dir:` declares, when the caller read it.
+    iac_outputs: Option<&'a BTreeMap<String, BTreeMap<String, Type>>>,
     diags: Vec<Diagnostic>,
     /// The dotted path of the entry being checked (`deploy.image`), attached
     /// to every diagnostic raised while it is checked.
@@ -287,6 +315,14 @@ struct StepInfo<'a> {
     ci_only: bool,
     /// `decide` only: the answers declared under `returns:`.
     variants: Vec<String>,
+    /// The literal `dir:` a `tofu.plan` step reads, as the file spells it.
+    dir: Option<String>,
+    /// An apply step's `plan:`: the step whose `.file` it applies.
+    plan: Option<String>,
+    /// An apply step's `outputs:`: each run-time output and the type the
+    /// file says it holds, or `None` when the spelling is not a type at
+    /// all (reported in the second pass).
+    outputs: Vec<(String, Option<Type>)>,
     /// The `when:` condition, for the planner.
     when: Option<Condition>,
 }
@@ -306,6 +342,7 @@ impl<'a> Ctx<'a> {
         actor: Option<ActorKind>,
         context: Option<CheckContext>,
         in_ci: bool,
+        iac_outputs: Option<&'a BTreeMap<String, BTreeMap<String, Type>>>,
         diags: Vec<Diagnostic>,
     ) -> Ctx<'a> {
         Ctx {
@@ -314,6 +351,7 @@ impl<'a> Ctx<'a> {
             actor,
             context,
             in_ci,
+            iac_outputs,
             diags,
             subject: None,
             env_names: Vec::new(),
@@ -548,6 +586,9 @@ impl<'a> Ctx<'a> {
                 spec,
                 ci_only,
                 variants,
+                dir: literal_input(s, "dir"),
+                plan: plan_step(s),
+                outputs: outputs_mapping(s, spec),
                 when: None,
             });
             self.index.insert(name.to_string(), self.steps.len() - 1);
@@ -616,6 +657,20 @@ impl<'a> Ctx<'a> {
     }
 
     fn check_input(&mut self, idx: usize, iname: &str, input: Entry<'_>) {
+        // `outputs:` maps an apply step's run-time outputs to types; it is a
+        // mapping, so it has children and no value of its own.
+        if iname == "outputs"
+            && self.steps[idx].spec.is_some_and(|sp| APPLY_KINDS.contains(&sp.name.as_str()))
+        {
+            return self.check_outputs(input);
+        }
+        // A kind that is not an apply step has no `outputs:` whatever shape
+        // it is written in: a mapping with children is an unknown input like
+        // any other. (An unknown kind checks no inputs at all, as everywhere
+        // else, so it says nothing about `outputs:` either way.)
+        if iname == "outputs" && self.steps[idx].spec.is_some() && input.expr().is_none() {
+            return self.unknown_input(idx, iname, input);
+        }
         let Some(e) = input.expr() else { return }; // missing values: parse error
         // The reserved inputs mean the same for every kind, checked or not.
         match iname {
@@ -628,19 +683,7 @@ impl<'a> Ctx<'a> {
             return;
         };
         let Some(ty) = spec.input(iname) else {
-            let span = input.key_span();
-            let msg = format!("unknown input `{iname}` for step kind `{}`", spec.name);
-            let names = spec.input_names();
-            match suggestion(iname, &names) {
-                Some((s, unique)) => self.err_hint_fix(
-                    Code::UnknownInput,
-                    span,
-                    msg,
-                    format!("did you mean `{s}`?"),
-                    Fix::new(span, s, unique),
-                ),
-                None => self.err(Code::UnknownInput, span, msg),
-            }
+            self.unknown_input(idx, iname, input);
             return;
         };
         match iname {
@@ -687,6 +730,42 @@ impl<'a> Ctx<'a> {
     /// diagnostics they reach for a reference. A value that is not a name is
     /// reported rather than ignored: an ordering edge that quietly orders
     /// nothing is the one mistake here nobody would notice.
+    /// An apply step's `outputs:` mapping, checked here in the second pass: a
+    /// value that is not a type is a type error like any other, named
+    /// against the line that spells it.
+    fn check_outputs(&mut self, entry: Entry<'_>) {
+        for (out, (_, ty)) in entry.children().zip(parse_outputs(entry)) {
+            if ty.is_some() {
+                continue;
+            }
+            let hint = "spell it as `k8s.Cluster`, `string` or `{name: type}`";
+            let msg = match out.expr().as_ref().and_then(value_word) {
+                Some(spelled) => format!("`{spelled}` is not a type"),
+                None => "an output's type is a single name".to_string(),
+            };
+            self.err_hint(Code::TypeMismatch, out.key_span(), msg, hint.to_string());
+        }
+    }
+
+    /// The input the kind's contract does not declare, named where it is
+    /// written, with the kind's own inputs offered as the near misses.
+    fn unknown_input(&mut self, idx: usize, iname: &str, input: Entry<'_>) {
+        let Some(spec) = self.steps[idx].spec else { return };
+        let span = input.key_span();
+        let msg = format!("unknown input `{iname}` for step kind `{}`", spec.name);
+        let names = spec.input_names();
+        match suggestion(iname, &names) {
+            Some((s, unique)) => self.err_hint_fix(
+                Code::UnknownInput,
+                span,
+                msg,
+                format!("did you mean `{s}`?"),
+                Fix::new(span, s, unique),
+            ),
+            None => self.err(Code::UnknownInput, span, msg),
+        }
+    }
+
     fn check_after(&mut self, idx: usize, e: &Expr<'_>) {
         for item in after_names(e) {
             let (name, span) = match item {
@@ -1116,7 +1195,7 @@ impl<'a> Ctx<'a> {
         let Some(rest) = rest else { return self.bare_step_type(i) };
         let (out, more) = split_first(rest);
         if out == "out" {
-            return Type::Any; // run-time output: the name is not verified
+            return self.run_output(i, rest, more, span);
         }
         let spec = self.steps[i].spec;
         // A `decide` answer types as its declared `returns:` variants.
@@ -1155,6 +1234,75 @@ impl<'a> Ctx<'a> {
                 Type::Any
             }
         }
+    }
+
+    /// `<apply step>.out.<name>`: a run-time output, typed by what the IaC
+    /// declares. `outputs:` on the step wins, then the `.tf` files behind
+    /// its plan's `dir:` when the caller read them; with neither, the name
+    /// is unchecked and the type is `any`, as it always was.
+    fn run_output(&mut self, i: usize, rest: &str, more: Option<&str>, span: Span) -> Type {
+        // `rest` is `<out>.<name>[.<field>…]`; the name is its second
+        // segment, and anything after it names a field of the output.
+        let Some(after_out) = more else { return Type::Any }; // a bare `.out`
+        let (name, deeper) = split_first(after_out);
+        let mapped =
+            self.steps[i].outputs.iter().find(|(n, _)| n == name).and_then(|(_, ty)| ty.clone());
+        if let Some(ty) = mapped {
+            return Self::field_of(ty, deeper);
+        }
+        let (Some(dir), Some(declared)) = (self.iac_dir(i), self.iac_outputs) else {
+            return Type::Any;
+        };
+        // An empty declaration says as little as no directory at all.
+        let Some(outputs) = declared.get(dir).filter(|o| !o.is_empty()) else { return Type::Any };
+        let Some(ty) = outputs.get(name).cloned() else {
+            let step = self.steps[i].name.clone();
+            let names: Vec<String> = outputs.keys().cloned().collect();
+            let declared: String =
+                names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ");
+            let hint = format!("`{dir}` declares {declared}");
+            let msg = format!("step `{step}` produces no output `{name}`");
+            let at = segment_span(rest, span.end - rest.len() as u32, 1);
+            match suggestion(name, &names) {
+                Some((s, unique)) => {
+                    let fix = Fix::new(at, s.clone(), unique);
+                    self.err_hint_fix(
+                        Code::UnknownOutput,
+                        span,
+                        msg,
+                        format!("{hint}; did you mean `{s}`?"),
+                        fix,
+                    );
+                }
+                None => self.err_hint(Code::UnknownOutput, span, msg, hint),
+            }
+            return Type::Any;
+        };
+        Self::field_of(ty, deeper)
+    }
+
+    /// The `dir:` whose `.tf` files answer for step `i`: the plan it
+    /// applies. `None` for anything that is not an apply step, so nothing
+    /// else in the file is checked against Terraform's outputs.
+    fn iac_dir(&self, i: usize) -> Option<&str> {
+        let step = &self.steps[i];
+        if !step.spec.is_some_and(|sp| APPLY_KINDS.contains(&sp.name.as_str())) {
+            return None;
+        }
+        let plan = self.step_index(step.plan.as_deref()?)?;
+        self.steps[plan].dir.as_deref()
+    }
+
+    /// The type a field of `ty` has, where `rest` is the `.field…` tail. A
+    /// record knows its fields; anything else is unchecked.
+    fn field_of(ty: Type, rest: Option<&str>) -> Type {
+        let (Some(rest), Type::Record(fields)) = (rest, &ty) else { return ty };
+        let (name, deeper) = split_first(rest);
+        fields
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, t)| Self::field_of(t.clone(), deeper))
+            .unwrap_or(Type::Any)
     }
 
     fn context(&mut self, ns: &str, rest: Option<&str>, span: Span) -> Option<Type> {
@@ -2058,6 +2206,45 @@ fn value_word(e: &Expr<'_>) -> Option<String> {
         Expr::Atom { atom: Atom::Word(w), .. } => Some(w.text().to_string()),
         _ => None,
     }
+}
+
+/// A step's literal input value, when it has one: `dir: ./infra/prod`.
+fn literal_input(step: Entry<'_>, name: &str) -> Option<String> {
+    step.children()
+        .find(|c| c.key_name() == Some(name))
+        .and_then(|c| c.expr())
+        .as_ref()
+        .and_then(value_word)
+}
+
+/// The step an apply step's `plan:` applies: `plan: plan.file` names `plan`.
+fn plan_step(step: Entry<'_>) -> Option<String> {
+    let ref_ = literal_input(step, "plan")?;
+    let (name, output) = split_first(&ref_);
+    (output == Some("file") && name != ref_).then(|| name.to_string())
+}
+
+/// An apply step's `outputs:` mapping, name to type. Any other kind has none:
+/// `outputs` there means what the catalog says it means.
+fn outputs_mapping(step: Entry<'_>, spec: Option<&StepTypes>) -> Vec<(String, Option<Type>)> {
+    if !spec.is_some_and(|sp| APPLY_KINDS.contains(&sp.name.as_str())) {
+        return Vec::new();
+    }
+    step.children().find(|c| c.key_name() == Some("outputs")).map(parse_outputs).unwrap_or_default()
+}
+
+/// One `outputs:` mapping, read the way it was written. A type that does not
+/// parse is kept as `None` and reported in the second pass, so a mapping is
+/// never silently ignored.
+fn parse_outputs(entry: Entry<'_>) -> Vec<(String, Option<Type>)> {
+    entry
+        .children()
+        .filter_map(|c| {
+            let name = c.key_name()?.to_string();
+            let ty = c.expr().as_ref().and_then(value_word).and_then(|t| Type::parse(&t));
+            Some((name, ty))
+        })
+        .collect()
 }
 
 fn subject_word<'a>(e: &'a Expr<'a>) -> Option<Word<'a>> {
