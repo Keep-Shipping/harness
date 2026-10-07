@@ -75,7 +75,8 @@ impl fmt::Display for Severity {
 /// tools can match on. Codes are grouped by block — `KS00xx` syntax,
 /// `KS01xx` types, `KS02xx` names and references, `KS03xx` workflow
 /// structure, `KS04xx` policy, `KS05xx` secrets, `KS06xx` environment and CI
-/// warnings — and are never renumbered: gaps stay free for new codes.
+/// warnings, `KS07xx` approval safety — and are never renumbered: gaps stay
+/// free for new codes.
 ///
 /// The meaning, a bad and a good example of every code are documented in
 /// `docs/ERRORS.md`, generated from the registry in `ks-core`.
@@ -125,6 +126,8 @@ pub enum Code {
     SecretShown,
     /// An optional context value used where it may be absent.
     OptionalAbsent,
+    /// An `auto:` approval rule that could approve a destructive plan.
+    AutoDestroys,
 }
 
 impl Code {
@@ -154,6 +157,7 @@ impl Code {
             Code::SecretInString => "KS0501",
             Code::SecretShown => "KS0502",
             Code::OptionalAbsent => "KS0601",
+            Code::AutoDestroys => "KS0701",
         }
     }
 
@@ -182,6 +186,7 @@ impl Code {
         Code::SecretInString,
         Code::SecretShown,
         Code::OptionalAbsent,
+        Code::AutoDestroys,
     ];
 }
 

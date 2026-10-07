@@ -4,7 +4,8 @@ Every diagnostic the `ks` parser and checker emit carries exactly one code,
 stable forever: tools and agents match on the code, not on the message. Codes
 are grouped by block — `KS00xx` syntax, `KS01xx` types, `KS02xx` names and
 references, `KS03xx` workflow structure, `KS04xx` policy, `KS05xx` secrets,
-`KS06xx` environment and CI warnings — with gaps left for growth.
+`KS06xx` environment and CI warnings, `KS07xx` approval safety — with gaps
+left for growth.
 
 This file is generated from the registry in `crates/core/src/registry.rs`;
 edit the registry, never this file. Regenerate with:
@@ -37,6 +38,7 @@ UPDATE_GOLDEN=1 cargo test -p ks-core --test registry
 - [KS0501 — secret in a string](#ks0501-secret-in-a-string)
 - [KS0502 — secret shown](#ks0502-secret-shown)
 - [KS0601 — optional value may be absent](#ks0601-optional-value-may-be-absent)
+- [KS0701 — `auto:` could destroy](#ks0701-auto-could-destroy)
 
 ## KS0001: unexpected syntax
 
@@ -266,24 +268,30 @@ Not ok:
 
 ```ks
 steps:
+  plan: tofu.plan
+    dir: ./infra
   risk: decide
     model: typesafe/jev
     ask: "How risky is the plan?"
     returns: low | medium | high
   gate: approval
     auto: risk is huge
+         and plan.destroys == 0
 ```
 
 Ok:
 
 ```ks
 steps:
+  plan: tofu.plan
+    dir: ./infra
   risk: decide
     model: typesafe/jev
     ask: "How risky is the plan?"
     returns: low | medium | high
   gate: approval
     auto: risk is low
+         and plan.destroys == 0
 ```
 
 ## KS0205: unknown action
@@ -296,12 +304,15 @@ Not ok:
 
 ```ks
 steps:
+  plan: tofu.plan
+    dir: ./infra
   risk: decide
     model: typesafe/jev
     ask: "How risky is the plan?"
     returns: low | high
   gate: approval
     auto: risk is low
+         and plan.destroys == 0
     else: notify ops
 ```
 
@@ -309,12 +320,15 @@ Ok:
 
 ```ks
 steps:
+  plan: tofu.plan
+    dir: ./infra
   risk: decide
     model: typesafe/jev
     ask: "How risky is the plan?"
     returns: low | high
   gate: approval
     auto: risk is low
+         and plan.destroys == 0
     else: show risk.reason
 ```
 
@@ -633,4 +647,41 @@ steps:
     model: typesafe/jev
     ask: "Deploy commit {git.sha}?"
     returns: yes | no
+```
+
+## KS0701: `auto:` could destroy
+
+Severity: warning.
+
+The `auto:` rule of an `approval` step approves without asking anyone, and it does not say what happens to a plan that destroys. Destroy goes to a human, always — the engine conjoins `and plan.destroys == 0` whatever the file says — so this is a warning about the file reading as more permissive than the run is. Write the clause: a guard inside an `or` does not count.
+
+Not ok:
+
+```ks
+steps:
+  plan: tofu.plan
+    dir: ./infra
+  risk: decide
+    model: typesafe/jev
+    ask: "How risky is this plan?"
+    input: plan.changes
+    returns: low | medium | high
+  review: approval
+    auto: risk is low ≥ 0.95
+```
+
+Ok:
+
+```ks
+steps:
+  plan: tofu.plan
+    dir: ./infra
+  risk: decide
+    model: typesafe/jev
+    ask: "How risky is this plan?"
+    input: plan.changes
+    returns: low | medium | high
+  review: approval
+    auto: risk is low ≥ 0.95
+         and plan.destroys == 0
 ```
