@@ -226,3 +226,34 @@ namespace with no interfaces (the `offline` job).
 `--fix` is the one exception, and it is the flag's whole purpose: it writes
 back the files it checks, and only those. It still opens no socket and
 reads no store.
+
+## `keepshipping log`
+
+`keepshipping log [RUN-ID]` prints a run's events, one line per entry —
+`HH:MM:SS  type  field=value …`, with the time in UTC:
+
+```
+22:13:20  run.started  actor=ci  file_hash=sha256:aa  is_agent=false  trigger=push main
+22:13:20  step.started  step=build
+22:13:20  step.finished  duration_ms=1.2s  ok=true  outputs=digest  step=build
+22:13:20  approval.requested  artifacts=sha256:bb  channel=github  step=deploy
+22:13:20  run.finished  shipped=sha256:cc  status=shipped
+```
+
+With no run id the most recent run under `.keepshipping/runs/` is printed — a
+ULID sorts by time, so the newest is simply the last.
+
+`--format json` prints the entries as stored, byte for byte: a tool that
+re-checks the chain hashes exactly those lines. `github` is rejected — an entry
+has no source span to annotate. Printing never verifies, so a log that was
+edited still prints and can be read.
+
+`keepshipping log verify [RUN-ID]` checks the chain offline and prints
+`ok: N entries, chain intact`, or, at the first entry that does not hold,
+`<path>:<line>: chain broken: <reason>` on stderr and exit 1. Editing a field,
+deleting an entry and reordering two are caught, because every entry names the
+hash of the one before it. Truncating entries off the end is not — a prefix of
+a good chain is still a good chain, and telling that from a run that genuinely
+ended needs a signature over the tip ([#112]). It needs nothing but the file — no
+network, no store — so a CI job can fetch the log as an artifact and verify it
+there.

@@ -17,8 +17,10 @@ mod drive;
 #[allow(dead_code)]
 mod github_actions_run_context;
 mod http_client;
+mod log;
 mod progress;
 mod render;
+mod run_log;
 mod upgrade;
 
 use std::io::{IsTerminal, Write as _};
@@ -51,6 +53,7 @@ fn dispatch() -> ExitCode {
         Some("fmt") => upgrade::fmt(&args[1..]),
         Some("blocks") => blocks::blocks(&args[1..]),
         Some("lsp") => ks_lsp::serve(),
+        Some("log") => log::log(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)

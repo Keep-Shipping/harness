@@ -21,6 +21,7 @@ ks-engine.workspace = true
 ks-lang.workspace = true
 ks-lsp.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 ks-testing.workspace = true
