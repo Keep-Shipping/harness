@@ -19,7 +19,8 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
                           [--actor human|agent|ci] [--secrets]
        keepshipping run [FILE] [--env NAME] [--event \"push main\"] [--actor human|agent|ci]
                         [--non-interactive]
-       keepshipping blocks search <QUERY> [--index URL] [--limit N] [--format human|json]";
+       keepshipping blocks search <QUERY> [--index URL] [--limit N] [--format human|json]
+       keepshipping lsp";
 
 /// Which subcommand's flags `parse_args` accepts. `--format`, `--all`,
 /// `--warnings-as-errors` and `--secrets` belong to `check` alone; `run`

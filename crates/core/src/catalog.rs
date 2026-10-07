@@ -45,7 +45,7 @@ impl StepTypes {
     }
 
     /// The input names a value could be meant for, `when:` included.
-    pub(crate) fn input_names(&self) -> Vec<String> {
+    pub fn input_names(&self) -> Vec<String> {
         let mut v: Vec<String> = self.inputs.iter().map(|(n, _)| n.clone()).collect();
         v.push(WHEN.to_string());
         v
@@ -224,8 +224,16 @@ impl Catalog {
     }
 
     /// The step kind registered under `name`.
-    pub(crate) fn step(&self, name: &str) -> Option<&StepTypes> {
+    pub fn step(&self, name: &str) -> Option<&StepTypes> {
         self.steps.get(name)
+    }
+
+    /// Every registered step kind, in name order. Editors list these when a
+    /// step header is being written.
+    pub fn kinds(&self) -> impl Iterator<Item = &StepTypes> {
+        let mut kinds: Vec<&StepTypes> = self.steps.values().collect();
+        kinds.sort_by(|a, b| a.name.cmp(&b.name));
+        kinds.into_iter()
     }
 
     /// Why the nominal type `want` exists, when the catalog declares one.

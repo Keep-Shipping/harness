@@ -1,0 +1,57 @@
+//! One line of prose per built-in step kind, for hover.
+//!
+//! The catalog itself carries schemas, not documentation, and
+//! `docs/STEPS.md` is generated from it; the wording here mirrors that
+//! document and `docs/LANGUAGE.md`. A kind nobody has written a line for
+//! still hovers — just without the sentence.
+
+/// What a built-in step kind does, in one line.
+pub fn kind_doc(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "oci.image" => "Build a container image from a Dockerfile, and publish its digest and tag.",
+        "tofu.plan" => "Plan an infrastructure change, and count what it would add and destroy.",
+        "approval" => "Hold the run until a human answers, showing an earlier step's outputs.",
+        "tofu.apply" => {
+            "Apply a plan file. Its outputs are known only at run time, as `out.<name>`."
+        }
+        "k8s.rollout" => {
+            "Roll a deployment out to a cluster. Its outputs are known only at run time."
+        }
+        "decide" => "Ask a model a question, and branch on the answer it declares in `returns:`.",
+        _ => return None,
+    })
+}
+
+/// What a step does: its kind's line, or a note that the kind is not
+/// built in and so unchecked.
+pub fn step_doc(kind: Option<&str>) -> String {
+    match kind {
+        Some(kind) => match kind_doc(kind) {
+            Some(doc) => format!("`{kind}` — {doc}"),
+            None => {
+                format!("`{kind}` — not a built-in kind, so its inputs and outputs are unchecked.")
+            }
+        },
+        None => "this step declares no kind, so its inputs and outputs are unchecked.".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ks_core::Catalog;
+
+    #[test]
+    fn every_built_in_kind_has_a_line() {
+        for kind in Catalog::builtin().kinds() {
+            assert!(kind_doc(&kind.name).is_some(), "no doc for `{}`", kind.name);
+        }
+    }
+
+    #[test]
+    fn an_unknown_kind_says_so_instead_of_nothing() {
+        assert_eq!(kind_doc("acme.deploy"), None);
+        assert!(step_doc(Some("acme.deploy")).contains("not a built-in kind"));
+        assert!(step_doc(None).contains("declares no kind"));
+    }
+}
