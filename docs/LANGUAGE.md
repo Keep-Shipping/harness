@@ -185,10 +185,29 @@ built-in catalog in `ks-core`: `oci.image`, `tofu.plan`, `approval`,
 `tofu.apply`, `k8s.rollout`, `decide`); unknown kinds are unchecked, their
 outputs type `any`. **`out.` rule**: outputs the kind declares statically are
 read as `<step>.<output>`; outputs that exist only at run time (tofu
-outputs, script and block returns) are read as `<step>.out.<name>[.<field>…]`
-— typed `any`, name not verified. Reading `apply.digest` on a run-time-only
-kind is an error pointing at `apply.out.`. Misspelled steps, outputs, context
-values and enum answers get a did-you-mean hint.
+outputs, script and block returns) are read as `<step>.out.<name>[.<field>…]`.
+Reading `apply.digest` on a run-time-only kind is an error pointing at
+`apply.out.`. Misspelled steps, outputs, context values and enum answers get
+a did-you-mean hint.
+
+**Typed IaC outputs.** When the `tofu.plan` a `tofu.apply` applies has a
+literal `dir:`, `check` reads the `*.tf` files in that directory (no tofu, no
+network) and types `<step>.out.<name>` from what they declare, so a missing
+output is a check-time error (KS0203), not a run-time surprise. The type
+comes from the first of these:
+
+1. an `outputs:` mapping on the apply step — `cluster: k8s.Cluster`, one name
+   to a type per line;
+2. a `# keepshipping:type <Type>` comment (or `//`) on the lines above the
+   `output` block, or on a line directly inside it;
+3. the shape of `value = { … }`: the keys `endpoint`, `ca` and `auth` make a
+   `k8s.Cluster` — an API server, its CA and an exec auth method (`eks`,
+   `gke`, `aks`), never a credential — and any other object a record of its
+   keys.
+
+Anything else is `any`. A `dir:` that is absent, unreadable or holds no `.tf`
+files says nothing, and its outputs stay unchecked: `check` never fails for a
+file it did not see.
 
 **Context namespaces.** `git.{sha,ref,branch}`, `git.tag?`, `pr.number?`,
 `pr.base?`, `run.{id,actor}`, `run.is_agent`, `env.name`, `ci.provider?`,
@@ -397,6 +416,10 @@ revisit:
   `|` a union of alternatives.
 - Run-time outputs are namespaced under `<step>.out.`; statically declared
   outputs are read directly (`<step>.<output>`).
+- A `tofu.apply` step's `out.` names are typed from what the `.tf` files
+  behind its plan's `dir:` declare: an `outputs:` mapping on the step, else a
+  `# keepshipping:type <Type>` comment in the `.tf`, else the shape of an
+  object value. A directory `check` cannot read types nothing (#70).
 - An approval that shows a step's outputs gates every other consumer of that
   step (approval gating adds graph edges). A step that only follows another
   with `after:` is not one of those consumers.

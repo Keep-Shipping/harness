@@ -688,18 +688,18 @@ steps:
         assert!(rename(&doc, "f", at, "compile").is_err());
     }
 
-    /// A step can be named without a field — `to: build` wires a dependency.
+    /// A step can be named without a field — `wait: build` wires a dependency.
     /// Renaming it must carry that word along, or the reference dangles.
     #[test]
     fn a_rename_carries_a_bare_step_reference() {
-        let src = "steps:\n  build: oci.image\n  deploy: k8s.rollout\n    image: build.digest\n    to: build\n";
+        let src = "steps:\n  build: oci.image\n  deploy: k8s.rollout\n    image: build.digest\n    wait: build\n";
         let doc = Doc::new(src.to_string(), Encoding::Utf16);
         let at = src.find("build: oci").expect("the header") as u32;
         let edits = rename(&doc, "f", at, "compile").expect("rename");
         let changed = edits["changes"]["f"].as_array().expect("edits").clone();
         let texts: Vec<&str> =
             changed.iter().map(|e| e["newText"].as_str().expect("text")).collect();
-        // header, `image: build.digest`, and the bare `to: build`.
+        // header, `image: build.digest`, and the bare `wait: build`.
         assert_eq!(texts, ["compile", "compile", "compile"]);
         // The result still checks clean, so the rename left nothing dangling.
         let after = Doc::new(apply(src, &changed), Encoding::Utf16);
