@@ -41,6 +41,20 @@ Newest first, one heading per contract version, dated.
   engine uses the store directly, so `Port` and `define_ports!` are
   untouched. The remaining ports are as declared above.
 
+- **2026-10-07** — Added the `DecisionModel` trait
+  ([#54](https://github.com/Keep-Shipping/harness/issues/54)), in
+  [`crates/core/src/ports/decision_model.rs`](../crates/core/src/ports/decision_model.rs).
+  One `ask` call carries one `RedactedState` and a `BTreeMap<String, Question>`,
+  and answers with `BTreeMap<String, Answer>` — so the model sees one picture and
+  the answers are consistent with each other. `DecisionModel` also declares
+  `profile()`, returning a `ModelProfile` naming the model, its pinned version,
+  its calibration family and its `max_state_bytes` truncation bound.
+
+  Like `BlocksIndex` before it, this is a trait plus fakes and a conformance
+  kit: there is **no `Port` enum variant yet**, so a step cannot declare it and
+  a harness cannot hand one to a step. The trait is versioned now so that adding
+  the variant later is not itself a contract change.
+
 ## STEP_API 1
 
 - **2026-10-07** — The initial port contract

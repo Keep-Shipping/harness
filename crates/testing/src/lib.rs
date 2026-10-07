@@ -16,6 +16,7 @@ use std::task::Poll;
 
 pub mod blocks;
 pub mod clock;
+pub mod decision_model;
 pub mod http;
 pub mod iac;
 pub mod id_gen;

@@ -15,6 +15,7 @@
 //! - [`id_gen`] — minting fresh run ids;
 //! - [`run_log`] — the append-only record of what a run did ([#46](https://github.com/Keep-Shipping/harness/issues/46));
 //! - [`script_host`] — running the TypeScript escape-hatch steps;
+//! - [`decision_model`] — asking a model a judgement it cannot be handed ([#54](https://github.com/Keep-Shipping/harness/issues/54));
 //! - [`state_store`] — a parked run's state and its saved plans
 //!   ([#42](https://github.com/Keep-Shipping/harness/issues/42)).
 //!
@@ -42,6 +43,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn core::future::Future<Output = T> + Send 
 
 pub mod blocks;
 pub mod clock;
+pub mod decision_model;
 pub mod http;
 pub mod iac;
 pub mod id_gen;
