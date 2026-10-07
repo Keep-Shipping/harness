@@ -290,8 +290,12 @@ pub struct TypeDef {
 pub struct Field {
     pub name: &'static str,
     pub ty: TypeRef,
-    /// Absent means required.
+    /// Absent means the field takes whatever the step works out for itself — see
+    /// [`Field::optional`].
     pub default: Option<Value>,
+    /// Whether the field may be left out. A field with no default is required unless this
+    /// says otherwise.
+    pub optional: bool,
     /// What the field means, shown in generated docs.
     pub doc: &'static str,
 }
@@ -299,12 +303,20 @@ pub struct Field {
 impl Field {
     /// Declares a required field, e.g. `Field::new("tag", ty, "which tag")`.
     pub fn new(name: &'static str, ty: TypeRef, doc: &'static str) -> Field {
-        Field { name, ty, default: None, doc }
+        Field { name, ty, default: None, optional: false, doc }
     }
 
     /// Makes the field optional with `default`.
     pub fn with_default(mut self, default: Value) -> Field {
         self.default = Some(default);
+        self
+    }
+
+    /// Makes the field optional with no value of its own: a run that leaves it out is not an
+    /// error, and the step works out what it means. For a field whose absence carries meaning —
+    /// a context that defaults to the Dockerfile's own directory, not to a fixed `.`.
+    pub fn optional(mut self) -> Field {
+        self.optional = true;
         self
     }
 }

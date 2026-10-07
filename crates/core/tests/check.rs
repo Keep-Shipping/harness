@@ -158,7 +158,7 @@ steps:
 ";
     let all = messages(src);
     assert!(
-        all.iter().any(|m| m.contains("expected oci.Digest, got string")
+        all.iter().any(|m| m.contains("expected oci.Digest, got oci.Tag")
             && m.contains("use build.digest so prod runs exactly the image you built")),
         "{all:?}"
     );

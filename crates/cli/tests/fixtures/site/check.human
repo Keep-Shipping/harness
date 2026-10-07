@@ -1,4 +1,4 @@
-✗ ship.ks:21  deploy.image  expected oci.Digest, got string
+✗ ship.ks:21  deploy.image  expected oci.Digest, got oci.Tag
   │
 21 │     image: build.tag
   │            ^^^^^^^^^

@@ -310,7 +310,7 @@ Every value has a type, and types never convert implicitly
   the primitive it was meant to be.
 - Nominal types (`oci.Digest`, `tofu.PlanFile`, ...) come from step schemas:
   they coerce only to themselves, and a mismatch diagnostic names both types
-  (`expected oci.Digest, got string`) and suggests a same-workflow output of
+  (`expected oci.Digest, got oci.Tag`) and suggests a same-workflow output of
   the wanted type (`use build.digest so prod runs exactly the image you
   built`). A well-formed `sha256:…` *literal* where a digest is declared is
   accepted with a warning: pin by reference, not by pasted digest.

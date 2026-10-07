@@ -10,18 +10,22 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ks_core::ports::BoxFuture;
 use ks_core::ports::supply_chain::{
-    ArtifactUpload, BuildError, BuildOutput, BuildRequest, Descriptor, Digest, ImageBuilder,
-    ImageRef, OciLayoutContents, Reference, Registry, RegistryError, SignError, SignPayload,
-    Signature, Signer, SignerIdentity,
+    ArtifactUpload, BuildCache, BuildError, BuildOutput, BuildRequest, BuildSecrets, Descriptor,
+    Digest, ImageBuilder, ImageRef, OciLayoutContents, Reference, Registry, RegistryError,
+    SignError, SignPayload, Signature, Signer, SignerIdentity,
 };
 use sha2::{Digest as _, Sha256};
 
-/// The manifest media type the fakes use for image and artifact manifests.
+/// The manifest media type the fakes use for image manifests.
 const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+/// The manifest media type the fakes use for a multi-platform build: an
+/// image index listing one manifest per platform.
+const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
 /// The layer media type the fake registry wraps artifact blobs in.
 const OCI_LAYER: &str = "application/vnd.oci.image.layer.v1.tar";
 
@@ -326,11 +330,60 @@ fn artifact_manifest(upload: &ArtifactUpload) -> Vec<u8> {
     json.into_bytes()
 }
 
+/// One build as [`FakeImageBuilder`] recorded it: every field of the request
+/// except the secret *values*, which never enter a record a test can print.
+/// Which mounts a build asked for is part of what it did; what was behind
+/// them is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedBuild {
+    /// The build context directory.
+    pub context: PathBuf,
+    /// The Dockerfile the build read.
+    pub dockerfile: PathBuf,
+    /// The build args.
+    pub args: BTreeMap<String, String>,
+    /// The platforms built for.
+    pub platforms: Vec<String>,
+    /// The stage built, if any.
+    pub target: Option<String>,
+    /// The repository pushed to, if any.
+    pub push_to: Option<String>,
+    /// The secret mount names, sorted.
+    pub secrets: Vec<String>,
+    /// Where the builder was told it may keep its cache.
+    pub cache: BuildCache,
+    /// Whether an SBOM was asked for.
+    pub sbom: bool,
+}
+
+impl RecordedBuild {
+    fn of(request: &BuildRequest) -> RecordedBuild {
+        RecordedBuild {
+            context: request.context.clone(),
+            dockerfile: request.dockerfile.clone(),
+            args: request.args.clone(),
+            platforms: request.platforms.clone(),
+            target: request.target.clone(),
+            push_to: request.push_to.clone(),
+            secrets: request.secrets.names().map(str::to_string).collect(),
+            cache: request.cache,
+            sbom: request.sbom,
+        }
+    }
+}
+
 /// A deterministic [`ImageBuilder`]: the manifest it builds is a canonical
 /// text rendering of the request, so the same request always yields the same
 /// digest and any changed field (an arg, a platform, the target) yields a
-/// different one. Every request is recorded in
+/// different one. A build for more than one platform produces an OCI image
+/// index, so the digest it reports addresses the index rather than a single
+/// image. Every build is recorded in
 /// [`requests`](FakeImageBuilder::requests).
+///
+/// Secret values are the one thing the fake never renders into what it
+/// builds: a real builder mounts them, and a mounted secret leaves no trace
+/// in the layers it produced. Only the mount *names* reach the manifest,
+/// which is the strongest claim the fake can honestly make.
 ///
 /// With `push_to` set the output is [`BuildOutput::PushedImage`]; when the
 /// fake is wired to a shared [`FakeRegistry`] via
@@ -341,7 +394,8 @@ fn artifact_manifest(upload: &ArtifactUpload) -> Vec<u8> {
 pub struct FakeImageBuilder {
     registry: Option<Arc<FakeRegistry>>,
     failure: Option<String>,
-    requests: Mutex<Vec<BuildRequest>>,
+    claimed: Option<Digest>,
+    requests: Mutex<Vec<RecordedBuild>>,
 }
 
 impl FakeImageBuilder {
@@ -362,8 +416,16 @@ impl FakeImageBuilder {
         self
     }
 
-    /// Every build request so far, oldest first.
-    pub fn requests(&self) -> Vec<BuildRequest> {
+    /// Scripts every build to *report* `digest` instead of the one it
+    /// computed — a builder that misreports what it pushed, for the
+    /// confirmation a caller is supposed to make rather than trust.
+    pub fn claiming(mut self, digest: Digest) -> FakeImageBuilder {
+        self.claimed = Some(digest);
+        self
+    }
+
+    /// Every build so far, oldest first, with secret values left behind.
+    pub fn requests(&self) -> Vec<RecordedBuild> {
         self.requests.lock().expect("fake image builder").clone()
     }
 }
@@ -373,7 +435,7 @@ impl ImageBuilder for FakeImageBuilder {
         &'a self,
         request: &'a BuildRequest,
     ) -> BoxFuture<'a, Result<BuildOutput, BuildError>> {
-        self.requests.lock().expect("fake image builder").push(request.clone());
+        self.requests.lock().expect("fake image builder").push(RecordedBuild::of(request));
         let result = match &self.failure {
             Some(reason) => Err(BuildError::Failed { reason: reason.clone() }),
             None => self.finish(request),
@@ -384,36 +446,39 @@ impl ImageBuilder for FakeImageBuilder {
 
 impl FakeImageBuilder {
     fn finish(&self, request: &BuildRequest) -> Result<BuildOutput, BuildError> {
+        let media_type = if request.platforms.len() > 1 { OCI_INDEX } else { OCI_MANIFEST };
         let manifest = synthetic_manifest(request);
         let descriptor = Descriptor {
-            media_type: OCI_MANIFEST.to_string(),
+            media_type: media_type.to_string(),
             digest: digest_of(&manifest),
             size: manifest.len() as u64,
             annotations: BTreeMap::new(),
         };
+        // `claiming` is a lie about the digest only: the bytes still land.
+        let reported = self.claimed.clone().unwrap_or_else(|| descriptor.digest.clone());
         match &request.push_to {
             Some(repository) => match &self.registry {
                 Some(registry) => {
                     let layout = OciLayoutContents {
-                        media_type: OCI_MANIFEST.to_string(),
+                        media_type: media_type.to_string(),
                         manifest,
                         blobs: Vec::new(),
                     };
                     // The fake registry's futures are always ready, so the
                     // crate's own block_on drives it inside a sync method.
                     let pushed = crate::block_on(registry.push_layout(repository, &layout));
-                    let pushed = pushed.map_err(|error| BuildError::Push {
+                    pushed.map_err(|error| BuildError::Push {
                         repository: repository.clone(),
                         message: error.to_string(),
                     })?;
                     Ok(BuildOutput::PushedImage {
                         repository: repository.clone(),
-                        digest: pushed.digest,
+                        digest: reported,
                     })
                 }
                 None => Ok(BuildOutput::PushedImage {
                     repository: repository.clone(),
-                    digest: descriptor.digest,
+                    digest: reported,
                 }),
             },
             None => Ok(BuildOutput::OciLayout {
@@ -427,12 +492,20 @@ impl FakeImageBuilder {
 /// A canonical stand-in for a real image manifest: a text rendering of
 /// everything in the request that can change the output. Not a real manifest
 /// — but the property under test (same request in, same digest out) holds of
-/// the real bytes too.
+/// the real bytes too. Secret *names* are rendered, because a mount is part
+/// of what the build did; secret values are not, because a mounted secret is
+/// not.
 fn synthetic_manifest(request: &BuildRequest) -> Vec<u8> {
+    // More than one platform is an image index, not an image: the digest a build reports
+    // addresses the index, and the index lists one manifest per platform.
+    if request.platforms.len() > 1 {
+        return synthetic_index(request);
+    }
     let mut text = format!(
-        "dockerfile={}\ncontext={}\n",
+        "dockerfile={}\ncontext={}\ncache={}\n",
         request.dockerfile.display(),
-        request.context.display()
+        request.context.display(),
+        request.cache
     );
     for (key, value) in &request.args {
         let _ = writeln!(text, "arg {key}={value}");
@@ -440,10 +513,54 @@ fn synthetic_manifest(request: &BuildRequest) -> Vec<u8> {
     for platform in &request.platforms {
         let _ = writeln!(text, "platform {platform}");
     }
+    for name in request.secrets.names() {
+        let _ = writeln!(text, "secret {name}");
+    }
     if let Some(target) = &request.target {
         let _ = writeln!(text, "target {target}");
     }
     text.into_bytes()
+}
+
+/// The stand-in for a multi-platform build: a hand-formatted OCI image index
+/// (no serde here, as with the artifact manifest) listing one
+/// [`synthetic_manifest`] per platform. Real enough that a caller can see it
+/// *is* an index, which is the property a multi-platform build has to hold.
+fn synthetic_index(request: &BuildRequest) -> Vec<u8> {
+    let mut json = format!("{{\"schemaVersion\":2,\"mediaType\":\"{OCI_INDEX}\",\"manifests\":[");
+    for (index, platform) in request.platforms.iter().enumerate() {
+        let manifest = synthetic_manifest(&single_platform(request, platform));
+        if index > 0 {
+            json.push(',');
+        }
+        let (os, architecture) = platform.split_once('/').unwrap_or(("linux", platform.as_str()));
+        let _ = write!(
+            json,
+            "{{\"mediaType\":\"{OCI_MANIFEST}\",\"digest\":\"{}\",\"size\":{},\
+             \"platform\":{{\"os\":\"{os}\",\"architecture\":\"{architecture}\"}}}}",
+            digest_of(&manifest),
+            manifest.len()
+        );
+    }
+    json.push_str("]}");
+    json.into_bytes()
+}
+
+/// The same request for exactly one platform, carrying no secret values: a
+/// manifest for one platform never mentions another, and a value is not what
+/// a mount renders as anyway.
+fn single_platform(request: &BuildRequest, platform: &str) -> BuildRequest {
+    BuildRequest {
+        context: request.context.clone(),
+        dockerfile: request.dockerfile.clone(),
+        args: request.args.clone(),
+        platforms: vec![platform.to_string()],
+        target: request.target.clone(),
+        push_to: request.push_to.clone(),
+        secrets: BuildSecrets::new(),
+        cache: request.cache,
+        sbom: request.sbom,
+    }
 }
 
 /// A [`Signer`] whose signature is `sha256(identity bytes ‖ payload bytes)`.

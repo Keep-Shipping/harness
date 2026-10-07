@@ -329,6 +329,7 @@ impl Harness {
                 Some(default) => {
                     inputs.insert(field.name.to_string(), default.clone());
                 }
+                None if field.optional => {}
                 None => {
                     return Err(StepError::InvalidInput {
                         field: field.name.to_string(),
