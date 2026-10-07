@@ -44,6 +44,27 @@ feat(engine): plan steps as a DAG (#42)
 
 Every diagnostic carries a stable `KSxxxx` code, documented in [docs/ERRORS.md](docs/ERRORS.md) (generated — do not edit). To add a code: extend `ks_lang::Code`, document it in the exhaustive `explain` match in `crates/core/src/registry.rs` with a bad and a good example, then regenerate the docs with `UPDATE_GOLDEN=1 cargo test -p ks-core --test registry`. How diagnostics are printed — formats, exit codes, colour — is pinned in [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md).
 
+## Releasing and compatibility
+
+Three contracts are public surface, each a constant in `crates/core/src/version.rs`: `FORMAT_VERSION` (the `ship.ks` format), `STEP_API` (the `StepKind` and port contract) and `SCRIPT_PROTOCOL` (the TypeScript script-host protocol). [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) is the table a step author reads; [docs/PORTS.md](docs/PORTS.md) is the hand-written port changelog.
+
+**Changing a port trait means bumping `STEP_API`** — `HarnessBuilder::build` refuses a step whose `step_api()` differs, so a silent signature change is a breaking release anyway. Four edits, in this order — the first three are hand edits, and CI fails if you skip one:
+
+1. Bump `STEP_API` in `crates/core/src/version.rs` (minor for additive, major for breaking).
+2. Add a `## STEP_API <n>` entry under `## Changelog` in `docs/PORTS.md` saying what changed.
+3. Hand-edit `PINNED_PORT_CONTRACT` in `crates/testing/tests/compatibility.rs` to the new `STEP_API` and the new digest. It is a plain `const` and **nothing writes it for you** — not `KS_BLESS`, not `UPDATE_GOLDEN`. Get the digest by running the test below and reading the digest it reports in the failure message.
+4. Only then regenerate the compatibility table:
+
+```sh
+KS_BLESS=1 cargo test -p ks-testing --test compatibility
+```
+
+Order matters. Steps 1–3 are what the gate actually checks; step 4 only rewrites `docs/COMPATIBILITY.md`. Bless first and step 4 makes `docs_compatibility_md_is_in_sync` pass while the pin and changelog checks still fail, so you read green on one test and ship two broken ones.
+
+`docs/COMPATIBILITY.md` is generated — **do not edit it by hand**; `KS_BLESS=1` is the command that rewrites it. That test is the gate: it compares the port-contract fingerprint against `PINNED_PORT_CONTRACT`, checks `Port` and `define_ports!` agree in order, and checks `docs/PORTS.md` has a heading for the current `STEP_API`.
+
+A tag matching `v*` runs [`.github/workflows/release.yml`](.github/workflows/release.yml): `keepshipping` for macOS arm64/x86_64 and Linux x86_64/arm64, a cosign-keyless-signed `SHA256SUMS`, and a GitHub Release whose notes come from GitHub's own release-notes generator over the conventional commits. Crates are **not** published to crates.io — `publish = false` is set workspace-wide and stays set while the repository is private, which [ADR 0006](docs/adr/0006-licence-and-open-source-model.md) holds until M1 exits — so a release is binaries only.
+
 ## ADRs
 
 Architecture changes go through a new ADR — never by editing an accepted one.

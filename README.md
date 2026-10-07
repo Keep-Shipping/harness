@@ -45,7 +45,7 @@ Step families (`oci.*`, `tofu.*` / `terraform.*`, `k8s.*`, `vm.*`, `fn.*`, `appr
 | `sdk/ts` | — | `@keepshipping/sdk` for TypeScript escape-hatch steps (later epic) |
 | `ventures/keepshipping` | — | The optional hosted parts (waitlist, web approvals, run-log viewer, blocks index) as a Cratefield venture (later epic) |
 
-The language is decided: [ADR 0013](docs/adr/0013-rust-workspace.md). The layout is a proposal until its ADR is accepted: [#3](https://github.com/Keep-Shipping/harness/issues/3) (ports and adapters) and [#4](https://github.com/Keep-Shipping/harness/issues/4) (syntax).
+The language and the layout are proposals until their ADRs are accepted: [#2](https://github.com/Keep-Shipping/harness/issues/2) (Rust), [#3](https://github.com/Keep-Shipping/harness/issues/3) (ports and adapters) and [#4](https://github.com/Keep-Shipping/harness/issues/4) (syntax).
 
 ## Milestones
 
