@@ -16,6 +16,9 @@ fn check_in(dir: &Path, args: &[&str]) -> (i32, String, String) {
         .arg("check")
         .args(args)
         .current_dir(dir)
+        // The ambient `CI` widens the "no format declared" warning, which
+        // these fixtures are not about.
+        .env_remove("CI")
         .output()
         .expect("run keepshipping");
     (
