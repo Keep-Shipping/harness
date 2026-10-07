@@ -25,7 +25,7 @@ Inputs:
 | `context` | path | - | the build context directory; defaults to the Dockerfile's own directory |
 | `args` | map | {} | build args, as ARGs |
 | `secrets` | map | {} | secret values by mount name, mounted into the build and never passed as args |
-| `platforms` | list | [`linux/arm64`] | platforms to build for; more than one produces an image index |
+| `platforms` | list | [] | platforms to build for; more than one produces an image index. Empty means the platform the build runs on |
 | `target` | string | `` | the stage to build |
 | `push` | oci.Tag | - | the image reference to push |
 | `sign` | bool | false | whether to sign the image |
