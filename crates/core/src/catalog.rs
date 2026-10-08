@@ -212,6 +212,41 @@ impl Catalog {
             true,
             false,
         );
+        // The same two steps under the Terraform names. The shapes are identical on purpose —
+        // field for field with `tofu.plan` / `tofu.apply` above — and only the nominal types
+        // differ. That is what stops a plan made by OpenTofu from being applied by `terraform`:
+        // the plan file formats are not interchangeable, and the type system says so.
+        add(
+            "terraform.plan",
+            &[
+                ("dir", Type::Path),
+                ("backend", Type::Optional(Box::new(Type::String))),
+                ("backend_config", Type::Optional(Box::new(Type::Map(Box::new(Type::String))))),
+                ("vars", Type::Optional(Box::new(Type::Map(Box::new(Type::String))))),
+                ("role", Type::Optional(Box::new(Type::String))),
+            ],
+            &[
+                ("file", named("terraform.PlanFile")),
+                ("changes", named("terraform.Changes")),
+                ("adds", Type::Int),
+                ("changes_count", Type::Int),
+                ("destroys", Type::Int),
+                ("empty", Type::Bool),
+                ("summary", Type::String),
+            ],
+            false,
+            false,
+        );
+        add(
+            "terraform.apply",
+            &[
+                ("plan", named("terraform.PlanFile")),
+                ("role", Type::Optional(Box::new(Type::String))),
+            ],
+            &[("out", named("terraform.Outputs")), ("applied", Type::Int)],
+            true,
+            false,
+        );
         add(
             "k8s.rollout",
             &[
@@ -358,8 +393,8 @@ impl Catalog {
 pub fn action_kind(kind: &str) -> ActionKind {
     match kind {
         "oci.image" | "oci.artifact" => ActionKind::Build,
-        "tofu.plan" => ActionKind::Plan,
-        "tofu.apply" => ActionKind::Apply,
+        "tofu.plan" | "terraform.plan" => ActionKind::Plan,
+        "tofu.apply" | "terraform.apply" => ActionKind::Apply,
         "k8s.rollout" => ActionKind::Deploy,
         _ => ActionKind::Other,
     }
@@ -376,6 +411,9 @@ const FAMILIES: &[(&str, Option<&str>)] = &[
     ("tofu.PlanFile", None),
     ("tofu.Changes", None),
     ("tofu.Outputs", None),
+    ("terraform.PlanFile", None),
+    ("terraform.Changes", None),
+    ("terraform.Outputs", None),
     ("k8s.Cluster", None),
     ("k8s.Namespace", None),
     ("vm.Hosts", None),

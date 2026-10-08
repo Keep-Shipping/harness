@@ -16,9 +16,15 @@ pub fn kind_doc(kind: &str) -> Option<&'static str> {
             "Refuse to continue unless an image digest carries a signature from a named identity."
         }
         "tofu.plan" => "Plan an infrastructure change, and count what it would add and destroy.",
+        "terraform.plan" => {
+            "Plan an infrastructure change with Terraform, and count what it would add and destroy."
+        }
         "approval" => "Hold the run until a human answers, showing an earlier step's outputs.",
         "tofu.apply" => {
             "Apply exactly the plan file an approval was bound to. Yields `applied` and the root outputs as `out.<name>`."
+        }
+        "terraform.apply" => {
+            "Apply exactly the Terraform plan file an approval was bound to. Yields `applied` and the root outputs as `out.<name>`."
         }
         "k8s.rollout" => {
             "Roll a deployment out to a cluster. Its outputs are known only at run time."
