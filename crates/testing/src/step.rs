@@ -31,6 +31,7 @@ use ks_core::ports::secrets::{
 use ks_core::step::{
     ActionClass, ActionKind, CancellationToken, Field, Inputs, LogRecord, LogSink, Outputs, Port,
     Ports, StepCtx, StepError, StepKind, StepLog, StepSchema, TypeRef, Version,
+    reject_secret_outputs,
 };
 
 /// How long the cancelled pass may take to come back [`StepError::Cancelled`] before the kit
@@ -495,6 +496,9 @@ async fn drive(
     let ctx =
         StepCtx::new(ports.restricted_to(&declared), Arc::clone(harness.clock()), cancel, step_log);
     let outputs = step.run(ctx, inputs).await?;
+    // Before the schema check, matching `run_step` line for line: a schema error names an
+    // undeclared output, and that name would reach diagnostics unredacted.
+    reject_secret_outputs(&redactor, &outputs)?;
     harness.check_outputs(step.as_ref(), &outputs)?;
     Ok(outputs)
 }

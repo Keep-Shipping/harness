@@ -5,6 +5,8 @@
 //! [`run_step`] checks, in order: the step exists, the run is not cancelled, the inputs match
 //! the schema (defaults applied), and the outputs match what was promised. Between the checks
 //! it hands the step a [`StepCtx`] holding only its declared ports, and logs the action class.
+//! One more check came with scripts ([#91](https://github.com/Keep-Shipping/harness/issues/91)):
+//! what a step returns may not contain a secret it was given.
 
 use std::sync::Arc;
 
@@ -13,6 +15,7 @@ use ks_core::ports::BoxFuture;
 use ks_core::ports::secrets::Redactor;
 use ks_core::step::{
     CancellationToken, Inputs, LogSink, Outputs, Port, StepCtx, StepError, StepKind, StepLog,
+    reject_secret_outputs,
 };
 
 /// Runs the step `name` from `harness` with `inputs`; `log` receives every record the engine
@@ -55,7 +58,8 @@ pub(crate) fn step_ctx(
     )
 }
 
-/// Logs the action class, runs an already-prepared step, and checks what it returned.
+/// Logs the action class, runs an already-prepared step, and checks what it returned — against
+/// the schema, and against the run's secrets.
 pub(crate) async fn execute(
     harness: &Harness,
     name: &str,
@@ -65,9 +69,13 @@ pub(crate) async fn execute(
     log: Arc<dyn LogSink>,
     redactor: Arc<Redactor>,
 ) -> Result<Outputs, StepError> {
-    let ctx = step_ctx(harness, step, name, cancel, log, redactor);
+    let ctx = step_ctx(harness, step, name, cancel, log, Arc::clone(&redactor));
     ctx.log().info("step started", &[("action", step.action(&inputs).to_string().as_str())]);
     let outputs = step.run(ctx, inputs).await?;
+    // Before the schema check, not after: `check_outputs` names an undeclared output in its
+    // error, and that name reaches diagnostics unredacted — so a step that named an output
+    // after a secret would have it read straight back out.
+    reject_secret_outputs(&redactor, &outputs)?;
     harness.check_outputs(step, &outputs)?;
     Ok(outputs)
 }

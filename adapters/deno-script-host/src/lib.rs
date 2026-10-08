@@ -86,9 +86,6 @@
 //!   step with no manifest cannot import anything at all.
 //! - **Non-Linux**: `/proc/self/fd` and the FIFO route are Linux. Any other
 //!   platform is a clear error naming it, not a silent fallback.
-//! - **Log plumbing through the port**: `ctx.log` lines go to
-//!   [`DenoScriptHost::with_log_sink`], since `ScriptHost` has no log channel
-//!   yet — also [#57](https://github.com/Keep-Shipping/harness/issues/57).
 //!
 //! ```
 //! # fn main() -> Result<(), ks_core::ports::script_host::ScriptHostError> {
@@ -115,6 +112,7 @@ use ks_core::ports::script_host::{
     ScriptHost, ScriptHostError, ScriptRef, StepSchema, ValueType, Values,
 };
 use ks_core::ports::secrets::{Redactor, SecretBundle};
+use ks_core::step::{LogLevel, StepLog};
 
 pub mod channel;
 mod install;
@@ -262,16 +260,12 @@ impl Invocation {
     }
 }
 
-/// Where a step's `ctx.log(level, message)` lines go, already redacted.
-type LogSink = Arc<dyn Fn(&str, &str) + Send + Sync>;
-
 /// A [`ScriptHost`] running steps in the pinned Deno.
 pub struct DenoScriptHost {
     workspace: PathBuf,
     cache_root: Option<PathBuf>,
     deno: Option<PathBuf>,
     fetch: Arc<dyn Fetcher>,
-    log_sink: Option<LogSink>,
 }
 
 impl DenoScriptHost {
@@ -301,7 +295,6 @@ impl DenoScriptHost {
             cache_root: install::default_cache_root(),
             deno: None,
             fetch: Arc::new(CurlFetcher),
-            log_sink: None,
         })
     }
 
@@ -321,17 +314,6 @@ impl DenoScriptHost {
     /// Fetches the release archive with `fetch` instead of `curl`.
     pub fn with_fetcher(mut self, fetch: Arc<dyn Fetcher>) -> DenoScriptHost {
         self.fetch = fetch;
-        self
-    }
-
-    /// Hands every `ctx.log(level, msg)` line to `sink`, already redacted.
-    /// Without one, log lines are discarded: they are the step's words, and
-    /// the port has nowhere to put them yet.
-    pub fn with_log_sink(
-        mut self,
-        sink: impl Fn(&str, &str) + Send + Sync + 'static,
-    ) -> DenoScriptHost {
-        self.log_sink = Some(Arc::new(sink));
         self
     }
 
@@ -734,8 +716,9 @@ impl ScriptHost for DenoScriptHost {
         script: &'a ScriptRef,
         inputs: &'a Values,
         secrets: &'a SecretBundle,
+        log: &'a StepLog,
     ) -> BoxFuture<'a, Result<Values, ScriptHostError>> {
-        let result = self.run_step(script, inputs, secrets);
+        let result = self.run_step(script, inputs, secrets, log);
         Box::pin(std::future::ready(result))
     }
 }
@@ -747,6 +730,7 @@ impl DenoScriptHost {
         script: &ScriptRef,
         inputs: &Values,
         secrets: &SecretBundle,
+        log: &StepLog,
     ) -> Result<Values, ScriptHostError> {
         let (schema, net) = self.describe(script)?;
         // Before the process starts: a script that was never legally invoked
@@ -771,10 +755,10 @@ impl DenoScriptHost {
         })?;
         let frames = self.spawn(&invocation, Some(&wire), &redactor)?;
 
-        if let Some(sink) = &self.log_sink {
-            for line in frames.logs {
-                sink(&redactor.redact(&line.0), &redactor.redact(&line.1));
-            }
+        // Every `ctx.log` line goes to the step's own logger, which redacts it
+        // through the run's redactor: the same channel a built-in step logs on.
+        for (level, message) in &frames.logs {
+            log.log(log_level(level), message, &[]);
         }
         let Some(output) = frames.output else {
             return Err(ScriptHostError::Protocol {
@@ -786,6 +770,17 @@ impl DenoScriptHost {
         })?;
         schema.validate_outputs(&outputs)?;
         Ok(outputs)
+    }
+}
+
+/// The [`LogLevel`] a `ctx.log(level, ..)` frame names. An unknown level is
+/// `info`, as a frame without one is: the line is the step's words either way.
+fn log_level(level: &str) -> LogLevel {
+    match level {
+        "debug" => LogLevel::Debug,
+        "warn" | "warning" => LogLevel::Warn,
+        "error" => LogLevel::Error,
+        _ => LogLevel::Info,
     }
 }
 

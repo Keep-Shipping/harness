@@ -721,11 +721,94 @@ impl StepLog {
     pub fn info(&self, message: &str, fields: &[(&str, &str)]) {
         self.log(LogLevel::Info, message, fields);
     }
+
+    /// Returns `text` with every registered secret replaced by `***`.
+    ///
+    /// For text a step puts somewhere the redactor does not get to see — most importantly a
+    /// [`StepError`]'s message, which reaches diagnostics verbatim. A script host uses it on a
+    /// failed script's stderr tail before building a
+    /// [`ScriptFailed`](crate::ports::script_host::ScriptHostError::ScriptFailed): those bytes
+    /// come from the process, so the adapter is the only place they can be scrubbed.
+    ///
+    /// [`log`](StepLog::log) is the other door into the sink and needs no help; this one is for
+    /// the paths that do not go through it.
+    pub fn redact(&self, text: &str) -> String {
+        self.redactor.redact(text)
+    }
 }
 
 impl fmt::Debug for StepLog {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StepLog").field("step", &self.step).finish()
+    }
+}
+
+/// Why a step's return value was refused: it carried a secret the run had already resolved.
+///
+/// The reason names *that* a secret is in there and never what it is — this error's text
+/// bypasses the redactor on its way to diagnostics ([`StepError`]'s own doc), so embedding the
+/// value would put it right back in the log this check exists to keep it out of.
+const SECRET_OUTPUT_REASON: &str = "contains a secret value; a step cannot return a secret";
+
+/// Why an output was refused, when the *name* is what carries the secret — and why that name is
+/// replaced by [`SECRET_NAME_PLACEHOLDER`] rather than printed.
+const SECRET_OUTPUT_NAME_REASON: &str =
+    "is named after a secret value; a step cannot name an output after a secret";
+
+/// Stands in for an output name that is itself a secret, so the error can point at *which* output
+/// without repeating it.
+const SECRET_NAME_PLACEHOLDER: &str = "<output name>";
+
+/// Fails `outputs` if any part of them carries a value the run's `redactor` already holds.
+///
+/// A step reads secrets; it must never hand one back. Outputs are the step's own words going
+/// straight into wiring, a cache key, and the run log — so a secret in one leaks everywhere
+/// later, and redacting it downstream would just mangle a value a dependent genuinely needs.
+/// The engine calls this on every step's outputs, *before* the schema check, which is what makes
+/// `return { leaked: db.reveal() }` a step failure rather than a downstream surprise. Before, and
+/// not after, because the schema check puts an undeclared output's *name* into its own error —
+/// and a script that names an output after a secret would otherwise have it read back out in the
+/// diagnostics.
+///
+/// The walk is total: strings inside `String`, `Number`s in their `Display` form, `List` items and
+/// `Map` keys and values, plus the output names themselves. An output *named* after a secret is
+/// reported without the name, for the same reason the value is never reported. `Outputs` is a
+/// `BTreeMap`, so the first hit reported is the same on every run.
+pub fn reject_secret_outputs(redactor: &Redactor, outputs: &Outputs) -> Result<(), StepError> {
+    for (name, value) in outputs {
+        if redactor.contains(name) {
+            // The name is itself the secret, so it is the one thing this error must not
+            // repeat: the field is named by a placeholder, and the reason says why.
+            return Err(StepError::InvalidOutput {
+                field: SECRET_NAME_PLACEHOLDER.to_string(),
+                reason: SECRET_OUTPUT_NAME_REASON.to_string(),
+            });
+        }
+        if value_has_secret(redactor, value) {
+            return Err(StepError::InvalidOutput {
+                field: name.clone(),
+                reason: SECRET_OUTPUT_REASON.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Whether `value` carries a registered secret anywhere inside it.
+///
+/// A number is matched as its `Display` form, because a secret is bytes and a script or step
+/// can hold the very same value as a number — a pin, an account number, a short token. It is a
+/// deliberate over-match: `1234.0` and the registered `1234` are the same secret, and a false
+/// positive costs one output while a false negative ships the value.
+fn value_has_secret(redactor: &Redactor, value: &Value) -> bool {
+    match value {
+        Value::Null | Value::Bool(_) => false,
+        Value::Number(number) => redactor.contains(&number.to_string()),
+        Value::String(text) => redactor.contains(text),
+        Value::List(items) => items.iter().any(|item| value_has_secret(redactor, item)),
+        Value::Map(entries) => entries
+            .iter()
+            .any(|(key, value)| redactor.contains(key) || value_has_secret(redactor, value)),
     }
 }
 
@@ -1020,6 +1103,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use crate::step::test_support::FixedClock;
+    use std::collections::BTreeMap;
 
     fn assert_send_sync<T: ?Sized + Send + Sync>() {}
 
@@ -1146,6 +1230,105 @@ mod tests {
             assert_eq!(status.as_str(), name);
             assert_eq!(status.to_string(), name);
         }
+    }
+
+    #[test]
+    fn a_step_cannot_return_a_secret_in_any_shape() {
+        fn redactor() -> Redactor {
+            let mut redactor = Redactor::new();
+            redactor.register(&crate::ports::secrets::SecretValue::new(b"hunter2".to_vec()));
+            redactor
+        }
+        // A bare value, a string that merely embeds one, a nested list item, a map key, a map
+        // value, and an output *named* after the secret — all refused.
+        let mut outputs: Outputs = BTreeMap::new();
+        outputs.insert("a".to_string(), Value::from("hunter2"));
+        // Assembled from fragments so no line here spells out a whole connection string.
+        outputs
+            .insert("b".to_string(), Value::from(concat!("postgres://", "app:", "hunter2", "@db")));
+        outputs
+            .insert("c".to_string(), Value::List(vec![Value::from("ok"), Value::from("hunter2")]));
+        outputs.insert(
+            "d".to_string(),
+            Value::Map(BTreeMap::from([("hunter2".to_string(), Value::from("x"))])),
+        );
+        outputs.insert(
+            "e".to_string(),
+            Value::Map(BTreeMap::from([("k".to_string(), Value::from("hunter2"))])),
+        );
+        // (An output *named* after the secret is its own case, below.)
+        let error = reject_secret_outputs(&redactor(), &outputs).expect_err("a secret came back");
+        assert_eq!(
+            error,
+            StepError::InvalidOutput {
+                field: "a".to_string(),
+                reason: SECRET_OUTPUT_REASON.to_string()
+            },
+            "the first field in BTreeMap order is the one named"
+        );
+        // The reason never carries the value: this text bypasses the redactor.
+        assert!(!error.to_string().contains("hunter2"), "{error}");
+
+        // An output *named* after the secret is refused without repeating the name — the name is
+        // the value here, so reporting it would put the secret straight back. Its own map,
+        // since in the one above an earlier field is reported first.
+        let only_named = Outputs::from([("hunter2".to_string(), Value::from("x"))]);
+        let named = reject_secret_outputs(&redactor(), &only_named).expect_err("named after it");
+        assert_eq!(
+            named,
+            StepError::InvalidOutput {
+                field: SECRET_NAME_PLACEHOLDER.to_string(),
+                reason: SECRET_OUTPUT_NAME_REASON.to_string()
+            },
+            "{named}"
+        );
+        assert!(!named.to_string().contains("hunter2"), "{named}");
+
+        let clean: Outputs = BTreeMap::from([
+            ("count".to_string(), Value::from(3.0)),
+            ("tags".to_string(), Value::List(vec![Value::from("web")])),
+            ("ok".to_string(), Value::from(true)),
+        ]);
+        assert_eq!(reject_secret_outputs(&redactor(), &clean), Ok(()));
+        // A redactor that holds nothing has no opinion.
+        assert_eq!(reject_secret_outputs(&Redactor::new(), &outputs), Ok(()));
+    }
+
+    /// A secret is bytes, and a value can hold those same bytes as a number — a pin, an account
+    /// number, a short token. Matching `Display` catches those.
+    #[test]
+    fn a_number_holding_a_secret_is_a_secret() {
+        let mut redactor = Redactor::new();
+        redactor.register(&crate::ports::secrets::SecretValue::new(b"1234".to_vec()));
+        let leaked: Outputs = BTreeMap::from([("pin".to_string(), Value::from(1234.0))]);
+        assert_eq!(
+            reject_secret_outputs(&redactor, &leaked),
+            Err(StepError::InvalidOutput {
+                field: "pin".to_string(),
+                reason: SECRET_OUTPUT_REASON.to_string()
+            })
+        );
+        // An ordinary number is nobody's secret.
+        let clean: Outputs = BTreeMap::from([("count".to_string(), Value::from(1235.0))]);
+        assert_eq!(reject_secret_outputs(&redactor, &clean), Ok(()));
+    }
+
+    /// A sink that keeps nothing: `redact` cleans text, it does not record it.
+    struct DiscardingSink;
+
+    impl LogSink for DiscardingSink {
+        fn record(&self, _record: LogRecord) {}
+    }
+
+    /// The same redactor as `log`, for the text that does not travel through it.
+    #[test]
+    fn a_step_log_redacts_text_that_never_becomes_a_record() {
+        let mut redactor = Redactor::new();
+        redactor.register(&crate::ports::secrets::SecretValue::new(b"hunter2".to_vec()));
+        let sink = Arc::new(DiscardingSink);
+        let log = StepLog::new("app.script", Arc::new(redactor), sink);
+        assert_eq!(log.redact("exit 1: bad password hunter2"), "exit 1: bad password ***");
+        assert_eq!(log.redact("nothing here"), "nothing here");
     }
 
     #[test]
