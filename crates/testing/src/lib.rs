@@ -34,6 +34,18 @@ pub mod state_store;
 pub mod step;
 pub mod supply_chain;
 
+/// The worked example in `docs/STEP-AUTHORING.md`, compiled and run as this
+/// crate's doctests ([#142](https://github.com/Keep-Shipping/harness/issues/142)).
+///
+/// `cfg(doctest)` keeps the item out of an ordinary build and out of the
+/// rendered docs; rustdoc sets it when it collects doctests, and then every
+/// Rust code block in the guide becomes one. The guide's example runs
+/// [`step::step_conformance`] against the fakes in this crate, so a step that
+/// drifts out of the kit's contract breaks `cargo test` rather than the review.
+#[cfg(doctest)]
+#[doc = include_str!("../../../docs/STEP-AUTHORING.md")]
+pub struct StepAuthoringGuide;
+
 /// Runs a future to completion on the current thread.
 ///
 /// A busy-poll loop over a [`std::task::Waker::noop`] waker: the fakes in
