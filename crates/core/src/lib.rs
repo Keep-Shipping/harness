@@ -37,6 +37,7 @@ pub mod format;
 pub mod harness;
 pub mod ids;
 pub mod plan_summary;
+pub mod policy;
 pub mod ports;
 pub mod registry;
 pub mod repro;
@@ -47,7 +48,7 @@ pub mod version;
 mod workflow;
 
 pub use auto_rule::{Decision, auto_approves, guards_destroys};
-pub use catalog::{Catalog, CatalogError, StepTypes};
+pub use catalog::{Catalog, CatalogError, StepTypes, action_kind};
 pub use check::{
     CheckOptions, Checked, EnvSecrets, SecretRequirement, SecretUse, check, check_with,
     secret_requirements,
@@ -55,9 +56,14 @@ pub use check::{
 pub use context::{CheckContext, ContextName, UnmetStep, run_order, unmet_steps};
 pub use env::{EnvChoice, select_env};
 pub use format::{BUILTIN as BUILTIN_FORMATS, Formats};
+pub use policy::{
+    BLOCKS, Decision as PolicyDecision, SCRIPTS, SECRETS, Source as PolicySource, action_of,
+    decide as decide_policy,
+};
 pub use registry::{Explanation, explain};
 pub use types::{LiteralFit, Type, coerce, literal, literal_type};
 pub use version::{FORMAT_VERSION, SCRIPT_PROTOCOL, STEP_API};
 pub use workflow::{
-    Condition, ContextTest, Env, NeverRule, Policy, Step, Trigger, TriggerKind, Workflow,
+    AskHandle, Condition, ContextTest, Env, Policy, PolicyRule, Step, Trigger, TriggerKind,
+    Workflow,
 };

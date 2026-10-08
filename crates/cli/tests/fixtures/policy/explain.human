@@ -1,0 +1,14 @@
+no baseline configured: the effective policy is this file's own policy
+ship.ks — actor: human
+
+step    action    decision      source
+build   build     can           default
+plan    plan      can           default
+review  —         not governed  —
+apply   apply     can           default
+        destroy*  can           default
+deploy  deploy    can           default
+
+* an apply whose plan destroys or replaces anything is a destroy
+
+0 steps ran. Nothing was touched.

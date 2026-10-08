@@ -429,6 +429,40 @@ steps:
     from: ./Dockerfile
 ",
         },
+        Code::PolicyUnused => Explanation {
+            code,
+            title: "policy rule for an action no step can do",
+            severity: Severity::Warning,
+            summary: "A `can:` or `before:` rule names an action class no step in this \
+                file can produce, so the rule binds nothing. It is a warning rather than an \
+                error: the rule may well be for a step kind another environment, a plugin \
+                or a future change brings in. Nothing is warned about under `never:` — \
+                forbidding what the file does not do is defensible policy.",
+            bad: "\
+envs:
+  prod:
+    ci-only: true
+policy:
+  agents:
+    can: deploy prod
+steps:
+  build: oci.image
+    from: ./Dockerfile
+",
+            good: "\
+envs:
+  prod:
+    ci-only: true
+policy:
+  agents:
+    can: deploy prod
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  deploy: k8s.rollout
+    image: build.digest
+",
+        },
         Code::PolicyForbidden => Explanation {
             code,
             title: "policy forbids the run",

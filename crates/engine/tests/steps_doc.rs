@@ -24,3 +24,22 @@ fn steps_doc_matches_the_builtin_steps() {
         .unwrap_or_else(|_| panic!("docs/STEPS.md is missing; {REGENERATE}"));
     assert!(rendered == current, "docs/STEPS.md is stale; {REGENERATE}");
 }
+
+/// Every built-in step's own `action()` must agree with the catalog's mapping
+/// ([#101](https://github.com/Keep-Shipping/harness/issues/101)). The two are
+/// written in different places — one on the implementation, one in the
+/// catalog the checker reads — and a step that disagrees is a policy answer
+/// that depends on which caller you asked.
+#[test]
+fn every_builtin_step_classifies_the_way_the_catalog_does() {
+    use ks_core::action_kind;
+    use ks_core::step::Inputs;
+
+    let steps = ks_engine::steps::builtin_steps();
+    assert!(!steps.is_empty(), "there are built-in steps to check");
+    for step in &steps {
+        let expected = action_kind(step.name());
+        let actual = step.action(&Inputs::new()).kind;
+        assert_eq!(actual, expected, "`{}` classifies itself differently", step.name());
+    }
+}

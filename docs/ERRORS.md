@@ -36,6 +36,7 @@ UPDATE_GOLDEN=1 cargo test -p ks-core --test registry
 - [KS0401 — unknown policy declaration](#ks0401-unknown-policy-declaration)
 - [KS0402 — unknown policy action](#ks0402-unknown-policy-action)
 - [KS0403 — policy forbids the run](#ks0403-policy-forbids-the-run)
+- [KS0404 — policy rule for an action no step can do](#ks0404-policy-rule-for-an-action-no-step-can-do)
 - [KS0501 — secret in a string](#ks0501-secret-in-a-string)
 - [KS0502 — secret shown](#ks0502-secret-shown)
 - [KS0601 — optional value may be absent](#ks0601-optional-value-may-be-absent)
@@ -596,6 +597,42 @@ policy:
 steps:
   migrate: db.migrate
     url: secrets.db_url
+```
+
+## KS0404: policy rule for an action no step can do
+
+Severity: warning.
+
+A `can:` or `before:` rule names an action class no step in this file can produce, so the rule binds nothing. It is a warning rather than an error: the rule may well be for a step kind another environment, a plugin or a future change brings in. Nothing is warned about under `never:` — forbidding what the file does not do is defensible policy.
+
+Not ok:
+
+```ks
+envs:
+  prod:
+    ci-only: true
+policy:
+  agents:
+    can: deploy prod
+steps:
+  build: oci.image
+    from: ./Dockerfile
+```
+
+Ok:
+
+```ks
+envs:
+  prod:
+    ci-only: true
+policy:
+  agents:
+    can: deploy prod
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  deploy: k8s.rollout
+    image: build.digest
 ```
 
 ## KS0501: secret in a string

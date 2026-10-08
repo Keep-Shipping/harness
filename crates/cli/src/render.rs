@@ -90,7 +90,7 @@ impl Lines {
 
     /// The 1-based line and column of a byte offset. Columns count
     /// characters, not bytes, so a multi-byte character is one column.
-    fn line_col(&self, src: &str, offset: u32) -> (usize, usize) {
+    pub fn line_col(&self, src: &str, offset: u32) -> (usize, usize) {
         let offset = (offset as usize).min(src.len()) as u32;
         let line = self.starts.partition_point(|&s| s <= offset) - 1;
         let col = src[self.starts[line] as usize..offset as usize].chars().count() + 1;

@@ -329,3 +329,67 @@ fn an_address_splits_into_its_module_and_type() {
         assert_eq!(address_parts(address), (module.to_string(), kind.to_string()), "{address}");
     }
 }
+
+/// The acceptance case for [#101]: an apply whose plan contains a *replace* is
+/// a destroy, so the site's policy asks `@platform` for it.
+///
+/// The count comes from the plan the adapter read, through
+/// [`PlanJson::destroys`] — the same count `tofu.plan` reports in its
+/// `destroys` output, so there is no second, disagreeing definition of "this
+/// plan destroys something" anywhere in the tree.
+#[test]
+fn an_apply_whose_plan_replaces_is_classified_as_a_destroy() {
+    use ks_core::policy::{Source, decide};
+    use ks_core::ports::policy::Disposition;
+    use ks_core::ports::run_context::ActorKind;
+    use ks_core::step::{ActionClass, ActionKind};
+    use ks_core::{Catalog, CheckOptions, check_with};
+
+    let replaces = parsed("replace.plan.json").destroys();
+    let creates = parsed("site.plan.json").destroys();
+    assert_eq!(replaces, 1, "a replace is a delete plus a create");
+    assert_eq!(creates, 0);
+
+    let apply = ActionClass::new(ActionKind::Apply);
+    assert_eq!(apply.clone().with_plan_destroys(replaces).kind, ActionKind::Destroy);
+    assert_eq!(apply.clone().with_plan_destroys(creates).kind, ActionKind::Apply);
+
+    // The site's policy block, over a file whose only consequential step is
+    // the apply: `apply` sits under `before:`, `can:` does not mention it.
+    let site = include_str!("../../lang/tests/fixtures/site-policy.ks");
+    let src = format!(
+        "\
+envs:
+  staging:
+    ci-only: true
+  prod:
+    ci-only: true
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  plan: tofu.plan
+    dir: ./infra
+  apply: tofu.apply
+    plan: plan.file
+  deploy: k8s.rollout
+    image: build.digest
+{site}"
+    );
+    let checked = check_with(&ks_lang::parse(&src), &CheckOptions::new(&Catalog::builtin()));
+    assert!(
+        !checked.diagnostics.iter().any(|d| d.severity == ks_lang::Severity::Error),
+        "{:#?}",
+        checked.diagnostics
+    );
+
+    let decision = decide(
+        checked.workflow.policy(),
+        None,
+        ActorKind::Agent,
+        &apply.with_plan_destroys(replaces),
+    )
+    .expect("destroy is governed");
+    assert_eq!(decision.disposition, Disposition::Ask, "not `can:`");
+    assert_eq!(decision.ask, ["platform"], "the file names who is asked");
+    assert_eq!(decision.source, Source::File);
+}

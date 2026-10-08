@@ -14,6 +14,38 @@ implemented end to end today; `run` is not.
 - `keepshipping blocks search <QUERY>` — search the metadata-only blocks index (`--index URL` or
   `KEEPSSHIPPING_BLOCKS_INDEX`, `--limit N`, `--format human|json`). It asks the index; it never
   downloads a block.
+- `keepshipping policy explain [FILE]` — the effective policy for one actor (`--as agent|human|ci`,
+  default `agent`; `--env NAME`), each row attributed to the document that decided it. Below.
+
+## `policy explain`
+
+What this file's policy allows for one actor, each row attributed to the document that decided it
+([ADR 0012](adr/0012-policy-authority.md)). Offline, so it shares `check`'s exit codes. The **first
+line** says whether an org baseline is configured — no `PolicyStore` adapter yet, so always no.
+
+```
+$ keepshipping policy explain --as agent
+no baseline configured: the effective policy is this file's own policy
+ship.ks — actor: agent
+
+step    action          decision       source
+build   build           can            file ship.ks:34
+plan    plan            can            file ship.ks:34
+review  —               not governed   —
+apply   apply           ask @platform  file ship.ks:36
+        destroy*        ask @platform  file ship.ks:36
+deploy  deploy staging  can            file ship.ks:34
+deploy  deploy prod     ask @platform  file ship.ks:36
+
+* an apply whose plan destroys or replaces anything is a destroy
+```
+
+**decision** — `can`, `ask @handle, @handle` (`ask a human` when none is named), or `never`.
+**source** — `file FILE:LINE`, `default` (the leash, for an agent), `baseline`, or `hard rule`. An
+`apply` also gets a `destroy*` row, footnoted below the table; steps outside the vocabulary
+(`approval`, `decide`, …) get `not governed`. Without `--env`, a step deciding the same everywhere
+gets one env-less row and one that differs gets a row per environment. `--as human` is the same
+file minus the leash.
 
 ## Exit codes
 

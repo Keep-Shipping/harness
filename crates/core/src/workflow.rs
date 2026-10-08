@@ -3,6 +3,7 @@
 
 use ks_lang::Span;
 
+use crate::ports::policy::{ANY_OBJECT, Disposition};
 use crate::ports::run_context::ActorKind;
 
 /// One `on:` trigger.
@@ -119,49 +120,111 @@ pub(crate) fn implicit_default() -> Env {
     }
 }
 
-/// One `never:` rule: who may never do what
-/// (`agents: never: read secrets`).
+/// One `policy:` rule: what a subject may do, and what happens if they try
+/// (`agents: never: read secrets`, `agents: can: deploy staging`).
+///
+/// The same shape covers all three declarations — `can:` records
+/// [`Disposition::Allow`], `before:` [`Disposition::Ask`], `never:`
+/// [`Disposition::Never`] — because a decision has to weigh all three
+/// together ([#101](https://github.com/Keep-Shipping/harness/issues/101)):
+/// a rule that is dropped on the floor because it sat under `can:` is a
+/// policy the engine cannot answer questions about.
 #[derive(Clone, Debug)]
-pub struct NeverRule {
+pub struct PolicyRule {
     /// The subject the rule binds.
     pub subject: ActorKind,
-    /// The action verb (`read`).
+    /// The action verb (`read`, `deploy`, …).
     pub verb: String,
-    /// The action object (`secrets`, or the environment another verb names).
+    /// The action object: the environment a verb names, `secrets` / `scripts`
+    /// / `blocks` for the object-taking verbs, or [`ANY_OBJECT`] when the
+    /// rule names none.
     pub object: String,
+    /// What the rule says: `can` allows, `before` asks, `never` refuses.
+    pub disposition: Disposition,
     /// Where the rule is declared, for diagnostics that point at it.
     pub span: Span,
 }
 
-/// The workflow's policy, as far as static checks enforce it: the `never:`
-/// rules a declared subject must respect. The checker enforces the agents'
-/// `read secrets` rule against agent runs
-/// ([#27](https://github.com/Keep-Shipping/harness/issues/27)); nothing else
-/// is refused yet.
+/// One handle a subject's `ask:` names: `@platform`, and where it is
+/// declared.
+#[derive(Clone, Debug)]
+pub struct AskHandle {
+    /// The subject the handles belong to.
+    pub subject: ActorKind,
+    /// The handle text, without the `@`.
+    pub handle: String,
+    /// Where the handle is declared.
+    pub span: Span,
+}
+
+/// The workflow's policy, as the file declares it: every rule under `can:`,
+/// `before:` and `never:`, and the handles under `ask:`, per subject
+/// ([#101](https://github.com/Keep-Shipping/harness/issues/101)).
+///
+/// Nothing here is *decided* — a policy answers no question on its own; it is
+/// an input to [`decide`](crate::policy::decide), which weighs it against the
+/// org baseline and the hard rules. What the checker does with it directly is
+/// refuse an agent run a `never:` rule forbids
+/// ([#27](https://github.com/Keep-Shipping/harness/issues/27)).
 #[derive(Clone, Debug, Default)]
 pub struct Policy {
-    never: Vec<NeverRule>,
+    rules: Vec<PolicyRule>,
+    asks: Vec<AskHandle>,
 }
 
 impl Policy {
+    /// Every rule the file declares, in declaration order.
+    #[must_use]
+    pub fn rules(&self) -> &[PolicyRule] {
+        &self.rules
+    }
+
+    /// The handles `subject` asks, in declaration order — empty when the
+    /// subject declares no `ask:`, which the decision renders as "ask a
+    /// human".
+    pub fn ask_handles(&self, subject: ActorKind) -> impl Iterator<Item = &str> {
+        self.asks.iter().filter(move |a| a.subject == subject).map(|a| a.handle.as_str())
+    }
+
     /// Whether `subject` is forbidden `verb` on `object`.
     #[must_use]
     pub fn forbids(&self, subject: ActorKind, verb: &str, object: &str) -> bool {
-        self.never.iter().any(|r| r.subject == subject && r.verb == verb && r.object == object)
+        self.rules.iter().any(|r| {
+            r.subject == subject
+                && r.verb == verb
+                && matches_object(&r.object, object)
+                && r.disposition == Disposition::Never
+        })
     }
 
     /// Where a rule binding `subject` to `verb` `object` is declared.
     pub(crate) fn rule_span(&self, subject: ActorKind, verb: &str, object: &str) -> Option<Span> {
-        self.never
+        self.rules
             .iter()
-            .find(|r| r.subject == subject && r.verb == verb && r.object == object)
+            .find(|r| {
+                r.subject == subject
+                    && r.verb == verb
+                    && matches_object(&r.object, object)
+                    && r.disposition == Disposition::Never
+            })
             .map(|r| r.span)
     }
 
-    /// Records a `never:` rule; `check` does this while reading `policy:`.
-    pub(crate) fn forbid(&mut self, rule: NeverRule) {
-        self.never.push(rule);
+    /// Records a rule; `check` does this while reading `policy:`.
+    pub(crate) fn forbid(&mut self, rule: PolicyRule) {
+        self.rules.push(rule);
     }
+
+    /// Records an `ask:` handle; `check` does this while reading `policy:`.
+    pub(crate) fn ask(&mut self, handle: AskHandle) {
+        self.asks.push(handle);
+    }
+}
+
+/// Whether a rule's object covers the object an action names: `*` covers
+/// every environment, anything else must match exactly.
+fn matches_object(rule_object: &str, object: &str) -> bool {
+    rule_object == ANY_OBJECT || rule_object == object
 }
 
 /// The checked workflow.
