@@ -47,6 +47,7 @@ UPDATE_GOLDEN=1 cargo test -p ks-core --test registry
 - [KS0610 — file format is one behind](#ks0610-file-format-is-one-behind)
 - [KS0611 — file format not declared](#ks0611-file-format-not-declared)
 - [KS0701 — `auto:` could destroy](#ks0701-auto-could-destroy)
+- [KS0702 — artifact used after an approval that does not show it](#ks0702-artifact-used-after-an-approval-that-does-not-show-it)
 - [KS0801 — image build is not reproducible](#ks0801-image-build-is-not-reproducible)
 
 ## KS0001: unexpected syntax
@@ -931,6 +932,44 @@ steps:
   review: approval
     auto: risk is low ≥ 0.95
          and plan.destroys == 0
+```
+
+## KS0702: artifact used after an approval that does not show it
+
+Severity: error.
+
+An `approval` is a promise about particular hashes: the approver is shown the plan file and the image digests, and says yes to those. A step the file orders after the approval consumes an artifact the approval never showed, so the thing being deployed is not the thing that was approved. Add the artifact to `show:`, or order the step before the approval.
+
+Not ok:
+
+```ks
+steps:
+  plan: tofu.plan
+    dir: ./infra
+  build: oci.image
+    from: ./Dockerfile
+  review: approval
+    show: plan.changes
+    from: @platform
+  deploy: k8s.rollout
+    image: build.digest
+    after: review
+```
+
+Ok:
+
+```ks
+steps:
+  plan: tofu.plan
+    dir: ./infra
+  build: oci.image
+    from: ./Dockerfile
+  review: approval
+    show: plan.changes, build.digest
+    from: @platform
+  deploy: k8s.rollout
+    image: build.digest
+    after: review
 ```
 
 ## KS0801: image build is not reproducible

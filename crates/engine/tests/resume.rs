@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use ks_core::harness::Harness;
 use ks_core::ids::RunId;
@@ -25,7 +26,7 @@ use ks_core::step::{
 use ks_engine::run::run_step;
 use ks_engine::state::{
     CompletedStep, LocalStateStore, PlanRef, ResumeError, RunState, fetch_plan, park, plan_key,
-    resume, save_plan, sha256_hex,
+    resume, resume_at, save_plan, sha256_hex,
 };
 use ks_testing::clock::FakeClock;
 use ks_testing::iac::FakeIacTool;
@@ -171,7 +172,9 @@ impl StepKind for PlanStep {
 
 /// Re-hashes the plan at `plan_path` and applies it if it still digests to
 /// `expected_sha256` — the "you cannot apply what you did not plan" rule the
-/// real `IacTool::apply` holds.
+/// real `IacTool::apply` holds. Its `sha256` output is reported as a
+/// `sha256:<hex>` content digest, the shape an `oci.image.digest` output really
+/// takes, so the record it lands in is one the binding has to read.
 struct ApplyStep;
 
 impl StepKind for ApplyStep {
@@ -228,11 +231,16 @@ impl StepKind for ApplyStep {
                 });
             }
             Ok(outputs(&[
-                ("sha256", actual),
+                ("sha256", digest_hex(&actual)),
                 ("bytes", String::from_utf8_lossy(&bytes).into_owned()),
             ]))
         })
     }
+}
+
+/// A 64-hex sha256 as the `sha256:<hex>` content digest a step output carries.
+fn digest_hex(hex: &str) -> String {
+    format!("sha256:{hex}")
 }
 
 /// The string input under `name`.
@@ -312,12 +320,16 @@ fn a_run_parked_at_approval_is_finished_by_a_second_job() {
     inputs.insert("plan_path".to_string(), Value::from(dest.display().to_string()));
     inputs.insert("expected_sha256".to_string(), Value::from(saved.sha256()));
     let applied = drive(&harness(), APPLY_STEP, inputs).expect("the apply step runs");
-    assert_eq!(out_text(&applied, "sha256"), sha256_hex(PLAN_BYTES));
+    assert_eq!(out_text(&applied, "sha256"), digest_hex(&sha256_hex(PLAN_BYTES)));
     assert_eq!(out_text(&applied, "bytes"), String::from_utf8_lossy(PLAN_BYTES));
 
+    // The apply step records a digest of its own — the same bytes it was
+    // handed, under a second output — and the run still resumes. That extra
+    // recorded artifact is the approval working, not the artifacts moving, and
+    // the binding reads the list rather than matching it exactly.
     state.record(CompletedStep {
         name: APPLY_STEP.to_string(),
-        outputs: BTreeMap::from([("sha256".to_string(), sha256_hex(PLAN_BYTES))]),
+        outputs: BTreeMap::from([("sha256".to_string(), digest_hex(&sha256_hex(PLAN_BYTES)))]),
         plans: Vec::new(),
     });
     ks_testing::block_on(park(&store, &state)).expect("the final state parks");
@@ -328,6 +340,7 @@ fn a_run_parked_at_approval_is_finished_by_a_second_job() {
     assert_eq!(finished.next, None);
     assert_eq!(finished.completed.len(), 2);
     assert_eq!(finished.completed[1].name, APPLY_STEP);
+    finished.check_bound(APPROVAL).expect("the approval still covers what the run holds");
 }
 
 #[test]
@@ -377,6 +390,73 @@ fn a_plan_blob_swapped_in_the_store_is_refused() {
     std::fs::remove_file(&blob).expect("the blob goes");
     let error = ks_testing::block_on(fetch_plan(&store, &run, &plan, &dest)).expect_err("gone");
     assert!(error.to_string().contains("run the plan step again"), "{error}");
+}
+
+#[test]
+fn an_approval_that_expired_before_the_run_picked_up_again_is_refused() {
+    let (root, run, _plan) = parked("ks-resume-expired-approval");
+    let store = LocalStateStore::new(&root);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+    // Job 2 answers the approval under an `expires: 1h`, binding whatever the
+    // run held at that moment, and parks again.
+    let mut state = ks_testing::block_on(resume(&store, &run, SHIP_KS)).expect("the run resumes");
+    state
+        .approve_until(APPROVAL, "ada", Duration::from_secs(3600), now)
+        .expect("the run is waiting on exactly this step");
+    assert!(!state.approvals[0].artifacts.is_empty(), "the answer is bound to the plan");
+    ks_testing::block_on(park(&store, &state)).expect("the answered run parks");
+
+    // Half an hour later the answer is still good, and the run picks up.
+    let resumed =
+        ks_testing::block_on(resume_at(&store, &run, SHIP_KS, now + Duration::from_secs(1800)))
+            .expect("the approval is still inside its hour");
+    assert_eq!(resumed.approvals[0].by, "ada", "the answer travelled with the record");
+
+    // Two hours later it is not, and nothing is released through it. The
+    // approval is judged against the clock `resume_at` was given, so this is
+    // not a test that waits for an hour.
+    let error =
+        ks_testing::block_on(resume_at(&store, &run, SHIP_KS, now + Duration::from_secs(7200)))
+            .expect_err("expired");
+    assert!(matches!(error, ResumeError::ApprovalExpired { .. }), "{error:?}");
+    match &error {
+        ResumeError::ApprovalExpired { expired_at, step, by, .. } => {
+            assert_eq!(*expired_at, now + Duration::from_secs(3600), "when it lapsed");
+            assert_eq!(step, APPROVAL);
+            assert_eq!(by, "ada");
+        }
+        other => panic!("an expired approval must say so, got {other:?}"),
+    }
+    let message = error.to_string();
+    for fragment in [APPROVAL, "ada", run.as_str(), "nothing was deployed", "new approval"] {
+        assert!(message.contains(fragment), "{fragment} missing from {message}");
+    }
+}
+
+#[test]
+fn a_rebuilt_plan_after_the_approval_refuses_the_resume() {
+    let (root, run, _plan) = parked("ks-resume-rebuilt");
+    let store = LocalStateStore::new(&root);
+
+    // An approval given for one plan, then the plan step runs again for
+    // another: the run holds bytes nobody approved.
+    let mut state = ks_testing::block_on(resume(&store, &run, SHIP_KS)).expect("the run resumes");
+    state.approve(APPROVAL, "ada").expect("the run is waiting on exactly this step");
+    let replanned = sha256_hex(b"# a different plan\n");
+    state.record(CompletedStep {
+        name: PLAN_STEP.to_string(),
+        outputs: BTreeMap::new(),
+        plans: vec![PlanRef { step: PLAN_STEP.to_string(), sha256: replanned.clone() }],
+    });
+    ks_testing::block_on(park(&store, &state)).expect("the rebuilt run parks");
+
+    let error = ks_testing::block_on(resume(&store, &run, SHIP_KS)).expect_err("replanned");
+    assert!(matches!(error, ResumeError::ArtifactsChanged { .. }), "{error:?}");
+    let message = error.to_string();
+    for fragment in [APPROVAL, &replanned, "nothing was deployed"] {
+        assert!(message.contains(fragment), "{fragment} missing from {message}");
+    }
 }
 
 #[test]

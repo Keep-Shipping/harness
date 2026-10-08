@@ -373,6 +373,9 @@ struct Ctx<'a> {
     /// orders them too.
     read: HashSet<(String, String)>,
     shown: Vec<(usize, usize)>, // (approval step, step it shows)
+    /// `(consumer, producer, output, span)` for every reference to an
+    /// artifact-typed output, for the approval-binding pass.
+    artifact_uses: Vec<(usize, usize, String, Span)>,
     name: Option<String>,
     triggers: Vec<Trigger>,
     envs: Vec<Env>,
@@ -470,6 +473,7 @@ impl<'a> Ctx<'a> {
             after: HashSet::new(),
             read: HashSet::new(),
             shown: Vec::new(),
+            artifact_uses: Vec::new(),
             name: None,
             triggers: Vec::new(),
             envs: Vec::new(),
@@ -1456,7 +1460,16 @@ impl<'a> Ctx<'a> {
             if let Some(cur) = cur {
                 self.edge(cur, i, span, true);
             }
-            return Some((Some(i), self.step_ref(i, rest, span)));
+            let ty = self.step_ref(i, rest, span);
+            // A block's `outputs:` mapping reads no artifact on a step's
+            // behalf, so only a step's read can need an approval to bind it.
+            if let Some(cur) = cur
+                && is_artifact(&ty)
+                && let Some(out) = rest
+            {
+                self.artifact_uses.push((cur, i, out.to_string(), span));
+            }
+            return Some((Some(i), ty));
         }
         if let Some(t) = self.context(first, rest, span) {
             // A secret reference is a requirement the run carries, wherever
@@ -2602,6 +2615,66 @@ impl<'a> Ctx<'a> {
         });
     }
 
+    /// An approval binds the artifacts the steps it gates act on: a step
+    /// ordered after the approval consumes an image digest or a saved plan
+    /// file, so the hash the approver signs for has to be in the approval's
+    /// `show:`.
+    ///
+    /// Two readings stay deliberately narrow. "Gates" is the edges the file
+    /// itself declares, the same `base` the ordering pass reads: an approval
+    /// that shows a step already gates its other consumers, and this pass
+    /// never widens that claim on its own. And an artifact produced *after*
+    /// the approval is not the approval's to bind — nothing to show for it
+    /// yet — so only artifacts that exist when the approval is asked for are
+    /// reported. Coverage is per step: showing any output of a step shows the
+    /// step.
+    fn bind_artifacts(&mut self, base: &[Edge]) {
+        let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
+        for e in base {
+            if let (Some(&from), Some(&to)) =
+                (self.index.get(e.from.as_str()), self.index.get(e.to.as_str()))
+            {
+                children.entry(from).or_default().push(to);
+            }
+        }
+        let uses = std::mem::take(&mut self.artifact_uses);
+        for a in 0..self.steps.len() {
+            if !self.steps[a].spec.is_some_and(|sp| sp.name == "approval")
+                || !self.shown.iter().any(|(x, _)| *x == a)
+            {
+                continue;
+            }
+            let mut gated: HashSet<usize> = HashSet::new();
+            let mut queue: Vec<usize> = vec![a];
+            while let Some(n) = queue.pop() {
+                for &to in children.get(&n).into_iter().flatten() {
+                    if gated.insert(to) {
+                        queue.push(to);
+                    }
+                }
+            }
+            let shown: HashSet<usize> =
+                self.shown.iter().filter(|(x, _)| *x == a).map(|(_, s)| *s).collect();
+            let name = self.steps[a].name.clone();
+            for (from, prod, out, span) in &uses {
+                if !gated.contains(from) || gated.contains(prod) || shown.contains(prod) {
+                    continue;
+                }
+                let (from, prod) = (self.steps[*from].name.clone(), self.steps[*prod].name.clone());
+                self.err_hint(
+                    Code::UncoveredArtifact,
+                    *span,
+                    format!(
+                        "`{from}` uses `{prod}.{out}` after `{name}` approved, which the approval \
+                         does not show"
+                    ),
+                    format!("add `{prod}.{out}` to `{name}`'s `show:` so the approval binds it"),
+                );
+            }
+        }
+        self.artifact_uses = uses;
+    }
+
     /// A policy check that binds the run's actor: when an agent runs a file
     /// whose policy forbids agents to read secrets, every distinct secret
     /// the run needs is refused once, at its first reference, so the run
@@ -2842,6 +2915,9 @@ impl<'a> Ctx<'a> {
         // Approval gating: an approval that shows S runs before every other
         // consumer of S, except steps the approval (transitively) depends on.
         let base: Vec<Edge> = std::mem::take(&mut self.edges);
+        // What the approval binds: an artifact a step it gates uses has to
+        // be in its `show:`.
+        self.bind_artifacts(&base);
         // Consumers of each step, so an approval finds them without scanning
         // every edge (that scan made checking cubic on approval-heavy files).
         // An `after:` edge is not one: following a step reads nothing of it,
@@ -3325,6 +3401,12 @@ fn bounded_levenshtein(a: &str, b: &str, limit: usize) -> usize {
         std::mem::swap(&mut prev, &mut cur);
     }
     prev[b.len()]
+}
+
+/// The outputs an approval has to bind: a content hash a later step acts
+/// on — an image digest, a saved plan file.
+fn is_artifact(ty: &Type) -> bool {
+    ty.is_named("oci.Digest") || ty.is_named("tofu.PlanFile")
 }
 
 /// Everything that can reach `start` following edges forward: the steps an

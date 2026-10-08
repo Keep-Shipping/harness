@@ -11,24 +11,40 @@
 //!
 //! Resume re-computes two digests rather than trusting the record: `ship.ks`
 //! still hashes to `RunState::file_sha256` ([`resume`]) and the fetched plan
-//! still hashes to [`PlanRef::sha256`] ([`fetch_plan`]). Image digests in
-//! `outputs` are **not** re-verified here — re-binding a published artifact is
-//! the producing port's job (`IacTool::apply` re-hashes the plan it is handed),
-//! and the plan is the only thing crossing the job boundary.
+//! still hashes to [`PlanRef::sha256`] ([`fetch_plan`]). An [`Approval`] is
+//! checked two ways before anything is released through it, and both are made
+//! by [`resume`] against the clock it is given: the approval must not have
+//! expired ([`ResumeError::ApprovalExpired`]), and every artifact it was bound
+//! to must still be held by the run ([`RunState::check_bound`], which
+//! re-derives them with [`recorded_artifacts`](RunState::recorded_artifacts) and so refuses a rebuilt image
+//! or a re-planned plan — a rebuild replaces the approved digest, while an
+//! artifact recorded after the answer adds to what the run holds and
+//! invalidates nothing that was approved). The binding is never passed in by
+//! the caller — an approval records what the run had when the answer arrived,
+//! so "the same artifacts" is a fact about the record rather than a claim a
+//! caller could get wrong.
+//!
+//! Image digests in `outputs` are **not** re-verified here — re-binding a
+//! published artifact is the producing port's job (`IacTool::apply` re-hashes
+//! the plan it is handed), and the plan is the only thing crossing the job
+//! boundary.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use ks_core::ids::RunId;
 use ks_core::ports::BoxFuture;
+use ks_core::ports::approval::{Artifact, ArtifactKind};
 use ks_core::ports::iac::{IacError, SavedPlan};
 use ks_core::ports::state_store::{StateError, StateStore, check_key};
+use ks_core::ports::supply_chain::Digest as ContentDigest;
 
 /// The key the run record is parked under.
 pub const STATE_KEY: &str = "state.json";
@@ -41,6 +57,105 @@ const RECORD_VERSION: u64 = 1;
 /// in the engine, matching what the ports hash with.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// An instant as RFC 3339 (`2023-11-14T22:13:20Z`) — the form every timestamp a
+/// record or a step output carries.
+///
+/// Hand-rolled because a calendar is arithmetic once the leap-year rule is
+/// stated: `civil_from_days` is Howard Hinnant's, and `ks-engine` keeps its
+/// dependencies to the two it already needs.
+pub fn rfc3339(at: SystemTime) -> String {
+    let seconds = at.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let (year, month, day) = civil_from_days((seconds / 86_400) as i64);
+    let rest = seconds % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        (rest % 3600) / 60,
+        rest % 60
+    )
+}
+
+/// The proleptic Gregorian date `days` after 1970-01-01, as `(year, month,
+/// day)`. Era-based, so it never depends on how many days a month has.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_of_year = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_of_year + 2) / 5 + 1;
+    let month = if month_of_year < 10 { month_of_year + 3 } else { month_of_year - 9 };
+    (
+        if month <= 2 { year_of_era + era * 400 + 1 } else { year_of_era + era * 400 },
+        month as u32,
+        day as u32,
+    )
+}
+
+/// The exact inverse of [`civil_from_days`]: days since 1970-01-01 for a
+/// proleptic Gregorian date. Same post, same era arithmetic — the two have to
+/// round-trip, which is why they sit next to each other rather than one of
+/// them being rewritten.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 }.div_euclid(400);
+    let year_of_era = year - era * 400; // [0, 399]
+    let month_of_year = if month > 2 { month - 3 } else { month + 9 }; // [0, 11]
+    let day_of_year = (153 * month_of_year + 2) / 5 + day - 1; // [0, 365]
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// The inverse of [`rfc3339`]: `2023-11-14T22:13:20Z` as a [`SystemTime`].
+///
+/// The UTC `Z` form only, because that is all [`rfc3339`] writes and a record
+/// is read back by the same code that wrote it. `None` for anything else — a
+/// malformed `expires_at` is a decode failure, never a silent default, since
+/// defaulting would turn "the approval's end is unreadable" into "the approval
+/// never expires".
+fn parse_rfc3339(text: &str) -> Option<SystemTime> {
+    let bytes = text.as_bytes();
+    let digits = |range: std::ops::Range<usize>| -> Option<i64> { text.get(range)?.parse().ok() };
+    let laid_out = matches!(bytes.get(4), Some(b'-'))
+        && matches!(bytes.get(7), Some(b'-'))
+        && matches!(bytes.get(10), Some(b'T'))
+        && matches!(bytes.get(13), Some(b':'))
+        && matches!(bytes.get(16), Some(b':'))
+        && matches!(bytes.get(19), Some(b'Z'));
+    if bytes.len() != 20 || !laid_out {
+        return None;
+    }
+    let (year, month, day) = (digits(0..4)?, digits(5..7)?, digits(8..10)?);
+    let (hour, minute, second) = (digits(11..13)?, digits(14..16)?, digits(17..19)?);
+    if !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    // Day-of-month is checked against the month's length, so `2026-02-30` is
+    // refused rather than read as the 2nd of March.
+    let length = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ if is_leap(year) => 29,
+        _ => 28,
+    };
+    if day > length {
+        return None;
+    }
+    let seconds = days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second;
+    if seconds < 0 {
+        return None;
+    }
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds as u64))
+}
+
+/// The proleptic Gregorian leap rule: divisible by 4, except centuries,
+/// except every 400th.
+fn is_leap(year: i64) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 /// A saved plan as the record refers to it: the digest its bytes had when
@@ -66,13 +181,27 @@ pub struct CompletedStep {
     pub plans: Vec<PlanRef>,
 }
 
-/// An approval a run received, bound to the step it unblocks.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// An approval a run received, bound to the step it unblocks **and** to the
+/// exact artifacts it was given for.
+///
+/// The two extra fields are what an approval that expired or was given for a
+/// rebuilt image has to be caught by: an approval is a statement about specific
+/// bytes at a specific time, so both travel with it — through the
+/// [`StateStore`] with everything else, since a parked run is resumed by a
+/// different job. A record written before they existed decodes to no artifacts
+/// and no expiry — see [`RunState::from_json`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Approval {
     /// The step being approved.
     pub step: String,
     /// Who approved it — a handle, an actor from the `RunContext` port.
     pub by: String,
+    /// The exact artifacts the answer was bound to, as
+    /// [`recorded_artifacts`](RunState::recorded_artifacts) derived them when
+    /// it arrived. Empty for an approval recorded without a binding.
+    pub artifacts: Vec<Artifact>,
+    /// When the approval stops being good, as the `expires` it was asked under.
+    pub expires_at: Option<SystemTime>,
 }
 
 /// Why a resume or a plan fetch was refused. Every message names the run and
@@ -94,6 +223,22 @@ pub enum ResumeError {
     /// The step already has output recorded — it ran, so there is nothing left
     /// to approve.
     AlreadyCompleted { run: RunId, step: String },
+    /// The approval a gated step is about to rely on expired before the run
+    /// picked up again.
+    ApprovalExpired { run: RunId, step: String, by: String, expired_at: SystemTime },
+    /// The run holds no approval for the step that gates the artifacts it is
+    /// about to use.
+    NotApproved { run: RunId, step: String },
+    /// An artifact a gated step's approval was bound to is no longer what the
+    /// run holds — a rebuilt image, a re-planned plan.
+    ArtifactsChanged {
+        /// The gate being checked.
+        step: String,
+        /// The digests the approval was bound to.
+        approved: Vec<String>,
+        /// The digests the step is about to use.
+        using: Vec<String>,
+    },
     /// The store itself failed — a full disk, a revoked credential.
     Store { message: String },
     /// The fetched plan could not be turned into something apply accepts.
@@ -135,6 +280,23 @@ impl fmt::Display for ResumeError {
             ResumeError::AlreadyCompleted { run, step } => write!(
                 f,
                 "run {run} already completed {step}; it cannot be waited on or approved again"
+            ),
+            ResumeError::ApprovalExpired { run, step, by, expired_at } => write!(
+                f,
+                "run {run} cannot resume: the approval of {step} by {by} expired at {}; nothing \
+                 was deployed — ask for a new approval",
+                rfc3339(*expired_at)
+            ),
+            ResumeError::NotApproved { run, step } => write!(
+                f,
+                "run {run} holds no approval for {step}; ask for one before the step it gates runs"
+            ),
+            ResumeError::ArtifactsChanged { step, approved, using } => write!(
+                f,
+                "an artifact of {step} was approved and is no longer what the run holds: approved \
+                 [{}], about to use [{}]; nothing was deployed — ask again on the current artifacts",
+                approved.join(", "),
+                using.join(", ")
             ),
             ResumeError::Store { message } => write!(f, "the state store failed: {message}"),
             ResumeError::Plan { message } => {
@@ -230,7 +392,45 @@ impl RunState {
     /// waiting on exactly `step`, so an approval for a step the run has moved
     /// past cannot silently advance it, and with
     /// [`ResumeError::AlreadyCompleted`] for a step that has already run.
+    ///
+    /// The approval is bound to [`recorded_artifacts`](Self::recorded_artifacts)
+    /// as they stand now and never expires; an approval step that was asked
+    /// under an `expires:` records both with
+    /// [`approve_until`](Self::approve_until).
     pub fn approve(&mut self, step: &str, by: impl Into<String>) -> Result<(), ResumeError> {
+        self.record_approval(step, by, None)
+    }
+
+    /// [`approve`](Self::approve), recording that the answer expires `expires`
+    /// after `now`.
+    ///
+    /// The clock is a parameter rather than read here: the engine does not read
+    /// one, so a test can put an expiry in the past without waiting for it.
+    pub fn approve_until(
+        &mut self,
+        step: &str,
+        by: impl Into<String>,
+        expires: Duration,
+        now: SystemTime,
+    ) -> Result<(), ResumeError> {
+        let expires_at = now.checked_add(expires);
+        self.record_approval(step, by, expires_at)
+    }
+
+    /// The body both [`approve`](Self::approve) and
+    /// [`approve_until`](Self::approve_until) share.
+    ///
+    /// What the answer is bound to is *derived* from the record rather than
+    /// passed in: the run's own [`recorded_artifacts`](Self::recorded_artifacts)
+    /// at the moment the answer arrived. A caller that named the list itself
+    /// could bind an approval to something the run never had, and the check at
+    /// resume would then be comparing a lie with a lie.
+    fn record_approval(
+        &mut self,
+        step: &str,
+        by: impl Into<String>,
+        expires_at: Option<SystemTime>,
+    ) -> Result<(), ResumeError> {
         if self.completed.iter().any(|done| done.name == step) {
             return Err(ResumeError::AlreadyCompleted {
                 run: self.run.clone(),
@@ -244,8 +444,94 @@ impl RunState {
                 waiting: self.next.clone(),
             });
         }
-        self.approvals.push(Approval { step: step.to_string(), by: by.into() });
+        let artifacts = self.recorded_artifacts();
+        self.approvals.push(Approval {
+            step: step.to_string(),
+            by: by.into(),
+            artifacts,
+            expires_at,
+        });
         self.next = None;
+        Ok(())
+    }
+
+    /// The artifacts this run has produced: every output value that parses as
+    /// a content digest (an image digest, a chart digest) plus every saved
+    /// plan's sha256. Where a step ran twice — a rebuild — only its latest
+    /// outputs count, so the list follows what the run currently has rather
+    /// than what it ever had.
+    ///
+    /// Sorted by digest, so the same run always derives the same list and a
+    /// comparison never turns on the order outputs happened to be recorded in.
+    pub fn recorded_artifacts(&self) -> Vec<Artifact> {
+        let mut artifacts = Vec::new();
+        for (index, step) in self.completed.iter().enumerate() {
+            // A step that ran twice has two records, and only the later one is
+            // what the run has now: a rebuild supersedes the build before it,
+            // which is exactly the difference the binding has to notice.
+            if self.completed[index + 1..].iter().any(|later| later.name == step.name) {
+                continue;
+            }
+            for (key, value) in &step.outputs {
+                // An output that is not a digest is not an artifact: a version
+                // string or a tag has nothing an approval could bind to.
+                if let Ok(digest) = ContentDigest::parse(value) {
+                    artifacts.push(Artifact::new(ArtifactKind::Other(key.clone()), digest));
+                }
+            }
+            for plan in &step.plans {
+                // A plan's digest is recorded by [`save_plan`], which hashed
+                // the bytes itself, so it always parses.
+                if let Ok(digest) = ContentDigest::sha256_from_hex(&plan.sha256) {
+                    artifacts.push(Artifact::new(ArtifactKind::PlanFile, digest));
+                }
+            }
+        }
+        artifacts.sort_by_key(|artifact| artifact.digest.to_string());
+        artifacts
+    }
+
+    /// Whether the approval of `approval_step` still covers the artifacts this
+    /// run now has — the check [`resume`] makes before it releases anything
+    /// through it.
+    ///
+    /// The binding is a *subset* rule, not equality: every digest the approval
+    /// was given for must still be among the run's. Re-deriving with
+    /// [`recorded_artifacts`](Self::recorded_artifacts) and comparing digests
+    /// catches a rebuilt image or a re-planned plan — a rebuild replaces digest
+    /// A with digest B, so A is gone and this refuses with
+    /// [`ResumeError::ArtifactsChanged`], naming both digest lists and saying
+    /// nothing was deployed. An artifact *added* after the answer does not
+    /// invalidate anything that was approved, which is what lets the step the
+    /// approval granted go on to produce output of its own.
+    pub fn check_bound(&self, approval_step: &str) -> Result<(), ResumeError> {
+        let Some(approval) = self.approvals.iter().find(|approval| approval.step == approval_step)
+        else {
+            return Err(ResumeError::NotApproved {
+                run: self.run.clone(),
+                step: approval_step.to_string(),
+            });
+        };
+        // Digests, not `Artifact`s: the kind is display metadata, and a caller
+        // binding an image it read from `show:` need not use the same label as
+        // the record does.
+        let digests = |artifacts: &[Artifact]| -> Vec<String> {
+            artifacts.iter().map(|artifact| artifact.digest.to_string()).collect()
+        };
+        let approved = digests(&approval.artifacts);
+        let using = digests(&self.recorded_artifacts());
+        // Subset, not equality: what the approval was given for has to still be
+        // there. The gated step may have produced more since — that is the
+        // approval doing its job, not the ground shifting under it — but a
+        // rebuild replaces the approved digest rather than adding to it, and
+        // that is a change the approver never saw.
+        if approved.iter().any(|digest| !using.contains(digest)) {
+            return Err(ResumeError::ArtifactsChanged {
+                step: approval_step.to_string(),
+                approved,
+                using,
+            });
+        }
         Ok(())
     }
 
@@ -268,8 +554,15 @@ impl RunState {
                 "plans": step.plans.iter().map(|p| json!({ "step": p.step, "sha256": p.sha256 }))
                     .collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
-            "approvals": self.approvals.iter().map(|a| json!({ "step": a.step, "by": a.by }))
-                .collect::<Vec<_>>(),
+            "approvals": self.approvals.iter().map(|a| json!({
+                "step": a.step,
+                "by": a.by,
+                "artifacts": a.artifacts.iter().map(|artifact| json!({
+                    "kind": artifact_kind(&artifact.kind),
+                    "digest": artifact.digest.to_string(),
+                })).collect::<Vec<_>>(),
+                "expires_at": a.expires_at.map(rfc3339),
+            })).collect::<Vec<_>>(),
             "next": self.next,
         })
     }
@@ -338,8 +631,26 @@ impl RunState {
             .collect::<Result<Vec<_>, ResumeError>>()?;
         let approvals: Vec<Approval> = list("approvals")
             .iter()
-            .map(|a| Approval { step: text(a, "step"), by: text(a, "by") })
-            .collect();
+            .map(|a| {
+                Ok(Approval {
+                    step: text(a, "step"),
+                    by: text(a, "by"),
+                    artifacts: artifacts_of(a.get("artifacts"))
+                        .map_err(|reason| bad(format!("an approval's `artifacts`: {reason}")))?,
+                    expires_at: match a.get("expires_at") {
+                        // Absent or null: a record written before approvals
+                        // carried an expiry, which is one that never expires.
+                        None | Some(Value::Null) => None,
+                        Some(value) => {
+                            let at = value.as_str().unwrap_or_default();
+                            Some(parse_rfc3339(at).ok_or_else(|| {
+                                bad(format!("`expires_at` is {at:?}, not an RFC 3339 instant"))
+                            })?)
+                        }
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, ResumeError>>()?;
         // Read before `run` moves into the record: the closures above borrow it.
         let file_sha256 = required("file_sha256")?;
         let event = required("event")?;
@@ -361,6 +672,53 @@ impl RunState {
 /// leaf fields of a plan ref and an approval.
 fn text(value: &Value, name: &str) -> String {
     value.get(name).and_then(Value::as_str).unwrap_or_default().to_string()
+}
+
+/// An [`ArtifactKind`] as one string, so a record carries the discriminant and
+/// `Other`'s name without the two being told apart by how they are spelled.
+fn artifact_kind(kind: &ArtifactKind) -> String {
+    match kind {
+        ArtifactKind::PlanFile => "PlanFile".to_string(),
+        ArtifactKind::Image => "Image".to_string(),
+        ArtifactKind::Other(name) => format!("other:{name}"),
+    }
+}
+
+/// The [`ArtifactKind`] [`artifact_kind`] wrote; `None` for anything else, so
+/// a record from a build that speaks another vocabulary is refused rather than
+/// read as a kind it never meant.
+fn parse_artifact_kind(text: &str) -> Option<ArtifactKind> {
+    match text {
+        "PlanFile" => Some(ArtifactKind::PlanFile),
+        "Image" => Some(ArtifactKind::Image),
+        _ => text.strip_prefix("other:").map(|name| ArtifactKind::Other(name.to_string())),
+    }
+}
+
+/// The artifacts an approval is bound to. Absent decodes to none — a record
+/// parked before the binding existed binds nothing — while a list that does not
+/// read as artifacts is a decode error rather than a silently emptied one.
+fn artifacts_of(value: Option<&Value>) -> Result<Vec<Artifact>, String> {
+    let entries = match value {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(value) => value.as_array().ok_or("`artifacts` is not a list")?,
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            let kind = entry
+                .get("kind")
+                .and_then(Value::as_str)
+                .and_then(parse_artifact_kind)
+                .ok_or("an artifact has no `kind` this build reads")?;
+            let digest = entry
+                .get("digest")
+                .and_then(Value::as_str)
+                .and_then(|at| ContentDigest::parse(at).ok())
+                .ok_or("an artifact has no `digest` this build reads")?;
+            Ok(Artifact::new(kind, digest))
+        })
+        .collect()
 }
 
 /// The string map in `value`. A non-string entry is a decode error, not
@@ -411,13 +769,31 @@ pub async fn park(store: &dyn StateStore, state: &RunState) -> Result<(), Resume
     Ok(())
 }
 
-/// Loads `run`'s parked record and re-verifies its binding:
-/// [`ResumeError::NotFound`] if nothing is parked, [`ResumeError::FileChanged`]
-/// if `ship_ks_source` no longer hashes to the recorded digest.
+/// Loads `run`'s parked record and re-verifies its binding: nothing parked is
+/// [`ResumeError::NotFound`], a `ship_ks_source` that no longer hashes to
+/// [`RunState::file_sha256`] is [`ResumeError::FileChanged`], and an approval
+/// that has expired or no longer covers what the run holds is refused — see
+/// [`resume_at`], which this is.
 pub async fn resume(
     store: &dyn StateStore,
     run: &RunId,
     ship_ks_source: &[u8],
+) -> Result<RunState, ResumeError> {
+    resume_at(store, run, ship_ks_source, SystemTime::now()).await
+}
+
+/// [`resume`], deciding expiry against `now` instead of the wall clock, so a
+/// test can put an approval's expiry in the past without waiting for it.
+///
+/// Expiry is judged here rather than when the approval was recorded, because
+/// the two happen in different jobs: an answer given at 09:00 for one hour is
+/// still good when the run picks up at 09:30 and is not at 10:01, and only the
+/// resume knows which.
+pub async fn resume_at(
+    store: &dyn StateStore,
+    run: &RunId,
+    ship_ks_source: &[u8],
+    now: SystemTime,
 ) -> Result<RunState, ResumeError> {
     let bytes = store
         .get(run, STATE_KEY)
@@ -440,6 +816,25 @@ pub async fn resume(
     }
     if state.run != *run {
         return Err(undecodable(run, format!("the record is for run {} instead", state.run)));
+    }
+    for approval in &state.approvals {
+        // Expiry before binding: an approval that ran out of time is refused
+        // for that reason whatever the run now holds, and the message names
+        // the time it lapsed.
+        if let Some(expired_at) = approval.expires_at
+            && now >= expired_at
+        {
+            return Err(ResumeError::ApprovalExpired {
+                run: run.clone(),
+                step: approval.step.clone(),
+                by: approval.by.clone(),
+                expired_at,
+            });
+        }
+        // The step name is cloned so the borrow of `approvals` does not reach
+        // into `check_bound`'s `&self`.
+        let step = approval.step.clone();
+        state.check_bound(&step)?;
     }
     Ok(state)
 }
@@ -615,6 +1010,28 @@ mod tests {
         state
     }
 
+    /// A `sha256:` digest as an output value would be reported in.
+    fn digest_of(hex: char) -> String {
+        format!("sha256:{}", hex.to_string().repeat(64))
+    }
+
+    /// A run parked at `at`, having built an image with digest `hex`.
+    fn a_run_that_built(hex: char) -> RunState {
+        let mut state = RunState::new(RunId::from_parts(0, 1), b"ship.ks", "push");
+        state.record(CompletedStep {
+            name: "build".to_string(),
+            outputs: BTreeMap::from([
+                ("digest".to_string(), digest_of(hex)),
+                // Not a digest: a tag is mutable policy, not an artifact an
+                // approval could bind to, so it contributes nothing.
+                ("tag".to_string(), "v1".to_string()),
+            ]),
+            plans: Vec::new(),
+        });
+        state.park_at("review").expect("the run parks at the approval");
+        state
+    }
+
     #[test]
     fn a_record_round_trips_and_only_the_parked_step_can_be_approved() {
         let mut state = a_run();
@@ -622,7 +1039,17 @@ mod tests {
         state.park_at("tofu.apply").expect("the run parks at a step it has not run");
         assert!(state.approve("tofu.plan", "ada").is_err(), "a completed step cannot be approved");
         state.approve("tofu.apply", "ada").expect("the run is parked there");
-        assert_eq!(state.approvals, vec![Approval { step: "tofu.apply".into(), by: "ada".into() }]);
+        assert_eq!(
+            state.approvals,
+            vec![Approval {
+                step: "tofu.apply".into(),
+                by: "ada".into(),
+                // `approve` binds what the run has and never expires; the
+                // `expires_at` shape matters more than its value here.
+                artifacts: state.recorded_artifacts(),
+                expires_at: None,
+            }]
+        );
         assert_eq!(state.next, None);
         assert!(state.approve("tofu.apply", "grace").is_err(), "already approved");
         assert!(state.approve("deploy", "grace").is_err(), "wrong step");
@@ -654,6 +1081,185 @@ mod tests {
             [(value, "version 2"), (json!({"version": 1}), "`run`"), (json!({}), "`version`")]
         {
             assert!(RunState::from_json(&value).unwrap_err().to_string().contains(expected));
+        }
+    }
+
+    #[test]
+    fn an_approval_is_bound_to_what_the_run_had_when_it_was_given() {
+        let mut state = a_run_that_built('a');
+        state.approve("review", "ada").expect("the run is parked at the approval");
+
+        // The binding is derived from the record, not supplied by the caller,
+        // so it is exactly what the run held at that moment — and a tag, which
+        // is not a digest, is not in it.
+        assert_eq!(state.approvals[0].artifacts, state.recorded_artifacts());
+        assert_eq!(state.approvals[0].artifacts.len(), 1, "the image digest and nothing else");
+        assert_eq!(
+            state.approvals[0].artifacts[0].digest.to_string(),
+            digest_of('a'),
+            "the digest the approval is bound to"
+        );
+        assert_eq!(state.approvals[0].expires_at, None, "`approve` records no expiry");
+    }
+
+    #[test]
+    fn a_rebuild_after_the_approval_refuses_the_deploy() {
+        let mut state = a_run_that_built('a');
+        state.approve("review", "ada").expect("the run is parked at the approval");
+
+        // The same step name, a new digest: a rebuild. Only the later record
+        // counts, so the run now holds image b and no longer the image that
+        // was approved. The binding asks whether a is still there, and it is
+        // not — a rebuild replaces what was approved rather than adding to it.
+        state.record(CompletedStep {
+            name: "build".to_string(),
+            outputs: BTreeMap::from([("digest".to_string(), digest_of('b'))]),
+            plans: Vec::new(),
+        });
+
+        let error = state.check_bound("review").expect_err("the image was rebuilt");
+        assert!(matches!(error, ResumeError::ArtifactsChanged { .. }), "{error:?}");
+        let message = error.to_string();
+        for fragment in ["review", &digest_of('a'), &digest_of('b'), "nothing was deployed"] {
+            assert!(message.contains(fragment), "{fragment} missing from {message}");
+        }
+        // Both lists are named, so whoever reads the refusal can see which is
+        // which without re-deriving anything.
+        assert!(message.contains("ask again"), "{message}");
+    }
+
+    #[test]
+    fn an_artifact_the_approval_granted_the_run_to_produce_does_not_invalidate_it() {
+        let mut state = a_run_that_built('a');
+        state.approve("review", "ada").expect("the run is parked at the approval");
+
+        // The step the approval unblocks then produces output of its own — the
+        // receipt, the digest of what it pushed. Adding to what the run holds
+        // takes nothing away from what was approved, so the binding is
+        // untouched and the multi-stage run carries on rather than refusing a
+        // deploy the approver asked for.
+        state.record(CompletedStep {
+            name: "deploy".to_string(),
+            outputs: BTreeMap::from([("receipt".to_string(), digest_of('c'))]),
+            plans: Vec::new(),
+        });
+
+        assert!(state.check_bound("review").is_ok(), "the approved image is still held");
+        assert!(
+            state.recorded_artifacts().iter().any(|a| a.digest.to_string() == digest_of('c')),
+            "and the new artifact really is one the run holds"
+        );
+    }
+
+    #[test]
+    fn a_rebuild_after_the_approval_refuses_the_deploy_however_much_the_run_added_since() {
+        let mut state = a_run_that_built('a');
+        state.approve("review", "ada").expect("the run is parked at the approval");
+
+        // Both at once: the build runs again for another image *and* the gated
+        // step records its own artifact. The extra artifact does not rescue
+        // the run, because a is still the digest that went missing.
+        state.record(CompletedStep {
+            name: "build".to_string(),
+            outputs: BTreeMap::from([("digest".to_string(), digest_of('b'))]),
+            plans: Vec::new(),
+        });
+        state.record(CompletedStep {
+            name: "deploy".to_string(),
+            outputs: BTreeMap::from([("receipt".to_string(), digest_of('c'))]),
+            plans: Vec::new(),
+        });
+
+        let error = state.check_bound("review").expect_err("the approved image is gone");
+        assert!(matches!(error, ResumeError::ArtifactsChanged { .. }), "{error:?}");
+        match &error {
+            ResumeError::ArtifactsChanged { step, approved, using } => {
+                assert_eq!(step, "review");
+                assert_eq!(approved, &[digest_of('a')], "what was approved");
+                // The run holds b and c, and names both, so the reader can see
+                // that adding to the list did not bring a back.
+                assert_eq!(using, &[digest_of('b'), digest_of('c')].map(String::from));
+            }
+            other => panic!("a rebuilt image must be ArtifactsChanged, got {other:?}"),
+        }
+        let message = error.to_string();
+        for fragment in ["review", &digest_of('a'), "nothing was deployed", "ask again"] {
+            assert!(message.contains(fragment), "{fragment} missing from {message}");
+        }
+    }
+
+    #[test]
+    fn a_step_with_no_approval_is_not_approved() {
+        let state = a_run_that_built('a');
+        let error = state.check_bound("review").expect_err("nothing was approved");
+        assert!(matches!(error, ResumeError::NotApproved { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains("review") && message.contains("ask for one"), "{message}");
+    }
+
+    #[test]
+    fn the_binding_and_the_expiry_survive_being_parked() {
+        let expires = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let mut state = a_run_that_built('a');
+        state
+            .approve_until("review", "ada", Duration::from_secs(3600), SystemTime::UNIX_EPOCH)
+            .expect("the run is parked at the approval");
+        // An adapter-named kind, whose name is only in the string, so the
+        // round trip has to carry it or the artifact comes back anonymous.
+        state.approvals[0].artifacts.push(Artifact::new(
+            ArtifactKind::Other("sbom".to_string()),
+            ContentDigest::sha256_from_hex(&"b".repeat(64)).expect("64 hex digits"),
+        ));
+        state.approvals[0].expires_at = Some(expires);
+
+        let decoded = RunState::from_json(&state.to_json()).expect("the record decodes");
+        assert_eq!(decoded.approvals[0].artifacts, state.approvals[0].artifacts, "the binding");
+        assert_eq!(decoded.approvals[0].expires_at, Some(expires), "the expiry");
+        assert_eq!(
+            decoded.approvals[0].artifacts.last().map(|a| &a.kind),
+            Some(&ArtifactKind::Other("sbom".to_string())),
+            "the adapter's own name survives being parked"
+        );
+    }
+
+    #[test]
+    fn a_record_parked_before_the_binding_existed_still_decodes() {
+        // What a build without `artifacts`/`expires_at` wrote. It must decode
+        // cleanly rather than refuse: a run parked under an older build is
+        // still a run.
+        let mut value = a_run().to_json();
+        value["approvals"] = json!([{ "step": "review", "by": "ada" }]);
+        let decoded = RunState::from_json(&value).expect("an older record still decodes");
+        assert_eq!(decoded.approvals[0].step, "review");
+        assert_eq!(decoded.approvals[0].by, "ada");
+        assert!(decoded.approvals[0].artifacts.is_empty(), "no binding was recorded");
+        assert_eq!(decoded.approvals[0].expires_at, None, "and no expiry");
+
+        // An expiry that does not parse is a different matter: defaulting it
+        // to None would turn an unreadable end into "never expires".
+        value["approvals"] = json!([{ "step": "review", "by": "ada", "expires_at": "soon" }]);
+        let error = RunState::from_json(&value).expect_err("a malformed expiry");
+        assert!(matches!(error, ResumeError::Decode { .. }), "{error:?}");
+        assert!(error.to_string().contains("expires_at"), "{error}");
+    }
+
+    #[test]
+    fn rfc3339_reads_back_what_it_wrote() {
+        // The parser exists to undo the writer, so it is tested against the
+        // writer rather than against hand-written stamps.
+        for seconds in [0u64, 1, 86_399, 86_400, 951_782_400, 1_788_000_000] {
+            let at = SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
+            assert_eq!(parse_rfc3339(&rfc3339(at)), Some(at), "{}", rfc3339(at));
+        }
+        // A leap day, the case a hand-rolled calendar gets wrong first, and
+        // 30 February, which is not a date at all.
+        let leap = SystemTime::UNIX_EPOCH + Duration::from_secs(1_709_164_800);
+        assert_eq!(rfc3339(leap), "2024-02-29T00:00:00Z");
+        assert_eq!(parse_rfc3339("2024-02-29T00:00:00Z"), Some(leap));
+        assert_eq!(parse_rfc3339("2023-02-29T00:00:00Z"), None, "2023 was not a leap year");
+        assert_eq!(parse_rfc3339("2026-04-31T00:00:00Z"), None, "April has 30 days");
+        for bad in ["", "2026-10-08", "2026-10-08 00:00:00Z", "2026-10-08T00:00:00+01:00", "soon"] {
+            assert_eq!(parse_rfc3339(bad), None, "{bad:?} is not an instant");
         }
     }
 

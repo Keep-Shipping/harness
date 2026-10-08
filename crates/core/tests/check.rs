@@ -1514,3 +1514,46 @@ fn a_module_nobody_read_says_nothing() {
     let src = SCRIPT.replace("oci.image", "oci.verify");
     assert!(!check_script(&src, &[("rows", ks_core::Tag::Int)]).diagnostics.is_empty());
 }
+
+#[test]
+fn an_artifact_a_gated_step_uses_must_be_in_the_approval_that_gates_it() {
+    // The approval shows the plan and nothing else, yet `deploy` runs after it
+    // and acts on an image digest the approver never saw: the thing being
+    // rolled out is not the thing that was approved (KS0702).
+    let ungated = "\
+steps:
+  plan: tofu.plan
+    dir: ./infra
+  build: oci.image
+    from: ./Dockerfile
+  review: approval
+    show: plan.changes
+    from: @platform
+  deploy: k8s.rollout
+    image: build.digest
+    after: review
+";
+    let checked = check(&ks_lang::parse(ungated));
+    assert!(
+        checked.diagnostics.iter().any(|d| d.code == ks_lang::Code::UncoveredArtifact),
+        "KS0702 fires: {:#?}",
+        checked.diagnostics
+    );
+    let reported = errors(ungated);
+    assert!(
+        reported.iter().any(|e| e.contains("`deploy` uses `build.digest`")
+            && e.contains("`review`")
+            && e.contains("add `build.digest` to `review`'s `show:`")),
+        "{reported:?}"
+    );
+
+    // The same workflow with the digest in `show:` covers it, and nothing is
+    // reported.
+    let covered = ungated.replace("show: plan.changes", "show: plan.changes, build.digest");
+    assert!(errors(&covered).is_empty(), "{:?}", errors(&covered));
+
+    // Showing *any* output of `build` covers the step, so `build.tag` would
+    // do — coverage is per step, not per output.
+    let by_other_output = ungated.replace("show: plan.changes", "show: plan.changes, build.tag");
+    assert!(errors(&by_other_output).is_empty(), "{:?}", errors(&by_other_output));
+}
