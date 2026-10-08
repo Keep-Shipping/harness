@@ -50,10 +50,11 @@ metadata. Git stays where git is good — history, review, branching a block —
 and the OCI artifact is what a workflow file consumes.
 
 - **A reference in `ship.ks` is a name and a version**, spelled the way the
-  site spells it: `acme/web-service@v3`, or `@3.1` for a minor, or
-  `@3.1.0` for an exact one. A block with no `@` at all is the one failure
-  we refuse rather than default — there is no `latest` for a block, because
-  the whole pitch is that a repository pins.
+  site spells it: `acme/web-service@v3`, or `@3.1.0` for an exact one. (The
+  partial `@3.1` is not a spelling this ADR settles; the settled set and its
+  meaning are in [`docs/LOCKFILE.md`](../LOCKFILE.md).) A block with no `@` at
+  all is the one failure we refuse rather than default — there is no `latest`
+  for a block, because the whole pitch is that a repository pins.
 - **The name resolves to a repository through configured mappings**, not by
   guessing: `acme/web-service` becomes
   `ghcr.io/acme/blocks/web-service` under the default mapping of "the
@@ -180,7 +181,11 @@ and the OCI artifact is what a workflow file consumes.
   ([#149](https://github.com/Keep-Shipping/harness/issues/149)), the exact
   spelling of the `blocks:` configuration section, and the precise semantics
   of version constraints — whether `@v3` means the highest 3.x or a
-  prerelease-aware range. Those are the follow-up work this ADR unblocks:
+  prerelease-aware range. Those semantics are now settled, in
+  [`docs/LOCKFILE.md`](../LOCKFILE.md): `@v3` is the highest release of that
+  major and never a prerelease, `@3.1.2` is exact, and `@sha256:…` pins the
+  content; the format that records them is `lock = 1`. Where a block lives is
+  still open, and stays the follow-up work this ADR unblocks,
   [#79](https://github.com/Keep-Shipping/harness/issues/79), to be settled
   against what publishers actually tag. A reference that resolves to no
   published version is a `check` error naming what it looked for.

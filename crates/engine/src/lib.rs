@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod attestation;
+pub mod blocks;
 pub mod cache;
 pub mod exec;
 pub mod journal;
