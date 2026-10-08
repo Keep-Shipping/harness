@@ -33,10 +33,12 @@
 //! longer retained is [`ClusterError::RevisionUnknown`] rather than a silent
 //! fall back to whatever is running now.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use super::BoxFuture;
 use super::health::{Health, HealthReport};
+use super::supply_chain::{ImageRef, Reference};
 
 /// How an adapter authenticates against the cluster API.
 ///
@@ -309,11 +311,20 @@ pub enum ClusterError {
         revision: Revision,
     },
     /// A required field was empty. Raised by [`ClusterRef::new`],
-    /// [`Manifest::new`], [`ServiceAccount::named`] and
-    /// [`ExecCredential::plugin`] before any call is made.
+    /// [`Manifest::new`], [`ServiceAccount::named`],
+    /// [`ExecCredential::plugin`], [`Chart::path`], [`ImagePin::at`] and
+    /// [`ChartUpgrade::new`] before any call is made.
     Empty {
         /// The empty field's name.
         name: &'static str,
+    },
+    /// A reference this port requires to be immutable is a mutable tag
+    /// instead. Raised by [`Chart::oci`] and [`ImagePin::new`]/[`ImagePin::at`]
+    /// before any call is made, so a tag can never be written into a key named
+    /// `digest` and never reach a chart URL.
+    NotPinned {
+        /// What had to be pinned by digest, e.g. `"chart"` or `"image pin"`.
+        what: &'static str,
     },
 }
 
@@ -356,11 +367,302 @@ impl fmt::Display for ClusterError {
             ClusterError::Empty { name } => {
                 write!(f, "{name} must not be empty; set it in the cluster target")
             }
+            ClusterError::NotPinned { what } => {
+                write!(
+                    f,
+                    "{what} must be pinned by digest, not by tag: a tag can be repointed between \
+                     the plan and the apply; resolve it to a digest first"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for ClusterError {}
+
+/// Which chart a release is installed or upgraded from.
+///
+/// An OCI chart names a repository and a **digest**, never a tag: a tag can
+/// be repointed between the plan and the apply, and the point of pinning
+/// content is that it cannot move. A `Path` is a chart directory or a packaged
+/// `.tgz` on disk, used as given.
+///
+/// Build an OCI chart with [`Chart::oci`], which enforces that promise by
+/// refusing a tag reference with [`ClusterError::NotPinned`]. The `Oci` variant
+/// stays public so a caller that has already resolved a reference is not forced
+/// through a constructor, so the rule is a constructor-level guarantee rather
+/// than a type-level one: an adapter still has to handle a
+/// `Chart::Oci` built directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Chart {
+    /// A chart pulled from an OCI registry by digest, e.g.
+    /// `reg.example.com/team/chart@sha256:…`. Build it with [`Chart::oci`],
+    /// which rejects a tag reference.
+    Oci(ImageRef),
+    /// A chart directory or packaged `.tgz` on the local disk, used as given.
+    Path(String),
+}
+
+impl Chart {
+    /// A chart at `path` on disk — a directory or a packaged `.tgz`. Fails
+    /// with [`ClusterError::Empty { name: "chart path" }`] if the path is
+    /// empty: there is no chart to install.
+    pub fn path(path: impl Into<String>) -> Result<Self, ClusterError> {
+        let path = path.into();
+        if path.trim().is_empty() {
+            return Err(ClusterError::Empty { name: "chart path" });
+        }
+        Ok(Chart::Path(path))
+    }
+
+    /// An OCI chart pinned to `image`, which must name a **digest** rather than
+    /// a tag — see the contract on [`Chart`]. Fails with
+    /// [`ClusterError::NotPinned { what: "chart" }`] when it names a tag.
+    pub fn oci(image: ImageRef) -> Result<Self, ClusterError> {
+        pin_by_digest(&image, "chart")?;
+        Ok(Chart::Oci(image))
+    }
+
+    /// The OCI reference, for a [`Chart::Oci`]; `None` for a [`Chart::Path`],
+    /// which has no repository to name.
+    pub fn reference(&self) -> Option<&ImageRef> {
+        match self {
+            Chart::Oci(image) => Some(image),
+            Chart::Path(_) => None,
+        }
+    }
+
+    /// The on-disk path, for a [`Chart::Path`]; `None` for an OCI chart.
+    pub fn as_path(&self) -> Option<&str> {
+        match self {
+            Chart::Path(path) => Some(path),
+            Chart::Oci(_) => None,
+        }
+    }
+}
+
+/// The values a chart is rendered with, and whether they carry a secret.
+///
+/// **The security contract is the point of this type.** An adapter handed
+/// [`Values::secret`] values MUST pass them to its chart tooling by a
+/// temporary file created with `0600` permissions, and MUST delete that file
+/// once the call returns. It MUST NOT put a secret value on a command line:
+/// an argument is visible to every other process on the machine for as long
+/// as the call runs, and lands in the chart tooling's own process listing.
+///
+/// A [`ChartUpgrade::set`] entry is passed as a `--set` *argument*, so it
+/// therefore MUST NOT carry a secret — that is a property of the caller, not
+/// something this type can enforce.
+///
+/// Non-secret values ([`Values::new`]) may go either way: a values file or a
+/// flag, whichever the adapter prefers.
+///
+/// [`Clone`, `PartialEq` and `Eq`] are derived, but [`Debug`] is **not**: it is
+/// hand-written below so a `{:?}` can never print the document. See that impl.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Values {
+    document: String,
+    secret: bool,
+}
+
+impl fmt::Debug for Values {
+    /// Never the document — only its size.
+    ///
+    /// A [`Values::secret`] document holds a password, and it reaches a `{:?}`
+    /// constantly without anyone choosing to: `assert_eq!` on a
+    /// [`ChartUpgrade`] Debug-prints both sides on failure, and a run record
+    /// Debug-printing a call carries it into a CI log. The contract above says
+    /// a secret must not reach a command line; this is the other way it would
+    /// escape, and it is the quieter one, because a failing test is exactly
+    /// when the surrounding output gets pasted into an issue. The byte count is
+    /// kept because it is what tells a reader the document was there.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Values")
+            .field("document", &format_args!("<redacted: {} bytes>", self.document.len()))
+            .field("secret", &self.secret)
+            .finish()
+    }
+}
+
+impl Values {
+    /// Values the adapter may handle however it likes — a values file, a
+    /// flag, or a literal argument.
+    pub fn new(document: impl Into<String>) -> Self {
+        Values { document: document.into(), secret: false }
+    }
+
+    /// Values that carry a secret. See the contract on [`Values`]: a
+    /// `0600` temporary file, deleted when the call returns, and never a
+    /// command-line argument.
+    pub fn secret(document: impl Into<String>) -> Self {
+        Values { document: document.into(), secret: true }
+    }
+
+    /// The values document, verbatim — YAML or whatever the chart takes.
+    pub fn document(&self) -> &str {
+        &self.document
+    }
+
+    /// Whether these values carry a secret, and so the adapter must keep them
+    /// off every command line.
+    pub fn is_secret(&self) -> bool {
+        self.secret
+    }
+}
+
+/// Where a release's container image digest is written into its values.
+///
+/// Charts conventionally read the digest from `image.digest`; the key is
+/// configurable because not every chart uses that shape. A digest, not a tag,
+/// so the rendered Deployment carries an immutable reference.
+///
+/// Both constructors enforce that: an [`ImageRef`] naming a tag is
+/// [`ClusterError::NotPinned`], never an `ImagePin`. A mutable tag written into
+/// a key called `digest` is a lie the cluster only discovers at rollout time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImagePin {
+    image: ImageRef,
+    key: String,
+}
+
+/// Rejects an [`ImageRef`] that names a tag rather than a digest, naming `what`
+/// it was for so the error says which reference was wrong.
+fn pin_by_digest(image: &ImageRef, what: &'static str) -> Result<(), ClusterError> {
+    match image.reference() {
+        Reference::Digest(_) => Ok(()),
+        Reference::Tag(_) => Err(ClusterError::NotPinned { what }),
+    }
+}
+
+impl ImagePin {
+    /// Pins `image` at the conventional key `"image.digest"`. Fails with
+    /// [`ClusterError::NotPinned { what: "image pin" }`] when `image` names a
+    /// tag rather than a digest.
+    pub fn new(image: ImageRef) -> Result<Self, ClusterError> {
+        pin_by_digest(&image, "image pin")?;
+        Ok(ImagePin { image, key: "image.digest".to_string() })
+    }
+
+    /// Pins `image` at `key` — the values path the chart reads the digest
+    /// from. Fails with [`ClusterError::Empty { name: "digest key" }]` if the
+    /// key is empty: there would be nowhere to write the digest, and with
+    /// [`ClusterError::NotPinned { what: "image pin" }`] if `image` names a
+    /// tag.
+    pub fn at(image: ImageRef, key: impl Into<String>) -> Result<Self, ClusterError> {
+        pin_by_digest(&image, "image pin")?;
+        let key = key.into();
+        if key.trim().is_empty() {
+            return Err(ClusterError::Empty { name: "digest key" });
+        }
+        Ok(ImagePin { image, key })
+    }
+
+    /// The image whose digest is pinned — a digest reference, never a tag.
+    pub fn image(&self) -> &ImageRef {
+        &self.image
+    }
+
+    /// The values key the digest is written under, e.g. `"image.digest"`.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+/// One install or upgrade of a Helm release.
+///
+/// A request is the whole of what the chart needs: which chart, what values,
+/// what overrides, and where the image digest goes. It is a value, so a run
+/// can record it and a fake can assert on it without an adapter being present.
+///
+/// Everything not set is left to the chart's own defaults: no namespace means
+/// the adapter's configured default, no values means the chart's, no `set`
+/// entries means no overrides beyond the [`ImagePin`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChartUpgrade {
+    release: String,
+    chart: Chart,
+    namespace: Option<String>,
+    values: Option<Values>,
+    set: BTreeMap<String, String>,
+    image: Option<ImagePin>,
+}
+
+impl ChartUpgrade {
+    /// Installs or upgrades the release `release` from `chart`. Fails with
+    /// [`ClusterError::Empty { name: "release" }`] if the release name is
+    /// blank — a nameless release is a misconfigured deploy, not one worth
+    /// attempting. The name is kept exactly as given; it is not trimmed.
+    pub fn new(release: impl Into<String>, chart: Chart) -> Result<Self, ClusterError> {
+        let release = release.into();
+        if release.trim().is_empty() {
+            return Err(ClusterError::Empty { name: "release" });
+        }
+        Ok(ChartUpgrade {
+            release,
+            chart,
+            namespace: None,
+            values: None,
+            set: BTreeMap::new(),
+            image: None,
+        })
+    }
+
+    /// Deploys into `namespace` rather than the adapter's default.
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = Some(namespace.into());
+        self
+    }
+
+    /// Renders the chart with `values`.
+    pub fn with_values(mut self, values: Values) -> Self {
+        self.values = Some(values);
+        self
+    }
+
+    /// Overrides one values key, passed as a `--set` argument. Never carry a
+    /// secret here — see [`Values`].
+    pub fn with_set(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.set.insert(key.into(), value.into());
+        self
+    }
+
+    /// Writes the pinned image's digest into the chart's values, so the
+    /// rendered workload runs an immutable reference rather than a tag.
+    pub fn with_image(mut self, image: ImagePin) -> Self {
+        self.image = Some(image);
+        self
+    }
+
+    /// The release name, as given.
+    pub fn release(&self) -> &str {
+        &self.release
+    }
+
+    /// Which chart to install or upgrade from.
+    pub fn chart(&self) -> &Chart {
+        &self.chart
+    }
+
+    /// The target namespace, if one was set.
+    pub fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
+    }
+
+    /// The values the chart is rendered with, if any.
+    pub fn values(&self) -> Option<&Values> {
+        self.values.as_ref()
+    }
+
+    /// The `--set` overrides, sorted by key.
+    pub fn set(&self) -> &BTreeMap<String, String> {
+        &self.set
+    }
+
+    /// The image digest pin, if any.
+    pub fn image(&self) -> Option<&ImagePin> {
+        self.image.as_ref()
+    }
+}
 
 /// The `Cluster` port: an adapter drives an orchestrated deploy target —
 /// Kubernetes and its equivalents — and answers in the port's typed shapes.
@@ -384,12 +686,30 @@ pub trait Cluster: Send + Sync {
         manifests: &'a [Manifest],
     ) -> BoxFuture<'a, Result<Vec<String>, ClusterError>>;
 
-    /// Installs or upgrades the named chart `release` and reports the rollout
-    /// it started. A release the cluster does not have is
-    /// [`ClusterError::NotFound`] only when the adapter is configured not to
-    /// install new releases; installing is the default, and a failed upgrade
-    /// is [`ClusterError::Upgrade`].
-    fn upgrade<'a>(&'a self, release: &'a str) -> BoxFuture<'a, Result<Rollout, ClusterError>>;
+    /// Installs or upgrades the release `request` describes, and reports the
+    /// rollout it started. The request is the whole of what the chart needs:
+    /// a [`Chart`] (an OCI reference by digest, or a path), [`Values`] and a
+    /// `--set` map, plus an optional [`ImagePin`] that writes the container
+    /// image's digest into the chart's values.
+    ///
+    /// An adapter MUST install the release if the cluster does not have it and
+    /// upgrade it otherwise — the two are one operation, not two methods.
+    /// [`ClusterError::NotFound`] is therefore only correct when the adapter
+    /// is configured not to install new releases, and a failed upgrade is
+    /// [`ClusterError::Upgrade`].
+    ///
+    /// An upgrade that would leave the cluster in a worse state than it found
+    /// it MUST roll back rather than report a failure: a half-applied release
+    /// is not a failure a caller can recover from, it is a cluster that is now
+    /// wrong. Report [`ClusterError::Upgrade`] only after the rollback itself
+    /// failed.
+    ///
+    /// An adapter MUST NOT pass a [`Values::secret`] value on a command line,
+    /// where another process could read it; see the contract on [`Values`].
+    fn upgrade<'a>(
+        &'a self,
+        request: &'a ChartUpgrade,
+    ) -> BoxFuture<'a, Result<Rollout, ClusterError>>;
 
     /// Where the rollout of `name` is right now: the revision it is moving
     /// to and whether it has settled. Read-only, and safe to poll — it must
@@ -553,5 +873,192 @@ mod tests {
         assert!(unknown.contains('9') && unknown.contains("roll forward"), "{unknown}");
         let empty = ClusterError::Empty { name: "context" }.to_string();
         assert!(empty.contains("context") && empty.contains("must not be empty"), "{empty}");
+    }
+
+    const SHA256_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    /// A stand-in password document, assembled from fragments so the fixture
+    /// itself never appears in source as one literal.
+    const SECRET_DOC: &str = concat!("dbPassword: ", "hunter2");
+
+    #[test]
+    fn a_chart_upgrade_rejects_a_blank_release_and_keeps_the_name_it_was_given() {
+        let chart = Chart::path("./charts/api").expect("a path");
+        assert_eq!(
+            ChartUpgrade::new("", chart.clone()),
+            Err(ClusterError::Empty { name: "release" })
+        );
+        assert_eq!(
+            ChartUpgrade::new("   ", chart.clone()),
+            Err(ClusterError::Empty { name: "release" })
+        );
+        // The name is kept verbatim — not trimmed, not rewritten: a release
+        // name is an identifier the cluster already knows.
+        let request = ChartUpgrade::new(" api ", chart).expect("named release");
+        assert_eq!(request.release(), " api ");
+    }
+
+    #[test]
+    fn a_chart_path_must_not_be_empty() {
+        assert_eq!(Chart::path(""), Err(ClusterError::Empty { name: "chart path" }));
+        assert_eq!(Chart::path("   "), Err(ClusterError::Empty { name: "chart path" }));
+        let path = Chart::path("./charts/api.tgz").expect("a path");
+        assert_eq!(path.as_path(), Some("./charts/api.tgz"));
+        assert_eq!(path.reference(), None, "a path chart names no repository");
+    }
+
+    #[test]
+    fn an_oci_chart_carries_the_digest_it_was_built_from() {
+        let chart = Chart::oci(
+            ImageRef::parse(&format!("reg.example.com/team/chart@sha256:{SHA256_HEX}"))
+                .expect("a digest reference"),
+        )
+        .expect("a digest chart");
+        let image = chart.reference().expect("an OCI chart has a reference");
+        assert_eq!(image.repository(), "reg.example.com/team/chart");
+        assert_eq!(image.digest().map(|digest| digest.hex()), Some(SHA256_HEX));
+        assert_eq!(image.tag(), None, "a pinned chart is never a tag");
+        assert_eq!(chart.as_path(), None, "an OCI chart is not on disk");
+    }
+
+    #[test]
+    fn values_report_whether_they_carry_a_secret() {
+        let plain = Values::new("replicas: 2");
+        assert_eq!(plain.document(), "replicas: 2");
+        assert!(!plain.is_secret(), "Values::new is the non-secret constructor");
+
+        let secret = Values::secret(SECRET_DOC);
+        assert_eq!(secret.document(), SECRET_DOC);
+        assert!(secret.is_secret(), "Values::secret must say so, or the adapter leaks it");
+    }
+
+    #[test]
+    fn an_image_pin_defaults_to_the_conventional_key_and_refuses_an_empty_one() {
+        let image =
+            ImageRef::parse(&format!("reg.example.com/team/app@sha256:{SHA256_HEX}")).expect("pin");
+
+        let conventional = ImagePin::new(image.clone()).expect("a digest pin");
+        assert_eq!(conventional.key(), "image.digest");
+        assert_eq!(conventional.image().digest().map(|digest| digest.hex()), Some(SHA256_HEX));
+
+        assert_eq!(
+            ImagePin::at(image.clone(), ""),
+            Err(ClusterError::Empty { name: "digest key" })
+        );
+        let custom = ImagePin::at(image, "container.image.sha").expect("a named key");
+        assert_eq!(custom.key(), "container.image.sha");
+    }
+
+    #[test]
+    fn an_image_pin_that_is_a_tag_is_refused_rather_than_written_under_a_digest_key() {
+        // A tag written into `image.digest` renders a Deployment that claims to
+        // be pinned and is not — so the constructors refuse to build it at all.
+        for tagged in ["reg.example.com/team/api:1.2.3", "reg.example.com/team/api", "api:latest"] {
+            let image = ImageRef::parse(tagged).expect("a parseable tag");
+            assert!(image.tag().is_some(), "{tagged} is the tag case, not a digest");
+            assert_eq!(
+                ImagePin::new(image.clone()),
+                Err(ClusterError::NotPinned { what: "image pin" }),
+                "{tagged} must not be pinnable"
+            );
+            assert_eq!(
+                ImagePin::at(image, "container.image.sha"),
+                Err(ClusterError::NotPinned { what: "image pin" }),
+                "{tagged} must not be pinnable at a custom key either"
+            );
+        }
+        // And the error reads as what it is rather than as a panic.
+        let message = ClusterError::NotPinned { what: "image pin" }.to_string();
+        assert!(message.contains("digest") && message.contains("tag"), "{message}");
+    }
+
+    #[test]
+    fn an_oci_chart_that_is_a_tag_is_refused_by_its_constructor() {
+        let tagged = ImageRef::parse("reg.example.com/team/chart:1.2.3").expect("a tag reference");
+        assert_eq!(Chart::oci(tagged), Err(ClusterError::NotPinned { what: "chart" }));
+
+        let pinned = ImageRef::parse(&format!("reg.example.com/team/chart@sha256:{SHA256_HEX}"))
+            .expect("a digest reference");
+        let chart = Chart::oci(pinned).expect("a digest chart");
+        assert_eq!(chart.as_path(), None);
+        assert!(
+            chart.reference().and_then(ImageRef::tag).is_none(),
+            "a pinned chart is never a tag"
+        );
+    }
+
+    #[test]
+    fn a_values_debug_never_prints_the_document_it_carries() {
+        let secret = Values::secret(SECRET_DOC);
+        let printed = format!("{secret:?}");
+        assert!(!printed.contains(SECRET_DOC), "the secret is in the Debug output: {printed}");
+        assert!(!printed.contains("hunter2"), "the secret is in the Debug output: {printed}");
+        // Redacted rather than omitted: a reader still learns a document is
+        // there, and how much of it there was.
+        assert!(printed.contains("redacted"), "{printed}");
+        assert!(printed.contains(&SECRET_DOC.len().to_string()), "{printed}");
+        assert!(printed.contains("secret: true"), "{printed}");
+
+        // Non-secret values are redacted too — `is_secret` is a flag on the
+        // caller's promise, not a licence to print.
+        let plain = Values::new(SECRET_DOC);
+        assert!(!format!("{plain:?}").contains("hunter2"), "{plain:?}");
+        assert!(format!("{plain:?}").contains("secret: false"), "{plain:?}");
+
+        // It inherits up the chain: an assert_eq! on a request Debug-prints a
+        // ChartUpgrade on failure, which is exactly how this would have leaked.
+        let request = ChartUpgrade::new("api", Chart::path("./charts/api").expect("a path"))
+            .expect("named release")
+            .with_values(Values::secret(SECRET_DOC))
+            .with_set("image.tag", "canary");
+        assert!(!format!("{request:?}").contains("hunter2"), "{request:?}");
+    }
+
+    #[test]
+    fn a_chart_upgrade_accumulates_every_part_of_a_release() {
+        let chart = Chart::oci(
+            ImageRef::parse(&format!("reg.example.com/team/chart@sha256:{SHA256_HEX}"))
+                .expect("a digest reference"),
+        )
+        .expect("a digest chart");
+        let values = Values::new("replicas: 3");
+        let request = ChartUpgrade::new("api", chart)
+            .expect("named release")
+            .with_namespace("production")
+            .with_values(values.clone())
+            .with_set("image.tag", "canary")
+            .with_set("ingress.host", "api.example.com")
+            .with_image(
+                ImagePin::new(
+                    ImageRef::parse(&format!("reg.example.com/team/api@sha256:{SHA256_HEX}"))
+                        .expect("a digest reference"),
+                )
+                .expect("a digest pin"),
+            );
+
+        assert_eq!(request.release(), "api");
+        assert_eq!(request.namespace(), Some("production"));
+        assert_eq!(request.values(), Some(&values));
+        // Two `with_set` calls accumulate rather than replace each other, and
+        // a `BTreeMap` reports them in a stable order a test can assert on.
+        assert_eq!(request.set().get("image.tag").map(String::as_str), Some("canary"));
+        assert_eq!(request.set().get("ingress.host").map(String::as_str), Some("api.example.com"));
+        assert_eq!(request.set().len(), 2);
+        assert_eq!(request.image().map(ImagePin::key), Some("image.digest"));
+
+        let Chart::Oci(chart_image) = request.chart() else {
+            panic!("expected an OCI chart, got {:?}", request.chart());
+        };
+        assert_eq!(chart_image.digest().map(|digest| digest.hex()), Some(SHA256_HEX));
+    }
+
+    #[test]
+    fn a_chart_upgrade_leaves_everything_it_was_not_given_unset() {
+        let request = ChartUpgrade::new("api", Chart::path("./charts/api").expect("a path"))
+            .expect("named release");
+        assert_eq!(request.namespace(), None);
+        assert_eq!(request.values(), None);
+        assert!(request.set().is_empty());
+        assert_eq!(request.image(), None);
     }
 }

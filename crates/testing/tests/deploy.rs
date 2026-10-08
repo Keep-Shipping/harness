@@ -10,7 +10,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ks_core::ports::cluster::{Cluster, ClusterError, Manifest, Revision, Rollout};
+use ks_core::ports::cluster::{
+    Chart, ChartUpgrade, Cluster, ClusterError, Manifest, Revision, Rollout, Values,
+};
 use ks_core::ports::function_host::{
     Artifact, FunctionHost, FunctionHostError, TrafficSplit, Version,
 };
@@ -50,6 +52,15 @@ fn probe(command_line: &str) -> Probe {
 
 fn version(id: &str) -> Version {
     Version::new(id).expect("the test version id is not empty")
+}
+
+/// The release upgrade the cluster fake is asked for: a named release from a
+/// chart on disk, rendered with its own values.
+fn upgrade() -> ChartUpgrade {
+    ChartUpgrade::new("api", Chart::path("./charts/api").expect("a chart path"))
+        .expect("a named release")
+        .with_namespace("production")
+        .with_values(Values::new("replicas: 2"))
 }
 
 fn all_of(version: &Version) -> TrafficSplit {
@@ -172,10 +183,11 @@ fn a_rollback_names_its_revision_and_never_substitutes_the_running_one() {
 #[test]
 fn the_cluster_records_every_call_oldest_first() {
     let cluster = FakeCluster::new();
+    let request = upgrade();
     block_on(cluster.apply(&[manifest()])).expect("the manifests are accepted");
     block_on(cluster.rollout(WORKLOAD)).expect("a rollout");
     block_on(cluster.health(WORKLOAD)).expect("a report");
-    block_on(cluster.upgrade("api")).expect("an upgrade");
+    block_on(cluster.upgrade(&request)).expect("an upgrade");
     block_on(cluster.rollback(WORKLOAD, Revision::new(1))).expect("a rollback");
     assert_eq!(
         cluster.calls(),
@@ -183,10 +195,19 @@ fn the_cluster_records_every_call_oldest_first() {
             ClusterCall::Apply { names: vec![WORKLOAD.to_string()] },
             ClusterCall::Rollout { name: WORKLOAD.to_string() },
             ClusterCall::Health { name: WORKLOAD.to_string() },
-            ClusterCall::Upgrade { release: "api".to_string() },
+            ClusterCall::Upgrade { request: upgrade() },
             ClusterCall::Rollback { name: WORKLOAD.to_string(), revision: Revision::new(1) },
-        ]
+        ],
+        "the recorded upgrade is the whole request, not just the release name"
     );
+    // And the request that came out is the one that went in: the release, the
+    // chart it came from and the namespace it was told to deploy into.
+    let ClusterCall::Upgrade { request: recorded } = &cluster.calls()[3] else {
+        panic!("expected an upgrade call");
+    };
+    assert_eq!(recorded.release(), "api");
+    assert_eq!(recorded.chart().as_path(), Some("./charts/api"));
+    assert_eq!(recorded.namespace(), Some("production"));
     // `handle` is a read of the adapter's identity: a method, never a call
     // against the cluster, so it does not appear in the vector above.
     assert_eq!(cluster.handle().context(), "fake-context");
