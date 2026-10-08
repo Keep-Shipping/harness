@@ -74,7 +74,7 @@ pub use format::{BUILTIN as BUILTIN_FORMATS, Formats};
 pub use k8s::{Auth, Cluster, ExecPlugin, Target};
 pub use policy::{
     BLOCKS, Decision as PolicyDecision, SCRIPTS, SECRETS, Source as PolicySource, action_of,
-    decide as decide_policy,
+    decide as decide_policy, decide_with_base as decide_policy_with_base,
 };
 pub use registry::{Explanation, explain};
 pub use script::{ScriptOutputs, Tag};

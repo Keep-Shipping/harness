@@ -745,3 +745,108 @@ fn ks0404_goes_quiet_when_the_step_it_is_about_arrives() {
             .any(|d| d.code == Code::PolicyUnused)
     );
 }
+
+// --- the default branch's half of the policy --------------------------------
+
+use ks_core::policy::decide_with_base as folded;
+
+/// The `policy:` block `block` declares, as a run would read it out of a file.
+fn policy_of(block: &str) -> ks_core::Policy {
+    checked(&policy_file(block)).workflow.policy().clone()
+}
+
+/// One folded decision, with the whole of it asserted.
+#[track_caller]
+fn assert_folded(
+    file: &ks_core::Policy,
+    base: &ks_core::Policy,
+    class: &ActionClass,
+    disposition: Disposition,
+    source: Source,
+) {
+    let decision = folded(file, Some(base), None, Actor::Agent, class).expect("governed");
+    assert_eq!((decision.disposition, decision.source), (disposition, source), "class {class}");
+    if source == Source::DefaultBranch {
+        assert!(decision.rule_span.is_none(), "another file's span: {decision:?}");
+    }
+}
+
+#[test]
+fn a_branch_may_not_widen_what_the_default_branch_refuses() {
+    // `can: apply` on the branch against `before: apply` on the default branch.
+    // The branch's answer loses, and the decision says where it came from.
+    let base = policy_of("  agents:\n    before: apply\n");
+    let branch = policy_of("  agents:\n    can: apply\n");
+    assert_folded(&branch, &base, &apply(), Disposition::Ask, Source::DefaultBranch);
+
+    // Deleting `never: read secrets` from the default branch buys nothing.
+    let base = policy_of("  agents:\n    can: apply\n    never: read secrets\n");
+    let branch = policy_of("  agents:\n    can: apply\n");
+    let secrets = ActionClass::new(ActionKind::ReadSecrets);
+    assert_folded(&branch, &base, &secrets, Disposition::Never, Source::DefaultBranch);
+}
+
+#[test]
+fn a_branch_may_still_narrow_what_the_default_branch_allows() {
+    // Narrowing is the whole of what a branch is allowed to do, and it is
+    // attributed to the file: the branch's own rule is the strict one.
+    let base = policy_of("  agents:\n    can: apply\n");
+    let branch = policy_of("  agents:\n    never: apply\n");
+    assert_folded(&branch, &base, &apply(), Disposition::Never, Source::File);
+}
+
+#[test]
+fn a_rule_both_documents_read_the_same_way_stays_the_files_own() {
+    // The same `before: apply` in both: a tie is not a widening, so the file
+    // keeps the credit and the span still points into the file being read.
+    let both = policy_of("  agents:\n    before: apply\n");
+    let decision = folded(&both, Some(&both), None, Actor::Agent, &apply()).expect("governed");
+    assert_eq!((decision.disposition, decision.source), (Disposition::Ask, Source::File));
+    assert!(decision.rule_span.is_some(), "{decision:?}");
+}
+
+#[test]
+fn a_default_branch_that_names_nothing_has_not_granted_it() {
+    // The shape of a file copied to a path the default branch has never seen,
+    // and of a branch that adds a `can:` nobody reviewed: the base is empty, so
+    // its only answer is the leash's ask. That is the default branch declining
+    // to grant the action, not the leash — which is what stops the copy.
+    let base = policy_of("");
+    let branch = policy_of("  agents:\n    can: apply\n");
+    assert_folded(&branch, &base, &apply(), Disposition::Ask, Source::DefaultBranch);
+
+    // Silence the other way round is still silence: a file that names nothing
+    // is the file's own answer, and the leash keeps naming it. A run in a
+    // repository with no policy at all still starts.
+    let quiet = policy_of("");
+    let decision = folded(&quiet, Some(&base), None, Actor::Agent, &apply()).expect("governed");
+    assert_eq!((decision.disposition, decision.source), (Disposition::Ask, Source::Default));
+}
+
+#[test]
+fn with_no_default_branch_the_decision_is_the_files_own() {
+    // The case every run outside a repository is in, and the one the whole
+    // fold has to leave alone.
+    let policy = policy_of("  agents:\n    can: apply\n    never: read secrets\n");
+    for class in
+        [apply(), ActionClass::new(ActionKind::ReadSecrets), ActionClass::new(ActionKind::Build)]
+    {
+        assert_eq!(
+            folded(&policy, None, None, Actor::Agent, &class),
+            effective(&policy, None, Actor::Agent, &class),
+            "class {class}"
+        );
+    }
+}
+
+#[test]
+fn the_default_branch_cannot_unharden_a_hard_rule() {
+    // `can: destroy` on the default branch, and on the branch: the hard rule
+    // sits outside the intersection and still asks.
+    let base = policy_of("  agents:\n    can: destroy prod\n");
+    let branch = policy_of("  agents:\n    can: destroy prod\n");
+    let destroy = ActionClass::new(ActionKind::Destroy).in_env("prod");
+    // The branch's own answer is already the hard rule's ask, so the fold is a
+    // tie and keeps it — a hard rule is never attributed to a document.
+    assert_folded(&branch, &base, &destroy, Disposition::Ask, Source::HardRule);
+}

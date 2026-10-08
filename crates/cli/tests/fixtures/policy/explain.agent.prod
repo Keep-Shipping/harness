@@ -1,4 +1,5 @@
 no baseline configured: the effective policy is this file's own policy
+default branch main: this file may narrow its policy, never widen it
 ship.ks — actor: agent, env: prod
 
 step    action         decision       source
