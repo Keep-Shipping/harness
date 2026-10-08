@@ -46,11 +46,17 @@
 //!   ([#115](https://github.com/Keep-Shipping/harness/issues/115)).
 //!
 //! [`FakeHttpClient`]: https://docs.rs/ks-testing/latest/ks_testing/http/struct.FakeHttpClient.html
+//!
+//! Alongside those two ports the crate speaks the Checks API, so a finding can
+//! reach a PR as an annotation on the diff rather than as prose in a comment —
+//! see [`CheckRuns`].
 
 #![forbid(unsafe_code)]
 
+mod checks;
 pub mod fork;
 
+pub use checks::*;
 pub use fork::Origin;
 
 use std::collections::BTreeSet;
