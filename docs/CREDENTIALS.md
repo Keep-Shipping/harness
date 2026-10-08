@@ -262,8 +262,10 @@ that checks out code you trust.
 
 > **Partly wired.** Everything in this section is built and tested, and one command
 > is connected to it: `keepshipping resume` reads the provenance from the
-> environment ([`provenance_from_env`](../crates/cli/src/github_actions_run_context.rs))
-> and builds a [`PolicyGate`](../crates/engine/src/policy_gate.rs) with
+> environment — GitHub's
+> [`provenance_from_env`](../crates/cli/src/github_actions_run_context.rs) or
+> GitLab's, according to which CI is actually running — and builds a
+> [`PolicyGate`](../crates/engine/src/policy_gate.rs) with
 > `.with_provenance(...)`, so a parked fork or `pull_request_target` run is refused
 > `apply`, `deploy`, `destroy` and secret reads at the resume preflight — before
 > anything is approved or written. What is *not* connected is `keepshipping run`,
@@ -280,7 +282,7 @@ that depends on every future job in the repository getting it right, and a repos
 that gets it wrong fails silently. The machinery below exists to close that gap, and
 `resume` is where it bites today; it is not closed for a run that never parks.
 
-The GitHub Actions adapter classifies the provenance of the code a run is *about*,
+Every CI adapter classifies the provenance of the code a run is *about*,
 separately from the identity of whoever ran the job — an OIDC identity, a token from
 GitHub's OIDC endpoint whose signature this adapter does not verify, says GitHub ran
 the job, not whose `ship.ks` it just checked out
@@ -291,6 +293,10 @@ the job, not whose `ship.ks` it just checked out
 | `Repository` | a push, a tag, or a pull request whose head branch is in the same repository | yes |
 | `Fork` | a pull request whose head lives in another repository | no |
 | `Target` | any `pull_request_target`, `workflow_run` or `merge_group` run, whoever opened it and wherever the head lives | no |
+
+`Target` is a GitHub answer: it names the events that run a trusted file against
+code the run has not merged. GitLab and generic mode never produce it — an untrusted
+run there is a `Fork`, because the adapter has no such event to name.
 
 `Fork` and `Target` are both untrusted by construction: whoever wrote the `ship.ks`,
 the TypeScript script or the Dockerfile is not anybody this organisation granted
@@ -324,8 +330,31 @@ repository's own events, with no fork to speak of — which is why they reach
 provenance variables to escape the classification gets a stricter answer, not a
 looser one.
 
-For an untrusted run the adapter builds the context with OIDC **off**, so a `role:`
-cannot be federated — the error above, and no token in the job to mint one with. The
+GitLab classifies the same question from the variables the platform exports
+([GITLAB_CI.md](GITLAB_CI.md)). `CI_PIPELINE_SOURCE=external_pull_request_event` is a
+fork whatever the project ids say — a mirror of a pull request from another Git
+repository is by construction another project's code. On `merge_request_event`,
+`CI_MERGE_REQUEST_SOURCE_PROJECT_ID` differing from `CI_MERGE_REQUEST_PROJECT_ID` is a
+fork, and so is either id missing or empty: a payload the adapter cannot read is not
+consent. Everything else — push, schedule, tag, web, and a merge request whose two ids
+are equal — is the repository's own code.
+
+Generic `--ci` mode fails closed furthest of the three ([CI.md](CI.md)). It reads no
+fork marker it can trust: on Jenkins, Buildkite, CircleCI or a self-hosted runner the
+variables that would identify a fork either do not exist or are written by whoever
+wrote the pipeline, and a word in a pipeline file is not evidence about whose code is
+being built. A generic run is untrusted unless the operator declares the branch in
+`KEEP_SHIPPING_TRUSTED_BRANCHES`, and **a run on `main` is untrusted until `main` is
+named there** — there is no special case for the default branch. A `refs/tags/` ref
+is never eligible however the list is written.
+
+An untrusted run's context is built with OIDC **off**, so a `role:` cannot be
+federated — the error above, and no token in the job to mint one with. The
+GitLab adapter does the same: an untrusted run is built with `oidc: false`, so
+`oidc_token` answers `OidcUnavailable` for any audience, including one the job's
+pre-minted token's `aud` names exactly — otherwise the failure would be the token's,
+and the pipeline that asked for it is the fork's to write. Generic mode builds every
+run with `oidc: false`, untrusted or not (see [Identity](CI.md#identity)). The
 policy gate then refuses the run, consulted ahead of the file's own rules and ahead of
 the org baseline: no `apply`, no `deploy`, no `destroy`, no secret reads; `build` and
 `plan` — and any step kind the catalogue has not classified, which lands on `other`
@@ -338,12 +367,13 @@ code is.
 
 Which leaves the honest position today, and it is narrower than "nothing is wired"
 and wider than "the machinery is live". A run that parks at an approval and is
-carried on by `keepshipping resume` *is* provenance-gated: `resume` classifies the
-run from the environment and refuses apply, deploy, destroy and secret reads for a
-fork or a `pull_request_target`/`workflow_run`/`merge_group` run before anything is
-approved. A run that never parks is not — `keepshipping run` builds no
-`GithubActionsRunContext` and no `PolicyGate` at all, so it gates on the default
-`Provenance::Repository` and provenance distinguishes nothing there. And the
+carried on by `keepshipping resume` *is* provenance-gated: `resume` asks the CI that
+is actually running — under `GITLAB_CI=true` it uses GitLab's classification rather
+than the GitHub one — and refuses apply, deploy, destroy and secret reads for any run
+it classifies as untrusted: a fork, or a
+`pull_request_target`/`workflow_run`/`merge_group` one. A run that never parks is not
+— `keepshipping run` builds no `GithubActionsRunContext` and no `PolicyGate` at all, so
+nothing gates on its provenance there. And the
 withholding of OIDC for an untrusted run is still library code: `from_env` is called
 only from its own tests, so the `role:` a fork asks for is refused by the *workflow's*
 missing `id-token: write`, not by the adapter's answer.

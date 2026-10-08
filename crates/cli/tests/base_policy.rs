@@ -129,6 +129,17 @@ impl Repo {
     fn keepshipping(&self, args: &[&str]) -> (i32, String, String) {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_keepshipping"));
         cmd.args(args).current_dir(&self.root).env_remove("CI").env_remove("GITHUB_ACTIONS");
+        // The markers the resume's CI dispatch reads next, and the one variable
+        // that can make a generic run's branch the repository's own: a suite run
+        // on a GitLab runner, on Buildkite or on Jenkins must not answer for a
+        // test that means to be a laptop, and an operator's exported
+        // `KEEP_SHIPPING_TRUSTED_BRANCHES` must not decide what a test is about
+        // (#305).
+        for marker in
+            ["GITLAB_CI", "BUILDKITE", "CIRCLECI", "JENKINS_URL", "KEEP_SHIPPING_TRUSTED_BRANCHES"]
+        {
+            cmd.env_remove(marker);
+        }
         for marker in KNOWN_AGENT_MARKERS {
             cmd.env_remove(marker);
         }

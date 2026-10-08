@@ -94,6 +94,10 @@ origin.may_apply();         // false for a Fork
 origin.check_only();        // true  for a Fork
 ```
 
+The GitLab adapter and generic `--ci` mode answer the same question from their own
+variables, and both fail closed — see [GITLAB_CI.md](GITLAB_CI.md) and
+[CI.md](CI.md). The rules below are GitHub's, read from the event payload:
+
 [`fork.rs`](../adapters/github/src/fork.rs) classifies:
 
 - The four PR-family events — `pull_request`, `pull_request_target`,
