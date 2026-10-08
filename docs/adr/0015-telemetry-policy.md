@@ -35,7 +35,7 @@ and who decides.
   `keepshipping telemetry off` to revoke in one command, and `DO_NOT_TRACK`
   honoured if set. None of those commands exist today.
 - **Counts only**, and the payload is fixed in advance in
-  [`docs/TELEMETRY.md`](../../TELEMETRY.md): one version constant, the
+  [`docs/TELEMETRY.md`](../TELEMETRY.md): one version constant, the
   binary's own semver, the top-level CLI word, three counts, a
   power-of-two duration bucket, and one map of counts keyed by the closed
   `ActionKind` vocabulary. No paths, contents, repository names, hosts,
