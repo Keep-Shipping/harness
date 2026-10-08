@@ -598,12 +598,28 @@ produce binds nothing. Only verbs a step kind *can* produce are warned about (`d
 apply step exists, `read secrets` once the file references a secret); a verb no step kind produces
 yet is vocabulary ahead of the step kinds. `never:` is never warned about.
 
-**The effective policy is the baseline ∩ this file** ([ADR 0012](adr/0012-policy-authority.md)): a
-file may only narrow. The org baseline lives outside the repository (`ports::policy::PolicyStore`, no
-adapter yet), so where they disagree the stricter answer wins and the answer records which document
-it came from. **No baseline configured means the effective policy is this file's own** — a
-first-class state, not an error. One hard rule sits outside the intersection: **destroy never
-reaches an agent as an allow**.
+**The effective policy is the baseline ∩ the default branch ∩ this file**
+([ADR 0012](adr/0012-policy-authority.md)): a file may only narrow. The org baseline lives outside the
+repository (`ports::policy::PolicyStore`, no adapter yet), so where they disagree the stricter answer
+wins and the answer records which document it came from. **No baseline configured means the effective
+policy is this file's own** — a first-class state, not an error. One hard rule sits outside the
+intersection: **destroy never reaches an agent as an allow**.
+
+**The default branch's copy of this file is part of the intersection** — an agent on a branch edits
+the policy that constrains it, so the branch's `policy:` block is a proposal and the block `main` has
+is the authority. Where the two disagree the stricter answer wins, and where they agree the file's own
+rule is the one that is reported, because the run is reading this file. `keepshipping policy explain`
+names the base it folded in; `--base REF` (or `$KEEPSHIPPING_BASE`, or the first of
+`origin/$GITHUB_BASE_REF`, `origin/HEAD`, `origin/main`, `main`, `master` that resolves) says which
+one. A base that resolves but has no copy of the file contributes an empty policy — a widening
+nothing takes effect. A widening only takes effect once it is merged. Silence on the default branch
+is a decision too: a branch that `can:`s something the default branch says nothing about has proposed
+something nobody reviewed, so it is still an ask.
+
+**The base is only as trustworthy as whoever names it.** `--base` and `$KEEPSHIPPING_BASE` decide
+which document is the authority, so they belong to the CI workflow running the change, not to the
+command line an agent writes for itself — an agent that may pass `--base HEAD` may choose its own
+policy.
 
 ## Types and secrets
 

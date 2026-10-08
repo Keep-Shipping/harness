@@ -9,10 +9,13 @@ implemented end to end today; `run` is not.
   findings are printed, and how a run fails, is in [DIAGNOSTICS.md](DIAGNOSTICS.md).
 - `keepshipping run [FILE]` — check the file, choose an environment (`--env NAME`,
   `--event "push main"`, `--actor human|agent|ci`, `--as human|agent[:name]|ci`,
-  `--non-interactive`), print it, and stop. `--input KEY=VALUE` (repeatable; a value beginning
+  `--non-interactive`, `--base REF`), print it, and stop. `--input KEY=VALUE` (repeatable; a value beginning
   `@secret:` names a secret rather than carrying one) is checked before the run starts and echoed
   by `--dry-run`; no step is handed one yet. With `--only STEP` it names the inputs for one script
-  step — see [DIAGNOSTICS.md](DIAGNOSTICS.md) for the grammar.
+  step — see [DIAGNOSTICS.md](DIAGNOSTICS.md) for the grammar. `--base REF` reads the default
+  branch's `policy:` block out of git, so a branch may only narrow it
+  ([#118](https://github.com/Keep-Shipping/harness/issues/118)); a resume reads it from the
+  environment or finds it, so a run approved on a laptop resumes on a CI job without being told.
   Execution is not wired to the CLI yet: the planner and executor exist in `ks-engine` and
   `run` will hand them the plan. What `--as` means when it is left out is in
   [Who the run thinks it is](#who-the-run-thinks-it-is).
@@ -96,6 +99,7 @@ line** says whether an org baseline is configured — no `PolicyStore` adapter y
 ```
 $ keepshipping policy explain --as agent
 no baseline configured: the effective policy is this file's own policy
+default branch main: this file may narrow its policy, never widen it
 ship.ks — actor: agent
 
 step    action          decision       source
@@ -111,11 +115,27 @@ deploy  deploy prod     ask @platform  file ship.ks:36
 ```
 
 **decision** — `can`, `ask @handle, @handle` (`ask a human` when none is named), or `never`.
-**source** — `file FILE:LINE`, `default` (the leash, for an agent), `baseline`, or `hard rule`. An
+**source** — `file FILE:LINE`, `default` (the leash, for an agent), `default branch` (a rule written
+on the branch this file will be merged into, so no line of this one to point at), `baseline`, or
+`hard rule`. An
 `apply` also gets a `destroy*` row, footnoted below the table; steps outside the vocabulary
 (`approval`, `decide`, …) get `not governed`. Without `--env`, a step deciding the same everywhere
 gets one env-less row and one that differs gets a row per environment. `--as human` is the same
 file minus the leash.
+
+**The second line names the base.** A branch may only narrow the default branch's `policy:` block
+([#118](https://github.com/Keep-Shipping/harness/issues/118)), so `explain` folds the two in and says
+which one it read; `--base REF` names it. The ref is the first of `--base`, `$KEEPSHIPPING_BASE`,
+`origin/$GITHUB_BASE_REF`, and then `origin/HEAD`, `origin/main`, `main`, `master` that names a
+commit. A ref nobody asked for that is not there is simply no base (the second line says so); a ref
+you did ask for that is not there is a usage error and exits 2. A base that resolves but has no copy
+of the file contributes an empty policy, so a file added on a branch is not governed by anything.
+
+**The base names the authority, so it has to come from the CI side.** `--base` is the one argument
+that decides which policy the run is held to, and an agent that may pass `--base HEAD` may choose its
+own — so an agent that may set `$KEEPSHIPPING_BASE` has the same power. Set it in the workflow that
+runs the change, not on the command line the agent writes: a local run an agent started is only as
+constrained as the environment it was given.
 
 ## Publishing blocks
 
@@ -239,8 +259,8 @@ they are what a run will return once `run` is wired to the executor.
 | 1 | `failed` | `check` found errors (or warnings with `--warnings-as-errors`); a run failed: a step failed, a step timed out, or the run hit its own timeout |
 | 2 | — | usage: an unknown flag or format, a missing value, a file that cannot be read, or no environment could be chosen |
 | 3 | — | internal: an unexpected I/O error or a panic — a bug in keepshipping, never in your file |
-| 4 | `waiting_for_approval` | a step needs an approval nobody gave: the run wrote itself down and stopped there, and nothing after the approval ran. `keepshipping resume <run>` carries it on; an agent's run (`--as agent`) needs `keepshipping approve <run>` from a human first |
-| 5 | `policy_refused` | policy refused the run: the refused step and everything that needs it are skipped, and anything else in the run still runs |
+| 4 | `waiting_for_approval` | a step needs an approval nobody gave, or the effective policy asked about it before it ran: the run wrote itself down and stopped there, and nothing after the approval ran. `keepshipping resume <run>` carries it on; an agent's run (`--as agent`) needs `keepshipping approve <run>` from a human first |
+| 5 | `policy_refused` | policy refused the run: the refused step and everything that needs it are skipped, and anything else in the run still runs. A step the effective policy — the baseline ∩ the default branch's `policy:` ∩ this file's ([ADR 0012](adr/0012-policy-authority.md)) — refuses stops the run before the first step |
 | 130 | `cancelled` | the run was cancelled (Ctrl-C, a cancelled CI job) — 128 + `SIGINT`, as a shell reports it |
 
 ## Parking and resuming
@@ -260,6 +280,11 @@ timeout, so carrying on is a *new* job. Two kinds of run park, and the record sa
   only where the run is unattended or in CI: the approver is then a different process on a
   different machine. On a laptop the same process can run `keepshipping approve` as easily
   ([above](#who-the-run-thinks-it-is)).
+- **the effective policy asked about a step before it ran** — a `can:` / `before:` rule the file or
+  the default branch wrote, rather than an `approval` step. The run stops there with nothing
+  completed, the record names the step in `policy_gate`, and the same rules apply: a human approves,
+  then the resume *drives* that step rather than recording it as done. `run --base REF` reads the
+  default branch's `policy:` block out of git, the same way `policy explain` does.
 
 **`KEEPSHIPPING_REQUIRE_HUMAN` and resuming.** `resume` decides who is resuming under the same
 baseline, and it declares nothing: with the switch on, *every* resumer counts as an agent, a person

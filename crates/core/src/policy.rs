@@ -33,6 +33,10 @@ pub enum Source {
     /// A hard rule outside the intersection — destroy never reaches an agent
     /// as an allow.
     HardRule,
+    /// A rule the default branch's own `policy:` block declares, which the
+    /// branch's copy may only narrow ([#118](https://github.com/Keep-Shipping/harness/issues/118),
+    /// [ADR 0012](https://github.com/Keep-Shipping/harness/blob/main/docs/adr/0012-policy-authority.md)).
+    DefaultBranch,
 }
 
 impl Source {
@@ -44,6 +48,7 @@ impl Source {
             Source::Baseline => "baseline",
             Source::Default => "default",
             Source::HardRule => "hard rule",
+            Source::DefaultBranch => "default branch",
         }
     }
 }
@@ -230,6 +235,65 @@ pub fn decide(
         source,
         rule_span,
     })
+}
+
+/// What `actor` may do `class` when the file's own policy is folded against
+/// the default branch's ([#118](https://github.com/Keep-Shipping/harness/issues/118),
+/// [ADR 0012](https://github.com/Keep-Shipping/harness/blob/main/docs/adr/0012-policy-authority.md)):
+/// the org baseline ∩ the default branch's `policy:` ∩ the working file's.
+///
+/// The branch may only narrow. `base` is the default branch's policy as read
+/// from git, and [`None`] when none was read — no repository, no base — which
+/// is then the file's own policy, exactly as [`decide`] answers.
+///
+/// A tie keeps the file's own decision: a rule both documents read the same
+/// way is the file's rule, and saying so keeps a branch's own `before:` from
+/// being credited to the branch it was copied from.
+///
+/// When the default branch is stricter, the answer is credited to it — and not
+/// only when a rule on the default branch said so. A default branch that says
+/// nothing about an action a branch has just allowed is still declining to
+/// grant it, so its silence is reported as the default branch's rather than as
+/// the leash's. Otherwise a file copied to a path the default branch has never
+/// seen would escape the intersection entirely: there is no base copy, so every
+/// action falls to the leash, and a branch could allow anything simply by
+/// moving the file. A tie is where the leash carve-out still lives: a file that
+/// names nothing and a base that names nothing are the same silence, and it is
+/// the file's.
+///
+/// The span of a default-branch rule points into *that* file's bytes, so it is
+/// dropped rather than reported against the file being read.
+#[must_use]
+pub fn decide_with_base(
+    file: &Policy,
+    base: Option<&Policy>,
+    baseline: Option<&Baseline>,
+    actor: ActorKind,
+    class: &ActionClass,
+) -> Option<Decision> {
+    let own = decide(file, baseline, actor, class)?;
+    let Some(base) = base else { return Some(own) };
+    let Some(upstream) = decide(base, baseline, actor, class) else { return Some(own) };
+    // The same rule a document loses to itself does not move the decision, so
+    // only a strictly stricter answer from the default branch wins.
+    if upstream.disposition == own.disposition
+        || stricter(upstream.disposition, own.disposition) != upstream.disposition
+    {
+        return Some(own);
+    }
+    let source = match upstream.source {
+        // A hard rule and the org baseline are authorities in their own right:
+        // they are not the default branch declining to grant anything.
+        Source::HardRule | Source::Baseline => upstream.source,
+        // Everything else that got this far is the default branch not granting
+        // it — a rule written on the default branch, or the leash answering
+        // for a document that names nothing. Silence is not consent: a branch
+        // that adds a `can:` the default branch never wrote has proposed
+        // something nobody reviewed, and reading the leash there would let it
+        // through unasked (#118).
+        Source::File | Source::Default | Source::DefaultBranch => Source::DefaultBranch,
+    };
+    Some(Decision { disposition: upstream.disposition, ask: upstream.ask, source, rule_span: None })
 }
 
 #[cfg(test)]

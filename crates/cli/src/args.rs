@@ -21,7 +21,7 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
                           [--warnings-as-errors] [--env NAME] [--event \"push main\"]
                           [--actor human|agent|ci] [--context local|ci] [--secrets] [--fix] [--repro]
        keepshipping run [FILE] [--env NAME] [--event \"push main\"] [--actor human|agent|ci]
-                        [--as human|agent[:name]|ci]
+                        [--as human|agent[:name]|ci] [--base REF]
                         [--context local|ci] [--non-interactive] [--until STEP]
                         [--only STEP]... [--skip STEP]... [--input KEY=VALUE]... [--allow-partial]
                         [--dry-run] [-v]
@@ -34,7 +34,7 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
        keepshipping log [RUN-ID] [--format human|json]
        keepshipping log seal [RUN-ID]
        keepshipping log verify [RUN-ID | REPO@DIGEST] [--key FILE]
-       keepshipping policy explain [FILE] [--as agent|human|ci] [--env NAME]
+       keepshipping policy explain [FILE] [--as agent|human|ci] [--env NAME] [--base REF]
        keepshipping runs pending
        keepshipping approve RUN-ID [--comment TEXT]
        keepshipping deny RUN-ID --reason TEXT
@@ -125,6 +125,10 @@ pub struct Options {
     pub dry_run: bool,
     /// `-v`: stream each step's own output instead of its summaries.
     pub verbose: bool,
+    /// `--base REF`: the ref whose `policy:` block this file's policy is
+    /// folded against — the default branch, by default
+    /// ([#118](https://github.com/Keep-Shipping/harness/issues/118)).
+    pub base: Option<String>,
     /// The base URL of the blocks index, from `--index`. Absent means the
     /// command falls back to `INDEX_ENV`, and fails when neither is set.
     pub index: Option<String>,
@@ -184,6 +188,7 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
         allow_partial: false,
         dry_run: false,
         verbose: false,
+        base: None,
         index: None,
         limit: DEFAULT_SEARCH_LIMIT,
         offline: false,
@@ -244,6 +249,9 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
             "--allow-partial" if command == Command::Run => o.allow_partial = true,
             "--dry-run" if command == Command::Run => o.dry_run = true,
             "-v" | "--verbose" if command == Command::Run => o.verbose = true,
+            "--base" if matches!(command, Command::Run | Command::PolicyExplain) => {
+                o.base = Some(flag_value(&mut rest)?)
+            }
             "--upgrade" if command == Command::Fmt => o.upgrade = true,
             "--check" if command == Command::Fmt => o.check = true,
             // A lone `-` is stdin, the way every Unix filter spells it; it is

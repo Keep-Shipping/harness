@@ -10,6 +10,7 @@
 mod actor;
 mod approve;
 mod args;
+mod base_policy;
 mod blocks;
 mod blocks_cache;
 mod blocks_index;
@@ -64,7 +65,7 @@ use crate::args::{
     Command, Input, Options, USAGE, context_of, input_lines, parse_args, parse_inputs,
 };
 use crate::blocks::wait;
-use crate::drive::{Done, Outcome, StepRunner};
+use crate::drive::{Done, Outcome, Parking, StepRunner};
 use crate::progress::{Renderer, RunEvent};
 
 fn main() -> ExitCode {
@@ -233,10 +234,13 @@ fn selected(
     if refuses_ci_only(workflow, o, env, &steps) {
         return ExitCode::from(1);
     }
-    println!("environment: {env}");
     if o.dry_run {
         // The graph and the check, and nothing else: the promise `check`
-        // makes still holds, so it closes the report.
+        // makes still holds, so it closes the report. It is also the one path
+        // the default-branch gate below does not touch — a dry run starts
+        // nothing, so there is nothing there for a policy to stop, and its
+        // output is the graph the check already promised.
+        println!("environment: {env}");
         let mut out = std::io::stdout().lock();
         for step in &steps {
             let _ = writeln!(
@@ -255,30 +259,81 @@ fn selected(
         return ExitCode::SUCCESS;
     }
 
+    // The default branch's `policy:` block, read once, and the gate that folds
+    // this file's against it (#118). A branch may only narrow: a step the
+    // effective policy refuses is refused before the run says a word, and a
+    // step it asks about is a wait, the way an `approval` step is.
+    let base = match base_policy::read(&site.file, o.base.as_deref()) {
+        Ok(base) => base,
+        Err(why) => {
+            eprintln!("error: --base {why}");
+            return ExitCode::from(2);
+        }
+    };
+    let waiting = match policy::gate(
+        workflow,
+        &steps,
+        base.as_ref().map(|b| &b.policy),
+        &site.checked.secret_uses,
+        actor,
+        env,
+    ) {
+        Some(policy::Gate::Refused { step, why }) => {
+            eprintln!("refusing to start: step `{step}` — {why}");
+            return ExitCode::from(ks_engine::exec::EXIT_POLICY_REFUSED);
+        }
+        Some(policy::Gate::Wait { step, why }) => Some((step, why)),
+        None => None,
+    };
+    println!("environment: {env}");
+
     let what = workflow.name().map(str::to_string).unwrap_or_else(|| stem(&site.file));
     let tty = std::io::stdout().is_terminal() && std::env::var("TERM").is_ok_and(|t| t != "dumb");
     let shared = Mutex::new(renderer(tty, o.verbose));
     // Where a run that has to wait is written down, so the job can end and
     // `keepshipping resume` pick it up (#97). Nothing touches the disk unless
     // the run actually parks.
-    let parking = resume::Park::new(
+    let mut parking = resume::Park::new(
         resume::run_id(),
         site.src.as_bytes(),
         o.event.clone().unwrap_or_else(|| "manual".to_string()),
     )
     .with_context(resume::ACTOR, resume::actor_word(actor))
     .with_context(resume::ENVIRONMENT, env);
+    // The base this run was decided against, written down with it: a resume is
+    // a different job, on a different machine, and re-detecting would let the
+    // policy answer depend on what that machine happened to have checked out.
+    if let Some(base) = &base {
+        parking = parking.with_context(resume::BASE_REF, &base.git_ref);
+    }
+    // A step the effective policy asks about is a wait, and a wait is what an
+    // `approval` step is: the run writes itself down with nothing done and the
+    // job ends. An agent's run waits on a human decision, because an agent may
+    // not answer its own — the same rule, the same two commands.
+    if let Some((step, why)) = waiting {
+        eprintln!("waiting at {step}: {why}");
+        let mut parking = parking.with_context(resume::POLICY_GATE, &step);
+        let on = if is_agent {
+            drive::WaitReason::AgentDecision { notified: None }
+        } else {
+            drive::WaitReason::Approval { question: why }
+        };
+        let Some(run) = parking.park(&step, &[], &on) else {
+            return ExitCode::from(1);
+        };
+        return resume::park_notice(&run, &step, &on);
+    }
     let mut approver: Box<dyn drive::Approver> = if is_agent {
         // An agent's run parks at its first approval: it may not answer its
         // own. Who to tell comes from the approval's own `ask:`; until that is
         // read here, the run waits without naming anyone.
-        Box::new(drive::AgentRun { notified: None, parking })
+        Box::new(drive::AgentRun { notified: None, parking: &mut parking })
     } else if interactive(o) {
         Box::new(drive::TtyApprover::new(std::io::stdin().lock()))
     } else {
         // Nobody watching: the run parks rather than declines, and the job
         // ends instead of holding a runner open until it times out (#97).
-        Box::new(drive::Unwatched(parking))
+        Box::new(drive::Unwatched(&mut parking))
     };
     if is_agent {
         // An agent reads the run and acts on it, so its run opens with the

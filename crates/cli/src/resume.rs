@@ -61,6 +61,20 @@ pub const ACTOR: &str = "actor";
 /// resolved. `keepshipping runs pending` shows it.
 pub const ENVIRONMENT: &str = "environment";
 
+/// The key in a parked record's `context` naming the step the effective policy
+/// asked about, when the run stopped there rather than at an `approval`
+/// ([#118](https://github.com/Keep-Shipping/harness/issues/118)). Such a step
+/// has not run: a human's answer lets it go on, so a resume drives it rather
+/// than recording it as done.
+pub const POLICY_GATE: &str = "policy_gate";
+
+/// The key in a parked record's `context` naming the ref the run's policy was
+/// folded against ([#118](https://github.com/Keep-Shipping/harness/issues/118)).
+/// A resume reads the base from here rather than detecting it again: the
+/// answer a run got depended on the ref, and a different job on a different
+/// machine must not get a different one.
+pub const BASE_REF: &str = "base_ref";
+
 /// A fresh run id: the wall clock in the time field, and the process id against
 /// a counter in the random one, so two runs started in the same millisecond on
 /// the same machine still differ. ULIDs sort by time, which is what lets
@@ -257,7 +271,34 @@ pub fn resume(args: &[String]) -> ExitCode {
     if let Err(code) = refuses_by_policy(&site, &outstanding, acting) {
         return code;
     }
-
+    let env = state.context.get(ENVIRONMENT).cloned().unwrap_or_default();
+    // A step the effective policy asked about is not an approval step: it has
+    // not run, and a human's answer is what lets it run. So it is not recorded
+    // as done and not dropped from what is left — which is also what stops the
+    // run parking here forever (#118). The key outlives this resume on
+    // purpose: a run that fails before reaching the step is resumed again, and
+    // the next resume has to drive the same step rather than record it as
+    // something that never ran.
+    let gated = state.context.get(POLICY_GATE).is_some_and(|at| *at == gate.step);
+    let steps: Vec<Step> =
+        outstanding.into_iter().filter(|step| gated || step.name != gate.step).collect();
+    // The base this run was decided against, not one detected again here: the
+    // answer above depended on the ref, and a different job on a different
+    // machine must not get a different one.
+    let asked = state.context.get(BASE_REF).map(String::as_str);
+    // An approval covers the step it was given for and nothing further, so the
+    // gate is re-run over what is left *past* it. A later step the effective
+    // policy also asks about is a wait of its own, and the run parks there
+    // rather than carrying on into an action nobody was asked about.
+    let beyond: Vec<Step> = steps.iter().filter(|step| step.name != gate.step).cloned().collect();
+    let later = match refuses_by_base(&site, &beyond, acting, &env, asked) {
+        Ok(later) => later,
+        Err(code) => return code,
+    };
+    // The answer is taken and written down before anything is driven, whichever
+    // way this resume goes: a run that crashes half way through must still say
+    // which step the human let past, or the next resume reads a run that never
+    // answered.
     if gate.answer
         && let Err(error) =
             state.approve_until(&gate.step, drive::local_user(), APPROVAL_TTL, SystemTime::now())
@@ -265,9 +306,11 @@ pub fn resume(args: &[String]) -> ExitCode {
         eprintln!("error: {error}");
         return ExitCode::from(1);
     }
-    // The gate is behind the run now: recorded as done, and written down
-    // before anything runs, so a crash half way through keeps the answer.
-    state.record(CompletedStep { name: gate.step.clone(), ..Default::default() });
+    if !gated {
+        // The gate is behind the run now: recorded as done, and written down
+        // before anything runs, so a crash half way through keeps the answer.
+        state.record(CompletedStep { name: gate.step.clone(), ..Default::default() });
+    }
     state.next = None;
     state.context.remove(WAITING_ON);
     let mut park = Park::resuming(state);
@@ -276,8 +319,36 @@ pub fn resume(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let steps: Vec<Step> = outstanding.into_iter().filter(|step| step.name != gate.step).collect();
-    continue_run(&mut park, &steps, &file, acting == ActorKind::Agent, interactive)
+    // Nothing further to stop at: the run carries on through everything left.
+    let Some((wait_at, why)) = later else {
+        return continue_run(&mut park, &steps, &file, acting == ActorKind::Agent, interactive);
+    };
+    // Only the steps *before* the wait. Running in order is the whole of it, and a
+    // step after the wait is one nobody has been asked about either — driving it
+    // here would be running past a question to answer it later.
+    let upto: Vec<Step> = up_to(&steps, &wait_at);
+    if !upto.is_empty() {
+        let code = continue_run(&mut park, &upto, &file, acting == ActorKind::Agent, interactive);
+        if code != ExitCode::SUCCESS {
+            return code;
+        }
+    }
+    let on = if acting == ActorKind::Agent {
+        WaitReason::AgentDecision { notified: None }
+    } else {
+        WaitReason::Approval { question: why }
+    };
+    park = park.with_context(POLICY_GATE, &wait_at);
+    let Some(run) = park.park(&wait_at, &[], &on) else { return ExitCode::from(1) };
+    park_notice(&run, &wait_at, &on)
+}
+
+/// What a run drives before it stops at `wait_at`: the steps ahead of it, in
+/// run order, and nothing after. A step the policy asked about further on is a
+/// wait of its own, and a run that drove past one to reach a later question
+/// would have run something nobody was asked about.
+fn up_to(steps: &[Step], wait_at: &str) -> Vec<Step> {
+    steps.iter().take_while(|step| step.name != wait_at).cloned().collect()
 }
 
 /// The approval a resume continues past, and whether the resume answers it.
@@ -445,6 +516,55 @@ fn refuses_by_policy(site: &check::Site, steps: &[Step], actor: ActorKind) -> Re
     }
 }
 
+/// The same gate against the default branch's half of the policy
+/// ([#118](https://github.com/Keep-Shipping/harness/issues/118)): `approve`
+/// answers a question, it does not grant what a `never:` on the default branch
+/// takes away, so a resume whose file would widen one is refused rather than
+/// carried on. It returns the first step still left that the effective policy
+/// *asks* about: an approval covers the step it was given for, so a later ask
+/// is a wait of its own the run has to stop at.
+///
+/// `asked` is the base ref the run recorded, and `None` falls back to
+/// detecting one — which is what every run parked before the ref was written
+/// down does. A ref that was named and is not there is exit 2, the same as
+/// `run` says: a resume is not a place to guess around a base somebody pinned.
+fn refuses_by_base(
+    site: &check::Site,
+    steps: &[Step],
+    actor: ActorKind,
+    env: &str,
+    asked: Option<&str>,
+) -> Result<Option<(String, String)>, ExitCode> {
+    let base = match crate::base_policy::read(&site.file, asked) {
+        // A base that could not be detected at all leaves `refuses_by_policy`
+        // as the whole of what policy says, which is what every run before
+        // this read did.
+        Ok(Some(base)) => base,
+        Ok(None) => return Ok(None),
+        Err(why) => {
+            eprintln!("error: {why}");
+            return Err(ExitCode::from(2));
+        }
+    };
+    let by: Vec<&Step> = steps.iter().collect();
+    let gate = crate::policy::gate(
+        &site.checked.workflow,
+        &by,
+        Some(&base.policy),
+        &site.checked.secret_uses,
+        actor,
+        env,
+    );
+    match gate {
+        Some(crate::policy::Gate::Refused { step, why }) => {
+            eprintln!("error: refusing to resume: step `{step}` — {why}");
+            Err(ExitCode::from(ks_engine::exec::EXIT_POLICY_REFUSED))
+        }
+        Some(crate::policy::Gate::Wait { step, why }) => Ok(Some((step, why))),
+        None => Ok(None),
+    }
+}
+
 /// Drives what is left, and returns the run's honest outcome. An approval
 /// further on parks the run again, the same way `run` parks it; a run that
 /// ships is written down as finished.
@@ -497,6 +617,16 @@ fn continue_run(
                         .record(CompletedStep { name: step.name.clone(), ..Default::default() });
                 }
             }
+            // The gate is spent once its step is done: it kept the step out of
+            // the completed list while it was still unrun, and now it has run.
+            if park
+                .state
+                .context
+                .get(POLICY_GATE)
+                .is_some_and(|at| park.state.completed.iter().any(|done| &done.name == at))
+            {
+                park.state.context.remove(POLICY_GATE);
+            }
             if let Err(error) = park.persist() {
                 eprintln!("error: {error}");
                 return ExitCode::from(1);
@@ -537,6 +667,41 @@ fn usage() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The steps of a file, as the run sees them.
+    fn steps_of(src: &str) -> Vec<Step> {
+        ks_core::check(&ks_lang::parse(src)).workflow.steps().to_vec()
+    }
+
+    /// What a run drives before it stops at a wait is everything ahead of it in
+    /// run order and nothing after — a step past the wait is one nobody has
+    /// been asked about either, and driving it to get further along would be
+    /// running past the question to answer it afterwards.
+    #[test]
+    fn a_run_drives_up_to_a_wait_and_never_past_it() {
+        let steps = steps_of(
+            "name: api\n\
+             envs:\n\
+             \x20 staging:\n\
+             \x20   secrets: staging\n\
+             steps:\n\
+             \x20 build:  oci.image\n\
+             \x20   from:  ./Dockerfile\n\
+             \x20 review: approval\n\
+             \x20 apply:  tofu.apply\n",
+        );
+        let names =
+            |steps: Vec<Step>| -> Vec<String> { steps.into_iter().map(|s| s.name).collect() };
+
+        // The wait is the last step: everything before it runs.
+        assert_eq!(names(up_to(&steps, "apply")), ["build", "review"]);
+        // In the middle: the steps after it are not driven.
+        assert_eq!(names(up_to(&steps, "review")), ["build"]);
+        // The first: nothing runs before it.
+        assert!(up_to(&steps, "build").is_empty());
+        // Not among the steps at all — the whole run, rather than a guess.
+        assert_eq!(names(up_to(&steps, "deploy")), ["build", "review", "apply"]);
+    }
 
     /// The notice is the whole of what a person has when a job ends waiting:
     /// it names the run, the step, and the command that carries on — and for
