@@ -19,7 +19,7 @@ const REGENERATE: &str = "run KS_BLESS=1 cargo test -p ks-testing --test compati
 /// The port contract and the `STEP_API` it was last changed under. Changing a
 /// port trait means changing `STEP_API` in `crates/core/src/version.rs` AND
 /// this digest — that pair is the review signal.
-const PINNED_PORT_CONTRACT: (u32, &str) = (4, "4e54439ddf021455");
+const PINNED_PORT_CONTRACT: (u32, &str) = (5, "9445c01ae662b292");
 
 /// What to do when the port contract and the `STEP_API` disagree, spelled out
 /// once so both asserts below can carry it.

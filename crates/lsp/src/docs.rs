@@ -19,6 +19,9 @@ pub fn kind_doc(kind: &str) -> Option<&'static str> {
         "terraform.plan" => {
             "Plan an infrastructure change with Terraform, and count what it would add and destroy."
         }
+        "vm.deploy" => {
+            "Deploy to a fleet of hosts over SSH, one batch at a time, with a pinned host key per host."
+        }
         "approval" => "Hold the run until a human answers, showing an earlier step's outputs.",
         "tofu.apply" => {
             "Apply exactly the plan file an approval was bound to. Yields `applied` and the root outputs as `out.<name>`."

@@ -263,7 +263,7 @@ impl ActionKind {
             "oci.image" | "oci.artifact" => ActionKind::Build,
             "tofu.plan" | "terraform.plan" => ActionKind::Plan,
             "tofu.apply" | "terraform.apply" => ActionKind::Apply,
-            "k8s.rollout" => ActionKind::Deploy,
+            "k8s.rollout" | "vm.deploy" => ActionKind::Deploy,
             _ => ActionKind::Other,
         }
     }

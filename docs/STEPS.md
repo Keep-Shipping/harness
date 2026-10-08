@@ -160,3 +160,31 @@ Outputs:
 | `destroys` | int | how many it destroys, replacements included |
 | `empty` | bool | whether it changes nothing |
 | `summary` | string | the plan in plain terms |
+
+## `vm.deploy` (v1.0.0)
+
+Deploys to a fleet of hosts over SSH, one batch at a time, and reports how many came up.
+
+- Action: deploy
+- Requires: RemoteShell
+
+Inputs:
+
+| Name | Type | Default | Description |
+| --- | --- | --- | --- |
+| `hosts` | list | - | the fleet: `address` and `host_key` are required on every entry, and a host with no pinned `host_key` is refused rather than trusted on first use. Each entry also takes `port` (22), `user` (`ssh_user`), and `host_key_algorithm` (`ssh-ed25519`) |
+| `batch` | string | `1` | how many hosts per batch: a count, or a percent of the fleet such as `"25%"`. A percent rounds up and is never zero |
+| `run` | list | - | commands to run on each host as it is deployed, in order, as `{ program, args, timeout }`. The argv is typed, never a shell string |
+| `health` | string | - | a probe command to run on each host after its commands; the deploy waits for it to report healthy. Without one there is no health gate |
+| `health_timeout` | int | 60 | how long the health gate polls a host before calling it failed |
+| `max_failures` | int | 0 | how many hosts may fail health before the deploy stops and rolls back |
+| `rollback` | list | - | commands that restore a host's previous artifact, in the same `{ program, args, timeout }` shape as `run`, run on every host of a failed batch |
+| `ssh_user` | string | `deploy` | the user to deploy as, for the hosts that do not name one |
+
+Outputs:
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `healthy` | int | the hosts that reached health |
+| `total` | int | the hosts in the fleet |
+| `summary` | string | the fleet in one line, as `{healthy}/{total} hosts healthy` |

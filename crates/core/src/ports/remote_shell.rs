@@ -25,6 +25,11 @@
 //! exactly the one an attacker would win. The key is a public fingerprint —
 //! never a private key, which must stay on the harness side.
 //!
+//! [`RemoteShell::host`] names the one host an adapter was configured for.
+//! [`RemoteShell::connect`] opens the rest of a fleet over the same
+//! transport and credentials, each to the host — and therefore the pin — the
+//! caller named.
+//!
 //! # Every command has a deadline
 //!
 //! [`Command::new`] rejects a zero timeout: a command that can hang forever
@@ -35,6 +40,7 @@
 
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::BoxFuture;
@@ -397,6 +403,29 @@ pub trait RemoteShell: Send + Sync {
 
     /// The host this adapter connects to, and the key it pins.
     fn host(&self) -> &Host;
+
+    /// Opens a second shell to `host`: the same transport and the same
+    /// credentials, aimed at another host.
+    ///
+    /// [`host`](RemoteShell::host) names one host, but a deploy has rarely
+    /// only one — a rolling deploy walks a fleet, and each host in it pins
+    /// its **own** [`HostKey`]. This method is how a step reaches the rest of
+    /// the fleet without a second configured adapter per box: the transport
+    /// and the credentials are the adapter's, the destination and the pin are
+    /// the caller's.
+    ///
+    /// Everything in the [module documentation](self) still holds for the
+    /// host returned here, with one exception worth stating: the pin checked
+    /// is `host`'s own, not the configured [`host`](RemoteShell::host)'s, so a
+    /// mismatch surfaces as [`ShellError::HostKeyMismatch`] on use, exactly as
+    /// it does on the host the adapter was configured for. There is no
+    /// default implementation and no "accept once": an adapter that cannot
+    /// reach a second host says so with [`ShellError::Unreachable`] rather
+    /// than opening the connection unchecked.
+    fn connect<'a>(
+        &'a self,
+        host: &'a Host,
+    ) -> BoxFuture<'a, Result<Arc<dyn RemoteShell>, ShellError>>;
 }
 
 #[cfg(test)]

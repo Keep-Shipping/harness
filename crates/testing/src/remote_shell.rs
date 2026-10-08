@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ks_core::ports::BoxFuture;
@@ -40,6 +40,12 @@ pub const FAILING_PROGRAM: &str = "false";
 pub const UNANSWERABLE_PROBE: &str = "ks-conformance-nothing-answers-this";
 /// The bytes a fresh [`FakeRemoteShell`] reports for every copy.
 pub const DEFAULT_COPY_BYTES: u64 = 4096;
+/// The address the conformance kit asks [`RemoteShell::connect`] for: in the
+/// `.invalid` TLD, which [RFC 2606] reserves and which therefore never
+/// resolves, so no adapter can reach it.
+///
+/// [RFC 2606]: https://www.rfc-editor.org/rfc/rfc2606
+const UNREACHABLE_ADDRESS: &str = "ks-conformance-unreachable.invalid";
 /// The fingerprint a rejected host is reported as having presented: the fake
 /// stands in for a host that was rebuilt, or for a MITM.
 pub const REBUILT_HOST_KEY: &str = "SHA256:0000000000000000000000000000000000";
@@ -71,6 +77,11 @@ pub enum ShellCall {
         /// The probe command line.
         command: String,
     },
+    /// [`RemoteShell::connect`] was asked for this address.
+    Connect {
+        /// The address of the host that was asked for.
+        address: String,
+    },
 }
 
 /// The fake's mutable state; every accessor goes through one mutex, so the
@@ -87,6 +98,9 @@ struct State {
     cursors: BTreeMap<String, usize>,
     /// Fingerprints the fake refuses to connect to.
     rejected: Vec<String>,
+    /// The hosts [`connect`](RemoteShell::connect) can reach, each its own
+    /// fake so a test can inspect what was done on that host.
+    peers: Vec<Arc<FakeRemoteShell>>,
     /// Every call, oldest first.
     calls: Vec<ShellCall>,
 }
@@ -109,6 +123,12 @@ struct State {
 ///   [`Health::Progressing`] into [`Health::Healthy`]. A probe with no script
 ///   answers [`Health::NoData`]: the probe produced nothing the port can
 ///   interpret, and silence is not health.
+/// - **A fleet.** [`with_host`](FakeRemoteShell::with_host) makes a fake stand
+///   for a named host with its own pin, and
+///   [`with_peer`](FakeRemoteShell::with_peer) registers it as somewhere
+///   [`RemoteShell::connect`] can reach. An address with no peer is
+///   [`ShellError::Unreachable`], so a step that walks past the fleet it was
+///   given fails instead of reaching a host nobody described.
 ///
 /// ```
 /// use std::time::Duration;
@@ -151,7 +171,9 @@ struct State {
 /// [`calls`](FakeRemoteShell::calls) records every call **made against the
 /// host** — `run`, `copy` and `probe`. [`RemoteShell::host`] is not in the
 /// record: it reads the adapter's own configured identity, not the target, so
-/// no call was made anywhere. The [`FakeCluster`] fake applies the same rule to
+/// no call was made anywhere. [`connect`](RemoteShell::connect) is: it names a
+/// host somewhere else, so the address a step asked for is worth showing. The
+/// [`FakeCluster`] fake applies the same rule to
 /// [`Cluster::handle`], while the [`FakeFunctionHost`] records its own sync
 /// read, [`FunctionHost::pin_is_detectable`], because that read decides whether
 /// a smoke check may be believed at all.
@@ -278,6 +300,26 @@ impl FakeRemoteShell {
         self
     }
 
+    /// Makes this fake stand in for `host` instead of
+    /// [`DEFAULT_ADDRESS`]:[`DEFAULT_PORT`]. A fleet fake uses it to give
+    /// every host its own address, port and pin, which is what
+    /// [`connect`](RemoteShell::connect) matches on.
+    pub fn with_host(mut self, host: Host) -> FakeRemoteShell {
+        self.host = host;
+        self
+    }
+
+    /// Registers `peer` as one host this fake can be [`connect`](RemoteShell::connect)ed
+    /// to. The peer is matched on its address and port, so a fleet fake is a
+    /// gateway plus one peer per host — each of which a test can inspect
+    /// afterwards with [`calls`](FakeRemoteShell::calls). An address with no
+    /// peer is [`ShellError::Unreachable`]: the fake never invents a host it
+    /// was not handed.
+    pub fn with_peer(self, peer: Arc<FakeRemoteShell>) -> FakeRemoteShell {
+        self.state.lock().expect("fake remote shell state").peers.push(peer);
+        self
+    }
+
     /// Every call made against the fake, oldest first.
     #[must_use]
     pub fn calls(&self) -> Vec<ShellCall> {
@@ -293,6 +335,7 @@ impl fmt::Debug for FakeRemoteShell {
             .field("failures", &state.errors.len())
             .field("probe_scripts", &state.probe_scripts.len())
             .field("rejected_host_keys", &state.rejected.len())
+            .field("peers", &state.peers.len())
             .field("copy_bytes", &self.copy_bytes)
             .field("calls", &state.calls.len())
             .finish()
@@ -406,6 +449,31 @@ impl RemoteShell for FakeRemoteShell {
     fn host(&self) -> &Host {
         &self.host
     }
+
+    /// Hands back the registered peer for `host`, or
+    /// [`ShellError::Unreachable`] when there is none. The peer keeps its own
+    /// pin rule, so a fleet fake still refuses a host that was rebuilt: the
+    /// refusal lands on the peer the call was made against, which is where a
+    /// test can see it.
+    fn connect<'a>(
+        &'a self,
+        host: &'a Host,
+    ) -> BoxFuture<'a, Result<Arc<dyn RemoteShell>, ShellError>> {
+        self.record(ShellCall::Connect { address: host.address().to_string() });
+        let result = self
+            .state
+            .lock()
+            .expect("fake remote shell state")
+            .peers
+            .iter()
+            .find(|peer| peer.host.address() == host.address() && peer.host.port() == host.port())
+            .map(|peer| Arc::clone(peer) as Arc<dyn RemoteShell>)
+            .ok_or_else(|| ShellError::Unreachable {
+                host: format!("{}:{}", host.address(), host.port()),
+                message: "no peer is registered for this host".to_string(),
+            });
+        Box::pin(std::future::ready(result))
+    }
 }
 
 /// How many times a conformance kit polls a probe while waiting for the host
@@ -434,7 +502,9 @@ const SETTLE_POLLS: usize = 64;
 /// - running the same command twice is idempotent: connects are per command
 ///   and leave nothing behind;
 /// - copying a local path that does not exist fails rather than reporting a
-///   short [`Copied`].
+///   short [`Copied`];
+/// - [`RemoteShell::connect`] to a host nothing can reach is an error, never
+///   a shell.
 pub async fn conformance(shell: &dyn RemoteShell) {
     let host = shell.host();
     assert!(!host.address().is_empty(), "remote_shell conformance: the host must name an address");
@@ -510,6 +580,21 @@ pub async fn conformance(shell: &dyn RemoteShell) {
     assert!(
         copied.is_err(),
         "remote_shell conformance: a truncated transfer is an error, not a shorter Copied, got {copied:?}"
+    );
+
+    // `connect` reaches the rest of a fleet, and only the rest of a fleet:
+    // `.invalid` never resolves (RFC 2606), so no adapter can reach it and
+    // one that answers `Ok` there is handing back a connection to something
+    // nobody named.
+    let unknown_key = HostKey::new("ssh-ed25519", "SHA256:conformance")
+        .expect("the conformance host key is well formed");
+    let unknown = Host::new(UNREACHABLE_ADDRESS, 22, "deploy", unknown_key)
+        .expect("the conformance host is well formed");
+    let reached = shell.connect(&unknown).await;
+    assert!(
+        reached.is_err(),
+        "remote_shell conformance: a host nothing can reach must not connect, got {:?}",
+        reached.err()
     );
 }
 
@@ -659,6 +744,66 @@ mod tests {
         assert_eq!(
             block_on(shell.probe(&probe("curl other"))).expect("a report").state(),
             Health::NoData
+        );
+    }
+
+    #[test]
+    fn connect_hands_back_the_peer_for_a_host_and_refuses_one_it_was_not_given() {
+        let key = |fingerprint: &str| {
+            HostKey::new("ssh-ed25519", fingerprint).expect("a well-formed host key")
+        };
+        let a = Host::new("a.example", 22, "deploy", key("SHA256:a")).expect("a named host");
+        let b = Host::new("b.example", 2222, "deploy", key("SHA256:b")).expect("a named host");
+        let peer_a = Arc::new(FakeRemoteShell::new().with_host(a.clone()));
+        let peer_b = Arc::new(FakeRemoteShell::new().with_host(b.clone()));
+        let gateway =
+            FakeRemoteShell::new().with_peer(Arc::clone(&peer_a)).with_peer(Arc::clone(&peer_b));
+
+        // The peer is the one the host names, and the call is recorded against
+        // the gateway — that is where the address was asked for.
+        let reached = block_on(gateway.connect(&a)).expect("a registered host connects");
+        assert_eq!(reached.host(), &a);
+        assert_eq!(reached.host().host_key().fingerprint(), "SHA256:a");
+
+        // The port, not the port number alone, is what matches: another port
+        // on the same address is a host this fake was not given.
+        let other_port =
+            Host::new("a.example", 2222, "deploy", key("SHA256:a")).expect("a named host");
+        assert!(matches!(
+            block_on(gateway.connect(&other_port)),
+            Err(ShellError::Unreachable { .. })
+        ));
+
+        let elsewhere =
+            Host::new("nowhere.example", 22, "deploy", key("SHA256:c")).expect("a named host");
+        assert!(matches!(
+            block_on(gateway.connect(&elsewhere)),
+            Err(ShellError::Unreachable { host, .. })
+                if host == "nowhere.example:22"
+        ));
+
+        assert_eq!(
+            gateway.calls(),
+            vec![
+                ShellCall::Connect { address: "a.example".to_string() },
+                ShellCall::Connect { address: "a.example".to_string() },
+                ShellCall::Connect { address: "nowhere.example".to_string() },
+            ]
+        );
+
+        // The peer's own pin rule still holds: connecting to it is not a way
+        // around the host key it pins.
+        let rebuilt = Arc::new(
+            FakeRemoteShell::new().with_host(a.clone()).with_rejected_host_key("SHA256:a"),
+        );
+        let gateway = FakeRemoteShell::new().with_peer(rebuilt);
+        let reached = block_on(gateway.connect(&a)).expect("the host is registered");
+        assert_eq!(
+            block_on(reached.run(&command(OK_PROGRAM))),
+            Err(ShellError::HostKeyMismatch {
+                expected: "SHA256:a".to_string(),
+                got: REBUILT_HOST_KEY.to_string()
+            })
         );
     }
 
