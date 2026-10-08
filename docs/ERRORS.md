@@ -39,6 +39,7 @@ UPDATE_GOLDEN=1 cargo test -p ks-core --test registry
 - [KS0402 — unknown policy action](#ks0402-unknown-policy-action)
 - [KS0403 — policy forbids the run](#ks0403-policy-forbids-the-run)
 - [KS0404 — policy rule for an action no step can do](#ks0404-policy-rule-for-an-action-no-step-can-do)
+- [KS0405 — a block may not carry policy](#ks0405-a-block-may-not-carry-policy)
 - [KS0501 — secret in a string](#ks0501-secret-in-a-string)
 - [KS0502 — secret shown](#ks0502-secret-shown)
 - [KS0601 — optional value may be absent](#ks0601-optional-value-may-be-absent)
@@ -714,6 +715,31 @@ steps:
     from: ./Dockerfile
   deploy: k8s.rollout
     image: build.digest
+```
+
+## KS0405: a block may not carry policy
+
+Severity: error.
+
+A block definition declares a `policy:` block of its own. A block is someone else's pipeline code: letting it ship rules into your run would let the publisher decide what constrains it. Policy belongs to the repository and to the org baseline, so move these rules to the workflow file that uses the block.
+
+Not ok:
+
+```ks
+block:  web-service
+inputs:
+  image:    oci.Digest
+policy:
+  agents:
+    never: destroy prod
+```
+
+Ok:
+
+```ks
+block:  web-service
+inputs:
+  image:    oci.Digest
 ```
 
 ## KS0501: secret in a string

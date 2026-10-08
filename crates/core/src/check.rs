@@ -8,6 +8,7 @@ use ks_lang::{Atom, Code, Diagnostic, Entry, Expr, Fix, Span, StrPart, Word};
 
 use crate::auto_rule::{self, MISSING_GUARD_HINT, MISSING_GUARD_MESSAGE};
 use crate::block::{self, BLOCK_KEY, BlockInput, BlockSignature};
+use crate::block_trust;
 use crate::catalog::{AFTER, Catalog, StepTypes, WHEN};
 use crate::context::{CheckContext, unmet_steps};
 use crate::format::{self, Formats, Header};
@@ -531,6 +532,18 @@ impl<'a> Ctx<'a> {
         }
         if !saw_envs {
             self.envs.push(implicit_default());
+        }
+        // A block may not carry `policy:`: policy is the repo's and the org's.
+        // `blocks publish` (ADR 0011) is to call the same function and refuse
+        // such a block outright, so the two agree by construction.
+        for span in block_trust::policy_sections(&file) {
+            self.err_hint(
+                Code::BlockPolicy,
+                span,
+                "a block may not declare `policy:`",
+                "policy belongs to the repo and the org baseline; move these rules into the \
+                 workflow file that uses the block",
+            );
         }
     }
 

@@ -568,6 +568,28 @@ steps:
     url: secrets.db_url
 ",
         },
+        Code::BlockPolicy => Explanation {
+            code,
+            title: "a block may not carry policy",
+            severity: Severity::Error,
+            summary: "A block definition declares a `policy:` block of its own. A block is \
+                someone else's pipeline code: letting it ship rules into your run would let the \
+                publisher decide what constrains it. Policy belongs to the repository and to the \
+                org baseline, so move these rules to the workflow file that uses the block.",
+            bad: "\
+block:  web-service
+inputs:
+  image:    oci.Digest
+policy:
+  agents:
+    never: destroy prod
+",
+            good: "\
+block:  web-service
+inputs:
+  image:    oci.Digest
+",
+        },
         Code::SecretInString => Explanation {
             code,
             title: "secret in a string",
