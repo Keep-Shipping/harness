@@ -155,12 +155,18 @@ fn each_transition_emits_exactly_one_event() {
             Box::pin(j.decide_answered(
                 "d",
                 "model",
+                "v1",
+                "sha256:aa",
+                "sha256:bb",
                 "yes",
                 0.9,
                 vec![("yes".into(), 0.9)],
                 0.5,
                 "ok",
             ))
+        }),
+        ("decision.overridden", |j| {
+            Box::pin(j.decision_overridden("01ARZ3NDEKTSV4RRFFQ69G5FAV", "d", "ada", "wrong"))
         }),
         ("policy.refused", |j| Box::pin(j.policy_refused(Some("d"), "no-prod"))),
         ("attestation.attached", |j| {
@@ -226,12 +232,16 @@ fn a_secret_value_never_reaches_the_log() {
         "deploy",
         SECRET,
         SECRET,
+        SECRET,
+        SECRET,
+        SECRET,
         0.5,
         vec![(SECRET.into(), 0.5)],
         0.5,
         SECRET,
     ))
     .expect("lands");
+    block_on(j.decision_overridden(SECRET, SECRET, SECRET, SECRET)).expect("lands");
     block_on(j.policy_refused(Some(SECRET), SECRET)).expect("lands");
     block_on(j.run_finished(SECRET, vec![SECRET.into()])).expect("lands");
     // And through a step's own error message — where a secret really arrives.

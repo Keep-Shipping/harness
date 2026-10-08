@@ -34,6 +34,12 @@ implemented end to end today; `run` is not.
   parked from (default `ship.ks`). [Parking and resuming](#parking-and-resuming) below.
 - `keepshipping policy explain [FILE]` — the effective policy for one actor (`--as agent|human|ci`,
   default `agent`; `--env NAME`), each row attributed to the document that decided it. Below.
+- `keepshipping decisions report [--json]` and `keepshipping decisions export` — read every run log
+  under `.keepshipping/runs/` and report what the decision models answered: counts per answer, per
+  outcome and per `model@version`, a ten-band confidence histogram, and every decision a human
+  overrode. `export` writes one JSON line per decision for labelling and calibration. A log whose
+  hash chain is broken is named on stderr, left out of the numbers and makes the command exit 1.
+  [CALIBRATION.md](CALIBRATION.md) is the workflow.
 
 There is **no `--as` flag** on `approve` or `deny`. The approver named in the state and the log is
 the environment's own (`$USER`, then `$USERNAME`, then `local`): a label for the run log, not a

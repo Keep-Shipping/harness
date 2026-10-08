@@ -15,6 +15,7 @@ mod blocks_cache;
 mod blocks_index;
 mod blocks_publish;
 mod check;
+mod decisions;
 mod drive;
 mod fmt;
 // The GitHub Actions run context (#150) is built and tested here, but the
@@ -92,6 +93,7 @@ fn dispatch() -> ExitCode {
         // The job that carries a parked run on (#97): it re-checks the
         // record's binding, the context gate and policy, then drives the rest.
         Some("resume") => resume::resume(&args[1..]),
+        Some("decisions") => decisions::decisions(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)

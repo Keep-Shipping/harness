@@ -255,6 +255,9 @@ fn event_fields(event: &RunEvent) -> Result<Map<String, Value>, RunLogError> {
         RunEvent::DecideAnswered {
             step,
             model,
+            version,
+            question_hash,
+            state_hash,
             answer,
             confidence,
             probabilities,
@@ -263,6 +266,9 @@ fn event_fields(event: &RunEvent) -> Result<Map<String, Value>, RunLogError> {
         } => {
             put("step", text(step));
             put("model", text(model));
+            put("version", text(version));
+            put("question_hash", text(question_hash));
+            put("state_hash", text(state_hash));
             put("answer", text(answer));
             put("confidence", number(*confidence));
             put(
@@ -284,6 +290,12 @@ fn event_fields(event: &RunEvent) -> Result<Map<String, Value>, RunLogError> {
                 put("role", text(role));
             }
             put("via", text(via));
+        }
+        RunEvent::DecisionOverridden { decision_run, step, by, reason } => {
+            put("decision_run", text(decision_run));
+            put("step", text(step));
+            put("by", text(by));
+            put("reason", text(reason));
         }
         RunEvent::AttestationAttached { step, subject, predicate_type, attestation } => {
             put("step", text(step));
