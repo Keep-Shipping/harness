@@ -19,6 +19,8 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 
 const HERO: &str = include_str!("../../lang/tests/fixtures/site-hero.ks");
 const BROKEN: &str = include_str!("fixtures/site/ship.ks");
+const SCRIPT_SITE: &str = include_str!("fixtures/script/ship.ks");
+const SCRIPT_MODULE: &str = include_str!("fixtures/script/ship/migrate.ts");
 
 const HERO_URI: &str = "file:///hero.ks";
 
@@ -286,4 +288,30 @@ fn a_rename_rewrites_the_header_and_every_reference() {
     assert_eq!(edits[1]["range"]["start"]["line"], line, "the reference");
     assert_eq!(edits[1]["newText"], "compile");
     assert_eq!(client.shutdown_and_exit(), 0);
+}
+
+#[test]
+fn hovering_a_script_step_output_names_the_type_its_module_declares() {
+    // The document has to be a file the server can open: what a `script`
+    // step declares is read out of the module its kind names, and only the
+    // caller — here, the binary that owns node — can do that.
+    let has_node = Command::new("node").arg("--version").output().is_ok_and(|o| o.status.success());
+    if !has_node {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("keepshipping-script-lsp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("ship")).expect("create the site directory");
+    std::fs::write(dir.join("ship.ks"), SCRIPT_SITE).expect("write the site file");
+    std::fs::write(dir.join("ship/migrate.ts"), SCRIPT_MODULE).expect("write the module");
+    let uri = format!("file://{}", dir.join("ship.ks").to_string_lossy());
+
+    let mut client = Client::open(&uri, SCRIPT_SITE);
+    let (line, character) = position_of(SCRIPT_SITE, "migrate.applied");
+    let answer = client.request("textDocument/hover", at(&uri, line, character + 2));
+    let code = client.shutdown_and_exit();
+    let text = answer["result"]["contents"]["value"].as_str().expect("markdown");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(text.contains("migrate.applied: int"), "{text}");
+    assert_eq!(code, 0);
 }

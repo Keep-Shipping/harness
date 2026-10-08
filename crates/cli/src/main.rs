@@ -74,7 +74,11 @@ fn dispatch() -> ExitCode {
         Some("graph") => graph::graph(&args[1..]),
         Some("blocks") => blocks::blocks(&args[1..]),
         Some("policy") => policy::policy(&args[1..]),
-        Some("lsp") => ks_lsp::serve(),
+        // The checker is pure, so the only thing that can know what a
+        // `script` step's TypeScript module declares is this one. It is
+        // handed over rather than reached for, keeping node and the cache
+        // out of the language server.
+        Some("lsp") => ks_lsp::serve_with(ks_cli::scripts::script_outputs),
         Some("log") => log::log(&args[1..]),
         _ => {
             eprintln!("{USAGE}");

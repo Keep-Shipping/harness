@@ -1418,3 +1418,99 @@ fn a_field_of_an_output_keeps_the_types_it_knows() {
     let src = IAC.replace("apply.out.cluster", "apply.out.thing.nope");
     assert!(errors(&src).is_empty(), "{:?}", errors(&src));
 }
+
+// --- script steps: `<step>.<name>` typed from the module -----------------
+
+/// A site whose `migrate.applied` is checked against what the module its
+/// kind names declares for it. The read is interpolated into a tag, so a
+/// site that cannot read the module at all still checks clean.
+const SCRIPT: &str = "\
+steps:
+  migrate: ./ship/migrate.ts
+  build:   oci.image
+    from:   ./Dockerfile
+    push:   ghcr.io/acme/api:v{migrate.applied}
+";
+
+/// The same site, reading `migrate.applied` in a position that needs an
+/// `int`. Used only where the module was read, so an unchecked `any` — which
+/// no comparison accepts — cannot be mistaken for a typed one.
+const COMPARED: &str = "\
+steps:
+  migrate: ./ship/migrate.ts
+  build:   oci.image
+    from:   ./Dockerfile
+    when:   migrate.applied > 0
+";
+
+/// Checks `src` with `./ship/migrate.ts` declaring `outputs`.
+fn check_script(src: &str, outputs: &[(&str, ks_core::Tag)]) -> ks_core::Checked {
+    let catalog = ks_core::Catalog::builtin();
+    let tags: std::collections::BTreeMap<String, ks_core::Tag> =
+        outputs.iter().map(|(n, t)| (n.to_string(), t.clone())).collect();
+    let declared = std::collections::BTreeMap::from([(
+        "./ship/migrate.ts".to_string(),
+        ks_core::script::outputs(&tags),
+    )]);
+    let options = ks_core::CheckOptions::new(&catalog).script_outputs(&declared);
+    ks_core::check_with(&ks_lang::parse(src), &options)
+}
+
+fn script_errors(src: &str, outputs: &[(&str, ks_core::Tag)]) -> Vec<String> {
+    check_script(src, outputs).diagnostics.iter().map(std::string::ToString::to_string).collect()
+}
+
+#[test]
+fn a_declared_output_is_typed_from_its_module() {
+    // `applied` is an int, and `> 0` needs one.
+    assert!(script_errors(COMPARED, &[("applied", ks_core::Tag::Int)]).is_empty());
+    // A string is not an int, so the comparison fails on the declaration.
+    let all = script_errors(COMPARED, &[("applied", ks_core::Tag::Str)]);
+    assert!(all.iter().any(|m| m.contains("cannot compare `string` and `int`")), "{all:?}");
+}
+
+#[test]
+fn a_declared_output_is_the_type_hover_shows() {
+    let at = SCRIPT.find("migrate.applied").expect("the read") + "migrate.applied".len();
+    let checked = check_script(SCRIPT, &[("applied", ks_core::Tag::Int)]);
+    assert_eq!(checked.type_at(at as u32).map(|(_, ty)| ty.clone()), Some(ks_core::Type::Int));
+}
+
+#[test]
+fn an_output_the_module_does_not_declare_is_an_unknown_output() {
+    let all = script_errors(SCRIPT, &[("rows", ks_core::Tag::Int), ("apllied", ks_core::Tag::Int)]);
+    // The hint lists what the module really declares, and the misspelling
+    // in the file is one edit from one of them.
+    assert!(
+        all.iter().any(|m| m.contains("`./ship/migrate.ts` declares `apllied`, `rows`")),
+        "{all:?}"
+    );
+    assert!(all.iter().any(|m| m.contains("did you mean `apllied`?")), "{all:?}");
+    let all = script_errors(SCRIPT, &[("rows", ks_core::Tag::Int)]);
+    assert!(all.iter().any(|m| m.contains("produces no output `applied`")), "{all:?}");
+}
+
+#[test]
+fn an_output_that_is_not_a_ks_type_is_an_error_saying_how_to_be_one() {
+    let all = script_errors(SCRIPT, &[("applied", ks_core::Tag::Number)]);
+    assert!(
+        all.iter().any(|m| m.contains("`applied` of step `migrate` is not a ks type")),
+        "{all:?}"
+    );
+    assert!(all.iter().any(|m| m.contains("ambiguous in ks")), "{all:?}");
+    assert!(all.iter().any(|m| m.contains("`int()` or `float()`")), "{all:?}");
+}
+
+#[test]
+fn a_module_nobody_read_says_nothing() {
+    // No caller to read it at all, and a module that declares nothing, are
+    // the same silence as a kind the catalog answers for itself.
+    assert!(errors(SCRIPT).is_empty(), "{:?}", errors(SCRIPT));
+    assert!(script_errors(SCRIPT, &[]).is_empty());
+    let src = "steps:\n  build: oci.image\n    from: ./Dockerfile\n    push: ghcr.io/acme/api:{git.sha}\n";
+    assert!(script_errors(src, &[("digest", ks_core::Tag::Int)]).is_empty());
+    // A kind whose declaration nobody read stays unchecked, where another
+    // kind would say it has no such output.
+    let src = SCRIPT.replace("oci.image", "oci.verify");
+    assert!(!check_script(&src, &[("rows", ks_core::Tag::Int)]).diagnostics.is_empty());
+}

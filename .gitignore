@@ -18,3 +18,5 @@ sdk/ts/node_modules/
 .gitmodules
 # MCP client configuration (may embed endpoint tokens)
 .mcp.json
+# What `keepshipping check` caches beside a site file (script signatures)
+.keepshipping/

@@ -9,6 +9,9 @@
 //! which block the line sits in, and which names the checked file already
 //! declares.
 
+use std::collections::BTreeMap;
+
+use ks_core::script::ScriptOutputs;
 use ks_core::{Catalog, Checked, Step, StepTypes};
 use ks_lang::{Scalar, Span, classify_scalar};
 use serde_json::{Value, json};
@@ -42,7 +45,22 @@ pub struct Doc {
 
 impl Doc {
     pub fn new(text: String, encoding: Encoding) -> Doc {
-        let checked = ks_core::check(&ks_lang::parse(&text));
+        Doc::new_with(text, encoding, &BTreeMap::new())
+    }
+
+    /// As [`Doc::new`], with what each `script` step's module declares, so
+    /// a read of one is typed the way `check` types it
+    /// ([#88](https://github.com/Keep-Shipping/harness/issues/88)). The
+    /// checker is pure; reading a module is the caller's job, and an empty
+    /// map leaves every `script` output unchecked exactly as before.
+    pub fn new_with(
+        text: String,
+        encoding: Encoding,
+        scripts: &BTreeMap<String, ScriptOutputs>,
+    ) -> Doc {
+        let catalog = ks_core::Catalog::builtin();
+        let options = ks_core::CheckOptions::new(&catalog).script_outputs(scripts);
+        let checked = ks_core::check_with(&ks_lang::parse(&text), &options);
         let index = LineIndex::new(&text, encoding);
         Doc { text, checked, index }
     }

@@ -16,6 +16,7 @@ use crate::policy::{self, BLOCKS, SCRIPTS, SECRETS};
 use crate::ports::policy::{ANY_OBJECT, Disposition};
 use crate::ports::run_context::ActorKind;
 use crate::ports::secrets::SecretRef;
+use crate::script::ScriptOutputs;
 use crate::script_step::{is_script_kind, script_path};
 use crate::step::{ActionClass, ActionKind, RollbackPolicy};
 use crate::types::{self, LiteralFit, Type};
@@ -165,6 +166,11 @@ pub struct CheckOptions<'a> {
     /// use's kind exactly as the file spells it (`acme/web-service@v3`). A
     /// use is checked against its signature and nothing else.
     pub(crate) blocks: Option<&'a BTreeMap<String, BlockSignature>>,
+    /// What the module behind each script step declares, read out of it by
+    /// the caller ([`script`](crate::script)) — keyed by the kind path as
+    /// the file spells it (`./ship/migrate.ts`). Without it every output
+    /// stays unchecked.
+    pub(crate) script_outputs: Option<&'a BTreeMap<String, ScriptOutputs>>,
 }
 
 impl<'a> CheckOptions<'a> {
@@ -178,6 +184,7 @@ impl<'a> CheckOptions<'a> {
             in_ci: false,
             iac_outputs: None,
             blocks: None,
+            script_outputs: None,
         }
     }
 
@@ -247,6 +254,22 @@ impl<'a> CheckOptions<'a> {
         self.blocks = Some(blocks);
         self
     }
+
+    /// Checks against what the module behind each script step declares, as
+    /// read by the caller ([`script`](crate::script)). `outputs` is keyed by
+    /// the step's kind path exactly as the file spells it
+    /// (`./ship/migrate.ts`), then by output name. A script step's outputs
+    /// are then typed, and one the module does not declare is an error here
+    /// rather than at run time; a kind absent from the map says nothing,
+    /// and its outputs stay unchecked.
+    #[must_use]
+    pub fn script_outputs(
+        mut self,
+        outputs: &'a BTreeMap<String, ScriptOutputs>,
+    ) -> CheckOptions<'a> {
+        self.script_outputs = Some(outputs);
+        self
+    }
 }
 
 /// Type-check `parse` and build its [`Workflow`], against `options`.
@@ -259,6 +282,7 @@ pub fn check_with(parse: &ks_lang::Parse, options: &CheckOptions<'_>) -> Checked
         options.in_ci,
         options.iac_outputs,
         options.blocks,
+        options.script_outputs,
         parse.diagnostics().to_vec(),
     );
     c.file(parse.file());
@@ -327,6 +351,9 @@ struct Ctx<'a> {
     /// its internal steps read as `inputs.<name>`. `None` in every other
     /// file, so `inputs.` names nothing a workflow could have spelled.
     block: Option<BlockScope>,
+    /// What the module behind each script step declares, when the caller
+    /// read it — keyed by the kind path as the file spells it.
+    script_outputs: Option<&'a BTreeMap<String, ScriptOutputs>>,
     diags: Vec<Diagnostic>,
     /// The dotted path of the entry being checked (`deploy.image`), attached
     /// to every diagnostic raised while it is checked.
@@ -419,6 +446,7 @@ impl<'a> Ctx<'a> {
         in_ci: bool,
         iac_outputs: Option<&'a BTreeMap<String, BTreeMap<String, Type>>>,
         blocks: Option<&'a BTreeMap<String, BlockSignature>>,
+        script_outputs: Option<&'a BTreeMap<String, ScriptOutputs>>,
         diags: Vec<Diagnostic>,
     ) -> Ctx<'a> {
         Ctx {
@@ -428,6 +456,7 @@ impl<'a> Ctx<'a> {
             context,
             in_ci,
             iac_outputs,
+            script_outputs,
             diags,
             blocks,
             block: None,
@@ -1509,6 +1538,13 @@ impl<'a> Ctx<'a> {
         if spec.is_some_and(|sp| sp.decision) && out == "answer" && more.is_none() {
             return Type::Decision(self.steps[i].variants.clone());
         }
+        // A script step's outputs are whatever its module declares, which
+        // the catalog cannot know — its kind is a path, not a registered
+        // kind. With nothing read out of the module the name stays
+        // unchecked.
+        if let Some(ty) = self.script_output(i, rest, span) {
+            return ty;
+        }
         match spec.and_then(|sp| sp.output(out)) {
             Some(ty) if more.is_none() => ty.clone(),
             Some(_) => Type::Any, // a field of a declared output, unchecked
@@ -1612,6 +1648,62 @@ impl<'a> Ctx<'a> {
             return Type::Any;
         };
         Self::field_of(ty, deeper)
+    }
+
+    /// `<script step>.<name>`: an output the module its kind names declares.
+    /// `None` only for a step whose kind is not a module's path; a module
+    /// nobody read answers `any`, saying nothing, because a missing module —
+    /// no node, no network — is not evidence about the step.
+    fn script_output(&mut self, i: usize, rest: &str, span: Span) -> Option<Type> {
+        let step = &self.steps[i];
+        let kind = step.kind_name.as_deref()?;
+        if !is_script_kind(kind) {
+            return None;
+        }
+        let (out, deeper) = split_first(rest);
+        // An empty declaration says as little as no module at all.
+        let Some(declared) =
+            self.script_outputs.and_then(|m| m.get(kind)).filter(|d| !d.is_empty())
+        else {
+            return Some(Type::Any);
+        };
+        let Some(ty) = declared.get(out) else {
+            let name = self.steps[i].name.clone();
+            let names = declared.names();
+            let list: String =
+                names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ");
+            let msg = format!("step `{name}` produces no output `{out}`");
+            let hint = format!("`{kind}` declares {list}");
+            let at = segment_span(rest, span.end - rest.len() as u32, 0);
+            return Some(match suggestion(out, &names) {
+                Some((s, unique)) => {
+                    let fix = Fix::new(at, s.clone(), unique);
+                    self.err_hint_fix(
+                        Code::UnknownOutput,
+                        span,
+                        msg,
+                        format!("{hint}; did you mean `{s}`?"),
+                        fix,
+                    );
+                    Type::Any
+                }
+                None => {
+                    self.err_hint(Code::UnknownOutput, span, msg, hint);
+                    Type::Any
+                }
+            });
+        };
+        match ty {
+            Ok(ty) => Some(Self::field_of(ty.clone(), deeper)),
+            Err(why) => {
+                // The module declares something ks has no type for. The read
+                // is the only place to say so: the declaration is not in
+                // this file, and only its type would name it.
+                let msg = format!("`{out}` of step `{}` is not a ks type", self.steps[i].name);
+                self.err_hint(Code::TypeMismatch, span, msg, why.clone());
+                Some(Type::Any)
+            }
+        }
     }
 
     /// The `dir:` whose `.tf` files answer for step `i`: the plan it

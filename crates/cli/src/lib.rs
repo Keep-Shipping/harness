@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod http_client;
+pub mod scripts;
 // Test-only scaffolding, but it has to be reachable from the binary's test
 // harness too — `github_actions_run_context` drives a real socket through it —
 // and a `#[cfg(test)]` module of the library is not compiled into the library

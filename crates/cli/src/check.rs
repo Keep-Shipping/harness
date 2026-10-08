@@ -548,11 +548,16 @@ pub fn load(
     // no tofu, no network, no store.
     let outputs = iac_outputs(path.parent().unwrap_or(Path::new(".")), &src);
     let blocks = local_blocks(path, &catalog);
+    // What each `script` step's module declares, read out of the module
+    // without running it. A module that cannot be read leaves its outputs
+    // unchecked, as they were.
+    let scripts = ks_cli::scripts::script_outputs(path, &src);
     let options = ks_core::CheckOptions::new(&catalog)
         .actor(actor)
         .context(ctx.clone())
         .ci(in_ci_env())
-        .iac_outputs(&outputs);
+        .iac_outputs(&outputs)
+        .script_outputs(&scripts);
     let options = match &blocks {
         Some((signatures, _)) => options.blocks(signatures),
         None => options,
