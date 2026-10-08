@@ -99,8 +99,9 @@ fn dispatch() -> ExitCode {
         Some("graph") => graph::graph(&args[1..]),
         Some("blocks") => blocks::blocks(&args[1..]),
         Some("policy") => policy::policy(&args[1..]),
-        // `import shell` turns an existing deploy script into a starting
-        // `.ks` file: best effort, and it says what it did not recognise.
+        // `import shell` turns an existing deploy script, and `import
+        // github-actions` a workflow, into a starting `.ks` file: best effort,
+        // and each says what it did not recognise.
         Some("import") => import::import(&args[1..]),
         // The checker is pure, so the only thing that can know what a
         // `script` step's TypeScript module declares is this one. It is

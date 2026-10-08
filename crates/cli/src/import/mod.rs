@@ -1,7 +1,8 @@
 //! The `import` subcommands: turning something that already exists into a
-//! starting `.ks` file. Today `import shell` is the only one — it reads a
-//! deployment shell script, recognises the commands keepshipping has a step
-//! kind for, and writes out the file those become.
+//! starting `.ks` file. `import shell` reads a deployment shell script,
+//! recognises the commands keepshipping has a step kind for, and writes out the
+//! file those become; `import github-actions` translates GitHub Actions
+//! workflows into site files and an `IMPORT-REPORT.md` (see its own module).
 //!
 //! Import is a **best effort**, and says so. A shell script is not a
 //! pipeline: it branches, it loops, it holds values in variables. `.ks` has
@@ -16,6 +17,7 @@
 //! already exists (this command writes, it does not overwrite), and 1 when the
 //! output cannot be written.
 
+mod github_actions;
 mod shell;
 
 use std::process::ExitCode;
@@ -26,6 +28,7 @@ use crate::args::USAGE;
 pub fn import(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("shell") => shell::shell(&args[1..]),
+        Some("github-actions") => github_actions::github_actions(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
