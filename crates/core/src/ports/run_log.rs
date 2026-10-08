@@ -74,9 +74,19 @@ pub enum RunEvent {
     /// which rule held ([#99](https://github.com/Keep-Shipping/harness/issues/99)).
     ApprovalRejected { step: String, detail: String, channel: String, artifacts: Vec<String> },
     /// A decision model answered, with its probabilities and what the run did with it.
+    ///
+    /// Everything a calibration report needs is here, including what it must not store:
+    /// `question_hash` and `state_hash` are the sha256 hex of the canonical question and of the
+    /// redacted state actually sent, so a decision can later be matched to the inputs it was made
+    /// from without the log holding either. `version` is the pinned model version from the
+    /// [`ModelProfile`](crate::ports::decision_model::ModelProfile): confidence is only comparable
+    /// against other decisions the *same* version made, so a report groups by `model@version`.
     DecideAnswered {
         step: String,
         model: String,
+        version: String,
+        question_hash: String,
+        state_hash: String,
         answer: String,
         confidence: f64,
         probabilities: Vec<(String, f64)>,
@@ -89,6 +99,11 @@ pub enum RunEvent {
     /// `"profile:<name>"` or `"ambient"`. The token itself is never here, only the shape of the
     /// assumption.
     CredentialsResolved { step: String, cloud: String, role: Option<String>, via: String },
+    /// A human disagreed with a decision recorded earlier, named by `(decision_run, step)`. It
+    /// may live in a later run than the decision it overrides — a rollback run is the usual case —
+    /// which is why the decision's run is a field rather than an assumption that it is this one.
+    /// The step names the decision *inside* that run.
+    DecisionOverridden { decision_run: String, step: String, by: String, reason: String },
     /// An attestation (provenance or an SBOM) was pushed against an image.
     /// `subject` is the image's digest and `attestation` the pushed envelope's; both are
     /// hashes, not references.
@@ -142,6 +157,7 @@ impl RunEvent {
             RunEvent::ApprovalRejected { .. } => "approval.rejected",
             RunEvent::DecideAnswered { .. } => "decide.answered",
             RunEvent::CredentialsResolved { .. } => "credentials.resolved",
+            RunEvent::DecisionOverridden { .. } => "decision.overridden",
             RunEvent::AttestationAttached { .. } => "attestation.attached",
             RunEvent::PolicyRefused { .. } => "policy.refused",
             RunEvent::PlanStale { .. } => "plan.stale",
@@ -215,9 +231,22 @@ impl RunEvent {
                 *channel = r.redact(channel);
                 list(artifacts);
             }
-            RunEvent::DecideAnswered { step, model, answer, probabilities, outcome, .. } => {
+            RunEvent::DecideAnswered {
+                step,
+                model,
+                version,
+                question_hash,
+                state_hash,
+                answer,
+                probabilities,
+                outcome,
+                ..
+            } => {
                 *step = r.redact(step);
                 *model = r.redact(model);
+                *version = r.redact(version);
+                *question_hash = r.redact(question_hash);
+                *state_hash = r.redact(state_hash);
                 *answer = r.redact(answer);
                 *outcome = r.redact(outcome);
                 *probabilities =
@@ -228,6 +257,12 @@ impl RunEvent {
                 *cloud = r.redact(cloud);
                 *role = role.as_deref().map(|name| r.redact(name));
                 *via = r.redact(via);
+            }
+            RunEvent::DecisionOverridden { decision_run, step, by, reason } => {
+                *decision_run = r.redact(decision_run);
+                *step = r.redact(step);
+                *by = r.redact(by);
+                *reason = r.redact(reason);
             }
             RunEvent::AttestationAttached { step, subject, predicate_type, attestation } => {
                 *step = r.redact(step);
@@ -376,6 +411,9 @@ mod tests {
                 RunEvent::DecideAnswered {
                     step: s(),
                     model: s(),
+                    version: s(),
+                    question_hash: s(),
+                    state_hash: s(),
                     answer: s(),
                     confidence: 0.5,
                     probabilities: vec![(s(), 0.5)],
@@ -386,6 +424,10 @@ mod tests {
             (
                 "credentials.resolved",
                 RunEvent::CredentialsResolved { step: s(), cloud: s(), role: Some(s()), via: s() },
+            ),
+            (
+                "decision.overridden",
+                RunEvent::DecisionOverridden { decision_run: s(), step: s(), by: s(), reason: s() },
             ),
             (
                 "attestation.attached",

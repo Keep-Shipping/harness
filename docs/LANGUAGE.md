@@ -112,6 +112,10 @@ auto: risk is low >= 0.95
 
 is one expression: `risk is low ≥ 0.95 and plan.destroys == 0`.
 
+That `0.95` is an example, not a recommendation. No confidence threshold is recommended as safe
+until a calibration report for the pinned model version exists — see
+[CALIBRATION.md](CALIBRATION.md).
+
 ### Scalar classes
 
 A bare word is classified, in order: `Bool` (`true`, `false`), `Duration`
@@ -653,7 +657,8 @@ revisit:
   with spaces.
 - Reserved words `and`, `or`, `not`, `is`; comparison operators in ASCII and
   Unicode spellings (`>=` / `≥`, `<=` / `≤`); `=` introduces a default.
-- `is` compares with an optional `≥`/`>=` threshold (`risk is low ≥ 0.95`).
+- `is` compares with an optional `≥`/`>=` threshold (`risk is low ≥ 0.95` — an example; see
+  [CALIBRATION.md](CALIBRATION.md) before treating any threshold as safe).
 - `|` block strings follow YAML's shape and claim every deeper line until a
   line at or above the key's indent.
 - Interpolation `{dotted.name}` is allowed inside bare words and strings.

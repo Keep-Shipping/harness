@@ -166,13 +166,18 @@ impl Journal {
         self.emit(e).await
     }
 
-    /// Records a decision model's answer: the model, its answer and confidence, the probabilities
-    /// it reported, the threshold, and what the run did with it.
+    /// Records a decision model's answer: the model and the version pinned for it, the hashes of
+    /// the question and the state actually sent (so the decision can be matched to its inputs
+    /// without the log storing either), its answer and confidence, the probabilities it reported,
+    /// the threshold, and what the run did with it.
     #[allow(clippy::too_many_arguments)] // the event's fields, one for one
     pub async fn decide_answered(
         &self,
         step: &str,
         model: &str,
+        version: &str,
+        question_hash: &str,
+        state_hash: &str,
         answer: &str,
         confidence: f64,
         probabilities: Vec<(String, f64)>,
@@ -182,6 +187,9 @@ impl Journal {
         let e = RunEvent::DecideAnswered {
             step: step.into(),
             model: model.into(),
+            version: version.into(),
+            question_hash: question_hash.into(),
+            state_hash: state_hash.into(),
             answer: answer.into(),
             confidence,
             probabilities,
@@ -206,6 +214,25 @@ impl Journal {
             via: credentials.via().into(),
         })
         .await
+    }
+
+    /// Records that a human disagreed with a decision made earlier, named by the run it is in and
+    /// the step within it — the override usually lands in a *later* run (a rollback), which is why
+    /// `decision_run` is carried rather than assumed.
+    pub async fn decision_overridden(
+        &self,
+        decision_run: &str,
+        step: &str,
+        by: &str,
+        reason: &str,
+    ) -> Result<(), RunLogError> {
+        let e = RunEvent::DecisionOverridden {
+            decision_run: decision_run.into(),
+            step: step.into(),
+            by: by.into(),
+            reason: reason.into(),
+        };
+        self.emit(e).await
     }
 
     /// Records that an attestation was pushed against an image: the digest of
