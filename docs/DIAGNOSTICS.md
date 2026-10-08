@@ -180,6 +180,7 @@ a captured run reads like a terminal's.
 | `--until STEP` | run `STEP` and everything it depends on |
 | `--only STEP` | run `STEP` and the steps it depends on; repeatable |
 | `--skip STEP` | drop `STEP` and everything downstream of it; repeatable |
+| `--input KEY=VALUE` | hand the steps this run takes an explicit input; repeatable |
 | `--dry-run` | graph the run and check it; run nothing |
 | `-v` | stream each step's own output |
 
@@ -194,7 +195,38 @@ with `nothing left to run` rather than shipping a run of no steps.
 
 `--dry-run` prints one `▸ {step:<8}{kind}` line per selected step in
 topological order, closes with the same `0 steps ran. Nothing was touched.`
-footer `check` uses, and exits 0.
+footer `check` uses, and exits 0. Given `--input`, an `inputs:` block
+follows the graph and comes before that footer — one
+`  input {key} = {value}` line per override, last-write-wins per key, and a
+`@secret:` value printed as `  input {key} = @secret:{reference} (reference)`
+so it cannot read as a value that was read. Without `--input` there is no
+block and the output is exactly what it was before the flag existed:
+
+```
+environment: default
+▸ build   oci.image
+inputs:
+  input db = @secret:dev-db (reference)
+0 steps ran. Nothing was touched.
+```
+
+`KEY=VALUE` is the whole grammar: the key ends at the first `=`, so a value
+may contain more of them; a repeated key is an override and the last one
+wins; a value that begins `@secret:` is a reference to a secret rather than
+one, and nothing resolves it, because nothing does yet. A malformed pair is
+a usage error before the run starts, each naming the way out — and each
+refusing what would forge or blur a line of the report, which is
+line-oriented: a `\n` or `\r` in a key or a value, and whitespace at
+either end of either. Interior whitespace is left to the value, so
+`--input "message=two words"` is a value; a key is one name and takes no
+whitespace at all. An empty value is a value — `--input tag=` hands a step
+an empty string, which it can act on — where `@secret:` with nothing after
+it names nothing and is refused.
+
+The flag is inert outside `--dry-run` today: a run checks every pair, and no
+step is handed one yet. Unit-testing a script step with hand-picked inputs
+and no real secrets is the SDK's `@keepshipping/sdk/testing` helper
+([sdk/ts/README.md](../sdk/ts/README.md)).
 
 No step kind is executable yet, so a run stops on its first step with
 `` `{kind}` steps are not built in yet `` and exits 1. Nothing is built and
