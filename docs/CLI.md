@@ -12,10 +12,15 @@ implemented end to end today; `run` is not.
   Execution is not wired to the CLI yet: the planner and executor exist in `ks-engine` and
   `run` will hand them the plan.
 - `keepshipping blocks search <QUERY>` — search the metadata-only blocks index (`--index URL` or
-  `KEEPSSHIPPING_BLOCKS_INDEX`, `--limit N`, `--format human|json`). It asks the index; it never
-  downloads a block.
+  `KEEPSSHIPPING_BLOCKS_INDEX`, `--limit N`, `--offline`, `--format human|json`). It asks the
+  index; it never downloads a block.
 - `keepshipping policy explain [FILE]` — the effective policy for one actor (`--as agent|human|ci`,
   default `agent`; `--env NAME`), each row attributed to the document that decided it. Below.
+
+Each successful online search is cached under `$XDG_CACHE_HOME/keepshipping/blocks` (or
+`$HOME/.cache/keepshipping/blocks`), keyed by index URL, query and limit; a search that fails
+stores nothing. `--offline` answers from that cache without touching the network — a query with
+nothing cached exits 2, never an empty result.
 
 ## `policy explain`
 

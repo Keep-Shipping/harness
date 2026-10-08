@@ -66,6 +66,13 @@ impl HostedBlocksIndex {
         Ok(HostedBlocksIndex { base: trimmed.to_string(), http })
     }
 
+    /// The base this client actually queries, trailing slashes dropped. The
+    /// blocks cache keys entries by it, so two spellings of one index share
+    /// one entry.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
     /// The URL one search goes to; exposed for tests and diagnostics.
     pub fn search_url(&self, query: &BlockQuery) -> String {
         format!(
@@ -74,6 +81,26 @@ impl HostedBlocksIndex {
             query.limit,
             base = self.base
         )
+    }
+
+    /// The one search request, returning the index's response body verbatim.
+    /// The command line caches that body, so the request and its HTTP
+    /// failures have exactly one implementation shared with [`BlocksIndex::search`].
+    pub fn search_body<'a>(
+        &'a self,
+        query: &'a BlockQuery,
+    ) -> BoxFuture<'a, Result<Vec<u8>, BlocksIndexError>> {
+        Box::pin(async move {
+            let mut request = HttpRequest::new(HttpMethod::Get, self.search_url(query));
+            request.headers.push(("Accept".to_string(), "application/json".to_string()));
+            let response = self.http.send(request).await.map_err(Self::backend)?;
+            if response.status != 200 {
+                return Err(BlocksIndexError::Backend {
+                    message: format!("the index answered {}", response.status),
+                });
+            }
+            Ok(response.body)
+        })
     }
 
     /// Maps an [`HttpError`] onto the port's error: from the index's side,
@@ -88,22 +115,14 @@ impl BlocksIndex for HostedBlocksIndex {
         &'a self,
         query: &'a BlockQuery,
     ) -> BoxFuture<'a, Result<Vec<BlockEntry>, BlocksIndexError>> {
-        Box::pin(async move {
-            let mut request = HttpRequest::new(HttpMethod::Get, self.search_url(query));
-            request.headers.push(("Accept".to_string(), "application/json".to_string()));
-            let response = self.http.send(request).await.map_err(Self::backend)?;
-            if response.status != 200 {
-                return Err(BlocksIndexError::Backend {
-                    message: format!("the index answered {}", response.status),
-                });
-            }
-            parse_response(&response.body)
-        })
+        Box::pin(async move { parse_response(&self.search_body(query).await?) })
     }
 }
 
-/// Parses one search response body against the wire contract.
-fn parse_response(body: &[u8]) -> Result<Vec<BlockEntry>, BlocksIndexError> {
+/// Parses one search response body against the wire contract. Public inside
+/// the crate so `blocks search` can validate a cached body with the very same
+/// checks a live one gets.
+pub(crate) fn parse_response(body: &[u8]) -> Result<Vec<BlockEntry>, BlocksIndexError> {
     let json: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| invalid(format!("the body is not valid json ({e})")))?;
     let results = json

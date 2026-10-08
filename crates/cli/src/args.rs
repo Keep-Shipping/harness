@@ -28,7 +28,7 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
        keepshipping fmt [PATH...] [--check]
        keepshipping fmt -
        keepshipping fmt --upgrade [PATH...]
-       keepshipping blocks search <QUERY> [--index URL] [--limit N] [--format human|json]
+       keepshipping blocks search <QUERY> [--index URL] [--limit N] [--offline] [--format human|json]
        keepshipping log [RUN-ID] [--format human|json]
        keepshipping log verify [RUN-ID]
        keepshipping policy explain [FILE] [--as agent|human|ci] [--env NAME]
@@ -39,7 +39,7 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
 /// rejects them like any other unrecognized option. `--until`, `--skip` and
 /// `--allow-partial` belong to `run` alone, and `--context` to both.
 /// `blocks search` has its own `--format` (human or json, no github
-/// annotations), `--index` and `--limit`. `graph` has its own `--format` —
+/// annotations), `--index`, `--limit` and `--offline`. `graph` has its own `--format` —
 /// `text|dot|json`, not the diagnostic formats, so `check --format dot` stays
 /// the usage error it has always been. `fmt` takes `--check`, the `-` stdin
 /// positional, and `--upgrade`; it rejects `--env`, `--event`, `--actor` and
@@ -102,6 +102,9 @@ pub struct Options {
     pub index: Option<String>,
     /// The `--limit` of `blocks search`, at least one.
     pub limit: u32,
+    /// `--offline` on `blocks search`: answer from the local metadata cache
+    /// and never touch the network.
+    pub offline: bool,
     /// `--upgrade` on `fmt`: rewrite each file to the format this build
     /// writes, rather than laying it out.
     pub upgrade: bool,
@@ -141,6 +144,7 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
         verbose: false,
         index: None,
         limit: DEFAULT_SEARCH_LIMIT,
+        offline: false,
         upgrade: false,
         check: false,
         stdin: false,
@@ -195,6 +199,7 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
                 let value = flag_value(&mut rest)?;
                 o.limit = value.parse().ok().filter(|limit| *limit > 0)?;
             }
+            "--offline" if command == Command::BlocksSearch => o.offline = true,
             // Everything after `--` is a path, even when it starts with a dash: the
             // one way to name a file called `-weird.ks`.
             "--" if command == Command::Fmt => {

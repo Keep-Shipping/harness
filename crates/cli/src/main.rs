@@ -9,6 +9,7 @@
 
 mod args;
 mod blocks;
+mod blocks_cache;
 mod blocks_index;
 mod check;
 mod drive;
