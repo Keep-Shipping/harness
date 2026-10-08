@@ -40,9 +40,18 @@
 //!   most recent marker comment are considered, so an approve written for one
 //!   parked request is not consumed by another's poll.
 //!
+//! - **Fork code is [`Origin::Fork`], whatever the workflow's trigger says.**
+//!   [`Origin`] classifies a GitHub Actions run from an event name and payload,
+//!   so the harness's own answer does not rest on the trigger
+//!   ([#115](https://github.com/Keep-Shipping/harness/issues/115)).
+//!
 //! [`FakeHttpClient`]: https://docs.rs/ks-testing/latest/ks_testing/http/struct.FakeHttpClient.html
 
 #![forbid(unsafe_code)]
+
+pub mod fork;
+
+pub use fork::Origin;
 
 use std::collections::BTreeSet;
 use std::fmt;
