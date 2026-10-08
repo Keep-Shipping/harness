@@ -11,5 +11,16 @@ repository.workspace = true
 ks-core.workspace = true
 sha2.workspace = true
 
+# For `tests/coexistence_guide.rs`, which checks the site file the coexistence
+# guide shows against the real checker. `ks-core::check` takes a `ks_lang::Parse`
+# and re-exports neither `ks_lang` nor a way to build one, so the parse has to
+# come from `ks-lang` directly — the same pairing `ks-core`'s own doctest uses.
+[dev-dependencies]
+ks-lang.workspace = true
+# Also already in the tree for `ks-engine`, so this adds no new package. It is
+# what makes the guide's workflow fences a real assertion — the step-shape check
+# in particular reads a parsed tree, which an indentation eyeball cannot do.
+serde_yaml_ng.workspace = true
+
 [lints]
 workspace = true
