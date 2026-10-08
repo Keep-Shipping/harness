@@ -24,7 +24,7 @@ fn steps_doc_matches_the_builtin_steps() {
         .filter(|step| !FEATURE_GATED.contains(&step.name()))
         .map(|step| step.as_ref())
         .collect();
-    let rendered = render_steps_markdown(&refs);
+    let rendered = render_steps_markdown(&refs, &ks_engine::steps::builtin_types());
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/STEPS.md");
     if std::env::var("KS_BLESS").as_deref() == Ok("1") {
         fs::write(&path, rendered).expect("docs/STEPS.md should be writable");

@@ -8,6 +8,15 @@ Regenerate with: KS_BLESS=1 cargo test -p ks-engine --test steps_doc
 Every step kind the harness ships, with its declared schema. Inputs are
 checked against the schema before the step runs; outputs, after.
 
+Named types:
+
+| Name | Base | Description |
+| --- | --- | --- |
+| `k8s.Cluster` | string | a resolved cluster target naming how the run authenticates, never a credential |
+| `oci.Artifact` | string | the digest of an artifact attached to an image — an SBOM, a signature |
+| `oci.Digest` | string | an OCI content digest (`sha256:…`), so a reference to content stays one |
+| `oci.Ref` | string | an image reference pinned to a digest, as `<repository>@<digest>` |
+| `oci.Tag` | string | a mutable image reference, as `<repository>:<tag>` |
 
 ## `k8s.rollout` (v1.1.0)
 
@@ -16,6 +25,7 @@ Applies manifests to a cluster with every image pinned by digest, and waits for 
 - Action: deploy
 - Requires: Cluster
 - Optional: Registry, Signer
+- Capabilities: none
 
 Inputs:
 
@@ -42,6 +52,7 @@ Push files as an OCI artifact with an artifactType and media types.
 - Action: build
 - Requires: Registry
 - Optional: Signer
+- Capabilities: network: any host
 
 Inputs:
 
@@ -67,6 +78,7 @@ Builds a container image from a Dockerfile, pushes it, and reports the digest th
 - Action: build
 - Requires: ImageBuilder, Registry
 - Optional: Signer, RunContext
+- Capabilities: none
 
 Inputs:
 
@@ -101,6 +113,7 @@ Refuses to continue unless an image digest carries a signature from a named iden
 
 - Action: other
 - Requires: Registry, Signer
+- Capabilities: none
 
 Inputs:
 
@@ -122,6 +135,7 @@ Applies exactly the plan file an approval was bound to, refusing if its sha256 n
 
 - Action: apply
 - Requires: IacTool
+- Capabilities: none
 
 Inputs:
 
@@ -142,6 +156,7 @@ Plans an infrastructure directory, and reports what it would change.
 
 - Action: plan
 - Requires: IacTool
+- Capabilities: none
 
 Inputs:
 
@@ -171,6 +186,7 @@ Deploys to a fleet of hosts over SSH, one batch at a time, and reports how many 
 - Action: deploy
 - Requires: RemoteShell
 - Optional: Registry, Signer
+- Capabilities: none
 
 Inputs:
 

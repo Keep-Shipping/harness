@@ -998,10 +998,15 @@ pub trait StepKind: Send + Sync + 'static {
     fn run(&self, ctx: StepCtx, inputs: Inputs) -> BoxFuture<'_, Result<Outputs, StepError>>;
 }
 
-/// Renders step kinds as deterministic Markdown for `docs/STEPS.md`, sorted by name. Action
-/// classes are rendered for empty inputs, so steps that compute the class from inputs show
-/// their base kind.
-pub fn render_steps_markdown(steps: &[&dyn StepKind]) -> String {
+/// Renders step kinds as deterministic Markdown for `docs/STEPS.md`, sorted by name, plus a
+/// table of the named types those schemas refer to. Action classes are rendered for empty
+/// inputs, so steps that compute the class from inputs show their base kind; capabilities are
+/// rendered for every step, so an omitted line never has to be read as "safe".
+///
+/// `types` is whatever vocabulary the caller can document: it may not cover every name a step
+/// schema mentions (the harness resolves some built-in names without a [`TypeDef`]). A name with
+/// no definition still renders as itself in the tables below.
+pub fn render_steps_markdown(steps: &[&dyn StepKind], types: &[TypeDef]) -> String {
     let mut out = String::from(
         "<!--\n\
          Generated from the built-in step kinds; do not edit by hand.\n\
@@ -1011,6 +1016,21 @@ pub fn render_steps_markdown(steps: &[&dyn StepKind]) -> String {
          Every step kind the harness ships, with its declared schema. Inputs are\n\
          checked against the schema before the step runs; outputs, after.\n\n",
     );
+    if !types.is_empty() {
+        let mut sorted_types = types.to_vec();
+        sorted_types.sort_by_key(|def| def.name);
+        push_line(&mut out, "Named types:");
+        out.push_str("\n| Name | Base | Description |\n| --- | --- | --- |\n");
+        for def in sorted_types {
+            let row = format!(
+                "| `{}` | {} | {} |",
+                md_cell(def.name),
+                md_cell(&def.base.to_string()),
+                md_cell(def.doc),
+            );
+            push_line(&mut out, &row);
+        }
+    }
     if steps.is_empty() {
         out.push_str("_No step kinds are built in yet._\n");
         return out;
@@ -1027,6 +1047,10 @@ pub fn render_steps_markdown(steps: &[&dyn StepKind]) -> String {
         if !step.optional().is_empty() {
             push_line(&mut out, &format!("- Optional: {}", join_ports(step.optional())));
         }
+        push_line(
+            &mut out,
+            &format!("- Capabilities: {}", join_capabilities(&step.capabilities())),
+        );
         out.push_str(
             "\nInputs:\n\n| Name | Type | Default | Description |\n| --- | --- | --- | --- |\n",
         );
@@ -1084,6 +1108,37 @@ fn join_ports(ports: &[Port]) -> String {
         return "none".to_string();
     }
     ports.iter().map(|port| port.to_string()).collect::<Vec<_>>().join(", ")
+}
+
+/// A compact, deterministic rendering of what a step needs from its environment. Mirrors
+/// [`join_ports`]: local-safe renders `none`, so a reader never has to guess whether an absent
+/// capability means "safe" or "not documented". A network scope of [`NetworkScope::None`] is
+/// implied by `none` on its own but named once anything else applies, because "no CI requirement
+/// but no network" is a different claim from "nothing needed".
+fn join_capabilities(capabilities: &StepCapabilities) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if capabilities.ci_only {
+        parts.push("CI only".to_string());
+    }
+    if capabilities.oidc {
+        parts.push("OIDC".to_string());
+    }
+    match &capabilities.network {
+        NetworkScope::None => {
+            if !parts.is_empty() {
+                parts.push("network: none".to_string());
+            }
+        }
+        NetworkScope::Any => parts.push("network: any host".to_string()),
+        NetworkScope::Hosts(hosts) => {
+            parts
+                .push(format!("network: {}", hosts.iter().cloned().collect::<Vec<_>>().join(", ")));
+        }
+    }
+    if parts.is_empty() {
+        return "none".to_string();
+    }
+    parts.join(", ")
 }
 
 /// A compact, deterministic rendering of a default value for the docs tables. Non-finite
@@ -1379,8 +1434,23 @@ mod tests {
         assert!(token.is_cancelled() && copy.is_cancelled());
     }
 
-    /// A step whose only job is to carry a schema into the renderer.
-    struct DocStep(StepSchema);
+    /// A step whose only job is to carry a schema and a capability set into the renderer.
+    struct DocStep {
+        schema: StepSchema,
+        capabilities: StepCapabilities,
+    }
+
+    impl DocStep {
+        /// A local-safe step: the default capabilities every built-in but `oci.artifact` has.
+        fn local(schema: StepSchema) -> Self {
+            DocStep { schema, capabilities: StepCapabilities::default() }
+        }
+
+        /// A step that needs more than a local machine.
+        fn needing(schema: StepSchema, capabilities: StepCapabilities) -> Self {
+            DocStep { schema, capabilities }
+        }
+    }
 
     impl StepKind for DocStep {
         fn name(&self) -> &'static str {
@@ -1392,7 +1462,7 @@ mod tests {
         }
 
         fn schema(&self) -> StepSchema {
-            self.0.clone()
+            self.schema.clone()
         }
 
         fn requires(&self) -> &'static [Port] {
@@ -1403,14 +1473,23 @@ mod tests {
             ActionClass::new(ActionKind::Other)
         }
 
+        fn capabilities(&self) -> StepCapabilities {
+            self.capabilities.clone()
+        }
+
         fn run(&self, _ctx: StepCtx, _inputs: Inputs) -> BoxFuture<'_, Result<Outputs, StepError>> {
             Box::pin(std::future::ready(Ok(Outputs::new())))
         }
     }
 
+    /// An empty schema, for tests that care about capabilities or types rather than fields.
+    fn bare_schema() -> StepSchema {
+        StepSchema { doc: "does a thing", inputs: Vec::new(), outputs: Vec::new() }
+    }
+
     #[test]
     fn rendered_markdown_escapes_every_cell() {
-        let step = DocStep(StepSchema {
+        let step = DocStep::local(StepSchema {
             doc: "tags one image | per run",
             inputs: vec![
                 Field::new("tag", TypeRef::Builtin(ValueType::String), "which tag | branch")
@@ -1420,10 +1499,103 @@ mod tests {
             ],
             outputs: Vec::new(),
         });
-        let markdown = render_steps_markdown(&[&step]);
+        let markdown = render_steps_markdown(&[&step], &[]);
         assert!(markdown.contains("tags one image \\| per run"), "{markdown}");
         assert!(markdown.contains("which tag \\| branch"), "{markdown}");
         assert!(markdown.contains("| `a\\|b` |"), "{markdown}");
         assert!(markdown.contains("| NaN |"), "{markdown}");
+    }
+
+    #[test]
+    fn local_safe_capabilities_render_as_none() {
+        let step = DocStep::local(bare_schema());
+        let markdown = render_steps_markdown(&[&step], &[]);
+        assert!(markdown.contains("- Capabilities: none"), "{markdown}");
+    }
+
+    #[test]
+    fn any_host_network_is_named_rather_than_left_out() {
+        let step = DocStep::needing(
+            bare_schema(),
+            StepCapabilities { network: NetworkScope::Any, ..StepCapabilities::default() },
+        );
+        let markdown = render_steps_markdown(&[&step], &[]);
+        assert!(markdown.contains("- Capabilities: network: any host"), "{markdown}");
+    }
+
+    #[test]
+    fn host_scoped_network_lists_its_hosts_sorted() {
+        let hosts =
+            BTreeSet::from(["registry.example.com".to_string(), "cdn.example.com".to_string()]);
+        let step = DocStep::needing(
+            bare_schema(),
+            StepCapabilities { network: NetworkScope::Hosts(hosts), ..StepCapabilities::default() },
+        );
+        let markdown = render_steps_markdown(&[&step], &[]);
+        assert!(
+            markdown.contains("- Capabilities: network: cdn.example.com, registry.example.com"),
+            "{markdown}"
+        );
+    }
+
+    #[test]
+    fn ci_only_and_oidc_each_appear_when_set() {
+        let ci = DocStep::needing(
+            bare_schema(),
+            StepCapabilities { ci_only: true, ..StepCapabilities::default() },
+        );
+        assert!(
+            render_steps_markdown(&[&ci], &[]).contains("- Capabilities: CI only, network: none"),
+            "no network alongside CI only"
+        );
+        let oidc = DocStep::needing(
+            bare_schema(),
+            StepCapabilities { oidc: true, ..StepCapabilities::default() },
+        );
+        assert!(
+            render_steps_markdown(&[&oidc], &[]).contains("- Capabilities: OIDC, network: none"),
+            "no network alongside OIDC"
+        );
+    }
+
+    #[test]
+    fn named_types_table_documents_what_it_is_given() {
+        let step = DocStep::local(bare_schema());
+        let types = [
+            TypeDef { name: "oci.Tag", base: ValueType::String, doc: "a mutable image reference" },
+            TypeDef { name: "int", base: ValueType::Number, doc: "a whole number" },
+        ];
+        let markdown = render_steps_markdown(&[&step], &types);
+        assert!(markdown.contains("Named types:"), "{markdown}");
+        let header = markdown
+            .find("| Name | Base | Description |\n| --- | --- | --- |")
+            .expect("the named types table has a header");
+        let int_row = markdown
+            .find("| `int` | number | a whole number |")
+            .unwrap_or_else(|| panic!("no row for `int` in {markdown}"));
+        let tag_row = markdown
+            .find("| `oci.Tag` | string | a mutable image reference |")
+            .unwrap_or_else(|| panic!("no row for `oci.Tag` in {markdown}"));
+        assert!(header < int_row && int_row < tag_row, "rows sort by name: {markdown}");
+    }
+
+    #[test]
+    fn a_named_type_with_no_definition_still_renders_its_bare_name() {
+        let step = DocStep::local(StepSchema {
+            doc: "builds from a checkout",
+            inputs: vec![Field::new("from", TypeRef::Named("path"), "the Dockerfile to build")],
+            outputs: Vec::new(),
+        });
+        let markdown = render_steps_markdown(&[&step], &[]);
+        assert!(markdown.contains("| `from` | path | - | the Dockerfile to build |"), "{markdown}");
+        assert!(!markdown.contains("Named types:"), "no vocabulary, no table: {markdown}");
+    }
+
+    #[test]
+    fn no_step_kinds_still_renders_the_named_types() {
+        let types = [TypeDef { name: "int", base: ValueType::Number, doc: "a whole number" }];
+        let markdown = render_steps_markdown(&[], &types);
+        assert!(markdown.contains("Named types:"), "{markdown}");
+        assert!(markdown.contains("_No step kinds are built in yet._"), "{markdown}");
     }
 }
