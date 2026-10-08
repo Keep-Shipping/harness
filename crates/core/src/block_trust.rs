@@ -23,11 +23,10 @@
 //! **What is in it?** A block that carries `policy:` would be a block shipping
 //! its own rules into your run. Policy is the repo's and the org's alone ([ADR
 //! 0012](https://github.com/Keep-Shipping/harness/blob/main/docs/adr/0012-policy-authority.md)),
-//! and a block is nobody's repo. [`policy_sections`] finds those entries, and
-//! `check` errors on them today ([`Code::BlockPolicy`](ks_lang::Code::BlockPolicy)).
-//! `blocks publish` (ADR
-//! 0011) is to call the same function when it lands, so the two agree by
-//! construction rather than by two rules that could drift apart.
+//! and a block is nobody's repo. [`policy_sections`] finds those entries,
+//! `check` errors on them today ([`Code::BlockPolicy`](ks_lang::Code::BlockPolicy)),
+//! and `blocks publish` refuses such a block outright (ADR 0011), so the two
+//! agree by construction rather than by two rules that could drift apart.
 //!
 //! Neither function does I/O: [`verify`] is a pure comparison against the
 //! baseline, and [`policy_sections`] reads an already-parsed file.
@@ -93,14 +92,25 @@ fn identity_text(identity: &SignerIdentity) -> String {
 /// same subject, and nothing looser, because an issuer that reuses a subject
 /// name across organizations would otherwise inherit the allowlist.
 ///
-/// Pure and offline, so it is callable from the same path as `check`.
+/// Pure and offline, so it costs a caller nothing but a comparison.
 ///
-/// **It has no call site yet.** Nothing resolves a block today, so nothing
-/// consults this verdict. It is the decision the block-resolution path (`using`,
-/// `ship.lock`) will call when that lands, under this contract: `check`
-/// reports an `Err` as a *warning* — a laptop author should see that a block
-/// is untrusted without being stopped by it — and `run` refuses outright.
-/// Both callers land with block resolution, not here.
+/// `ks_engine::blocks::verify` is a caller, and it fails closed: a package it
+/// is handed comes back as `VerifyError::Untrusted` and is not used. A signature
+/// from *any* signer satisfies the digest-and-status rules, so without this
+/// verdict a compromised publisher's block would clear the gate those rules
+/// leave open ([#125](https://github.com/Keep-Shipping/harness/issues/125)).
+///
+/// **That gate is not yet in front of a run.** Nothing resolves a block at run
+/// time today — `using` and `ship.lock` are not on any path a run takes — so
+/// no run consults this verdict, and the gate above has no production caller of
+/// its own. The rule is enforced wherever it is called and tested as a gate;
+/// calling it from `run` lands with block resolution, not here.
+///
+/// `check` does not consult this function, and is not going to: it reports
+/// [`policy_sections`] as an error but has no
+/// `ship.lock`-resolved package in hand and so no signature to check. The
+/// advisory half of the contract — a laptop author should see that a block is
+/// untrusted — is what that remains for; enforcement is the gate's.
 pub fn verify(
     signer: Option<&SignerIdentity>,
     baseline: &Baseline,
@@ -121,10 +131,9 @@ pub fn verify(
 /// policy belongs. A block file returns one span per `policy:` entry; the
 /// grammar allows more than one, and each is reported on its own.
 ///
-/// `check` calls this today and errors on every span it returns. `blocks
-/// publish` (ADR 0011) is to call the same function when it lands and refuse
-/// such a block outright — one rule, two callers, rather than two rules that
-/// could drift apart.
+/// `check` calls this and errors on every span it returns, and `blocks publish`
+/// calls the same function and refuses such a block outright (ADR 0011) — one
+/// rule, two callers, rather than two rules that could drift apart.
 #[must_use]
 pub fn policy_sections(file: &File<'_>) -> Vec<Span> {
     let is_block = file.entries().any(|e| e.key_name() == Some("block"));

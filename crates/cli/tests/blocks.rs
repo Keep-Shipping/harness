@@ -411,3 +411,31 @@ fn blocks_publish_usage_mistakes_are_exit_two() {
         assert!(stderr.contains(named), "{args:?}: {stderr}");
     }
 }
+
+/// A block that ships its own `policy:` is refused at the publisher's desk
+/// (ADR 0012). The target is `localhost:1`, where nothing listens: the refusal
+/// has to happen before the registry is asked for anything, so a regression
+/// that let it through fails as a connection error rather than hanging.
+#[test]
+fn a_block_that_ships_its_own_policy_is_refused_without_contacting_a_registry() {
+    let dir = TempDir::new("blocks-publish-policy");
+    let file = dir.path().join("web-service.ks");
+    std::fs::write(&file, "block: web-service\npolicy:\n  agents:\n    never: destroy prod\n")
+        .expect("write the block file");
+    let path = file.to_str().expect("a utf-8 path");
+
+    let (code, stdout, stderr) = run_with(
+        None,
+        &["blocks", "publish", path, "--version", "1.0.0", "--to", "localhost:1/acme"],
+        &[],
+    );
+
+    assert_eq!(code, 2, "{stdout}{stderr}");
+    assert!(stdout.is_empty(), "nothing is published: {stdout}");
+    assert!(stderr.contains("may not ship its own policy"), "{stderr}");
+    assert!(stderr.contains("policy"), "the message names the rule: {stderr}");
+    assert!(
+        !stderr.contains("connection refused") && !stderr.contains("localhost:1"),
+        "the registry is never asked: {stderr}"
+    );
+}

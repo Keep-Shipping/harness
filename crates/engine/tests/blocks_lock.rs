@@ -5,16 +5,19 @@
 //! not a prerelease; two repositories on different majors of one block both
 //! work; a pin resolves *once*, so a release published today does not change
 //! what an unchanged lock runs; exact and digest pins work; an upgrade is a
-//! diff of a version and a digest; and `verify` refuses a mismatched digest and
-//! an unsigned block.
+//! diff of a version and a digest; and `verify` refuses a mismatched digest, an
+//! unsigned block, and a block signed by a publisher the baseline does not
+//! list ([#125](https://github.com/Keep-Shipping/harness/issues/125)).
 //!
 //! Everything runs against [`FakeBlockSource`], so no test opens a socket — the
 //! same property the `offline` CI job asserts of `check`.
 
+use ks_core::block_trust::Untrusted;
 use ks_core::lock::{BlockRef, Lock};
 use ks_core::ports::block_source::{BlockDefinition, BlockPackage};
 use ks_core::ports::blocks::{BlockVersion, SignatureStatus};
-use ks_core::ports::supply_chain::Digest;
+use ks_core::ports::policy::Baseline;
+use ks_core::ports::supply_chain::{Digest, SignerIdentity};
 use ks_engine::blocks::{LockUpdateError, VerifyError, update, verify};
 use ks_testing::block_on;
 use ks_testing::block_source::{BlockSourceCall, FakeBlockSource};
@@ -63,6 +66,19 @@ fn package(byte: char, signature: SignatureStatus) -> BlockPackage {
     }
 }
 
+/// The publisher the fixture's blocks are signed by, and the baseline that
+/// trusts it: an organization that has chosen who may publish its blocks.
+fn publisher() -> SignerIdentity {
+    SignerIdentity::Keyless {
+        issuer: "https://token.acme.example".to_string(),
+        subject: "acme/release@v3".to_string(),
+    }
+}
+
+fn baseline() -> Baseline {
+    Baseline { publishers: vec![publisher()], ..Baseline::conservative() }
+}
+
 #[test]
 fn a_major_pin_picks_the_highest_release_of_that_major_and_not_a_prerelease() {
     let lock = block_on(update(&source(), &[reference("acme/web-service@v3")], &Lock::new()))
@@ -107,9 +123,22 @@ fn two_repositories_pinned_to_different_majors_both_work_against_one_source() {
     // Each package passes against its own lock and fails against the other's,
     // which is what makes the digest a pin rather than a record.
     for (own, own_byte, other_byte) in [(three, 'c', 'e'), (four, 'e', 'c')] {
-        assert_eq!(verify(own, &package(own_byte, SignatureStatus::Signed)), Ok(()));
+        assert_eq!(
+            verify(
+                own,
+                &package(own_byte, SignatureStatus::Signed),
+                Some(&publisher()),
+                &baseline()
+            ),
+            Ok(publisher())
+        );
         assert!(matches!(
-            verify(own, &package(other_byte, SignatureStatus::Signed)),
+            verify(
+                own,
+                &package(other_byte, SignatureStatus::Signed),
+                Some(&publisher()),
+                &baseline()
+            ),
             Err(VerifyError::DigestMismatch { .. })
         ));
     }
@@ -276,18 +305,83 @@ fn verify_refuses_content_that_is_not_the_pin_and_content_that_is_unsigned() {
     let lock = block_on(update(&source(), &[reference("acme/web-service@v3")], &Lock::new()))
         .expect("resolved");
     let entry = lock.get(&reference("acme/web-service@v3")).expect("the entry");
+    let signer = publisher();
 
-    assert_eq!(verify(entry, &package('c', SignatureStatus::Signed)), Ok(()));
     assert_eq!(
-        verify(entry, &package('e', SignatureStatus::Signed)).expect_err("not what was pinned"),
+        verify(entry, &package('c', SignatureStatus::Signed), Some(&signer), &baseline()),
+        Ok(signer.clone())
+    );
+    assert_eq!(
+        verify(entry, &package('e', SignatureStatus::Signed), Some(&signer), &baseline())
+            .expect_err("not what was pinned"),
         VerifyError::DigestMismatch {
             reference: "acme/web-service@v3".to_string(),
             expected: digest_of('c'),
             actual: digest_of('e'),
         }
     );
-    let unsigned = verify(entry, &package('c', SignatureStatus::Unsigned))
-        .expect_err("an unsigned block is not used");
+    let unsigned =
+        verify(entry, &package('c', SignatureStatus::Unsigned), Some(&signer), &baseline())
+            .expect_err("an unsigned block is not used");
     assert!(matches!(unsigned, VerifyError::Unsigned { .. }), "{unsigned:?}");
     assert!(unsigned.to_string().contains("no verified signature"), "{unsigned}");
+}
+
+/// The gap #125 names: a signature from *anybody* used to clear the gate, so a
+/// compromised publisher's block reached a run with the digest right and the
+/// status `signed`.
+#[test]
+fn a_block_signed_by_an_unlisted_publisher_is_refused() {
+    let lock = block_on(update(&source(), &[reference("acme/web-service@v3")], &Lock::new()))
+        .expect("resolved");
+    let entry = lock.get(&reference("acme/web-service@v3")).expect("the entry");
+    let intruder = SignerIdentity::Keyless {
+        issuer: "https://token.evil.example".to_string(),
+        subject: "acme/release@v3".to_string(),
+    };
+
+    // Same digest, `signed`, and still refused: the allowlist is the only thing
+    // that tells an honest publisher from a compromised one.
+    let refused =
+        verify(entry, &package('c', SignatureStatus::Signed), Some(&intruder), &baseline())
+            .expect_err("the baseline does not list that publisher");
+    let VerifyError::Untrusted { reference, reason } = &refused else {
+        panic!("a signature from an unlisted publisher is Untrusted, got {refused:?}");
+    };
+    assert_eq!(reference, "acme/web-service@v3");
+    assert_eq!(reason, &Untrusted::UnknownPublisher(intruder));
+    assert!(refused.to_string().contains("acme/release@v3"), "the message names it: {refused}");
+}
+
+#[test]
+fn a_block_signed_by_a_listed_publisher_is_accepted_and_named() {
+    let lock = block_on(update(&source(), &[reference("acme/web-service@v3")], &Lock::new()))
+        .expect("resolved");
+    let entry = lock.get(&reference("acme/web-service@v3")).expect("the entry");
+
+    let identity =
+        verify(entry, &package('c', SignatureStatus::Signed), Some(&publisher()), &baseline())
+            .expect("a listed publisher is trusted");
+
+    assert_eq!(identity, publisher(), "the caller records who published what it runs");
+}
+
+/// A package can report `signed` while the signature referrer resolved to nobody
+/// — a compromised registry, a referrer that did not verify. The baseline does
+/// not rescue it: without an identity there is no publisher to hold to it, so
+/// the gate fails closed.
+#[test]
+fn a_block_with_no_signer_is_refused_even_against_a_permissive_baseline() {
+    let lock = block_on(update(&source(), &[reference("acme/web-service@v3")], &Lock::new()))
+        .expect("resolved");
+    let entry = lock.get(&reference("acme/web-service@v3")).expect("the entry");
+
+    let refused = verify(entry, &package('c', SignatureStatus::Signed), None, &baseline())
+        .expect_err("a signed package with no identity behind it names no publisher");
+
+    assert!(
+        matches!(refused, VerifyError::Untrusted { reason: Untrusted::Unsigned, .. }),
+        "{refused:?}"
+    );
+    assert!(refused.to_string().contains("unsigned"), "{refused}");
 }
