@@ -15,6 +15,7 @@ use crate::oci_image::OciImage;
 use crate::oci_verify::OciVerify;
 use crate::tofu_apply::TofuApply;
 use crate::tofu_plan::TofuPlan;
+use crate::vm_deploy::VmDeploy;
 
 /// Every built-in step kind, in registration order.
 ///
@@ -37,6 +38,7 @@ pub fn builtin_steps() -> Vec<Arc<dyn StepKind>> {
         Some(Arc::new(OciVerify)),
         Some(Arc::new(TofuPlan)),
         Some(Arc::new(TofuApply)),
+        Some(Arc::new(VmDeploy)),
         decide,
     ]
     .into_iter()

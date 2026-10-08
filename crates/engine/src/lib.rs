@@ -25,3 +25,4 @@ pub mod state;
 pub mod steps;
 pub mod tofu_apply;
 pub mod tofu_plan;
+pub mod vm_deploy;

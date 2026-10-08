@@ -29,6 +29,20 @@ comment edits do not need any of that — the fingerprint normalises them away.
 
 Newest first, one heading per contract version, dated.
 
+## STEP_API 5
+
+- **2026-10-07** — Additive: the `RemoteShell` port gained
+  [`connect`](https://github.com/Keep-Shipping/harness/blob/main/crates/core/src/ports/remote_shell.rs)
+  ([#76](https://github.com/Keep-Shipping/harness/issues/76)), opening a
+  shell to a second pinned host over the same transport and credentials as
+  the adapter's configured host. Each `connect` checks the caller-supplied
+  [`HostKey`]; an unknown or mismatched host is
+  [`ShellError::Unreachable`](https://github.com/Keep-Shipping/harness/blob/main/crates/core/src/ports/remote_shell.rs)
+  / [`ShellError::HostKeyMismatch`], never accepted on trust (no TOFU). No
+  existing method changed shape; `run`, `copy`, `probe` and `host` are as
+  declared under `STEP_API 4`. The fingerprint covers every trait in
+  `ports/`, so the digest is re-pinned under `STEP_API 5`.
+
 ## STEP_API 4
 
 - **2026-10-07** — Breaking: the [`Cluster`](https://github.com/Keep-Shipping/harness/blob/main/crates/core/src/ports/cluster.rs)

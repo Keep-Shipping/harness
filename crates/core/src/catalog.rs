@@ -193,6 +193,25 @@ impl Catalog {
             false,
             false,
         );
+        // `hosts`, `run` and `rollback` are lists of maps, which a `TypeRef` cannot spell more
+        // precisely than a list: the step schema declares them as lists, so the catalog says the
+        // same and the two cannot drift.
+        add(
+            "vm.deploy",
+            &[
+                ("hosts", Type::List(Box::new(Type::Any))),
+                ("batch", Type::Optional(Box::new(Type::String))),
+                ("run", Type::Optional(Box::new(Type::List(Box::new(Type::Any))))),
+                ("health", Type::Optional(Box::new(Type::String))),
+                ("health_timeout", Type::Optional(Box::new(Type::Int))),
+                ("max_failures", Type::Optional(Box::new(Type::Int))),
+                ("rollback", Type::Optional(Box::new(Type::List(Box::new(Type::Any))))),
+                ("ssh_user", Type::Optional(Box::new(Type::String))),
+            ],
+            &[("healthy", Type::Int), ("total", Type::Int), ("summary", Type::String)],
+            false,
+            false,
+        );
         add(
             "approval",
             &[
@@ -402,7 +421,7 @@ pub fn action_kind(kind: &str) -> ActionKind {
         "oci.image" | "oci.artifact" => ActionKind::Build,
         "tofu.plan" | "terraform.plan" => ActionKind::Plan,
         "tofu.apply" | "terraform.apply" => ActionKind::Apply,
-        "k8s.rollout" => ActionKind::Deploy,
+        "k8s.rollout" | "vm.deploy" => ActionKind::Deploy,
         _ => ActionKind::Other,
     }
 }

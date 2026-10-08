@@ -47,7 +47,7 @@ pub const FORMAT_VERSION: u32 = 1;
 /// signature a step must implement. A mismatch means the step has to be recompiled against
 /// the new `ks-core`: its `step_api()` and the harness's `STEP_API` are compared at
 /// composition time, so a stale step is a composition error rather than a silent one.
-pub const STEP_API: u32 = 4;
+pub const STEP_API: u32 = 5;
 
 /// The version of the JSON-stdio protocol between the harness and a TypeScript
 /// script running through the `ScriptHost` port.
