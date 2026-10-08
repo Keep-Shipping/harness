@@ -1156,6 +1156,8 @@ name = "ks-testing"
 version = "0.0.0"
 dependencies = [
  "ks-core",
+ "ks-lang",
+ "serde_yaml_ng",
  "sha2 0.10.9",
 ]
 
