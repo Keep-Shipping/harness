@@ -1,0 +1,105 @@
+# The Keep Shipping action: install a pinned release, then run one command on a site
+# file. GitHub Actions is the first native CI (ADR 0008); this is the published entry
+# point it asked for. Until the mirror repo is public (ADR 0006) this cannot be `uses:`'d
+# as `Keep-Shipping/action` from anywhere else; docs/GITHUB_ACTIONS.md has the fallback.
+name: keepshipping
+description: >-
+  Install a pinned, signature-verified keepshipping release and run `run` or
+  `check` on a site file with the CI context selected.
+author: Keep Shipping
+
+branding:
+  icon: anchor
+  color: blue
+
+inputs:
+  version:
+    description: >-
+      Exact version to install, e.g. 1.2.3 or 1.2.3-rc.1. `latest` is refused: a CI
+      job that installs "whatever is newest" is not reproducible, and ship.lock has no
+      keepshipping entry to read a pin from yet.
+    required: true
+  command:
+    description: "Which command to run: `run` or `check`. Anything else is a usage error."
+    required: false
+    default: run
+  file:
+    description: The site file to run or check. Defaults to `ship.ks` in the workspace, as the CLI does.
+    required: false
+    default: ship.ks
+  args:
+    description: >-
+      Extra flags for the command, as one string split on whitespace — e.g. `--until
+      plan --non-interactive` or `--format github`. Split with no globbing and no quote
+      handling, so a quoted value cannot be carried.
+    required: false
+    default: ''
+  verify-signature:
+    description: >-
+      Verify SHA256SUMS with cosign keyless before installing (`true` / `false`).
+      `false` means no authenticity check at all: SHA256SUMS comes from the same server
+      as the archive, so the checksum catches corruption but proves nothing about who
+      published the release.
+    required: false
+    default: 'true'
+  cache:
+    description: >-
+      Restore and save the step cache at `~/.cache/keepshipping/steps` through the
+      Actions cache API (`true` / `false`).
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    # Inputs arrive as `env:`, never interpolated into `run:` text: a `version` of
+    # `1.2.3; curl …` is a value on this path and code on the other one.
+    - name: Install cosign
+      if: inputs.verify-signature == 'true'
+      uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v3.9.2
+
+    - name: Install keepshipping ${{ inputs.version }}
+      shell: bash
+      env:
+        KS_VERSION: ${{ inputs.version }}
+        KS_VERIFY_SIGNATURE: ${{ inputs.verify-signature }}
+        # Sent only to github.com URLs by install.sh. The default token needs
+        # `contents: read`, which is what a private release download needs too.
+        GH_TOKEN: ${{ github.token }}
+      # `bash <path>` rather than `<path>`: an archive checkout does not carry the
+      # exec bit, and the file mode is not what this step should depend on.
+      run: 'bash "${{ github.action_path }}/install.sh"'
+
+    - name: Restore the step cache
+      if: inputs.cache == 'true'
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        # $XDG_CACHE_HOME is unset on the runners, so this is the directory
+        # docs/CACHING.md names. The version is in the key because two builds may key
+        # their entries differently.
+        path: ~/.cache/keepshipping/steps
+        key: keepshipping-${{ runner.os }}-v${{ inputs.version }}-${{ hashFiles('ship.lock', inputs.file) }}
+
+    - name: keepshipping ${{ inputs.command }} ${{ inputs.file }}
+      shell: bash
+      env:
+        KS_COMMAND: ${{ inputs.command }}
+        KS_FILE: ${{ inputs.file }}
+        KS_EXTRA_ARGS: ${{ inputs.args }}
+      run: |
+        set -euo pipefail
+        # Validated here rather than interpolated: an unknown word would otherwise
+        # become the command. `--non-interactive` belongs in `args`, where the caller
+        # decides whether this job may ask anything.
+        case "$KS_COMMAND" in
+          run | check) ;;
+          *) echo "::error::command='$KS_COMMAND' is not one of run, check"; exit 1 ;;
+        esac
+        # `read -ra` splits on whitespace, with no globbing and no quote handling.
+        extra=()
+        if [ -n "$KS_EXTRA_ARGS" ]; then
+          read -r -a extra <<<"$KS_EXTRA_ARGS"
+        fi
+        # `--context ci` is stated rather than detected: a job that sets CI=false
+        # still means CI here.
+        keepshipping "$KS_COMMAND" "$KS_FILE" --context ci "${extra[@]}"
