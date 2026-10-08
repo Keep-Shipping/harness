@@ -256,6 +256,80 @@ steps:
     else: show risk.reason
 ",
         },
+        Code::MissingInput => Explanation {
+            code,
+            title: "missing block input",
+            severity: Severity::Error,
+            summary: "A block use leaves out an input the block requires. Only an input \
+                with a default may be left out — pass the value, or give the input a \
+                default so leaving it out means something. The hint suggests the \
+                closest name when the missing one is a misspelling of another.",
+            bad: "\
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  deploy: acme/web-service@v3
+    image: build.digest
+",
+            good: "\
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  deploy: acme/web-service@v3
+    image: build.digest
+    domain: api.acme.dev
+",
+        },
+        Code::BlockDepth => Explanation {
+            code,
+            title: "blocks nest too deep",
+            severity: Severity::Error,
+            summary: "Blocks use other blocks, and a nest deeper than four cannot be \
+                resolved: there is no order to expand it in, and a file that nests \
+                that deep is not worth a reader's time either. Split the innermost \
+                block in two. The examples below are one block per file, separated \
+                by `---`; only the last one is checked against the rest.",
+            bad: "\
+block: a
+steps:
+  use: b
+---
+block: b
+steps:
+  use: c
+---
+block: c
+steps:
+  use: d
+---
+block: d
+steps:
+  use: e
+---
+block: e
+steps:
+  build: oci.image
+    from: ./Dockerfile
+",
+            good: "\
+block: a
+steps:
+  use: b
+---
+block: b
+steps:
+  use: c
+---
+block: c
+steps:
+  use: d
+---
+block: d
+steps:
+  build: oci.image
+    from: ./Dockerfile
+",
+        },
         Code::DuplicateStep => Explanation {
             code,
             title: "duplicate step",

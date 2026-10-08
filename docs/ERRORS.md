@@ -28,11 +28,13 @@ UPDATE_GOLDEN=1 cargo test -p ks-core --test registry
 - [KS0203 — unknown output](#ks0203-unknown-output)
 - [KS0204 — unknown answer](#ks0204-unknown-answer)
 - [KS0205 — unknown action](#ks0205-unknown-action)
+- [KS0206 — missing block input](#ks0206-missing-block-input)
 - [KS0301 — duplicate step](#ks0301-duplicate-step)
 - [KS0302 — reserved step name](#ks0302-reserved-step-name)
 - [KS0303 — unknown trigger](#ks0303-unknown-trigger)
 - [KS0304 — environment problem](#ks0304-environment-problem)
 - [KS0305 — cycle](#ks0305-cycle)
+- [KS0306 — blocks nest too deep](#ks0306-blocks-nest-too-deep)
 - [KS0401 — unknown policy declaration](#ks0401-unknown-policy-declaration)
 - [KS0402 — unknown policy action](#ks0402-unknown-policy-action)
 - [KS0403 — policy forbids the run](#ks0403-policy-forbids-the-run)
@@ -362,6 +364,33 @@ steps:
     else: show risk.reason
 ```
 
+## KS0206: missing block input
+
+Severity: error.
+
+A block use leaves out an input the block requires. Only an input with a default may be left out — pass the value, or give the input a default so leaving it out means something. The hint suggests the closest name when the missing one is a misspelling of another.
+
+Not ok:
+
+```ks
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  deploy: acme/web-service@v3
+    image: build.digest
+```
+
+Ok:
+
+```ks
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  deploy: acme/web-service@v3
+    image: build.digest
+    domain: api.acme.dev
+```
+
 ## KS0301: duplicate step
 
 Severity: error.
@@ -501,6 +530,58 @@ steps:
     model: typesafe/jev
     ask: "Ready?"
     returns: low | high
+```
+
+## KS0306: blocks nest too deep
+
+Severity: error.
+
+Blocks use other blocks, and a nest deeper than four cannot be resolved: there is no order to expand it in, and a file that nests that deep is not worth a reader's time either. Split the innermost block in two. The examples below are one block per file, separated by `---`; only the last one is checked against the rest.
+
+Not ok:
+
+```ks
+block: a
+steps:
+  use: b
+---
+block: b
+steps:
+  use: c
+---
+block: c
+steps:
+  use: d
+---
+block: d
+steps:
+  use: e
+---
+block: e
+steps:
+  build: oci.image
+    from: ./Dockerfile
+```
+
+Ok:
+
+```ks
+block: a
+steps:
+  use: b
+---
+block: b
+steps:
+  use: c
+---
+block: c
+steps:
+  use: d
+---
+block: d
+steps:
+  build: oci.image
+    from: ./Dockerfile
 ```
 
 ## KS0401: unknown policy declaration

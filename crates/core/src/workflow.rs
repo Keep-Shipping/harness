@@ -1,10 +1,13 @@
 //! The checked shape of a site file: steps, triggers, environments and the
 //! data-dependence graph between steps.
 
+use std::collections::BTreeMap;
+
 use ks_lang::Span;
 
 use crate::ports::policy::{ANY_OBJECT, Disposition};
 use crate::ports::run_context::ActorKind;
+use crate::step::ActionClass;
 
 /// One `on:` trigger.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,6 +48,14 @@ pub struct Step {
     /// `ci-only: true`: the step refuses to run off CI
     /// ([#34](https://github.com/Keep-Shipping/harness/issues/34)).
     pub ci_only: bool,
+    /// What the step does, for policy. A block use carries the actions of
+    /// the steps inside it, so a use cannot hide an apply
+    /// ([#80](https://github.com/Keep-Shipping/harness/issues/80)).
+    pub actions: Vec<ActionClass>,
+    /// A block use's inputs, with the signature's defaults filled in — what
+    /// the run will get, whether the file spelled it or the block declared
+    /// it. Empty for any other step.
+    pub block_inputs: BTreeMap<String, String>,
     /// The `when:` condition, when the step declares one. The planner reads
     /// it: a condition that names no step is settled before the run starts,
     /// one that reads step outputs cannot be.

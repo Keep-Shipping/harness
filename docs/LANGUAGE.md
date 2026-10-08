@@ -301,6 +301,72 @@ outputs are the same whatever the timing was: a step's records are only
 written once every lower-numbered step has finished
 ([#40](https://github.com/Keep-Shipping/harness/issues/40)).
 
+## Blocks
+
+A **block** is a file that declares a named, typed contract other files use
+instead of copying its steps. It is a normal `.ks` file with one extra
+top-level key:
+
+```ks
+# acme/blocks · web-service@v3
+block:  web-service
+inputs:
+  image:    oci.Digest
+  domain:   string
+  replicas: int = 2
+```
+
+Any file uses it as a step:
+
+```ks
+steps:
+  build:   oci.image
+    from:  ./Dockerfile
+  deploy:  acme/web-service@v3
+    image:  build.digest
+    domain: api.acme.dev
+```
+
+**Inputs.** Each `inputs:` child is a name and a type; `name: type = value`
+gives it a default. A use must spell every input without a default
+(`KS0206`, naming the block and the input, with the block's own inputs as the
+near misses) and may not spell one the block does not declare. Defaults are
+filled in where the use left them out: `replicas` above is `2` whether or not
+the use writes it, and the checked workflow records what the run will get.
+A value of the wrong type is the same type mismatch any other input has.
+
+**A block file reads its own inputs.** Its internal steps read them as
+`inputs.<name>`, and nothing else: `inputs.` is a namespace in block files
+only, so no workflow has to give the name up. An input no step or output
+reads is what a linter would say to; the checker only refuses the ones that do
+not exist.
+
+**Outputs.** A block may declare `outputs:` — a name, a type and the step
+output it maps (`ref: oci.Ref = pack.ref`) — checked against the block's own
+steps, so an output nothing produces is an error. A use reads them as
+`<step>.out.<name>`, exactly as a run-time-only step's outputs.
+
+**A use is checked against the signature alone.** It never sees the steps
+inside the block: what it may pass, and what it may read back, is what the
+signature says. Signatures are resolved by the caller and injected into
+`check` (`ks_core::block::block_signatures`, `CheckOptions::blocks`), keyed
+by the use's kind as written — resolving `acme/web-service@v3` to a version
+is [#81](https://github.com/Keep-Shipping/harness/issues/81). A use of a
+kind nothing resolves is checked like any unknown kind: no inputs, no
+outputs. `keepshipping check` resolves the `blocks/*.ks` beside the file it
+checks — a file inside `blocks/` sees its siblings — and matches a use by the
+name its `block:` declares, so `deploy: web-service` finds
+`blocks/web-service.ks`.
+
+**Blocks may use blocks**, and a nest may be four deep
+(`ks_core::block::MAX_BLOCK_DEPTH`). A use of another block contributes that
+block's actions to its use, so the whole nest is visible to policy: an
+`agents: never: deploy prod` rule refuses a `deploy:` that reaches a rollout
+to prod three blocks down, exactly as it refuses one written out. A nest
+that closes a circle, or reaches past the limit, is reported once with the
+path that gets there. A block's steps name their environment with
+`when: env is prod`, which is what gives an action its environment.
+
 ## Triggers and environments
 
 `on:` is a tuple of `push [<branch-glob>]` | `pr` | `tag [<glob>]` |
