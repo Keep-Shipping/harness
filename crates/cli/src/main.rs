@@ -53,7 +53,7 @@ use ks_core::ports::script_host::{ScriptHost, ScriptRef, Values};
 use ks_core::ports::secrets::{Redactor, SecretBundle};
 use ks_core::script_step::{is_script_kind, needing_approval, script_path};
 use ks_core::step::{ActionKind, LogRecord, LogSink, StepLog};
-use ks_core::{ContextName, Step, Trigger, TriggerKind};
+use ks_core::{ContextName, Step, Trigger, TriggerKind, ci_only_refusal};
 // The binary shares the adapter with the OCI distribution crate's tests, which
 // link this package as a library; the module is declared once, in `lib.rs`.
 use ks_cli::http_client;
@@ -224,6 +224,13 @@ fn selected(
     // declared one.
     let actor = if is_agent { ActorKind::Agent } else { o.actor };
     if refuses_scripts(workflow, actor, env, &steps) {
+        return ExitCode::from(1);
+    }
+    // An environment that is `ci-only` — by `ci-only: true`, or by being
+    // named `prod` — does not let a laptop apply or deploy into it. Stopped
+    // here for the same reason, and at the same moment: before the run has
+    // printed anything or resolved a credential.
+    if refuses_ci_only(workflow, o, env, &steps) {
         return ExitCode::from(1);
     }
     println!("environment: {env}");
@@ -418,6 +425,29 @@ fn refuses_scripts(
         "  hint: declare `action:` on the script step (one of {}), or put an \
          `approval` step before it",
         ActionKind::NAMES.join(", ")
+    );
+    true
+}
+
+/// The environment gate ([#123](https://github.com/Keep-Shipping/harness/issues/123)):
+/// `ci-only` belongs to the environment as much as to the step, so a step that
+/// applies or deploys into one is CI-only without saying so. A local run does
+/// not start; a run in CI is what the rule is asking for, so it is not asked.
+/// True when the run was refused; every offending step is named on stderr.
+fn refuses_ci_only(workflow: &ks_core::Workflow, o: &Options, env: &str, steps: &[&Step]) -> bool {
+    if context_of(o) == ContextName::Ci {
+        return false;
+    }
+    let Some(target) = workflow.envs().iter().find(|e| e.name == env) else { return false };
+    let running: Vec<&str> = steps.iter().map(|s| s.name.as_str()).collect();
+    let refusal = ci_only_refusal(workflow, target, &running);
+    if refusal.is_empty() {
+        return false;
+    }
+    eprintln!("{refusal}");
+    eprintln!(
+        "  hint: run it in CI (`--context ci`), or from an approval someone else gives — \
+         a local `y` is not a substitute"
     );
     true
 }

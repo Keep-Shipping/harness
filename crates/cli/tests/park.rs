@@ -58,6 +58,24 @@ policy:
     never: build
 ";
 
+/// A file that applies into an environment named `prod`, which is `ci-only`
+/// without saying so ([#123](https://github.com/Keep-Shipping/harness/issues/123)).
+/// Parking on a runner and resuming on a laptop must not be the way around
+/// that gate — the same gate a fresh local run gets.
+const PROD_ENV: &str = "\
+envs:
+  staging:
+    secrets: staging
+  prod:
+    secrets: prod
+steps:
+  review:  approval
+  plan:    tofu.plan
+    dir:    ./infra
+  apply:   tofu.apply
+    plan:   plan.file
+";
+
 /// What the binary prints when the run gets past the approval and reaches a
 /// step kind it cannot run yet.
 const NOT_BUILT: &str = "`oci.image` steps are not built in yet";
@@ -89,9 +107,18 @@ fn park_run(dir: &Path, state: &RunState) {
 /// What `run` leaves when nobody is watching: waiting at the approval, for the
 /// reason `waiting_on` says.
 fn parked_at_review(src: &str, waiting_on: &str) -> RunState {
+    parked_at_review_in(src, waiting_on, None)
+}
+
+/// The same, for a run that resolved `env` — the record carries the
+/// environment `run` selected, which a later job cannot re-derive.
+fn parked_at_review_in(src: &str, waiting_on: &str, env: Option<&str>) -> RunState {
     let mut state = RunState::new(run_id(), src.as_bytes(), "push main")
         .with_context("waiting_on", waiting_on)
         .with_context("actor", if waiting_on == "agent" { "agent" } else { "human" });
+    if let Some(env) = env {
+        state = state.with_context("environment", env);
+    }
     state.park_at("review").expect("review has not run");
     state
 }
@@ -290,6 +317,52 @@ fn a_resume_in_a_context_that_cannot_run_the_steps_is_refused() {
     assert!(err.contains("refusing to start"), "the gate speaks: {err}");
     assert!(err.contains("apply") && err.contains("needs CI"), "{err}");
     still_waiting(&dir);
+}
+
+/// The environment guard a fresh run gets ([#123](https://github.com/Keep-Shipping/harness/issues/123)):
+/// a run parked in CI on `prod` and resumed on a laptop is refused the same
+/// way a fresh local run into `prod` is — before the approval is answered and
+/// nothing recorded.
+#[test]
+fn a_resume_into_production_from_a_laptop_is_refused() {
+    let dir = work_dir("park-prod-env", PROD_ENV);
+    park_run(&dir, &parked_at_review_in(PROD_ENV, "approval", Some("prod")));
+    let (code, _, err) = keepshipping(&dir, &["resume", run_id().as_str()], &[]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("refusing to start"), "the guard speaks: {err}");
+    assert!(err.contains("step `apply` applies into `prod`"), "{err}");
+    assert!(err.contains("prod credentials belong in CI"), "{err}");
+    still_waiting(&dir);
+}
+
+/// The same run resumed where the apply belongs — in CI — is carried on, so
+/// the gate has not simply closed the door.
+#[test]
+fn a_resume_into_production_in_ci_is_carried_on() {
+    let dir = work_dir("park-prod-ci", PROD_ENV);
+    park_run(&dir, &parked_at_review_in(PROD_ENV, "approval", Some("prod")));
+    let (code, out, err) = keepshipping(
+        &dir,
+        &["resume", run_id().as_str()],
+        &[("CI", "true"), ("GITHUB_ACTIONS", "true")],
+    );
+    assert!(!err.contains("refusing to start"), "CI is the route through: {out}{err}");
+    assert_eq!(code, 1, "{out}{err}");
+    // Past the approval and on to the first step it cannot run yet, which is
+    // what a resume that was let through looks like.
+    assert!(out.contains("steps are not built in yet"), "{out}{err}");
+}
+
+/// The environment beside it, which is not production: the same parked record
+/// shape, resumed into `staging`, is not this guard's business.
+#[test]
+fn a_resume_into_staging_is_not_the_guards_business() {
+    let dir = work_dir("park-staging-env", PROD_ENV);
+    park_run(&dir, &parked_at_review_in(PROD_ENV, "approval", Some("staging")));
+    let (code, out, err) = keepshipping(&dir, &["resume", run_id().as_str()], &[]);
+    assert!(!err.contains("refusing to start"), "{out}{err}");
+    assert_eq!(code, 1, "{out}{err}");
+    assert!(out.contains("steps are not built in yet"), "{out}{err}");
 }
 
 /// The gate covers the approval being answered: a CI-only approval is not
