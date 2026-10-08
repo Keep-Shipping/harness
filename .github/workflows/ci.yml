@@ -193,6 +193,33 @@ jobs:
           cargo test -p ks-oci-distribution --test conformance -- --nocapture \
             || { echo "::error::the Registry conformance kit failed. Fix: run 'KS_OCI_CONFORMANCE_REGISTRIES=localhost:5001,localhost:5002 cargo test -p ks-oci-distribution --test conformance' against local zot and distribution, make it pass, and commit."; exit 1; }
 
+  script-runtime:
+    name: script runtime (pinned Deno)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain pinned in rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - name: Restore the cargo build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Restore the pinned Deno
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/keepshipping/deno
+          key: deno-2.9.7-x86_64-unknown-linux-gnu
+
+      - name: Run the ScriptHost conformance kit and the sandbox refusals on real Deno
+        env:
+          KS_DENO_CONFORMANCE: "1"
+        run: |
+          cargo test -p ks-deno-script-host --test conformance -- --nocapture \
+            || { echo "::error::the Deno script host failed. Fix: run 'KS_DENO_CONFORMANCE=1 cargo test -p ks-deno-script-host' locally, make it pass, and commit."; exit 1; }
+
   bench:
     name: check budget (cold 1 s, warm p95 100 ms)
     runs-on: ubuntu-latest
