@@ -254,6 +254,13 @@ impl Catalog {
                 ("to", named("k8s.Cluster")),
                 ("wait", Type::Any),
                 ("verify", Type::String),
+                // What is deployed, and where it goes. Optional, because a
+                // rollout may pin each image by container name instead, and
+                // because a workflow may declare its own defaults.
+                ("manifests", Type::Optional(Box::new(Type::Path))),
+                ("images", Type::Optional(Box::new(Type::Map(Box::new(named("oci.Digest")))))),
+                ("namespace", Type::Optional(Box::new(Type::String))),
+                ("rollback", Type::Optional(Box::new(Type::String))),
             ],
             &[],
             true,

@@ -10,6 +10,7 @@ pub mod credentials;
 pub mod decide;
 pub mod exec;
 pub mod journal;
+pub mod k8s_rollout;
 pub mod oci_artifact;
 pub mod oci_image;
 pub mod oci_verify;
