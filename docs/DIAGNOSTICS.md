@@ -299,15 +299,52 @@ re-checks the chain hashes exactly those lines. `github` is rejected — an entr
 has no source span to annotate. Printing never verifies, so a log that was
 edited still prints and can be read.
 
-`keepshipping log verify [RUN-ID]` checks the chain offline and prints
-`ok: N entries, chain intact`, or, at the first entry that does not hold,
-`<path>:<line>: chain broken: <reason>` on stderr and exit 1. Editing a field,
-deleting an entry and reordering two are caught, because every entry names the
-hash of the one before it. Truncating entries off the end is not — a prefix of
-a good chain is still a good chain, and telling that from a run that genuinely
-ended needs a signature over the tip ([#112]). It needs nothing but the file — no
-network, no store — so a CI job can fetch the log as an artifact and verify it
-there.
+`keepshipping log verify [RUN-ID] --key FILE` checks a run log offline and
+prints the story it tells — who proposed the run, which approvals it recorded,
+what it shipped, under which seals — or, at the first thing that does not hold,
+`<path>:<line>: <reason>` on stderr and exit 1.
+
+It checks two things. The hash chain, which every entry takes from the one
+before it: editing a field, deleting an entry and reordering two are all caught,
+at the line to look at. And the *seals* beside the log, signatures over the
+tip, which is what the chain cannot do — a prefix of a good chain is still a
+good chain, and a writer that recomputes the chain leaves one that is
+self-consistent but not the run that happened.
+
+A seal lives in a sidecar, `.keepshipping/runs/<RunId>.seals.jsonl`, one
+signature per line, so a seal is not an event inside the chain it signs.
+`keepshipping log seal [RUN-ID]` writes one: it signs the last entry with the
+ed25519 key at `$KEEPSHIPPING_SIGNING_KEY` (a file holding the 32-byte seed as 64
+hex characters) and appends the seal beside the log. Several seals per run are
+normal — one at each approval, one at the end. `verify` needs nothing but the
+files and the public key — no network, no store — so a CI job can fetch the log
+as an artifact and verify it there.
+
+Two ways of failing closed. A log with no seals at all is refused, not passed
+(`not sealed: truncation and rewrite cannot be ruled out`): nothing about it
+can be ruled out. A sealed log verified without `--key` says which key it needs
+rather than checking the signatures with nothing.
+
+What it names, at the line:
+
+- `chain broken: …` — an edited, deleted or reordered entry, by the chain;
+- `entry does not match the seal at seals line N: …` — a writer that
+  recomputed the chain, caught by the seal over the tip it no longer matches;
+- `entry missing — log truncated after seal` — entries cut off the end, which
+  the chain alone would not see;
+- `entry not covered by any seal (appended after sealing)` — entries written
+  after the last seal, which that seal therefore does not vouch for;
+- `no `run.finished` after the last seal — the run is unfinished or the log was
+  truncated` — the last seal covers an entry from before the run ended, so
+  cutting the entries off the end *and* the seals over them cannot pass as a
+  shorter run.
+
+A seal is also published with the artifact it is about: a run log is pushed as
+an OCI referrer of the digest the run says it shipped, under artifact type
+`application/vnd.keepshipping.run-log.v1`, and read back by
+`repo@<algo>:…`. The library does that (`seal::verify_from_registry`); the
+binary has no registry adapter wired in yet, so `log verify repo@<algo>:…`
+exits 2 saying so.
 
 ## `keepshipping graph`
 

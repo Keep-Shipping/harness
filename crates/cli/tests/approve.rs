@@ -91,6 +91,53 @@ fn keepshipping(dir: &Path, who: &str, args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// How many entries the run's log chains, or the first line that breaks it. `log verify` cannot
+/// say this any more for a run that is still going: since #112 it refuses an unsealed log, and a
+/// sealed one must end in `run.finished`, so a parked run's log is checked here the way the
+/// command's own chain check reads it — each `hash` the sha256 of the entry's canonical bytes
+/// without it, each `prev` the hash above, each `seq` its position.
+fn chain_length(dir: &Path) -> Result<usize, String> {
+    use sha2::Digest as _;
+    fn canonical(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::Object(entry) => {
+                let mut keys: Vec<&String> = entry.keys().collect();
+                keys.sort_unstable();
+                let body: Vec<String> = keys
+                    .into_iter()
+                    .map(|key| {
+                        format!(
+                            "{}:{}",
+                            serde_json::to_string(key).expect("key"),
+                            canonical(&entry[key])
+                        )
+                    })
+                    .collect();
+                format!("{{{}}}", body.join(","))
+            }
+            serde_json::Value::Array(items) => {
+                format!("[{}]", items.iter().map(canonical).collect::<Vec<_>>().join(","))
+            }
+            scalar => serde_json::to_string(scalar).expect("scalar"),
+        }
+    }
+    let text = std::fs::read_to_string(dir.join(".keepshipping/runs").join(format!("{RUN}.jsonl")))
+        .expect("read the run's log");
+    let mut prev = "0".repeat(64);
+    for (seq, line) in text.lines().enumerate() {
+        let mut entry: serde_json::Value = serde_json::from_str(line).expect("a JSON line");
+        let hash = entry["hash"].as_str().expect("a hash").to_string();
+        entry.as_object_mut().expect("an object").remove("hash");
+        let digest = sha2::Sha256::digest(canonical(&entry).as_bytes());
+        let computed: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        if computed != hash || entry["prev"] != prev.as_str() || entry["seq"] != seq as u64 {
+            return Err(format!("line {}: chain broken", seq + 1));
+        }
+        prev = hash;
+    }
+    Ok(text.lines().count())
+}
+
 /// The listing shows a run parked on a person: the id, the step, and the environment the record
 /// names. And a workspace where nothing has ever run is an empty queue, not a failure.
 #[test]
@@ -159,9 +206,7 @@ fn the_appended_approval_keeps_the_chain_intact() {
     let (code, _, stderr) = keepshipping(&dir, "ada", &["approve", RUN]);
     assert_eq!(code, 0, "{stderr}");
 
-    let (code, stdout, stderr) = keepshipping(&dir, "ada", &["log", "verify", RUN]);
-    assert_eq!(code, 0, "the chain broke: {stderr}");
-    assert_eq!(stdout, "ok: 10 entries, chain intact\n", "nine seeded, one appended");
+    assert_eq!(chain_length(&dir), Ok(10), "nine seeded, one appended");
 }
 
 /// A run that is not waiting cannot be moved by an approval — including a run that has already
@@ -246,9 +291,7 @@ fn deny_records_the_refusal_and_leaves_the_run_parked() {
     assert_eq!(last["channel"], "local");
 
     // And the chain the refusal was appended into still holds.
-    let (code, stdout, stderr) = keepshipping(&dir, "ada", &["log", "verify", RUN]);
-    assert_eq!(code, 0, "{stderr}");
-    assert_eq!(stdout, "ok: 10 entries, chain intact\n");
+    assert_eq!(chain_length(&dir), Ok(10));
 }
 
 /// A refusal with no reason is a usage error, and the run must be left alone. The reason is

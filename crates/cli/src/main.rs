@@ -26,12 +26,20 @@ mod fmt;
 #[allow(dead_code)]
 mod github_actions_run_context;
 mod graph;
+// The local ed25519 `Signer` for the signed run log (#112).
+mod local_key;
 mod log;
 mod policy;
 mod progress;
 mod render;
 mod resume;
 mod run_log;
+// The signed run log (#112). `log seal` and `log verify` use the sidecar and
+// its signatures; the registry half (`attach`, `verify_from_registry`) is built
+// and tested here but has no caller in the binary, which has no registry
+// adapter wired in — the same note `github_actions_run_context` carries.
+#[allow(dead_code)]
+mod seal;
 mod upgrade;
 
 use std::io::{IsTerminal, Write as _};

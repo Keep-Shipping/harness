@@ -24,6 +24,7 @@ ks-core.workspace = true
 ks-engine.workspace = true
 ks-lang.workspace = true
 ks-lsp.workspace = true
+ed25519-dalek.workspace = true
 ks-oci-distribution.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
