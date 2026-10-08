@@ -40,6 +40,7 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
        keepshipping resume RUN-ID [FILE]
        keepshipping decisions report [--json]
        keepshipping decisions export
+       keepshipping decide --explain [RUN-ID]
        keepshipping lsp";
 
 /// Which subcommand's flags `parse_args` accepts. `--format`, `--all`,

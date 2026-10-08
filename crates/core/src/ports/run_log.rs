@@ -6,7 +6,8 @@
 //! **Secret values never reach the port.** Redaction happens upstream, in `ks_engine::journal`,
 //! which scrubs each event through the run's [`Redactor`] *before* appending. **Raw plan values
 //! never reach it either**: only addresses, actions and counts, output *names* without their
-//! values, artifact hashes, and a decision model's answer. Hash-chaining and timestamps are the
+//! values, artifact hashes, a decision model's answer, and the redacted state sent to one
+//! ([#107](https://github.com/Keep-Shipping/harness/issues/107)). Hash-chaining and timestamps are the
 //! adapter's, so an event carries no clock of its own.
 //!
 //! Unlike every other port here the run log is *not* step-visible: the engine writes it, not a step.
@@ -73,6 +74,17 @@ pub enum RunEvent {
     /// own event so a run whose answer was thrown away never reads as still parked. `detail` says
     /// which rule held ([#99](https://github.com/Keep-Shipping/harness/issues/99)).
     ApprovalRejected { step: String, detail: String, channel: String, artifacts: Vec<String> },
+    /// The state and questions sent to a decision model, recorded so
+    /// `keepshipping decide --explain <run>` can show exactly what left the
+    /// machine ([#107](https://github.com/Keep-Shipping/harness/issues/107)).
+    ///
+    /// `state` is the [`RedactedState`](crate::ports::decision_model::RedactedState)
+    /// text and `questions` each question's instruction, keyed by its id. The
+    /// state was redacted before it got here — values outside a short allowlist
+    /// are withheld and every plan string is quoted as data — and
+    /// [`redacted`](Self::redacted) then masks any registered secret that still
+    /// appears in it as `***`.
+    DecideSent { step: String, model: String, state: String, questions: Vec<(String, String)> },
     /// A decision model answered, with its probabilities and what the run did with it.
     ///
     /// Everything a calibration report needs is here, including what it must not store:
@@ -155,6 +167,7 @@ impl RunEvent {
             RunEvent::ApprovalExpired { .. } => "approval.expired",
             RunEvent::ApprovalAborted { .. } => "approval.aborted",
             RunEvent::ApprovalRejected { .. } => "approval.rejected",
+            RunEvent::DecideSent { .. } => "decide.sent",
             RunEvent::DecideAnswered { .. } => "decide.answered",
             RunEvent::CredentialsResolved { .. } => "credentials.resolved",
             RunEvent::DecisionOverridden { .. } => "decision.overridden",
@@ -230,6 +243,15 @@ impl RunEvent {
                 *detail = r.redact(detail);
                 *channel = r.redact(channel);
                 list(artifacts);
+            }
+            // The state is already redacted and every string here is plan text
+            // that could name a secret, so it all goes through the scrubber.
+            RunEvent::DecideSent { step, model, state, questions } => {
+                *step = r.redact(step);
+                *model = r.redact(model);
+                *state = r.redact(state);
+                *questions =
+                    questions.iter().map(|(id, text)| (r.redact(id), r.redact(text))).collect();
             }
             RunEvent::DecideAnswered {
                 step,
@@ -404,6 +426,15 @@ mod tests {
                     detail: s(),
                     channel: s(),
                     artifacts: hashes(),
+                },
+            ),
+            (
+                "decide.sent",
+                RunEvent::DecideSent {
+                    step: s(),
+                    model: s(),
+                    state: s(),
+                    questions: vec![(s(), s())],
                 },
             ),
             (
