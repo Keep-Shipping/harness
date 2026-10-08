@@ -14,8 +14,8 @@ use ks_core::harness::Harness;
 use ks_core::ports::BoxFuture;
 use ks_core::ports::secrets::Redactor;
 use ks_core::step::{
-    CancellationToken, Inputs, LogSink, Outputs, Port, StepCtx, StepError, StepKind, StepLog,
-    reject_secret_outputs,
+    CancellationToken, Inputs, LogSink, Outputs, Port, Ports, StepCtx, StepError, StepKind,
+    StepLog, reject_secret_outputs,
 };
 
 /// Runs the step `name` from `harness` with `inputs`; `log` receives every record the engine
@@ -49,13 +49,27 @@ pub(crate) fn step_ctx(
     log: Arc<dyn LogSink>,
     redactor: Arc<Redactor>,
 ) -> StepCtx {
+    step_ctx_for(harness, declared_ports(harness, step), name, cancel, log, redactor)
+}
+
+/// The ports a step gets: the ones it declared, and nothing else.
+pub(crate) fn declared_ports(harness: &Harness, step: &dyn StepKind) -> Ports {
     let declared: Vec<Port> = step.requires().iter().chain(step.optional()).copied().collect();
-    StepCtx::new(
-        harness.ports().restricted_to(&declared),
-        Arc::clone(harness.clock()),
-        cancel,
-        StepLog::new(name, redactor, log),
-    )
+    harness.ports().restricted_to(&declared)
+}
+
+/// [`step_ctx`] with the ports chosen by the caller: the policy gate hands out the same
+/// restriction with the `Secrets` port wrapped ([#103](https://github.com/Keep-Shipping/harness/issues/103)),
+/// so there is still exactly one place a step's context is assembled.
+pub(crate) fn step_ctx_for(
+    harness: &Harness,
+    ports: Ports,
+    name: &str,
+    cancel: CancellationToken,
+    log: Arc<dyn LogSink>,
+    redactor: Arc<Redactor>,
+) -> StepCtx {
+    StepCtx::new(ports, Arc::clone(harness.clock()), cancel, StepLog::new(name, redactor, log))
 }
 
 /// Logs the action class, runs an already-prepared step, and checks what it returned — against
@@ -69,7 +83,33 @@ pub(crate) async fn execute(
     log: Arc<dyn LogSink>,
     redactor: Arc<Redactor>,
 ) -> Result<Outputs, StepError> {
-    let ctx = step_ctx(harness, step, name, cancel, log, Arc::clone(&redactor));
+    execute_with_ports(
+        harness,
+        name,
+        step,
+        inputs,
+        cancel,
+        log,
+        redactor,
+        declared_ports(harness, step),
+    )
+    .await
+}
+
+/// [`execute`] against ports the caller chose — the policy gate passes the step's declared ports
+/// with the `Secrets` slot gated, so the same check-and-run is used either way.
+#[allow(clippy::too_many_arguments)] // `execute`'s arguments, plus the ports they choose
+pub(crate) async fn execute_with_ports(
+    harness: &Harness,
+    name: &str,
+    step: &dyn StepKind,
+    inputs: Inputs,
+    cancel: CancellationToken,
+    log: Arc<dyn LogSink>,
+    redactor: Arc<Redactor>,
+    ports: Ports,
+) -> Result<Outputs, StepError> {
+    let ctx = step_ctx_for(harness, ports, name, cancel, log, Arc::clone(&redactor));
     ctx.log().info("step started", &[("action", step.action(&inputs).to_string().as_str())]);
     let outputs = step.run(ctx, inputs).await?;
     // Before the schema check, not after: `check_outputs` names an undeclared output in its
