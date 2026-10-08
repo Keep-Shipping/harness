@@ -6,6 +6,7 @@
 pub mod attestation;
 pub mod blocks;
 pub mod cache;
+pub mod decide;
 pub mod exec;
 pub mod journal;
 pub mod oci_artifact;

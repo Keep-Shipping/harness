@@ -232,7 +232,12 @@ impl Catalog {
                 ("input", Type::Any),
                 ("returns", Type::Any),
             ],
-            &[("answer", Type::Any), ("confidence", Type::Float), ("reason", Type::String)],
+            &[
+                ("answer", Type::Any),
+                ("confidence", Type::Float),
+                ("probabilities", Type::Map(Box::new(Type::Float))),
+                ("reason", Type::String),
+            ],
             false,
             true,
         );

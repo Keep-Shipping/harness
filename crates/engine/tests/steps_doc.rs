@@ -10,10 +10,20 @@ use ks_core::step::{StepKind, render_steps_markdown};
 const REGENERATE: &str =
     "run KS_BLESS=1 cargo test -p ks-engine --test steps_doc to regenerate docs/STEPS.md";
 
+/// The step kinds a cargo feature gates. The document describes what a
+/// shipped build registers, so they are dropped from the rendering whichever
+/// way the flag is set — otherwise `cargo test --all-features` would report
+/// every gated step as drift and ask for a document no released build matches.
+const FEATURE_GATED: &[&str] = &["decide"];
+
 #[test]
 fn steps_doc_matches_the_builtin_steps() {
     let steps = ks_engine::steps::builtin_steps();
-    let refs: Vec<&dyn StepKind> = steps.iter().map(|step| step.as_ref()).collect();
+    let refs: Vec<&dyn StepKind> = steps
+        .iter()
+        .filter(|step| !FEATURE_GATED.contains(&step.name()))
+        .map(|step| step.as_ref())
+        .collect();
     let rendered = render_steps_markdown(&refs);
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/STEPS.md");
     if std::env::var("KS_BLESS").as_deref() == Ok("1") {

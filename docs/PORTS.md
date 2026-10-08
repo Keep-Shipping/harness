@@ -29,6 +29,19 @@ comment edits do not need any of that — the fingerprint normalises them away.
 
 Newest first, one heading per contract version, dated.
 
+## STEP_API 3
+
+- **2026-10-08** — Additive: the `Port` enum gained a `DecisionModel` variant
+  ([#104](https://github.com/Keep-Shipping/harness/issues/104)), so the
+  `decide` step can declare and receive the port its trait has had since
+  `STEP_API 2`. `DecisionModel` itself is untouched — the same `ask` and
+  `profile` signatures, and the same `RedactedState` — so this is the
+  `Port`/`define_ports!` half of the contract only, and the fakes in
+  `ks-testing` work against it unchanged. The variant is optional for a step:
+  `decide` with `model: none` declares it optional and never reaches for it,
+  and a step that names a model with no adapter wired fails rather than
+  defaulting.
+
 ## STEP_API 2
 
 - **2026-10-07** — `BlockSource` and `PolicyStore`
