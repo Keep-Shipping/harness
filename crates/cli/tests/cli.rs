@@ -67,7 +67,7 @@ envs:
   prod:
     ci-only: true
 steps:
-  migrate: db.migrate
+  migrate: ./migrate.ts
     url: secrets.db_url
 policy:
   agents:

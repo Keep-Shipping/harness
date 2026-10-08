@@ -44,6 +44,7 @@ UPDATE_GOLDEN=1 cargo test -p ks-core --test registry
 - [KS0502 — secret shown](#ks0502-secret-shown)
 - [KS0601 — optional value may be absent](#ks0601-optional-value-may-be-absent)
 - [KS0602 — step needs more than this context has](#ks0602-step-needs-more-than-this-context-has)
+- [KS0603 — unknown step kind](#ks0603-unknown-step-kind)
 - [KS0610 — file format is one behind](#ks0610-file-format-is-one-behind)
 - [KS0611 — file format not declared](#ks0611-file-format-not-declared)
 - [KS0701 — `auto:` could destroy](#ks0701-auto-could-destroy)
@@ -848,6 +849,32 @@ steps:
     from: ./Dockerfile
   deploy: k8s.rollout
     image: build.digest
+```
+
+## KS0603: unknown step kind
+
+Severity: warning.
+
+The step's kind is not in the catalog — usually a misspelling, sometimes a kind another build, a plugin or a harness registers. The file still checks, but the step's inputs are not verified, so a typo in an input name or a value of the wrong type passes silently on this step; its outputs type `any`, read bare or through `.out.`. Check the spelling (the hint suggests the closest known kind) or register the kind's schema; where CI should refuse unknown kinds, run `keepshipping check --warnings-as-errors`.
+
+Not ok:
+
+```ks
+steps:
+  plan: tofu.plna
+    dir: ./infra
+  apply: tofu.apply
+    plan: plan.changes
+```
+
+Ok:
+
+```ks
+steps:
+  plan: tofu.plan
+    dir: ./infra
+  apply: tofu.apply
+    plan: plan.file
 ```
 
 ## KS0610: file format is one behind

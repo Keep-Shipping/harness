@@ -1116,6 +1116,13 @@ steps:
     url: secrets.db_url
 ";
 
+/// The policy tests here spell their step kind as `db.migrate`, which names
+/// no catalog kind, so every check below also carries a KS0603 warning. The
+/// subject of these tests is the policy, so they look past that warning.
+fn policy_diagnostics(checked: &ks_core::Checked) -> Vec<&ks_lang::Diagnostic> {
+    checked.diagnostics.iter().filter(|d| d.code != ks_lang::Code::UnknownKind).collect()
+}
+
 #[test]
 fn an_agent_needing_secrets_the_policy_forbids_is_refused() {
     let src = format!("{SECRET_NEED}policy:\n  agents:\n    never: read secrets\n");
@@ -1145,11 +1152,11 @@ fn an_agent_needing_secrets_the_policy_forbids_is_refused() {
     let options =
         ks_core::CheckOptions::new(&catalog).actor(ks_core::ports::run_context::ActorKind::Human);
     let checked = ks_core::check_with(&ks_lang::parse(&src), &options);
-    assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
+    assert!(policy_diagnostics(&checked).is_empty(), "{:#?}", checked.diagnostics);
 
     // And a check with no actor at all stays policy-silent.
     let checked = check(&ks_lang::parse(&src));
-    assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
+    assert!(policy_diagnostics(&checked).is_empty(), "{:#?}", checked.diagnostics);
 
     // Two references to the same key are refused once, at the first.
     let src = format!(
@@ -1165,7 +1172,7 @@ fn an_agent_needing_secrets_the_policy_forbids_is_refused() {
         .filter(|d| d.message.starts_with("policy forbids agents"))
         .collect();
     assert_eq!(refusals.len(), 1, "one per distinct key, not per reference: {:#?}", refusals);
-    assert_eq!(checked.diagnostics.len(), 2, "the refusal plus the one on the rule");
+    assert_eq!(policy_diagnostics(&checked).len(), 2, "the refusal plus the one on the rule");
 }
 
 #[test]
@@ -1177,17 +1184,17 @@ fn an_agent_runs_when_the_file_needs_no_secrets_or_the_policy_stays_silent() {
     let options =
         ks_core::CheckOptions::new(&catalog).actor(ks_core::ports::run_context::ActorKind::Agent);
     let checked = ks_core::check_with(&ks_lang::parse(&no_secrets), &options);
-    assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
+    assert!(policy_diagnostics(&checked).is_empty(), "{:#?}", checked.diagnostics);
 
     // Secrets without the never-rule: the agent may read them.
     let allowed = format!("{SECRET_NEED}policy:\n  agents:\n    can: read secrets\n");
     let checked = ks_core::check_with(&ks_lang::parse(&allowed), &options);
-    assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
+    assert!(policy_diagnostics(&checked).is_empty(), "{:#?}", checked.diagnostics);
 
     // A rule binding humans does not bind the agent.
     let humans_only = format!("{SECRET_NEED}policy:\n  humans:\n    never: read secrets\n");
     let checked = ks_core::check_with(&ks_lang::parse(&humans_only), &options);
-    assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
+    assert!(policy_diagnostics(&checked).is_empty(), "{:#?}", checked.diagnostics);
 }
 
 // --- suggested fixes -------------------------------------------------------
@@ -1710,4 +1717,83 @@ steps:
     image: build.digest
 ";
     assert!(errors(plain).is_empty(), "{:?}", errors(plain));
+}
+
+// --- unknown step kinds (KS0603) --------------------------------------------
+
+#[test]
+fn an_unknown_kind_warns_once_and_never_errors() {
+    // `madeup.kind` names nothing, so nothing about the step is checked: an
+    // input no catalog kind would accept passes, and the one diagnostic is
+    // the warning saying so.
+    let src = "steps:\n  job: madeup.kind\n    whatever: 3\n";
+    let checked = check(&ks_lang::parse(src));
+    assert_eq!(checked.diagnostics.len(), 1, "{:#?}", checked.diagnostics);
+    let d = &checked.diagnostics[0];
+    assert_eq!(d.code, ks_lang::Code::UnknownKind);
+    assert_eq!(d.severity, ks_lang::Severity::Warning);
+    assert_eq!(d.message, "unknown step kind `madeup.kind`; its inputs are not checked");
+    assert!(d.hints.is_empty(), "nothing close to suggest: {:#?}", d.hints);
+}
+
+#[test]
+fn a_misspelled_kind_gets_the_closest_known_one_as_a_hint() {
+    let src = "steps:\n  plan: tofu.plna\n    dir: ./infra\n";
+    let checked = check(&ks_lang::parse(src));
+    let hit = checked
+        .diagnostics
+        .iter()
+        .find(|d| d.code == ks_lang::Code::UnknownKind)
+        .expect("the misspelled kind warns");
+    assert_eq!(hit.severity, ks_lang::Severity::Warning);
+    assert_eq!(hit.hints, ["did you mean `tofu.plan`?"]);
+}
+
+#[test]
+fn an_unknown_kinds_outputs_read_as_any_bare_and_through_out() {
+    // Both spellings reach an unchecked `any`: `plan.changes` fills the
+    // apply's `tofu.PlanFile` input without a type error, and
+    // `plan.out.changes` resolves to the same silence.
+    let src = "\
+steps:
+  plan: madeup.plan
+    dir: ./infra
+  apply: tofu.apply
+    plan: plan.changes
+  ok: approval
+    show: plan.out.changes
+    from: @platform
+";
+    let checked = check(&ks_lang::parse(src));
+    assert!(
+        checked.diagnostics.iter().all(|d| d.code == ks_lang::Code::UnknownKind),
+        "only the unknown kind warns: {:#?}",
+        checked.diagnostics
+    );
+}
+
+#[test]
+fn a_script_kind_is_a_documented_kind_and_warns_nowhere() {
+    // `./migrate.ts` ends spec-less like an unknown kind, but it is the
+    // escape hatch the language names, so no KS0603.
+    let src = "steps:\n  migrate: ./ship/migrate.ts\n";
+    let checked = check(&ks_lang::parse(src));
+    assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
+}
+
+#[test]
+fn a_known_kind_with_a_misspelled_output_still_errors_with_the_suggestion() {
+    let src = "\
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  deploy: k8s.rollout
+    image: build.tagg
+";
+    let all = messages(src);
+    assert!(
+        all.iter().any(|m| m.contains("step `build` has no output `tagg`")
+            && m.contains("did you mean `tag`?")),
+        "{all:?}"
+    );
 }

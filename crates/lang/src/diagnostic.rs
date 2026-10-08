@@ -138,6 +138,8 @@ pub enum Code {
     OptionalAbsent,
     /// A step needs more than the context it would run in has.
     NeedsContext,
+    /// A step kind the catalog does not know.
+    UnknownKind,
     /// An `auto:` approval rule that could approve a destructive plan.
     AutoDestroys,
     /// A step an approval gates uses an artifact the approval does not show.
@@ -184,6 +186,7 @@ impl Code {
             Code::SecretShown => "KS0502",
             Code::OptionalAbsent => "KS0601",
             Code::NeedsContext => "KS0602",
+            Code::UnknownKind => "KS0603",
             Code::AutoDestroys => "KS0701",
             Code::UncoveredArtifact => "KS0702",
             Code::FormatUnsupported => "KS0005",
@@ -224,6 +227,7 @@ impl Code {
         Code::SecretShown,
         Code::OptionalAbsent,
         Code::NeedsContext,
+        Code::UnknownKind,
         Code::FormatDeprecated,
         Code::FormatUndeclared,
         Code::AutoDestroys,
