@@ -19,6 +19,7 @@ use ks_core::ports::run_log::{RunEvent, RunLog, RunLogError};
 use ks_core::ports::secrets::Redactor;
 use ks_core::step::{CancellationToken, Inputs, LogSink, Outputs, StepError};
 
+use crate::credentials::StepCredentials;
 use crate::run::run_step;
 
 /// Writes one run's transitions to a [`RunLog`]. Holds the run's id, the log, and the redactor
@@ -130,6 +131,23 @@ impl Journal {
             outcome: outcome.into(),
         };
         self.emit(e).await
+    }
+
+    /// Records which credentials a step ran with: the cloud, the role it
+    /// federated into (`None` when it assumed nothing) and how it got them.
+    /// The token is not an argument and cannot become one.
+    pub async fn credentials_resolved(
+        &self,
+        step: &str,
+        credentials: &StepCredentials,
+    ) -> Result<(), RunLogError> {
+        self.emit(RunEvent::CredentialsResolved {
+            step: step.into(),
+            cloud: credentials.cloud().into(),
+            role: credentials.role().map(str::to_string),
+            via: credentials.via().into(),
+        })
+        .await
     }
 
     /// Records that an attestation was pushed against an image: the digest of

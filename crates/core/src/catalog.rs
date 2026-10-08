@@ -179,6 +179,7 @@ impl Catalog {
                 ("backend", Type::Optional(Box::new(Type::String))),
                 ("backend_config", Type::Optional(Box::new(Type::Map(Box::new(Type::String))))),
                 ("vars", Type::Optional(Box::new(Type::Map(Box::new(Type::String))))),
+                ("role", Type::Optional(Box::new(Type::String))),
             ],
             &[
                 ("file", named("tofu.PlanFile")),
@@ -206,7 +207,7 @@ impl Catalog {
         );
         add(
             "tofu.apply",
-            &[("plan", named("tofu.PlanFile"))],
+            &[("plan", named("tofu.PlanFile")), ("role", Type::Optional(Box::new(Type::String)))],
             &[("out", named("tofu.Outputs")), ("applied", Type::Int)],
             true,
             false,

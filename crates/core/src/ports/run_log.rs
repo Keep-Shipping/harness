@@ -52,6 +52,12 @@ pub enum RunEvent {
         threshold: f64,
         outcome: String,
     },
+    /// Which credentials a step ran with: the `cloud` it talked to (`"aws"` or `"azure"`), the
+    /// `role` it federated into over OIDC — `None` when the step used ambient or local
+    /// credentials and assumed nothing — and `via`, how it got them: `"oidc"`,
+    /// `"profile:<name>"` or `"ambient"`. The token itself is never here, only the shape of the
+    /// assumption.
+    CredentialsResolved { step: String, cloud: String, role: Option<String>, via: String },
     /// An attestation (provenance or an SBOM) was pushed against an image.
     /// `subject` is the image's digest and `attestation` the pushed envelope's; both are
     /// hashes, not references.
@@ -98,6 +104,7 @@ impl RunEvent {
             RunEvent::ApprovalGranted { .. } => "approval.granted",
             RunEvent::ApprovalDenied { .. } => "approval.denied",
             RunEvent::DecideAnswered { .. } => "decide.answered",
+            RunEvent::CredentialsResolved { .. } => "credentials.resolved",
             RunEvent::AttestationAttached { .. } => "attestation.attached",
             RunEvent::PolicyRefused { .. } => "policy.refused",
             RunEvent::PlanStale { .. } => "plan.stale",
@@ -148,6 +155,12 @@ impl RunEvent {
                 *outcome = r.redact(outcome);
                 *probabilities =
                     probabilities.iter().map(|(label, p)| (r.redact(label), *p)).collect();
+            }
+            RunEvent::CredentialsResolved { step, cloud, role, via } => {
+                *step = r.redact(step);
+                *cloud = r.redact(cloud);
+                *role = role.as_deref().map(|name| r.redact(name));
+                *via = r.redact(via);
             }
             RunEvent::AttestationAttached { step, subject, predicate_type, attestation } => {
                 *step = r.redact(step);
@@ -269,6 +282,10 @@ mod tests {
                     threshold: 0.5,
                     outcome: s(),
                 },
+            ),
+            (
+                "credentials.resolved",
+                RunEvent::CredentialsResolved { step: s(), cloud: s(), role: Some(s()), via: s() },
             ),
             (
                 "attestation.attached",

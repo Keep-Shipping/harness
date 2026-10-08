@@ -254,6 +254,14 @@ fn event_fields(event: &RunEvent) -> Result<Map<String, Value>, RunLogError> {
             put("threshold", number(*threshold));
             put("outcome", text(outcome));
         }
+        RunEvent::CredentialsResolved { step, cloud, role, via } => {
+            put("step", text(step));
+            put("cloud", text(cloud));
+            if let Some(role) = role {
+                put("role", text(role));
+            }
+            put("via", text(via));
+        }
         RunEvent::AttestationAttached { step, subject, predicate_type, attestation } => {
             put("step", text(step));
             put("subject", text(subject));
@@ -575,6 +583,23 @@ mod tests {
         assert_eq!(failed["cause"], Value::from("state"));
         assert_eq!(failed["replanned"], Value::Null);
         assert_eq!(failed["differs"], Value::Null);
+    }
+
+    /// A step's credentials get a wire form: the fields that name the assumption, and no room
+    /// for a token.
+    #[test]
+    fn a_credentials_event_carries_the_role_and_nothing_else() {
+        let event = RunEvent::CredentialsResolved {
+            step: "apply".into(),
+            cloud: "aws".into(),
+            role: Some("arn:aws:iam::123456789012:role/ks-apply".into()),
+            via: "oidc".into(),
+        };
+        let fields = event_fields(&event).expect("fields");
+        assert_eq!(fields["step"], "apply");
+        assert_eq!(fields["role"], "arn:aws:iam::123456789012:role/ks-apply");
+        assert_eq!(fields["via"], "oidc");
+        assert_eq!(event.kind(), "credentials.resolved");
     }
 
     /// An attestation that was attached has a wire form like any other event: the step, the image
