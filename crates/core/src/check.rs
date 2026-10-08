@@ -16,6 +16,7 @@ use crate::policy::{self, BLOCKS, SCRIPTS, SECRETS};
 use crate::ports::policy::{ANY_OBJECT, Disposition};
 use crate::ports::run_context::ActorKind;
 use crate::ports::secrets::SecretRef;
+use crate::script_step::{is_script_kind, script_path};
 use crate::step::{ActionClass, ActionKind, RollbackPolicy};
 use crate::types::{self, LiteralFit, Type};
 use crate::workflow::{
@@ -373,6 +374,9 @@ struct StepInfo<'a> {
     ci_only: bool,
     /// The `rollback:` policy the step declared, for the executor.
     rollback: RollbackPolicy,
+    /// A script step's `action:`, parsed at the declaration; `None` when it
+    /// declares none (which reads as `other`).
+    action: Option<ActionKind>,
     /// `decide` only: the answers declared under `returns:`.
     variants: Vec<String>,
     /// The literal `dir:` a `tofu.plan` step reads, as the file spells it.
@@ -670,6 +674,7 @@ impl<'a> Ctx<'a> {
                 .and_then(|n| self.catalog.step(n).or_else(|| block.map(|b| b.as_step_types())));
             let ci_only = self.step_ci_only(s);
             let rollback = self.step_rollback(s);
+            let action = self.step_action(s, kind_name.as_deref(), kind_span);
             let variants = match spec.filter(|sp| sp.decision) {
                 Some(_) => s
                     .children()
@@ -703,6 +708,7 @@ impl<'a> Ctx<'a> {
                 spec,
                 ci_only,
                 rollback,
+                action,
                 variants,
                 dir: literal_input(s, "dir"),
                 plan: plan_step(s),
@@ -735,8 +741,13 @@ impl<'a> Ctx<'a> {
             for input in s.children() {
                 let Some(iname) = input.key_name() else { continue };
                 // Reserved properties are read with the declaration, not as
-                // an input the step kind would have to declare.
-                if STEP_PROPERTIES.contains(&iname) {
+                // an input the step kind would have to declare. `action:` is
+                // reserved on script steps only; on every other kind it is an
+                // ordinary input the catalog decides.
+                if STEP_PROPERTIES.contains(&iname)
+                    || (iname == "action"
+                        && self.steps[idx].kind_name.as_deref().is_some_and(is_script_kind))
+                {
                     continue;
                 }
                 self.subject = Some(format!("{}.{}", self.steps[idx].name, iname));
@@ -788,6 +799,66 @@ impl<'a> Ctx<'a> {
         let value = self.ci_only(p, Code::TypeMismatch);
         self.subject = None;
         value
+    }
+
+    /// A script step's reserved `action:` property, `None` when it declares
+    /// none. Reserved on script kinds only: on any other kind `action` is an
+    /// ordinary input the catalog decides ([#89](https://github.com/Keep-Shipping/harness/issues/89)).
+    fn step_action(
+        &mut self,
+        step: Entry<'_>,
+        kind: Option<&str>,
+        span: Span,
+    ) -> Option<ActionKind> {
+        let kind = kind?;
+        if !is_script_kind(kind) {
+            return None;
+        }
+        // A script step runs a file beside the `ship.ks`; one that reaches out
+        // of that directory is not a script this run may read.
+        if script_path(kind).is_none() {
+            self.err_hint(
+                Code::TypeMismatch,
+                span,
+                format!("`{kind}` is not a path inside the ship.ks directory"),
+                "a script step's kind is relative to the ship.ks: `./ship/migrate.ts`",
+            );
+        }
+        let p = step.children().find(|c| c.key_name() == Some("action"))?;
+        self.subject = step.key_name().map(|n| format!("{n}.action"));
+        let action = self.action(p);
+        self.subject = None;
+        action
+    }
+
+    /// The action name under a script step's `action:`; anything but one of
+    /// [`ActionKind::NAMES`] is an error, with the names offered in the hint.
+    fn action(&mut self, p: Entry<'_>) -> Option<ActionKind> {
+        let names = ActionKind::NAMES.join(", ");
+        match p.expr().as_ref().and_then(value_word).as_deref() {
+            Some(name) => match ActionKind::parse(name) {
+                Some(action) => Some(action),
+                None => {
+                    let msg = format!("unknown action `{name}`");
+                    self.err_hint(
+                        Code::UnknownAction,
+                        p.key_span(),
+                        msg,
+                        format!("`action:` takes one of {names}"),
+                    );
+                    None
+                }
+            },
+            None => {
+                self.err_hint(
+                    Code::UnknownAction,
+                    p.key_span(),
+                    "`action` takes one word",
+                    format!("`action: apply`; the actions are {names}"),
+                );
+                None
+            }
+        }
     }
 
     /// The `true`/`false` under a `ci-only` property; a value that is
@@ -2749,6 +2820,7 @@ impl<'a> Ctx<'a> {
                 block_inputs: s.block_inputs.clone(),
                 rollback: s.rollback,
                 when: s.when.clone(),
+                action: s.action,
             })
             .collect();
         let edges = edges.into_iter().map(|e| (e.from, e.to)).collect();

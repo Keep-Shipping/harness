@@ -7,7 +7,7 @@ use ks_lang::Span;
 
 use crate::ports::policy::{ANY_OBJECT, Disposition};
 use crate::ports::run_context::ActorKind;
-use crate::step::{ActionClass, RollbackPolicy};
+use crate::step::{ActionClass, ActionKind, RollbackPolicy};
 
 /// One `on:` trigger.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +65,9 @@ pub struct Step {
     /// it: a condition that names no step is settled before the run starts,
     /// one that reads step outputs cannot be.
     pub when: Option<Condition>,
+    /// The `action:` a script step declares ([#89](https://github.com/Keep-Shipping/harness/issues/89)).
+    /// `None` when it declares none, which reads as [`ActionKind::Other`].
+    pub action: Option<ActionKind>,
 }
 
 /// A step's `when:` condition, kept as written plus the two things a planner

@@ -322,7 +322,7 @@ fn index_error_text(error: &BlocksIndexError) -> String {
 /// so a busy poll with a noop waker terminates; this is the same shape
 /// `ks_testing::block_on` uses, inlined because ks-testing is a
 /// dev-dependency and must not ship in the binary.
-fn wait<F: std::future::Future>(future: F) -> F::Output {
+pub(crate) fn wait<F: std::future::Future>(future: F) -> F::Output {
     let mut future = std::pin::pin!(future);
     let waker = std::task::Waker::noop();
     let mut context = std::task::Context::from_waker(waker);

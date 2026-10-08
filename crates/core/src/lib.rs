@@ -45,6 +45,7 @@ pub mod policy;
 pub mod ports;
 pub mod registry;
 pub mod repro;
+pub mod script_step;
 pub mod step;
 pub mod tf;
 mod types;
