@@ -224,9 +224,12 @@ pub fn resume(args: &[String]) -> ExitCode {
 
     let context = crate::args::detect_context();
     let interactive = std::io::stdin().is_terminal() && std::env::var_os("CI").is_none();
-    // Who is resuming. Detection only ever escalates to an agent, and so does
-    // the record: an agent's run stays an agent's run whoever resumes it.
-    let resumer = actor::for_run(None, None, interactive, &actor::ActorBaseline::default()).kind;
+    // Who is resuming, under the same baseline this environment declares in
+    // `KEEPSHIPPING_AGENTS` / `KEEPSHIPPING_REQUIRE_HUMAN`. Detection only ever
+    // escalates to an agent, and so does the record: an agent's run stays an
+    // agent's run whoever resumes it.
+    let baseline = actor::ActorBaseline::from_env(&std::env::vars().collect());
+    let resumer = actor::for_run(None, None, interactive, &baseline).kind;
     let recorded = recorded_actor(&state);
     let acting = if resumer == ActorKind::Agent { ActorKind::Agent } else { recorded };
 

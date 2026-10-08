@@ -42,7 +42,12 @@ fn keepshipping(args: &[&str]) -> (i32, String, String) {
     for (name, _) in AGENT_TYPICAL_ENV {
         cmd.env_remove(*name);
     }
-    let out = cmd.env_remove("GITHUB_ACTIONS").output().expect("run keepshipping");
+    let out = cmd
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("KEEPSHIPPING_REQUIRE_HUMAN")
+        .env_remove("KEEPSHIPPING_AGENTS")
+        .output()
+        .expect("run keepshipping");
     (
         out.status.code().expect("exit code"),
         String::from_utf8_lossy(&out.stdout).into_owned(),

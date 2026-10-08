@@ -73,6 +73,8 @@ fn temp_site(src: &str) -> PathBuf {
 fn run(args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_keepshipping"));
     cmd.args(args).env_remove("GITHUB_ACTIONS").env_remove("CI");
+    cmd.env_remove("KEEPSHIPPING_REQUIRE_HUMAN");
+    cmd.env_remove("KEEPSHIPPING_AGENTS");
     let out = cmd.output().expect("run keepshipping");
     (
         out.status.code().expect("exit code"),
@@ -116,6 +118,8 @@ fn without_the_flag_the_environment_decides() {
             .args(["check", &file])
             .env(set.0, set.1)
             .env_remove(if set.0 == "CI" { "GITHUB_ACTIONS" } else { "CI" })
+            .env_remove("KEEPSHIPPING_REQUIRE_HUMAN")
+            .env_remove("KEEPSHIPPING_AGENTS")
             .output()
             .expect("run keepshipping");
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -128,6 +132,8 @@ fn without_the_flag_the_environment_decides() {
         .args(["check", &file])
         .env("CI", "false")
         .env_remove("GITHUB_ACTIONS")
+        .env_remove("KEEPSHIPPING_REQUIRE_HUMAN")
+        .env_remove("KEEPSHIPPING_AGENTS")
         .output()
         .expect("run keepshipping");
     assert!(String::from_utf8_lossy(&out.stdout).contains("needs CI"), "CI=false is not CI");

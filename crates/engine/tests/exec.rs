@@ -704,11 +704,14 @@ fn the_documented_exit_codes_and_deadlines_are_the_ones_in_force() {
     }
 
     // `| `build` | 30m |` and its six siblings: the default timeout for each action.
+    // Other tables name things in backticks too (the environment variables), so
+    // a row counts only when its second cell is a duration.
     let deadlines: HashMap<&str, Duration> = cli
         .lines()
         .filter_map(|line| {
             let (name, rest) = line.trim().strip_prefix("| `")?.split_once("` | ")?;
-            Some((name, minutes(rest.split('|').next()?.trim())))
+            let cell = rest.split('|').next()?.trim();
+            cell.starts_with(|c: char| c.is_ascii_digit()).then(|| (name, minutes(cell)))
         })
         .collect();
     let actions = [
