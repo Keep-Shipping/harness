@@ -6,18 +6,22 @@
 //! Exit codes follow the house rules: 0 when the search ran (even with no
 //! results), 1 when the index could not be queried, 2 for usage and
 //! configuration problems — including "no index configured", which must not
-//! masquerade as an empty result set.
+//! masquerade as an empty result set. `--offline` inherits the last rule: a
+//! query with nothing cached is a 2, because "no cached answer" is a
+//! configuration problem about the machine, not an empty result set.
 
 use std::io::Write;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use ks_core::ports::blocks::{BlockEntry, BlockQuery, BlocksIndex, BlocksIndexError};
+use ks_core::ports::blocks::{BlockEntry, BlockQuery, BlocksIndexError};
 use ks_core::ports::http::HttpPolicy;
 use ks_core::ports::supply_chain::SignerIdentity;
 
 use crate::args::{Command, INDEX_ENV, USAGE, parse_args};
-use crate::blocks_index::HostedBlocksIndex;
+use crate::blocks_cache::BlocksCache;
+use crate::blocks_index::{HostedBlocksIndex, parse_response};
 use crate::http_client::TcpHttpClient;
 use crate::render::Format;
 
@@ -64,7 +68,7 @@ fn search(args: &[String]) -> ExitCode {
         allowed_hosts: [host_of(&base)].into_iter().collect(),
         ..HttpPolicy::default()
     };
-    let index = match HostedBlocksIndex::new(base, Arc::new(TcpHttpClient::new(policy))) {
+    let index = match HostedBlocksIndex::new(base.clone(), Arc::new(TcpHttpClient::new(policy))) {
         Ok(index) => index,
         Err(message) => {
             eprintln!("error: {message}");
@@ -72,12 +76,48 @@ fn search(args: &[String]) -> ExitCode {
         }
     };
     let query = BlockQuery { text: text.to_string(), limit: o.limit };
-    let found = match wait(index.search(&query)) {
-        Ok(found) => found,
-        Err(error) => {
-            eprintln!("error: {}", index_error_text(&error));
-            return ExitCode::from(1);
+    // Resolved once, before the branch: the online path writes through it and
+    // the offline path reads from it, and `None` means this machine has no
+    // cache at all — which costs the online search nothing.
+    let cache = BlocksCache::in_default_root();
+    let found = if o.offline {
+        let hit = cache
+            .as_ref()
+            .and_then(|cache| cache.get(index.base(), text, o.limit))
+            // A body that no longer satisfies the index contract is a miss as
+            // well: the cache is an optimisation, never a source of truth.
+            .and_then(|hit| parse_response(&hit.body).ok().map(|found| (hit.fetched_at, found)));
+        let Some((fetched_at, found)) = hit else {
+            eprintln!(
+                "error: nothing cached for {text:?} at {}; run without --offline to query the index first",
+                index.base()
+            );
+            return ExitCode::from(2);
+        };
+        eprintln!(
+            "note: {} — served from the local blocks cache",
+            cache_age(fetched_at, unix_now())
+        );
+        found
+    } else {
+        let body = match wait(index.search_body(&query)) {
+            Ok(body) => body,
+            Err(error) => {
+                eprintln!("error: {}", index_error_text(&error));
+                return ExitCode::from(1);
+            }
+        };
+        let found = match parse_response(&body) {
+            Ok(found) => found,
+            Err(error) => {
+                eprintln!("error: {}", index_error_text(&error));
+                return ExitCode::from(1);
+            }
+        };
+        if let Some(cache) = &cache {
+            cache.put(index.base(), text, o.limit, &body, unix_now());
         }
+        found
     };
     let mut out = std::io::stdout().lock();
     let rendered = match o.format {
@@ -105,6 +145,27 @@ fn search(args: &[String]) -> ExitCode {
 fn query_text(raw: Option<&str>) -> Option<&str> {
     let text = raw?.trim();
     (!text.is_empty()).then_some(text)
+}
+
+/// Now, in unix seconds; 0 when the clock is before the epoch, which only
+/// makes a cache entry look ancient, never invalid.
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|since| since.as_secs()).unwrap_or(0)
+}
+
+/// How long ago a cached entry was fetched, for the note `--offline` prints.
+/// `now` is a parameter so the wording can be tested without a clock.
+fn cache_age(fetched_at: u64, now: u64) -> String {
+    let elapsed = now.saturating_sub(fetched_at);
+    if elapsed < 60 {
+        return "cached just now".to_string();
+    }
+    let (n, unit) = match elapsed {
+        seconds if seconds < 3600 => (seconds / 60, "minute"),
+        seconds if seconds < 86_400 => (seconds / 3600, "hour"),
+        seconds => (seconds / 86_400, "day"),
+    };
+    format!("cached {n} {unit}{} ago", if n == 1 { "" } else { "s" })
 }
 
 /// Which index to ask: `--index` when given, else `INDEX_ENV`. Both are
@@ -314,6 +375,22 @@ mod tests {
         let key = SignerIdentity::Key { key_id: "2026-q3".to_string() };
         assert_eq!(publisher_text(&key), "key:2026-q3");
         assert_eq!(publisher_json(&key), "{\"kind\":\"key\",\"key_id\":\"2026-q3\"}");
+    }
+
+    #[test]
+    fn the_cache_note_reads_by_how_stale_the_entry_is() {
+        let now = 1_700_000_000;
+        assert_eq!(cache_age(now, now), "cached just now");
+        assert_eq!(cache_age(now - 59, now), "cached just now");
+        assert_eq!(cache_age(now - 60, now), "cached 1 minute ago");
+        assert_eq!(cache_age(now - 600, now), "cached 10 minutes ago");
+        assert_eq!(cache_age(now - 3600, now), "cached 1 hour ago");
+        assert_eq!(cache_age(now - 3 * 3600, now), "cached 3 hours ago");
+        assert_eq!(cache_age(now - 86_400, now), "cached 1 day ago");
+        assert_eq!(cache_age(now - 3 * 86_400, now), "cached 3 days ago");
+        // An entry stamped in the future (a clock that moved back) reads as
+        // fresh rather than as a negative age.
+        assert_eq!(cache_age(now + 100, now), "cached just now");
     }
 
     #[test]
