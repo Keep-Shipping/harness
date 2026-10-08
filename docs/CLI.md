@@ -14,6 +14,9 @@ implemented end to end today; `run` is not.
 - `keepshipping blocks search <QUERY>` — search the metadata-only blocks index (`--index URL` or
   `KEEPSSHIPPING_BLOCKS_INDEX`, `--limit N`, `--offline`, `--format human|json`). It asks the
   index; it never downloads a block.
+- `keepshipping blocks publish <FILE>` — push a `.ks` block file to an OCI registry (`--version
+  X.Y.Z`, `--to <host>/<namespace>`, `--readme PATH`), refusing a breaking interface change inside a
+  release line. [Publishing blocks](#publishing-blocks) below.
 - `keepshipping policy explain [FILE]` — the effective policy for one actor (`--as agent|human|ci`,
   default `agent`; `--env NAME`), each row attributed to the document that decided it. Below.
 
@@ -51,6 +54,48 @@ deploy  deploy prod     ask @platform  file ship.ks:36
 (`approval`, `decide`, …) get `not governed`. Without `--env`, a step deciding the same everywhere
 gets one env-less row and one that differs gets a row per environment. `--as human` is the same
 file minus the leash.
+
+## Publishing blocks
+
+```sh
+keepshipping blocks publish blocks/web-service.ks --version 1.0.0 --to localhost:5001/acme/blocks
+```
+
+- `--version X.Y.Z` — the version to publish at. Strictly `MAJOR.MINOR.PATCH`: no `v` prefix, no
+  pre-release, no partial version.
+- `--to <host>/<namespace>` — the registry host (port included) and the namespace inside it. The
+  block's own `block:` name is the last path element. A **loopback** registry (`localhost`,
+  `127.0.0.1`, `::1`) is spoken to over plain `http`; any other host is `https`. Credentials come
+  from the docker config when one names the host.
+- `--readme PATH` — the README to publish with the block. Only when named: a `README.md` that
+  happens to sit beside the block file may be about something else.
+
+Exit 0 prints `published <name> <version> to <repository>@<digest>`. A usage problem — no block
+file, no `--version`, a version that is not `MAJOR.MINOR.PATCH`, a `--to` without a namespace, a
+`block:` name a registry could not hold — is exit 2. A refusal, or a registry that would not take
+the push, is exit 1.
+
+One OCI image manifest, `artifactType` `application/vnd.keepshipping.block.v1`, with layers in a
+fixed order — the interface (JSON: the block's `summary`, `inputs` and `outputs`, each field with
+its `name`, `type` and `required`), the `.ks` file verbatim, and the README when one was given. The
+manifest carries `org.opencontainers.image.title`, `org.opencontainers.image.version` and
+`io.keepshipping.block.layers` (`interface,definition[,readme]`), so a reader can see what the
+layers are instead of trusting position.
+
+### The compatibility rule
+
+A published version is immutable, so re-publishing one is refused rather than moving a tag
+consumers pinned by name. Within a **release line** — the major, or while the major is `0` the
+minor, the way cargo treats `0.x` — the interface is held still. **Breaking:** an input removed or
+retyped, an input that is new and required or went from optional to required, an output removed or
+retyped. **Compatible:** a new optional input, a required input that became optional, a new output.
+
+A breaking change inside a line is refused, with the changes listed and the version to use instead
+named. A new line is a new interface and is accepted whatever it changes — so after `1.0.0`,
+removing an input is a `2.0.0`, and a `0.9.0` beside them is its own line. A version *below* the
+highest published in its own line goes backwards and is refused too. Tags that are not
+`MAJOR.MINOR.PATCH` are not versions and are ignored. There is no signing flag yet: no `Signer`
+adapter is wired into the CLI, so a published block carries no signature.
 
 ## Exit codes
 

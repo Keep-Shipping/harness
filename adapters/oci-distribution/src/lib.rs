@@ -312,6 +312,82 @@ impl OciDistribution {
         req.headers.push(("Accept".to_string(), accept.to_string()));
         self.request(req).await
     }
+
+    /// The tags `repository` currently serves, in whatever order the registry
+    /// lists them.
+    ///
+    /// A repository that has never been pushed to answers 404 (`NAME_UNKNOWN`),
+    /// which is an empty tag list and not a failure: "nothing published yet" is
+    /// the answer to "which versions exist", not an error. Anything else that is
+    /// not 2xx is a [`RegistryError::Backend`], as everywhere else.
+    ///
+    /// A paginated listing answers each page with a `Link` header naming the next;
+    /// those are followed to the end rather than silently truncated, because a
+    /// caller reading this cannot tell a complete answer from a first page.
+    /// `TAG_PAGES` is a floor under a registry that never stops linking, not a
+    /// limit a real one reaches.
+    ///
+    /// Not part of the [`Registry`] port: a caller that needs a *specific* tag has
+    /// [`Registry::resolve`], and tag listing is the one read here with no port
+    /// method behind it.
+    pub async fn tags(&self, repository: &str) -> Result<Vec<String>, RegistryError> {
+        let endpoint = self.endpoint(repository)?;
+        let path = format!("/v2/{}/tags/list", endpoint.name);
+        let mut url = format!("{}{path}", endpoint.base);
+        let mut tags = Vec::new();
+        for _ in 0..TAG_PAGES {
+            let response = self.request(HttpRequest::new(HttpMethod::Get, url.clone())).await?;
+            let next = next_page(&response, &path);
+            let body = match response.status {
+                200..=299 => response.body,
+                404 if tags.is_empty() => return Ok(tags),
+                _ => return Err(backend(response, &endpoint, "tags/list")),
+            };
+            let listing: serde_json::Value =
+                serde_json::from_slice(&body).map_err(|error| RegistryError::Backend {
+                    message: format!("the tag listing could not be read: {error}"),
+                })?;
+            tags.extend(
+                listing
+                    .get("tags")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|tag| tag.as_str().map(str::to_string)),
+            );
+            match next {
+                Some(next) => url = format!("{}{next}", endpoint.base),
+                None => return Ok(tags),
+            }
+        }
+        Err(RegistryError::Backend {
+            message: format!(
+                "{} paginated its tag listing past {TAG_PAGES} pages without ending",
+                endpoint.host
+            ),
+        })
+    }
+}
+
+/// How many pages of `tags/list` [`OciDistribution::tags`] will follow before
+/// calling it a registry that will not stop.
+const TAG_PAGES: usize = 32;
+
+/// The URL of the next page of a paginated listing: the `Link` header's
+/// `<...>; rel="next"`. A `Link` that names no next page, or one naming a
+/// different repository than the walk started on, ends the walk — following
+/// either would answer a different question with someone else's answer.
+fn next_page(response: &HttpResponse, path: &str) -> Option<String> {
+    // The header is a comma-separated list of `<url>; rel="..."` entries.
+    // Entries are found by their `<` rather than split on commas, because a
+    // URL's own query string may carry commas that are not separators.
+    let link = header(response, "link")?;
+    link.split(", <")
+        .filter_map(|entry| entry.strip_prefix('<')?.split_once('>'))
+        .find(|(_, after)| after.contains("rel=\"next\""))
+        .map(|(target, _)| target)
+        .filter(|target| target.starts_with(path))
+        .map(str::to_string)
 }
 
 impl Registry for OciDistribution {

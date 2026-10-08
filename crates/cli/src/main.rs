@@ -11,6 +11,7 @@ mod args;
 mod blocks;
 mod blocks_cache;
 mod blocks_index;
+mod blocks_publish;
 mod check;
 mod drive;
 mod fmt;

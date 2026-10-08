@@ -358,10 +358,10 @@ fn an_empty_result_set_is_cached_too() {
 #[test]
 fn usage_mistakes_are_exit_two() {
     for args in [
-        vec!["blocks"],                 // no subcommand
-        vec!["blocks", "publish", "x"], // unknown subcommand
-        vec!["blocks", "search"],       // no query
-        vec!["blocks", "search", "  "], // blank query
+        vec!["blocks"],                    // no subcommand
+        vec!["blocks", "frobnicate", "x"], // unknown subcommand
+        vec!["blocks", "search"],          // no query
+        vec!["blocks", "search", "  "],    // blank query
         vec!["blocks", "search", "rollout", "--limit", "0"],
         vec!["blocks", "search", "rollout", "--limit", "lots"],
         vec!["blocks", "search", "rollout", "--format", "github"],
@@ -369,5 +369,45 @@ fn usage_mistakes_are_exit_two() {
     ] {
         let (code, _stdout, stderr) = keepshipping(&args);
         assert_eq!(code, 2, "{args:?}: {stderr}");
+    }
+}
+
+#[test]
+fn blocks_publish_usage_mistakes_are_exit_two() {
+    // No block file, no version, no target: each is checked before any traffic,
+    // so none of these reaches a registry. The string beside each case is what
+    // the message has to name, or nothing when the exit code is the whole point.
+    let publish = |args: &[&'static str]| {
+        let mut all = vec!["blocks", "publish"];
+        all.extend_from_slice(args);
+        all
+    };
+    for (args, named) in [
+        (vec![], ""),
+        (vec!["b.ks"], "MAJOR.MINOR.PATCH"),
+        (vec!["b.ks", "--version", "3.1.0"], "--to <host>/<namespace>"),
+        (vec!["b.ks", "--to", "localhost:5001/acme"], "MAJOR.MINOR.PATCH"),
+        // `--to` wants an authority and a namespace, and names where to push
+        // rather than a url to fetch.
+        (vec!["b.ks", "--version", "3.1.0", "--to", "localhost:5001"], "--to <host>/<namespace>"),
+        (vec!["b.ks", "--version", "3.1.0", "--to", "/acme/blocks"], "--to <host>/<namespace>"),
+        (
+            vec!["b.ks", "--version", "3.1.0", "--to", "http://localhost:5001/a"],
+            "is not a registry host",
+        ),
+        (vec!["b.ks", "--version", "3.1.0", "--to", "localhost:port/a"], "is not a registry host"),
+        // A version this build cannot compare is a usage error, not a push.
+        (vec!["b.ks", "--version", "3.1", "--to", "localhost:5001/a"], "MAJOR.MINOR.PATCH"),
+        (vec!["b.ks", "--version", "v3.1.0", "--to", "localhost:5001/a"], "MAJOR.MINOR.PATCH"),
+        (vec!["b.ks", "--version", "3.1.0-rc1", "--to", "localhost:5001/a"], "MAJOR.MINOR.PATCH"),
+        // Another command's flag is not this command's.
+        (vec!["b.ks", "--version", "3.1.0", "--to", "localhost:5001/a", "--all"], ""),
+        (vec!["b.ks", "--version", "3.1.0", "--to", "localhost:5001/a", "--index", "http://x"], ""),
+    ] {
+        let args = publish(&args);
+        let (code, stdout, stderr) = keepshipping(&args);
+        assert_eq!(code, 2, "{args:?}: {stdout}{stderr}");
+        assert!(stdout.is_empty(), "nothing is pushed: {args:?}: {stdout}");
+        assert!(stderr.contains(named), "{args:?}: {stderr}");
     }
 }

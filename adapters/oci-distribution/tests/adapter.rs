@@ -214,6 +214,58 @@ fn a_digest_nothing_refers_to_is_an_empty_list_not_an_error() {
 }
 
 #[test]
+fn the_tag_listing_reads_the_tags_and_a_missing_repository_is_an_empty_one() {
+    let url = "http://registry.example/v2/team/app/tags/list";
+    // `tags: null` is a repository with nothing in it, in the spelling some
+    // registries use for exactly that.
+    for (body, wanted) in [
+        (br#"{"name":"team/app","tags":["1.0.0","2.0.0"]}"#.as_slice(), vec!["1.0.0", "2.0.0"]),
+        (br#"{"name":"team/app","tags":null}"#.as_slice(), vec![]),
+    ] {
+        let fake = Arc::new(scripted().with_response(HttpMethod::Get, url, ok(body)));
+        let wanted: Vec<String> = wanted.into_iter().map(String::from).collect();
+        assert_eq!(block_on(insecure(&fake).tags(REPOSITORY)), Ok(wanted));
+    }
+
+    // A repository nothing was ever pushed to answers 404, which is the empty
+    // list and not a failure; a listing that is not json is a registry in
+    // trouble, not an empty one.
+    let missing = Arc::new(scripted().with_response(HttpMethod::Get, url, response(404, &[], b"")));
+    assert_eq!(block_on(insecure(&missing).tags(REPOSITORY)), Ok(vec![]));
+    let broken = Arc::new(scripted().with_response(HttpMethod::Get, url, ok(b"<html>nope</html>")));
+    assert!(block_on(insecure(&broken).tags(REPOSITORY)).is_err());
+}
+
+#[test]
+fn a_paginated_tag_listing_is_walked_to_the_end() {
+    let next = "/v2/team/app/tags/list?last=2.0.0&n=1";
+    let first = format!("<{next}>; rel=\"next\"");
+    let fake = Arc::new(
+        scripted()
+            .with_response(
+                HttpMethod::Get,
+                "http://registry.example/v2/team/app/tags/list",
+                response(200, &[("Link", &first)], br#"{"tags":["1.0.0","2.0.0"]}"#),
+            )
+            .with_response(
+                HttpMethod::Get,
+                format!("http://registry.example{next}"),
+                response(
+                    200,
+                    &[("Link", "</v2/other/app/tags/list?n=1>; rel=\"next\"")],
+                    br#"{"tags":["3.0.0"]}"#,
+                ),
+            ),
+    );
+    // The second page's `Link` names a different repository, so it ends the
+    // walk rather than being followed into someone else's listing.
+    assert_eq!(
+        block_on(insecure(&fake).tags(REPOSITORY)),
+        Ok(vec!["1.0.0".to_string(), "2.0.0".to_string(), "3.0.0".to_string()])
+    );
+}
+
+#[test]
 fn existence_is_false_only_on_a_real_404() {
     let present = digest_of(b"present");
     let absent = digest_of(b"absent");

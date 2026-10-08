@@ -193,6 +193,13 @@ jobs:
           cargo test -p ks-oci-distribution --test conformance -- --nocapture \
             || { echo "::error::the Registry conformance kit failed. Fix: run 'KS_OCI_CONFORMANCE_REGISTRIES=localhost:5001,localhost:5002 cargo test -p ks-oci-distribution --test conformance' against local zot and distribution, make it pass, and commit."; exit 1; }
 
+      - name: Publish and read a block back off both registries
+        env:
+          KS_OCI_CONFORMANCE_REGISTRIES: localhost:5001,localhost:5002
+        run: |
+          cargo test -p ks-cli --test blocks_registry -- --nocapture \
+            || { echo "::error::the blocks publish round trip failed. Fix: run 'KS_OCI_CONFORMANCE_REGISTRIES=localhost:5001,localhost:5002 cargo test -p ks-cli --test blocks_registry' against local zot and distribution, make it pass, and commit."; exit 1; }
+
   script-runtime:
     name: script runtime (pinned Deno)
     runs-on: ubuntu-latest
