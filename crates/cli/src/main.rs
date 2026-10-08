@@ -15,6 +15,7 @@ mod blocks_cache;
 mod blocks_index;
 mod blocks_publish;
 mod check;
+mod decide;
 mod decisions;
 mod drive;
 mod fmt;
@@ -94,6 +95,7 @@ fn dispatch() -> ExitCode {
         // record's binding, the context gate and policy, then drives the rest.
         Some("resume") => resume::resume(&args[1..]),
         Some("decisions") => decisions::decisions(&args[1..]),
+        Some("decide") => decide::decide(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)

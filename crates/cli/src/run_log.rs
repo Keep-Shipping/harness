@@ -252,6 +252,20 @@ fn event_fields(event: &RunEvent) -> Result<Map<String, Value>, RunLogError> {
             put("channel", text(channel));
             put("artifacts", strings(artifacts));
         }
+        RunEvent::DecideSent { step, model, state, questions } => {
+            put("step", text(step));
+            put("model", text(model));
+            put("state", text(state));
+            put(
+                "questions",
+                Value::Array(
+                    questions
+                        .iter()
+                        .map(|(id, instructions)| json!({"id": id, "instructions": instructions}))
+                        .collect(),
+                ),
+            );
+        }
         RunEvent::DecideAnswered {
             step,
             model,
@@ -687,6 +701,28 @@ mod tests {
         let bytes = written(&log, &run);
         assert_eq!(verify(&bytes).expect("chain intact"), 1);
         for field in ["attestation.attached", "\"step\":\"build\"", "\"subject\":\"sha256:ee\""] {
+            assert!(bytes.contains(field), "{field} is missing from {bytes}");
+        }
+    }
+
+    /// What left the machine for a decision model is logged like any other
+    /// event, so `keepshipping decide --explain` can show it.
+    #[test]
+    fn a_decide_sent_renders_as_one_line() {
+        let (log, run) = log("decide-sent");
+        block_on(log.append(
+            &run,
+            RunEvent::DecideSent {
+                step: "deploy".into(),
+                model: "fake".into(),
+                state: "1 resource(s) changed.".into(),
+                questions: vec![("deploy".into(), "Safe to run?".into())],
+            },
+        ))
+        .expect("append");
+
+        let bytes = written(&log, &run);
+        for field in ["decide.sent", "\"model\":\"fake\"", "resource(s) changed", "Safe to run?"] {
             assert!(bytes.contains(field), "{field} is missing from {bytes}");
         }
     }

@@ -121,8 +121,9 @@ fn usage() -> ExitCode {
 }
 
 /// The run's file and its text, or why there is nothing to read: no run at all, an id no run has,
-/// or a file that is not UTF-8.
-fn read_run(run: Option<&RunId>) -> Result<(PathBuf, String), String> {
+/// or a file that is not UTF-8. Shared with `decide --explain` ([`crate::decide`]), which reads a
+/// run the same way and reports an unreadable one the same way.
+pub(crate) fn read_run(run: Option<&RunId>) -> Result<(PathBuf, String), String> {
     let dir = Path::new(RUNS_DIR);
     let run = match run {
         Some(run) => run.clone(),

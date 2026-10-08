@@ -10,11 +10,13 @@
 //! [`step`](Journal::step) is the additive wrapper over [`run_step`], whose signature is untouched
 //! so callers that do not journal keep using it.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use ks_core::harness::Harness;
 use ks_core::ids::RunId;
+use ks_core::ports::decision_model::{Question, RedactedState};
 use ks_core::ports::run_log::{RunEvent, RunLog, RunLogError};
 use ks_core::ports::secrets::Redactor;
 use ks_core::step::{
@@ -142,6 +144,40 @@ impl Journal {
             proposer: proposer.into(),
             channel: channel.into(),
             artifacts,
+        };
+        self.emit(e).await
+    }
+
+    /// Records the state and questions about to go to the model, so
+    /// `keepshipping decide --explain <run>` shows exactly what left the
+    /// machine.
+    ///
+    /// Call this with the state **after** [`RedactedState::fit`] and immediately
+    /// before [`DecisionModel::ask`]: a state logged before the fit, or after
+    /// anything changed it, is not the text the answer came from
+    /// ([#107](https://github.com/Keep-Shipping/harness/issues/107)).
+    ///
+    /// [`RedactedState::fit`]: ks_core::ports::decision_model::RedactedState::fit
+    /// [`DecisionModel::ask`]: ks_core::ports::decision_model::DecisionModel::ask
+    pub async fn decide_sent(
+        &self,
+        step: &str,
+        model: &str,
+        state: &RedactedState,
+        questions: &BTreeMap<String, Question>,
+    ) -> Result<(), RunLogError> {
+        let questions = questions
+            .iter()
+            .map(|(id, question)| {
+                let Question::Choice { instructions, .. } = question;
+                (id.clone(), instructions.clone())
+            })
+            .collect();
+        let e = RunEvent::DecideSent {
+            step: step.into(),
+            model: model.into(),
+            state: state.as_str().to_string(),
+            questions,
         };
         self.emit(e).await
     }

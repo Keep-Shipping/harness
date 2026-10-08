@@ -10,9 +10,12 @@
 //! Three properties make those answers worth trusting:
 //!
 //! - **The state is redacted by construction.** [`RedactedState`] has no
-//!   public constructor; only [`RedactedState::summarise`], which renders an
-//!   already secret-stripped [`PlanSummary`], produces one. No value of the
-//!   type carries raw plan JSON, so a model cannot be handed one by accident.
+//!   public constructor; only [`RedactedState::from_changes`] and
+//!   [`summarise`](RedactedState::summarise) produce one, through
+//!   [`redact`](crate::redact). A value outside the allowlist never reaches it,
+//!   and every plan string is quoted as data
+//!   ([#107](https://github.com/Keep-Shipping/harness/issues/107)), so a model
+//!   cannot be handed a raw value — or an instruction — by accident.
 //! - **Truncation is deterministic and reported.** [`RedactedState::fit`] cuts
 //!   on a character boundary and returns a [`Truncation`] naming what it cut.
 //!   The port cannot log on an adapter's behalf, so logging it is the adapter's
@@ -27,7 +30,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use super::BoxFuture;
-use crate::plan_summary::{Limits, PlanSummary, Target};
+use crate::plan_summary::{Limits, PlanChange, PlanSummary, Target};
 
 /// The option every question must offer: the answer "a human decides".
 /// Required so an adapter that can decide nothing still has a legal answer.
@@ -240,20 +243,41 @@ impl Answer {
     }
 }
 
-/// The state a model is shown: rendered from an already secret-stripped
-/// [`PlanSummary`], and nothing else. No public constructor, private field, so
-/// the only way to hold one is [`summarise`](Self::summarise) — and no
-/// renderer can leak a value the summary already dropped.
+/// The state a model is shown: a plan's *shape* — addresses, types, actions,
+/// the names of the attributes that moved, counts — and, from
+/// [`from_changes`](Self::from_changes), the values of a short allowlist. Built
+/// by [`redact`](crate::redact) and nothing else: no public constructor and a
+/// private field, so no code path can put a value in one the allowlist does not
+/// allow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedactedState {
     text: String,
 }
 
 impl RedactedState {
-    /// Renders `summary` for `target` within `limits` as the model's state.
+    /// Renders `summary` as the model's state: **attribute names only, every
+    /// value withheld**, because a summary carries no record of what the tool
+    /// marked sensitive.
+    ///
+    /// `target` is ignored and [`Limits::max_bytes`] is not applied — bound the
+    /// state with [`fit`](Self::fit), which reports what it cut. What the limit
+    /// does drop, the state counts and names on a line of its own. New code
+    /// should use [`from_changes`](Self::from_changes), which can show
+    /// allowlisted values.
     #[must_use]
-    pub fn summarise(summary: &PlanSummary, target: Target, limits: &Limits) -> RedactedState {
-        RedactedState { text: summary.render(target, limits) }
+    pub fn summarise(summary: &PlanSummary, _target: Target, limits: &Limits) -> RedactedState {
+        RedactedState { text: crate::redact::render_summary(summary, limits.max_resources) }
+    }
+
+    /// Renders `changes` as the model's state — **the summariser**: addresses,
+    /// types, actions, the *names* of the attributes that moved, counts and
+    /// module paths, plus the values of the few attributes on
+    /// [`redact::VALUE_ALLOWLIST`](crate::redact::VALUE_ALLOWLIST). Every
+    /// value outside that allowlist is withheld, and every plan string is
+    /// quoted as data so none of it can be read as an instruction.
+    #[must_use]
+    pub fn from_changes(changes: &[PlanChange]) -> RedactedState {
+        RedactedState { text: crate::redact::render(changes) }
     }
 
     /// The rendered text, as the model will see it.
@@ -574,7 +598,6 @@ mod tests {
         let summary = summary();
         let full = RedactedState::summarise(&summary, Target::Plain, &Limits::default());
         assert!(full.as_str().contains("aws_instance.web"), "{}", full.as_str());
-        assert_eq!(full.len(), summary.render(Target::Plain, &Limits::default()).len());
         let length = full.len();
         assert!(length > 64, "the fixture must exceed the bound it is cut to: {length}");
 
@@ -593,6 +616,65 @@ mod tests {
         let empty = state().fit(0);
         assert!(empty.state.is_empty());
         assert_eq!(empty.truncated, Some(Truncation { from_bytes: length, to_bytes: 0 }));
+    }
+
+    #[test]
+    fn a_summarised_state_shows_names_and_withholds_every_value() {
+        // A summary keeps no record of what the tool marked sensitive, so even
+        // an allowlisted path arrives untrusted: `instance_type` is withheld
+        // here, while `from_changes` shows it.
+        let text = state();
+        assert!(
+            text.as_str().contains("\"instance_type\": (withheld) → (withheld)"),
+            "{}",
+            text.as_str()
+        );
+        assert!(!text.as_str().contains("t3.small"), "{}", text.as_str());
+
+        // A credential-shaped value, assembled here so this file holds no
+        // secret-shaped literal: what the test needs is the shape.
+        let key = ["AKI", "A", "IOSF", "ODNN", "7EXA", "MPLE"].concat();
+        let leak = PlanSummary {
+            risky: vec![SummaryEntry {
+                kind: Kind::Replace,
+                address: "aws_instance.web".to_string(),
+                attributes: vec![SummaryAttribute {
+                    path: "engine_version".to_string(),
+                    before: "15.1".to_string(),
+                    after: key.clone(),
+                    forces_replacement: false,
+                }],
+                reason: None,
+            }],
+            ..PlanSummary::default()
+        };
+        let text = RedactedState::summarise(&leak, Target::Plain, &Limits::default());
+        assert!(text.as_str().contains("\"engine_version\":"), "{}", text.as_str());
+        assert!(!text.as_str().contains(&key), "{}", text.as_str());
+    }
+
+    #[test]
+    fn a_summary_says_how_much_it_left_out() {
+        let many = PlanSummary {
+            others: (0..5)
+                .map(|i| SummaryEntry {
+                    kind: Kind::Add,
+                    address: format!("aws_instance.web{i}"),
+                    attributes: vec![],
+                    reason: None,
+                })
+                .collect(),
+            ..PlanSummary::default()
+        };
+        let limits = Limits { max_resources: Some(2), ..Limits::default() };
+        let text = RedactedState::summarise(&many, Target::Plain, &limits).as_str().to_string();
+        // The counts describe the whole plan; the truncation is named, not silent.
+        assert!(text.contains("5 resource(s) changed: 5 create"), "{text}");
+        assert!(text.contains("3 more resource(s) not shown."), "{text}");
+        assert!(!text.contains("web3"), "{text}");
+
+        let whole = RedactedState::summarise(&many, Target::Plain, &Limits::default());
+        assert!(!whole.as_str().contains("not shown"), "{}", whole.as_str());
     }
 
     #[test]

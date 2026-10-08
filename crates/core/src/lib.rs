@@ -44,6 +44,7 @@ pub mod lock;
 pub mod plan_summary;
 pub mod policy;
 pub mod ports;
+pub mod redact;
 pub mod registry;
 pub mod repro;
 pub mod script;
