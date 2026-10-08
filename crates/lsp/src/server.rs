@@ -2,15 +2,22 @@
 //! stdio transport LSP is defined on. Everything it answers comes from
 //! [`crate::analysis`]; this module only speaks the protocol.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use serde_json::{Value, json};
 
+use ks_core::script::ScriptOutputs;
+
 use crate::analysis::{self, Doc};
 use crate::rpc;
 use crate::text::Encoding;
+
+/// What the module a script step's kind names declares: the document's own
+/// path and the text it currently holds, keyed by the kind path as spelled.
+pub type ScriptProvider = fn(&Path, &str) -> BTreeMap<String, ScriptOutputs>;
 
 /// JSON-RPC error codes, from the base protocol.
 const PARSE_ERROR: i64 = -32700;
@@ -25,9 +32,30 @@ pub fn serve() -> ExitCode {
     serve_stream(&mut BufReader::new(io::stdin().lock()), io::stdout())
 }
 
+/// Serve as [`serve`], with what a `script` step's module declares.
+///
+/// The checker is pure, so the only way it can know what a TypeScript step
+/// declares is if something reads the module for it. That something needs a
+/// filesystem and a process, which this crate has no business owning — the
+/// caller owns it and hands it over here.
+pub fn serve_with(scripts: ScriptProvider) -> ExitCode {
+    serve_stream_with(&mut BufReader::new(io::stdin().lock()), io::stdout(), Some(scripts))
+}
+
 /// The loop, over any pair of streams. Returns the process exit code.
 pub fn serve_stream(input: &mut impl BufRead, output: impl Write) -> ExitCode {
-    let mut server = Server::new(output);
+    serve_stream_with(input, output, None)
+}
+
+/// The loop, with `scripts` answering what a `script` step in an open
+/// document declares. `None` — the default — leaves every `script` step's
+/// outputs unchecked.
+pub fn serve_stream_with(
+    input: &mut impl BufRead,
+    output: impl Write,
+    scripts: Option<ScriptProvider>,
+) -> ExitCode {
+    let mut server = Server::new(output, scripts);
     loop {
         let message = match rpc::read_message(input) {
             // A frame the protocol does not allow: say so and carry on.
@@ -56,6 +84,8 @@ struct Server<W> {
     encoding: Encoding,
     shutting_down: bool,
     out: W,
+    /// What a `script` step declares, when the caller can read it.
+    scripts: Option<ScriptProvider>,
 }
 
 enum Handled {
@@ -64,8 +94,14 @@ enum Handled {
 }
 
 impl<W: Write> Server<W> {
-    fn new(out: W) -> Server<W> {
-        Server { docs: HashMap::new(), encoding: Encoding::default(), shutting_down: false, out }
+    fn new(out: W, scripts: Option<ScriptProvider>) -> Server<W> {
+        Server {
+            docs: HashMap::new(),
+            encoding: Encoding::default(),
+            shutting_down: false,
+            out,
+            scripts,
+        }
     }
 
     fn exit_code(&self) -> ExitCode {
@@ -158,7 +194,9 @@ impl<W: Write> Server<W> {
                 .unwrap_or_default()
                 .to_string()
         };
-        self.docs.insert(uri.clone(), Doc::new(text, self.encoding));
+        let scripts = self.declared(&uri, &text).unwrap_or_default();
+        let doc = Doc::new_with(text, self.encoding, &scripts);
+        self.docs.insert(uri.clone(), doc);
         self.publish(&uri);
     }
 
@@ -168,6 +206,15 @@ impl<W: Write> Server<W> {
         // Diagnostics for a closed file are cleared, or the editor keeps
         // showing squiggles for a file it is no longer looking at.
         self.notify("textDocument/publishDiagnostics", json!({ "uri": uri, "diagnostics": [] }));
+    }
+
+    /// What a `script` step in `uri` declares, from the caller's provider.
+    /// `None` when there is no provider or the document is not a file on
+    /// disk — a document with no path has no module beside it.
+    fn declared(&self, uri: &str, text: &str) -> Option<BTreeMap<String, ScriptOutputs>> {
+        let scripts = self.scripts?;
+        let path = path_of(uri)?;
+        Some(scripts(&path, text))
     }
 
     /// Re-check the open document and publish its diagnostics.
@@ -220,6 +267,29 @@ fn uri_of(params: &Value) -> String {
     params["textDocument"]["uri"].as_str().unwrap_or_default().to_string()
 }
 
+/// The path a `file://` URI names, or `None` for anything else: enough of
+/// RFC 3986 to open a file the client already has — the scheme, the empty
+/// authority a local file has, and the percent-escapes a path can carry.
+fn path_of(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let rest = rest.get(rest.find('/')?..)?;
+    let mut out: Vec<u8> = Vec::with_capacity(rest.len());
+    let mut at = 0;
+    while at < rest.len() {
+        if rest[at..].starts_with('%') {
+            out.push(u8::from_str_radix(rest.get(at + 1..at + 3)?, 16).ok()?);
+            at += 3;
+        } else {
+            let ch = rest[at..].chars().next()?;
+            out.extend_from_slice(&rest.as_bytes()[at..at + ch.len_utf8()]);
+            at += ch.len_utf8();
+        }
+    }
+    // A NUL in a path is not a path; anything else the client wrote is the
+    // client's business, not this server's.
+    String::from_utf8(out).ok().filter(|s| !s.contains('\0')).map(PathBuf::from)
+}
+
 /// UTF-16, the encoding LSP defaults to and every client lists, unless the
 /// client says it can only speak UTF-8.
 fn negotiate_encoding(params: &Value) -> Encoding {
@@ -260,6 +330,21 @@ mod tests {
             out.push(message);
         }
         (code, out)
+    }
+
+    #[test]
+    fn a_file_uri_names_the_path_it_can_open() {
+        assert_eq!(path_of("file:///a/ship.ks"), Some(PathBuf::from("/a/ship.ks")));
+        // A path a client percent-escaped is the path it means.
+        assert_eq!(
+            path_of("file:///a/my%20site/ship.ks"),
+            Some(PathBuf::from("/a/my site/ship.ks"))
+        );
+        // A path a client percent-escaped wrongly is not one to guess at.
+        assert_eq!(path_of("file:///a/ship.ks%zz"), None);
+        // Anything that is not a file on disk names no path to read beside.
+        assert_eq!(path_of("untitled:Untitled-1"), None);
+        assert_eq!(path_of(""), None);
     }
 
     #[test]

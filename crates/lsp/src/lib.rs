@@ -16,7 +16,7 @@ pub mod server;
 mod text;
 
 pub use analysis::{Doc, SOURCE};
-pub use server::{serve, serve_stream};
+pub use server::{ScriptProvider, serve, serve_stream, serve_stream_with, serve_with};
 pub use text::{Encoding, LineIndex, Position, Range};
 
 use ks_lang::Span;

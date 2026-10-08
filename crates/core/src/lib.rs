@@ -45,6 +45,7 @@ pub mod policy;
 pub mod ports;
 pub mod registry;
 pub mod repro;
+pub mod script;
 pub mod script_step;
 pub mod step;
 pub mod tf;
@@ -66,6 +67,7 @@ pub use policy::{
     decide as decide_policy,
 };
 pub use registry::{Explanation, explain};
+pub use script::{ScriptOutputs, Tag};
 pub use types::{LiteralFit, Type, coerce, literal, literal_type};
 pub use version::{FORMAT_VERSION, SCRIPT_PROTOCOL, STEP_API};
 pub use workflow::{

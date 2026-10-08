@@ -224,7 +224,8 @@ reference.
 
 **Steps and outputs.** Each kind declares its inputs and outputs (see the
 built-in catalog in `ks-core`: `oci.image`, `tofu.plan`, `approval`,
-`tofu.apply`, `k8s.rollout`, `decide`); unknown kinds are unchecked, their
+`tofu.apply`, `k8s.rollout`, `decide`, and a TypeScript module's path — see
+**Script steps** below); unknown kinds are unchecked, their
 outputs type `any`. **`out.` rule**: outputs the kind declares statically are
 read as `<step>.<output>`; outputs that exist only at run time (tofu
 outputs, script and block returns) are read as `<step>.out.<name>[.<field>…]`.
@@ -266,6 +267,36 @@ comes from the first of these:
 Anything else is `any`. A `dir:` that is absent, unreadable or holds no `.tf`
 files says nothing, and its outputs stay unchecked: `check` never fails for a
 file it did not see.
+
+**Script steps.** A step whose *kind* is the path of a TypeScript module —
+`migrate: ./ship/migrate.ts` — is a script step, and there is no kind to
+register: the kind is the module. `check` reads what that module declares by
+importing it with `@keepshipping/sdk` resolved to a bundled stub (no
+`npm install`, no network) and taking the `step()` descriptor off the default
+export. `run` is never called; the module's body does run, because reaching
+the descriptor means importing the module. The declared constructors map to
+ks types like this:
+
+| In the module | In ks |
+|---|---|
+| `int()`, `float()`, `string()`/`String`, `bool()`/`Boolean`, `secret()`, `path()`, `url()`, `duration()` | the same type |
+| `list(x)`, `optional(x)` | `list(x)`, `optional(x)` |
+| `Number` | an error: `int` and `float` are different types and only the module knows which it meant |
+| anything else | an error naming what it was |
+
+A declared output is then read as `<step>.<output>`, typed as the table says,
+and one the module does not declare is KS0203 with the module named and a
+did-you-mean. A declared output that is not a ks type is an error at the
+read, since the declaration is not in this file. Two limits worth knowing:
+the module's `inputs:` are extracted but not checked yet, and only a declared
+`outputs:` is known — nothing is inferred from the body.
+
+The extraction is cached per site under
+`.keepshipping/cache/scripts/<sha256 of the extractor + the module>.json`, so
+the second check reads one file and spawns nothing. A module that is not
+there, a `node` that cannot be found, and an import that fails all leave the
+step's outputs unchecked and say nothing at all: `check` never fails for a
+file it did not see, exactly as for an unreadable `dir:` above.
 
 **Context namespaces.** `git.{sha,ref,branch}`, `git.tag?`, `pr.number?`,
 `pr.base?`, `run.{id,actor}`, `run.is_agent`, `env.name`, `ci.provider?`,
