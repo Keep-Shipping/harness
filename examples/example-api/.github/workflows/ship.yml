@@ -1,0 +1,61 @@
+name: ship
+
+# The gate: every push and every pull request runs `keepshipping check` over
+# ship.ks, and anything it finds lands on the diff as an annotation.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # Bump to the release this repo builds against. The archives are published
+  # by the harness's own release workflow; SHA256SUMS beside them is the
+  # cosign-signed list of what that release contains.
+  KEEP_SHIPPING_VERSION: 0.1.0
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  check:
+    name: keepshipping check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # There is no packaged GitHub Action yet — nothing with an action.yml is
+      # published — so there is no `uses: Keep-Shipping/...` to write here.
+      # The workflow installs the binary from the release archive instead;
+      # when a packaged action ships, this step becomes that `uses:` and the
+      # download below goes away.
+      - name: Install keepshipping
+        run: |
+          set -euo pipefail
+          base="https://github.com/Keep-Shipping/harness/releases/download/v${KEEP_SHIPPING_VERSION}"
+          mkdir -p dist
+          curl -fsSL -o dist/SHA256SUMS "${base}/SHA256SUMS"
+          curl -fsSL -o "dist/keepshipping-${KEEP_SHIPPING_VERSION}-${TARGET}.tar.xz" \
+            "${base}/keepshipping-${KEEP_SHIPPING_VERSION}-${TARGET}.tar.xz"
+          # Verify before unpacking: the checksums are what the release signed.
+          # `--ignore-missing` skips the archives for the other targets, which
+          # SHA256SUMS also lists and which were not downloaded.
+          ( cd dist && sha256sum -c --ignore-missing SHA256SUMS )
+          # The archive's top-level directory is `keepshipping-<version>`, so
+          # the binary lands one level below `dist`, not directly in it.
+          tar -C dist -xf "dist/keepshipping-${KEEP_SHIPPING_VERSION}-${TARGET}.tar.xz"
+          # $GITHUB_PATH takes *directories*, which the runner prepends to PATH
+          # for the rest of the job — so this names the directory the binary is
+          # in, and `keepshipping` resolves on the two steps below. Putting the
+          # binary's own path here would not work.
+          echo "$GITHUB_WORKSPACE/dist/keepshipping-${KEEP_SHIPPING_VERSION}" >> "$GITHUB_PATH"
+
+      # `--format github` prints findings as workflow annotations, so a broken
+      # step name shows up on the diff instead of only in this log.
+      - name: Check ship.ks
+        run: keepshipping check --format github
+
+      - name: Plan, without touching anything
+        run: keepshipping run --dry-run
