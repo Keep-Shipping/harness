@@ -117,19 +117,48 @@ pub fn archive_url() -> String {
     format!("https://dl.deno.land/release/v{DENO_VERSION}/deno-{DENO_TARGET}.zip")
 }
 
-/// The stamp written next to an installed binary: the digest it was installed
-/// from. Re-installing a Deno under the same version is a bug, and this is how
-/// it shows up instead of silently running someone else's binary.
+/// The stamp written next to an installed binary: the digest of the *archive*
+/// it was installed from.
+///
+/// It is not, on its own, a statement about the file on disk — the binary is
+/// unpacked from the archive, so the two do not hash the same and the archive
+/// digest cannot be checked against it later. It says the download was the
+/// pinned one; [`binary_stamp_path`] is what says the file is still what that
+/// download produced.
 fn stamp_path(root: &Path) -> PathBuf {
     version_dir(root).join("deno.sha256")
+}
+
+/// The stamp of the *installed binary's* own digest — the only check that can
+/// notice somebody else's Deno having been dropped in over it after the fact.
+///
+/// Kept apart from the archive stamp because the two answer different
+/// questions and cost different amounts to ask. Re-installing is guarded by a
+/// string comparison against a 64-byte file; "the cache still holds what we
+/// put there" is a SHA-256 over ~100 MB, which is why it is not folded into
+/// the cheap check and why a cache that has been tampered with is re-fetched
+/// rather than re-examined.
+fn binary_stamp_path(root: &Path) -> PathBuf {
+    version_dir(root).join("deno.binary.sha256")
+}
+
+/// `<root>/<version>/deno-<target>.zip`: where an air-gapped machine puts the
+/// release archive, by hand or by whatever its own cache policy allows.
+fn preseeded_archive(root: &Path) -> PathBuf {
+    version_dir(root).join(format!("deno-{DENO_TARGET}.zip"))
 }
 
 /// Returns the path to the pinned Deno, installing it from `fetch` if the cache
 /// does not hold it yet.
 ///
-/// An existing binary is only used when its stamp names the pinned digest. A
-/// download whose digest does not match writes nothing at all: the bytes are
-/// verified before a single byte is put on disk.
+/// An existing binary is only used when its archive stamp names the pinned
+/// digest *and* the binary still hashes to the digest recorded when it was
+/// installed; anything else is treated as no cache at all and installed afresh.
+/// Self-healing rather than fatal: the replacement is verified against the same
+/// pinned digest either way, and a cache nobody has to clear by hand recovers
+/// on the next run instead of never. A download whose digest does not match
+/// writes nothing at all: the bytes are verified before a single byte is put on
+/// disk.
 pub fn ensure(root: &Path, fetch: &dyn Fetcher) -> Result<PathBuf, ScriptHostError> {
     ensure_digest(root, fetch, DENO_ARCHIVE_SHA256)
 }
@@ -143,40 +172,78 @@ fn ensure_digest(
 ) -> Result<PathBuf, ScriptHostError> {
     check_platform()?;
     let binary = deno_path(root);
-    if binary.is_file() && stamp_matches(root, expected) {
+    if binary.is_file() && stamp_matches(root, expected) && binary_unchanged(root, &binary) {
         return Ok(binary);
     }
     let url = archive_url();
-    let archive = fetch.fetch(&url).map_err(|error| ScriptHostError::Protocol {
-        message: format!(
-            "could not download the pinned Deno {DENO_VERSION} from {url}: {error}. \
-                 On an air-gapped machine, pre-seed {}/deno-x86_64-unknown-linux-gnu.zip \
-                 in the cache directory instead",
-            version_dir(root).display()
+    let preseeded = preseeded_archive(root);
+    // The air-gapped install ADR 0009 promises: the same archive, the same
+    // pinned digest, put in the cache by hand instead of fetched. It is
+    // verified exactly like a download — the point is that no *network* is
+    // needed, not that no *check* is.
+    let (archive, from) = match std::fs::read(&preseeded) {
+        Ok(bytes) => (bytes, format!("the pre-seeded archive {}", preseeded.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+            fetch.fetch(&url).map_err(|error| ScriptHostError::Protocol {
+                message: format!(
+                    "could not download the pinned Deno {DENO_VERSION} from {url}: {error}. \
+                         On an air-gapped machine, pre-seed {} in the cache directory instead",
+                    preseeded.display()
+                ),
+            })?,
+            url.clone(),
         ),
-    })?;
+        Err(error) => {
+            return Err(io_error("could not read the pre-seeded Deno archive", &preseeded)(error));
+        }
+    };
     let digest = hex(&Sha256::digest(&archive));
     if digest != expected {
         return Err(ScriptHostError::Protocol {
             message: format!(
-                "the Deno {DENO_VERSION} archive from {url} hashes to {digest}, not the pinned \
+                "the Deno {DENO_VERSION} archive from {from} hashes to {digest}, not the pinned \
                  {expected}; nothing was installed"
             ),
         });
     }
     let bytes = extract(&archive)?;
     install_binary(root, &bytes)?;
-    std::fs::write(stamp_path(root), format!("{expected}\n")).map_err(|error| {
-        ScriptHostError::Protocol {
-            message: format!("could not stamp the installed Deno: {error}"),
-        }
-    })?;
+    stamp(&stamp_path(root), expected, "the installed Deno")?;
+    stamp(&binary_stamp_path(root), &hex(&Sha256::digest(&bytes)), "the installed Deno binary")?;
     Ok(binary)
 }
 
 /// Whether the installed binary was installed from the expected archive.
 fn stamp_matches(root: &Path, expected: &str) -> bool {
     std::fs::read_to_string(stamp_path(root)).is_ok_and(|stamp| stamp.trim() == expected)
+}
+
+/// Whether `<root>/<version>/deno` still hashes to what it hashed to when it
+/// was written out. Streamed, so the ~100 MB binary is never held in memory.
+fn binary_unchanged(root: &Path, binary: &Path) -> bool {
+    let Ok(expected) = std::fs::read_to_string(binary_stamp_path(root)) else {
+        return false;
+    };
+    let Ok(mut file) = std::fs::File::open(binary) else {
+        return false;
+    };
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        match std::io::Read::read(&mut file, &mut buffer) {
+            Ok(0) => break,
+            Ok(read) => digest.update(&buffer[..read]),
+            Err(_) => return false,
+        }
+    }
+    hex(&digest.finalize()) == expected.trim()
+}
+
+/// Writes one stamp, with the failure that says which one.
+fn stamp(path: &Path, digest: &str, what: &str) -> Result<(), ScriptHostError> {
+    std::fs::write(path, format!("{digest}\n")).map_err(|error| ScriptHostError::Protocol {
+        message: format!("could not record the digest of {what}: {error}"),
+    })
 }
 
 /// Pulls the single `deno` entry out of the release archive.
@@ -249,6 +316,18 @@ pub fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// The gate on every test below that installs anything:
+    /// [`ensure_digest`] calls [`check_platform`] first and refuses anything
+    /// but linux-x86_64, so off that platform these assert the platform, or
+    /// panic on an `expect` — and the two that use `expect_err` would pass on
+    /// it without ever reaching the digest check they are named for. It is
+    /// *gating*, not `#[ignore]`: `cargo test --workspace` on Linux still runs
+    /// every one of them.
+    ///
+    /// The helpers below carry it too, for the same reason: off that platform
+    /// nothing names them, and an unused item is a warning, and warnings are
+    /// errors in this repository.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     /// A fetcher that hands back fixed bytes and counts its calls, so a test
     /// can tell "installed" from "reused what was there".
     struct Stub {
@@ -256,6 +335,7 @@ mod tests {
         calls: std::sync::Mutex<usize>,
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     impl Stub {
         fn new(bytes: Vec<u8>) -> Stub {
             Stub { bytes, calls: std::sync::Mutex::new(0) }
@@ -266,6 +346,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     impl Fetcher for Stub {
         fn fetch(&self, _url: &str) -> std::io::Result<Vec<u8>> {
             *self.calls.lock().expect("stub fetch count") += 1;
@@ -274,6 +355,7 @@ mod tests {
     }
 
     /// The release archive's shape: one stored entry named `deno`.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn archive() -> Vec<u8> {
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
         let options: zip::write::FileOptions<()> =
@@ -284,6 +366,7 @@ mod tests {
         writer.finish().expect("the stub archive is writable").into_inner()
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn root(name: &str) -> PathBuf {
         let root =
             std::env::temp_dir().join(format!("ks-deno-install-{}-{name}", std::process::id()));
@@ -303,6 +386,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn a_wrong_digest_installs_nothing() {
         let root = root("mismatch");
@@ -317,6 +401,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn a_verified_archive_installs_once_and_is_reused_afterwards() {
         use std::os::unix::fs::PermissionsExt;
@@ -338,6 +423,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn a_pre_seeded_archive_installs_without_a_network_call() {
+        let root = root("preseed");
+        let bytes = archive();
+        let digest = hex(&Sha256::digest(&bytes));
+        std::fs::create_dir_all(version_dir(&root)).expect("the cache directory is writable");
+        std::fs::write(preseeded_archive(&root), &bytes).expect("the pre-seed is writable");
+
+        let fetch = Stub::new(Vec::new());
+        let installed =
+            ensure_digest(&root, &fetch, &digest).expect("a verified pre-seed installs");
+        assert_eq!(installed, deno_path(&root));
+        assert_eq!(fetch.calls(), 0, "a pre-seeded cache needs no network at all");
+        assert!(std::fs::read(&installed).expect("the binary is there").starts_with(b"#!/bin/sh"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn a_pre_seeded_archive_is_verified_like_a_download() {
+        let root = root("preseed-mismatch");
+        // A pre-seed of some *other* release: the name says 2.9.7 and the pin
+        // is what decides.
+        let bytes = archive();
+        std::fs::create_dir_all(version_dir(&root)).expect("the cache directory is writable");
+        std::fs::write(preseeded_archive(&root), &bytes).expect("the pre-seed is writable");
+        let digest = hex(&Sha256::digest(b"a different archive entirely"));
+
+        let fetch = Stub::new(Vec::new());
+        let error = ensure_digest(&root, &fetch, &digest)
+            .expect_err("a pre-seed is not trusted over the pin");
+        assert!(
+            matches!(&error, ScriptHostError::Protocol { message } if message.contains("nothing was installed")),
+            "{error}"
+        );
+        assert!(
+            !deno_path(&root).exists(),
+            "nothing is installed from a pre-seed that does not match"
+        );
+        assert_eq!(fetch.calls(), 0, "a pre-seed that does not match is a refusal, not a download");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn an_overwritten_cached_binary_is_re_installed_not_run() {
+        let root = root("tampered");
+        let bytes = archive();
+        let digest = hex(&Sha256::digest(&bytes));
+        let fetch = Stub::new(bytes);
+        ensure_digest(&root, &fetch, &digest).expect("the verified archive installs");
+        assert_eq!(fetch.calls(), 1);
+
+        // What the review reproduced: the archive stamp still matches, and the
+        // binary underneath it is somebody else's.
+        std::fs::write(deno_path(&root), "#!/bin/sh\necho not deno\n")
+            .expect("the cache is writable by its owner");
+        assert!(
+            stamp_matches(&root, &digest),
+            "the archive stamp is untouched by this: it is a statement about the download"
+        );
+        ensure_digest(&root, &fetch, &digest).expect("the cache is re-installed rather than run");
+        assert_eq!(fetch.calls(), 2, "the tampered cache is replaced, not trusted");
+        assert!(
+            std::fs::read(deno_path(&root)).expect("the binary is there").starts_with(b"#!/bin/sh")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn an_unverifiable_download_never_reaches_the_disk() {
         struct Failing;

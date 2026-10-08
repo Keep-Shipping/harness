@@ -211,7 +211,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/keepshipping/deno
-          key: deno-2.9.7-x86_64-unknown-linux-gnu
+          key: deno-${{ runner.os }}-2.9.7-x86_64-unknown-linux-gnu
+          # A different pinned version still restores: the download is verified
+          # against the compiled-in digest either way, so a stale cache is a
+          # miss the installer replaces, not a wrong binary it runs.
+          restore-keys: |
+            deno-${{ runner.os }}-
 
       - name: Run the ScriptHost conformance kit and the sandbox refusals on real Deno
         env:

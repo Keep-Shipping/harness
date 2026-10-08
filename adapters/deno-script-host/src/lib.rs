@@ -17,6 +17,29 @@
 //!   and the one FIFO this run's secrets arrive on. No write, no env, no net,
 //!   no subprocesses, no FFI, no sys. A step reading `$HOME/.ssh/id_ed25519`
 //!   or `Deno.env.get("HOME")` gets `NotCapable`.
+//! - **Read, by way of a link**: Deno checks that grant against the path a step
+//!   *names*, not against the file behind it, so a symlink inside the
+//!   workspace pointing out of it is a hole — measured on 2.9.7:
+//!   `readTextFileSync("keys/id_ed25519")` returns the key, while
+//!   `readTextFileSync("/home/…/id_ed25519")` is `NotCapable`. The adapter
+//!   walks the workspace before it spawns anything and hands every link that
+//!   escapes to `--deny-read`, which Deno applies over `--allow-read` — so the
+//!   path is refused and the step still runs, which is the only way a stock
+//!   `.venv`, a pnpm-linked `node_modules` or a half-finished `npm install`
+//   (all of which have such links, and are all denied nothing useful) can work
+//!   at all. The walk is `DenoScriptHost::escaping_links`, private to this
+//!   adapter: it is a policy decision this crate makes about the workspace it
+//!   was handed, not part of the `ScriptHost` port, so it is documented on the
+//!   method rather than exported for a caller to lean on.
+//!
+//!   What that actually buys, precisely: a step cannot read *through* a link
+//!   that existed when the walk finished. It is not a claim about the whole
+//!   machine — the walk sees symlinks only, so a hardlink to `/etc/shadow` or a
+//!   bind mount under the workspace is outside it — and it is not atomic with
+//!   the spawn, so a link created after the walk is not in the deny list. A
+//!   workspace an attacker can write to while a step runs is not a sandbox this
+//!   flag makes sound; the walk is a closure of the ordinary hole, not of every
+//!   way a path can be made to lie.
 //! - **Net**: `--allow-net` with exactly the hosts the step *declared* in its
 //!   default export, and nothing at all when it declared none.
 //! - **Dependencies**: a `deno.json`/`package.json` beside a step requires a
@@ -81,6 +104,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -163,6 +187,10 @@ pub struct Invocation {
     /// Exactly what the child may read: the workspace, the bootstrap, and (in
     /// `run`) the secret FIFO.
     pub read_grants: Vec<PathBuf>,
+    /// Paths the child may not read whatever `--allow-read` says, and Deno
+    /// applies these over it: the links inside the workspace whose targets are
+    /// outside it. Empty means no `--deny-read` at all.
+    pub deny_read: Vec<PathBuf>,
     /// The hosts the step declared. Empty means no `--allow-net` at all.
     pub net_grants: Vec<String>,
     /// How dependencies are pinned.
@@ -208,6 +236,19 @@ impl Invocation {
             read_grant.push(path);
         }
         argv.push(read_grant);
+        // One `=` argument for the same reason, and because Deno keeps only
+        // the last of a repeated flag rather than adding to it: the deny list
+        // has to be a single argument or the first entries would be dropped.
+        if !self.deny_read.is_empty() {
+            let mut deny = OsString::from("--deny-read=");
+            for (index, path) in self.deny_read.iter().enumerate() {
+                if index > 0 {
+                    deny.push(",");
+                }
+                deny.push(path);
+            }
+            argv.push(deny);
+        }
         if !self.net_grants.is_empty() {
             argv.push(OsString::from(format!("--allow-net={}", self.net_grants.join(","))));
         }
@@ -447,7 +488,11 @@ impl DenoScriptHost {
     }
 
     /// The full description of one child process.
-    fn invocation(
+    ///
+    /// Public because it is the whole sandbox: `argv` is where every grant a
+    /// step gets is decided, and a test that could read an `Invocation` off a
+    /// host would not have to spawn Deno to check what that sandbox says.
+    pub fn invocation(
         &self,
         script: &ScriptRef,
         mode: Mode,
@@ -459,6 +504,10 @@ impl DenoScriptHost {
         if let Some(secrets) = secrets {
             read_grants.push(secrets.to_path_buf());
         }
+        // Here rather than in `spawn`, because that is the only place the scan
+        // cannot be forgotten: the deny list is part of the argv, so a child
+        // spawned without one was never described.
+        let deny_read = self.escaping_links()?;
         let script = self.script_path(script)?;
         let manifest = Self::manifest(&script)?;
         Ok(Invocation {
@@ -466,9 +515,128 @@ impl DenoScriptHost {
             script,
             mode,
             read_grants,
+            deny_read,
             net_grants: net.to_vec(),
             manifest,
             secrets: secrets.map(Path::to_path_buf),
+        })
+    }
+
+    /// The workspace paths a step may not read, because a symlink there leaves
+    /// the workspace.
+    ///
+    /// `--allow-read=<workspace>` is checked by Deno against the path the step
+    /// *names*, not against the file behind it (measured on 2.9.7:
+    /// `readTextFileSync("keys/id_ed25519")` reads the key, while the key's own
+    /// path is `NotCapable`). So these are returned as `--deny-read` grants,
+    /// which Deno applies *over* `--allow-read`, and the step runs with the
+    /// link refused. Refusing the run instead would have been simpler and wrong:
+    /// `.venv/bin/python3 -> /usr/bin/python3`, a pnpm store behind
+    /// `node_modules/.bin`, and the `.bin` entries a half-finished `npm install`
+    /// leaves dangling are all links that leave, and all of them are what an
+    /// ordinary repository looks like.
+    ///
+    /// What is returned is the link *as named inside the workspace*, not the
+    /// target behind it: that is the path Deno checks, and the target is already
+    /// unreachable through the workspace grant itself.
+    ///
+    /// Conservative where it cannot tell. A link that does not resolve — a
+    /// dangling target, a loop — is returned too: denying a path that leads
+    /// nowhere costs nothing, and the alternative is guessing what a target
+    /// that cannot be read now might become later. A directory that cannot be
+    /// enumerated is returned for the same reason: refusing the whole step over
+    /// one unreadable directory would be a denial of service, and denying it
+    /// denies exactly what nobody could vouch for.
+    ///
+    /// What this is not: it walks symlinks, so a hardlink to `/etc/shadow` or a
+    /// bind mount under the workspace is not in this list; and it runs before
+    /// the child, not atomically with it, so a link swapped in afterwards is
+    /// not either. It closes the ordinary hole; it does not make a workspace
+    /// that an attacker is writing to concurrently into a sandbox.
+    ///
+    /// The walk is not bounded. It costs one `read_dir` per directory and one
+    /// `canonicalize` per link, which is cheap next to the Deno process it
+    /// guards, and a workspace big enough to hurt is also a workspace whose
+    /// escape the run should not be making on the strength of a limit.
+    fn escaping_links(&self) -> Result<Vec<PathBuf>, ScriptHostError> {
+        let mut denied: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut directories = vec![self.workspace.clone()];
+        while let Some(directory) = directories.pop() {
+            // A directory the adapter cannot read is one it cannot enumerate, so
+            // it cannot say what is inside it. Skipping it would let the very
+            // escape it is looking for through the one hole nobody looked into;
+            // refusing the step over it would let anyone with one unreadable
+            // directory stop every run in the repository. Denying it is what is
+            // left, and it is exactly the set nobody could vouch for.
+            let entries = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(_) => {
+                    denied.insert(self.deniable(&directory)?);
+                    continue;
+                }
+            };
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    denied.insert(self.deniable(&directory)?);
+                    break;
+                };
+                // `file_type` reads the entry itself: a symlink is a leaf here,
+                // never a directory to descend into, so the walk cannot loop
+                // even though a link could point back up the tree. An entry
+                // that will not say is an un-enumerated directory again.
+                let Ok(kind) = entry.file_type() else {
+                    denied.insert(self.deniable(&directory)?);
+                    break;
+                };
+                if kind.is_dir() {
+                    directories.push(entry.path());
+                    continue;
+                }
+                if !kind.is_symlink() {
+                    continue;
+                }
+                let path = entry.path();
+                // `canonicalize` resolves every component, link by link, so a
+                // chain that leaves the workspace cannot stop halfway looking
+                // innocent. It fails on a dangling target and on a loop; either
+                // way the link is denied rather than trusted.
+                match path.canonicalize() {
+                    Ok(target) if target.starts_with(&self.workspace) => {}
+                    // It escapes, or it does not resolve at all. Both are the
+                    // same answer: deny the link.
+                    _ => {
+                        denied.insert(self.deniable(&path)?);
+                    }
+                }
+            }
+        }
+        Ok(denied.into_iter().collect())
+    }
+
+    /// `path` as a `--deny-read` grant, or the refusal for one that has no
+    /// spelling.
+    ///
+    /// Deno's grant list is comma-separated and has no escaping, takes no globs,
+    /// and repeating the flag keeps only the last occurrence — all three
+    /// measured on 2.9.7, and all three fatal to any way of spelling a path
+    /// with a comma in it. Denying an ancestor instead does not help: the comma
+    /// is in the ancestor too, so it is in the descendant's whole path either
+    /// way. Nor does denying the workspace root, which would take the step's own
+    /// module down with the link.
+    ///
+    /// That leaves refusing, which is the one thing here that still stops a
+    /// step, and it should: there is no grant to hand over, and a silently
+    /// dropped path would be a hole wearing the shape of a fix.
+    fn deniable(&self, path: &Path) -> Result<PathBuf, ScriptHostError> {
+        if !path.to_string_lossy().contains(',') {
+            return Ok(path.to_path_buf());
+        }
+        Err(ScriptHostError::Protocol {
+            message: format!(
+                "the workspace link {} cannot be denied: --deny-read takes a comma-separated \
+                 list with no escaping, and this path has a comma in it. Nothing was run",
+                path.display()
+            ),
         })
     }
 
@@ -481,6 +649,10 @@ impl DenoScriptHost {
         inputs: Option<&str>,
         redactor: &Redactor,
     ) -> Result<Frames, ScriptHostError> {
+        // Every child this adapter starts was described by `invocation` first,
+        // which is where the workspace was walked and the escaping links turned
+        // into `--deny-read`. Nothing is left to check here: the argv *is* the
+        // check, and it is the argv that gets spawned.
         let deno = self.deno()?;
         let mut command = std::process::Command::new(deno);
         command.args(invocation.argv());
@@ -726,6 +898,145 @@ mod tests {
         let error = frames_from(&[r#"{"output":{}}"#, r#"{"output":{}}"#])
             .expect_err("exactly one output frame");
         assert!(error.to_string().contains("more than one"), "{error}");
+    }
+
+    /// The gate on every test below that builds a `DenoScriptHost`:
+    /// `DenoScriptHost::new` refuses anything but linux-x86_64 as its first
+    /// statement, so off that platform such a test asserts the platform check,
+    /// or panics on an `expect` — and the two that use `expect_err` would pass
+    /// on it without ever reaching the code they are named for. It is
+    /// *gating*, not `#[ignore]`: `cargo test --workspace` on Linux still runs
+    /// every one of them.
+    ///
+    /// The helper carries the same gate: off that platform nothing names it,
+    /// and an unused function is a warning, and warnings are errors here.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn scratch(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("ks-deno-lib-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("the scratch workspace is writable");
+        std::fs::write(path.join("step.ts"), "export default {};").expect("the step is writable");
+        path.canonicalize().expect("the scratch workspace resolves")
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn a_workspace_of_ordinary_files_denies_nothing() {
+        let workspace = scratch("clean");
+        std::fs::create_dir_all(workspace.join("scripts/deep/deeper")).expect("writable");
+        std::fs::write(workspace.join("scripts/deep/deeper/deno.lock"), "{}\n").expect("writable");
+        let host = DenoScriptHost::new(&workspace).expect("a workspace root");
+        assert!(host.escaping_links().expect("the workspace is readable").is_empty());
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn a_link_that_stays_inside_the_workspace_is_allowed() {
+        let workspace = scratch("inward");
+        let target = workspace.join("real.ts");
+        std::fs::write(&target, "export default {};").expect("writable");
+        std::os::unix::fs::symlink(&target, workspace.join("step-link.ts"))
+            .expect("the link is writable");
+        let host = DenoScriptHost::new(&workspace).expect("a workspace root");
+        assert!(
+            host.escaping_links().expect("a link within the workspace is not an escape").is_empty(),
+            "nothing to deny, so no --deny-read at all"
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn a_link_out_of_the_workspace_is_denied_rather_than_refused() {
+        // The regression: a stock `.venv` has `.venv/bin/python3 -> /usr/bin/python3`,
+        // a pnpm store has `node_modules/.bin/*` pointing out of the tree, and a
+        // half-finished `npm install` leaves `.bin` entries dangling. Refusing the
+        // run over any of those is refusing to run the repository.
+        let workspace = scratch("outward");
+        let outside =
+            std::env::temp_dir().join(format!("ks-deno-lib-outside-{}", std::process::id()));
+        std::fs::write(&outside, "PRIVATE KEY").expect("the outside file is writable");
+        let link = workspace.join("sh.ts");
+        std::os::unix::fs::symlink(&outside, &link).expect("the link is writable");
+
+        let host = DenoScriptHost::new(&workspace).expect("a workspace root");
+        let denied = host.escaping_links().expect("the workspace is readable");
+        assert_eq!(denied, vec![link], "the link is returned by the path Deno checks");
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn a_link_that_cannot_be_resolved_is_denied_too() {
+        // A dangling target and a loop: neither resolves inside the workspace,
+        // and neither is something to guess about. Denying a path that leads
+        // nowhere costs nothing, so they come back like any other escape.
+        let workspace = scratch("unresolvable");
+        let dangling = workspace.join("dangling.ts");
+        std::os::unix::fs::symlink(workspace.join("nowhere.ts"), &dangling)
+            .expect("the link is writable");
+        let host = DenoScriptHost::new(&workspace).expect("a workspace root");
+        assert_eq!(
+            host.escaping_links().expect("the workspace is readable"),
+            vec![dangling],
+            "a dangling link is denied: the target it might become later is not this one's to guess"
+        );
+
+        let looped = scratch("looped");
+        std::os::unix::fs::symlink(looped.join("b"), looped.join("a"))
+            .expect("the link is writable");
+        std::os::unix::fs::symlink(looped.join("a"), looped.join("b"))
+            .expect("the link is writable");
+        let host = DenoScriptHost::new(&looped).expect("a workspace root");
+        assert_eq!(
+            host.escaping_links().expect("the workspace is readable"),
+            vec![looped.join("a"), looped.join("b")],
+            "a link loop does not resolve either, and neither member of it is trusted"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&looped);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn a_link_with_no_spelling_as_a_deny_grant_is_the_one_thing_refused() {
+        // `--deny-read` is a comma-separated list with no escaping, so a path
+        // with a comma in it cannot be named at all — not by an ancestor, which
+        // has the same comma, and not by the workspace root, which would take
+        // the step's own module down with it. That leaves refusing, and quietly
+        // dropping the path would be a hole rather than a fix.
+        let workspace = scratch("comma");
+        let awkward = workspace.join("odd,name");
+        std::fs::create_dir_all(&awkward).expect("writable");
+        let outside = std::env::temp_dir().join(format!("ks-deno-comma-{}", std::process::id()));
+        std::fs::write(&outside, "PRIVATE KEY").expect("the outside file is writable");
+        std::os::unix::fs::symlink(&outside, awkward.join("key")).expect("the link is writable");
+
+        let host = DenoScriptHost::new(&workspace).expect("a workspace root");
+        let error = host.escaping_links().expect_err("there is no grant that names this path");
+        assert!(error.to_string().contains("cannot be denied"), "{error}");
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn a_link_back_up_the_tree_does_not_send_the_walk_round_in_circles() {
+        // The walk treats a symlink as a leaf, so a link pointing at an
+        // ancestor is checked once and never descended into.
+        let workspace = scratch("upward");
+        let nested = workspace.join("a/b");
+        std::fs::create_dir_all(&nested).expect("writable");
+        std::os::unix::fs::symlink(&workspace, nested.join("loop")).expect("the link is writable");
+        let host = DenoScriptHost::new(&workspace).expect("a workspace root");
+        assert!(
+            host.escaping_links().expect("the link resolves inside the workspace").is_empty(),
+            "it resolves to the workspace root, which is inside it"
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[test]

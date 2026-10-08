@@ -7,8 +7,9 @@
 //! the ordinary test run stays offline and service-free. They are Linux-x86_64
 //! only, for the reasons in the ADR.
 //!
-//! The Deno is downloaded into `$XDG_CACHE_HOME/keepshipping/deno` (or a
-//! scratch cache), verified against the compiled-in digest, and reused.
+//! The Deno is downloaded into the cache the library itself defaults to —
+//! `$XDG_CACHE_HOME/keepshipping/deno`, or `$HOME/.cache/keepshipping/deno` —
+//! verified against the compiled-in digest, and reused. See [`host`].
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -126,6 +127,105 @@ fn a_step_cannot_read_outside_the_workspace_or_the_environment() {
             "{what}: {message}"
         );
     }
+}
+
+#[test]
+fn a_symlink_out_of_the_workspace_is_denied_though_deno_would_allow_it() {
+    if !gated() {
+        return;
+    }
+    // The hole the direct-path test above cannot see. Deno checks
+    // `--allow-read=<workspace>` against the path a step *names*, not the file
+    // behind it, so `readTextFileSync("keys/id_ed25519")` is permitted even
+    // though it reads a file outside the workspace. A refusal that only ever
+    // sees `/etc/shadow` spelled out in full does not cover this.
+    let root = workspace("symlink-escape");
+    let outside = workspace("symlink-escape-outside");
+    let key = outside.join("id_ed25519");
+    std::fs::write(&key, "PRIVATE KEY").expect("the fake key is writable");
+
+    let keys = root.join("keys");
+    std::fs::create_dir_all(&keys).expect("the key directory is writable");
+    let link = keys.join("id_ed25519");
+    std::os::unix::fs::symlink(&key, &link).expect("the link is writable");
+
+    write(
+        &root,
+        "through-the-link.ts",
+        r#"export default {
+  inputs: {},
+  outputs: { read: "string" },
+  async run() {
+    // A path inside the workspace, by every measure Deno checks.
+    return { read: Deno.readTextFileSync("keys/id_ed25519") };
+  },
+};
+"#,
+    );
+    let host = host(&root);
+    let error = block_on(host.run(
+        &ScriptRef::new("through-the-link.ts"),
+        &Values::new(),
+        &SecretBundle::new(),
+    ))
+    .expect_err("a link out of the workspace is denied");
+
+    // The step *starts* and the step *runs*: that is the half the old scan got
+    // wrong, since a stock `.venv` or a pnpm-linked `node_modules` has links
+    // that escape too and the repository still has to run. What stops the read
+    // is the grant, not the adapter — so the refusal is Deno's `NotCapable`
+    // from inside the child, naming the link, and never the file behind it.
+    let message = error.to_string();
+    assert!(
+        matches!(error, ScriptHostError::ScriptFailed { exit_code: Some(1), .. }),
+        "the denial is Deno's, mid-step, not the adapter's before any child: {message}"
+    );
+    assert!(message.contains("NotCapable"), "{message}");
+    assert!(message.contains("keys/id_ed25519"), "the refusal names the offending link: {message}");
+    assert!(
+        !message.contains("PRIVATE KEY"),
+        "and never echoes what the link pointed at: {message}"
+    );
+}
+
+#[test]
+fn a_symlink_that_stays_inside_the_workspace_still_runs() {
+    if !gated() {
+        return;
+    }
+    // The other half, and the reason the test above is worth having: the
+    // control must be about where a link *points*, not about links. Denying
+    // every symlink would make the denial above pass for entirely the wrong
+    // reason — and would break every repository with a `.venv` in it.
+    let workspace = workspace("symlink-inward");
+    std::fs::write(workspace.join("real.txt"), "in the workspace").expect("the target is writable");
+    std::os::unix::fs::symlink(workspace.join("real.txt"), workspace.join("alias.txt"))
+        .expect("the link is writable");
+
+    write(
+        &workspace,
+        "through-the-link.ts",
+        r#"export default {
+  inputs: {},
+  outputs: { read: "string" },
+  async run() {
+    return { read: Deno.readTextFileSync("alias.txt") };
+  },
+};
+"#,
+    );
+    let host = host(&workspace);
+    let outputs = block_on(host.run(
+        &ScriptRef::new("through-the-link.ts"),
+        &Values::new(),
+        &SecretBundle::new(),
+    ))
+    .expect("a link within the workspace is not an escape");
+    assert_eq!(
+        outputs["read"],
+        Value::from("in the workspace"),
+        "the step read through the link and the adapter let it"
+    );
 }
 
 #[test]
@@ -349,18 +449,17 @@ fn gated() -> bool {
 
 /// A host over `workspace`, sharing one cache so the pinned Deno is installed
 /// once for the whole run.
+///
+/// The cache is the *library's* default — the one `DenoScriptHost::new` picks
+/// when nobody calls `with_cache_root` — rather than a path this file works out
+/// for itself. An earlier version resolved `$XDG_CACHE_HOME`, and fell back to
+/// `std::env::temp_dir()` when that was unset, which is what a GitHub runner
+/// does: the tests installed into `/tmp/keepshipping/deno` while CI restored
+/// `~/.cache/keepshipping/deno`, so the cache was dead weight and every run
+/// re-downloaded the ~40 MB release. Asking the library for its own default is
+/// also the stronger test: it is the path production uses.
 fn host(workspace: &Path) -> DenoScriptHost {
-    DenoScriptHost::new(workspace).expect("a workspace root").with_cache_root(cache_root())
-}
-
-/// `$XDG_CACHE_HOME/keepshipping/deno`, or a scratch cache under the temp dir.
-fn cache_root() -> PathBuf {
-    std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .unwrap_or_else(std::env::temp_dir)
-        .join("keepshipping")
-        .join("deno")
+    DenoScriptHost::new(workspace).expect("a workspace root")
 }
 
 /// A scratch directory, emptied on the way in: the workspace a generated step
