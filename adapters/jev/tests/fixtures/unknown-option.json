@@ -1,0 +1,28 @@
+{
+  "model": "jev-1.13.0",
+  "answers": {
+    "risk": {
+      "type": "choice",
+      "choice": "moderate",
+      "probabilities": {
+        "low": 0.15,
+        "medium": 0.62,
+        "high": 0.13
+      },
+      "confidence": 0.82
+    },
+    "deploy": {
+      "type": "choice",
+      "choice": "approve",
+      "probabilities": {
+        "approve": 0.55,
+        "escalate": 0.45
+      },
+      "confidence": 0.61
+    }
+  },
+  "usage": {
+    "input_tokens": 400,
+    "output_tokens": 80
+  }
+}
