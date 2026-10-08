@@ -31,6 +31,22 @@ Newest first, one heading per contract version, dated.
 
 ## STEP_API 6
 
+- **2026-10-08** — `RunLock`
+  ([#175](https://github.com/Keep-Shipping/harness/issues/175)) added, in
+  [`crates/core/src/ports/run_lock.rs`](../crates/core/src/ports/run_lock.rs):
+  mutual exclusion of runs that change one (account, module), as a lease —
+  `acquire`, `renew` and `release` over a `Lease` carrying an expiry and a
+  fencing token strictly increasing per key across every grant, so a run whose
+  workflow resumed after its lease expired and was taken over acts with a
+  lower token and is refused by whatever the lease guards. Re-acquire by the
+  live holder is idempotent (the Worker restarted mid-run and the workflow
+  resumes); a lapsed lease goes to the next taker at a higher token. Like
+  `BlockSource`, `PolicyStore` and `ApprovalInbox`, it is engine/CLI-only —
+  the engine holds it across plan-through-apply, a step never sees it — so it
+  is in neither `Port` nor `define_ports!`, and no step-facing surface
+  changed. The fingerprint covers every trait in `ports/`, so the digest is
+  re-pinned under `STEP_API 6` without a bump.
+
 - **2026-10-08** — `Event` gained `provenance`
   ([#126](https://github.com/Keep-Shipping/harness/issues/126)), with a
   [`Provenance`](https://github.com/Keep-Shipping/harness/blob/main/crates/core/src/ports/run_context.rs)

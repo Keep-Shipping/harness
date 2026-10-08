@@ -27,6 +27,7 @@ pub mod id_gen;
 pub mod policy;
 pub mod remote_shell;
 pub mod run_context;
+pub mod run_lock;
 pub mod run_log;
 pub mod script_host;
 pub mod secrets;
