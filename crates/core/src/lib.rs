@@ -39,6 +39,7 @@ mod env;
 pub mod format;
 pub mod harness;
 pub mod ids;
+pub mod k8s;
 pub mod lock;
 pub mod plan_summary;
 pub mod policy;
@@ -65,6 +66,7 @@ pub use check::{
 pub use context::{CheckContext, ContextName, UnmetStep, run_order, unmet_steps};
 pub use env::{EnvChoice, select_env};
 pub use format::{BUILTIN as BUILTIN_FORMATS, Formats};
+pub use k8s::{Auth, Cluster, ExecPlugin, Target};
 pub use policy::{
     BLOCKS, Decision as PolicyDecision, SCRIPTS, SECRETS, Source as PolicySource, action_of,
     decide as decide_policy,
