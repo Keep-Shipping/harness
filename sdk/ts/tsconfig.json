@@ -13,7 +13,8 @@
     "skipLibCheck": true,
     "types": ["node"],
     "paths": {
-      "@keepshipping/sdk": ["./src/index.ts"]
+      "@keepshipping/sdk": ["./src/index.ts"],
+      "@keepshipping/sdk/testing": ["./src/testing.ts"]
     }
   },
   "include": ["src", "test", "examples"]

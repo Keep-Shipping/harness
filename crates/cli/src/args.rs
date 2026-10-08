@@ -23,7 +23,7 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
        keepshipping run [FILE] [--env NAME] [--event \"push main\"] [--actor human|agent|ci]
                         [--as human|agent[:name]|ci]
                         [--context local|ci] [--non-interactive] [--until STEP]
-                        [--only STEP]... [--skip STEP]... [--allow-partial]
+                        [--only STEP]... [--skip STEP]... [--input KEY=VALUE]... [--allow-partial]
                         [--dry-run] [-v]
        keepshipping graph [FILE] [--env NAME] [--event \"push main\"] [--format text|dot|json]
        keepshipping fmt [PATH...] [--check]
@@ -107,6 +107,14 @@ pub struct Options {
     /// `run --skip STEP`: drop these steps and everything downstream,
     /// repeatable.
     pub skip: Vec<String>,
+    /// `run --input KEY=VALUE`: an explicit input for the steps this run
+    /// takes, repeatable. A value that starts `@secret:` names a secret
+    /// instead of carrying one; [`parse_inputs`] rejects a malformed pair
+    /// before the run starts.
+    ///
+    /// Today the flag is inert outside `--dry-run`: `run` checks every pair
+    /// and `--dry-run` echoes them, and no step is handed one yet (#92).
+    pub inputs: Vec<String>,
     /// `--allow-partial`: start a run whose steps the context cannot run.
     pub allow_partial: bool,
     /// `run --dry-run`: graph the run and check it, run nothing.
@@ -168,6 +176,7 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
         until: None,
         only: Vec::new(),
         skip: Vec::new(),
+        inputs: Vec::new(),
         allow_partial: false,
         dry_run: false,
         verbose: false,
@@ -227,6 +236,7 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
             "--until" if command == Command::Run => o.until = Some(flag_value(&mut rest)?),
             "--only" if command == Command::Run => o.only.push(flag_value(&mut rest)?),
             "--skip" if command == Command::Run => o.skip.push(flag_value(&mut rest)?),
+            "--input" if command == Command::Run => o.inputs.push(flag_value(&mut rest)?),
             "--allow-partial" if command == Command::Run => o.allow_partial = true,
             "--dry-run" if command == Command::Run => o.dry_run = true,
             "-v" | "--verbose" if command == Command::Run => o.verbose = true,
@@ -280,6 +290,145 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
         return None;
     }
     Some(o)
+}
+
+/// One `--input KEY=VALUE` override, split at its first `=`. No further than
+/// the binary: the fields are private to this module and [`input_lines`] is
+/// the only thing that turns one into output. `main.rs` names the type to
+/// carry parsed pairs, which is why it is crate-visible and no more.
+pub(crate) struct Input<'a> {
+    /// What the override is for, ending at the first `=`. One name, with no
+    /// whitespace in it: a key with a space in it reads as two things in a
+    /// report and names nothing a step could be asked for.
+    key: &'a str,
+    /// What the step would be handed, or — when `secret` is set — the
+    /// reference it names, with the marker already stripped. Carried as
+    /// written, so what a user typed is what a future executor receives and
+    /// what the report shows.
+    value: &'a str,
+    /// The value names a secret rather than being one: `@secret:` and the
+    /// rest of it. A reference is not secret and may be shown; what it
+    /// points at never is ([`ks_core::ports::secrets`]).
+    secret: bool,
+}
+
+/// The marker a value uses to name a secret instead of carrying one. What
+/// follows is the reference itself: a `resolver:key` pair in the shape a
+/// `SecretRef` prints, or a bare key for the environment's own resolver.
+const SECRET_MARKER: &str = "@secret:";
+
+/// `--input KEY=VALUE`, checked before a run starts. A pair without `=`, a
+/// pair with no key, a secret marker that names nothing, and anything that
+/// would forge or blur a line of the `--dry-run` report are usage errors:
+/// each message names the problem and the way out, the way [`parse_args`]
+/// cannot, having only a yes or no to give.
+pub(crate) fn parse_inputs(raw: &[String]) -> Result<Vec<Input<'_>>, String> {
+    let mut inputs: Vec<Input> = Vec::new();
+    for text in raw {
+        let input = split_input(text)?;
+        // A repeated key is an override, not a second value for the same
+        // step: the last `--input` wins, as it does for every other flag.
+        match inputs.iter_mut().find(|i| i.key == input.key) {
+            Some(seen) => *seen = input,
+            None => inputs.push(input),
+        }
+    }
+    Ok(inputs)
+}
+
+/// The `--dry-run` lines for the overrides a run was given: the key, and
+/// either the value or the secret reference it names, marked as a reference
+/// so it cannot be mistaken for a value that was read. The pairs are
+/// parsed and checked by the caller, before the run starts, so there is
+/// nothing to say about a malformed one here.
+pub(crate) fn input_lines(inputs: &[Input]) -> Vec<String> {
+    // No `--input`, no lines: a run without the flag says exactly what it
+    // said before the flag existed.
+    if inputs.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::with_capacity(inputs.len() + 1);
+    lines.push("inputs:".to_string());
+    lines.extend(inputs.iter().map(|i| {
+        if i.secret {
+            format!("  input {} = {SECRET_MARKER}{} (reference)", i.key, i.value)
+        } else {
+            format!("  input {} = {}", i.key, i.value)
+        }
+    }));
+    lines
+}
+
+/// `KEY=VALUE`, the smallest grammar that says what it means: the key ends
+/// at the first `=`, so a value may contain more of them. A value that
+/// starts `@secret:` is a reference, and the rest of it is passed through as
+/// written — nothing here resolves a secret, because nothing does yet.
+///
+/// What the grammar refuses is what would forge or blur a line of the
+/// `--dry-run` report, which is line-oriented and prints one input per line:
+/// a `\n` or `\r` in a key or a value would put a line of the user's own
+/// choosing where a step line should be, and whitespace at either end would
+/// print as padding the report cannot show. Everything else is the value's
+/// business — `two words` is a legitimate value, and interior whitespace is
+/// left alone. The asymmetry with an empty value is deliberate: `k=` says
+/// "the value is empty", which is a fact a step can act on, where `@secret:`
+/// with nothing after it names nothing at all.
+fn split_input(text: &str) -> Result<Input<'_>, String> {
+    // A pair that breaks a line is quoted with the break escaped, so the
+    // usage error about it stays on one line too.
+    let said = if breaks_a_line(text) { text.escape_debug().to_string() } else { text.to_string() };
+    let Some((key, value)) = text.split_once('=') else {
+        return Err(format!("`--input {said}` has no `=`; write --input KEY=VALUE"));
+    };
+    if key.is_empty() {
+        return Err(format!("`--input {said}` has an empty key; write --input KEY=VALUE"));
+    }
+    if breaks_a_line(key) {
+        return Err(format!(
+            "`--input {said}` breaks a line in its key; write --input KEY=VALUE as one line"
+        ));
+    }
+    if padded(key) {
+        return Err(format!(
+            "`--input {said}` has whitespace around its key; write --input KEY=VALUE with no padding"
+        ));
+    }
+    if key.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "`--input {said}` has whitespace inside its key; a key is one name, so write it without spaces"
+        ));
+    }
+    if breaks_a_line(value) {
+        return Err(format!(
+            "`--input {said}` breaks a line in its value; write --input KEY=VALUE as one line"
+        ));
+    }
+    if padded(value) {
+        return Err(format!(
+            "`--input {said}` has whitespace around its value; write --input KEY=VALUE with no padding"
+        ));
+    }
+    let Some(reference) = value.strip_prefix(SECRET_MARKER) else {
+        return Ok(Input { key, value, secret: false });
+    };
+    if reference.is_empty() {
+        return Err(format!(
+            "`--input {said}` names no secret; write --input KEY={SECRET_MARKER}RESOLVER:NAME"
+        ));
+    }
+    Ok(Input { key, value: reference, secret: true })
+}
+
+/// Whether `part` would end the report line it is printed on: `\n` and `\r`
+/// both break it, and both can be written inside a shell argument.
+fn breaks_a_line(part: &str) -> bool {
+    part.contains(['\n', '\r'])
+}
+
+/// Whether `part` carries whitespace at either end, which the report shows
+/// as padding between words rather than as the edge of the value.
+fn padded(part: &str) -> bool {
+    part.trim() != part
 }
 
 /// `--actor human|agent|ci`; anything else is a usage error.

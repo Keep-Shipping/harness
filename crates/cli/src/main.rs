@@ -50,7 +50,9 @@ use ks_cli::http_client;
 #[cfg(test)]
 use ks_cli::test_server;
 
-use crate::args::{Command, Options, USAGE, context_of, parse_args};
+use crate::args::{
+    Command, Input, Options, USAGE, context_of, input_lines, parse_args, parse_inputs,
+};
 use crate::blocks::wait;
 use crate::drive::{Done, Outcome, StepRunner};
 use crate::progress::{Renderer, RunEvent};
@@ -102,6 +104,17 @@ fn run(args: &[String]) -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
+    // `--input` is parsed once, here, before anything runs: a malformed pair
+    // is a mistake in the command line, and the run should not start to find
+    // that out. The parsed pairs travel to `--dry-run` from here, so there is
+    // no second parse that could disagree with this one.
+    let inputs = match parse_inputs(&o.inputs) {
+        Ok(inputs) => inputs,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return ExitCode::from(2);
+        }
+    };
     let path = o.path.as_deref().unwrap_or("ship.ks");
     let context = context_of(&o);
     // Who is running this, decided once from the declaration, the environment
@@ -143,12 +156,12 @@ fn run(args: &[String]) -> ExitCode {
         None => None,
     };
     match ks_core::select_env(&site.checked.workflow, o.env.as_deref(), event.as_ref()) {
-        Ok(ks_core::EnvChoice::Selected(name)) => selected(&o, &site, &name, is_agent),
+        Ok(ks_core::EnvChoice::Selected(name)) => selected(&o, &site, &name, is_agent, &inputs),
         Ok(ks_core::EnvChoice::Ambiguous(names)) => {
             let offered = names.join(", ");
             if interactive(&o) {
                 match prompt(&offered, &names) {
-                    Some(name) => selected(&o, &site, &name, is_agent),
+                    Some(name) => selected(&o, &site, &name, is_agent, &inputs),
                     None => {
                         eprintln!("error: no environment chosen (expected one of {offered})");
                         ExitCode::from(2)
@@ -175,7 +188,13 @@ fn run(args: &[String]) -> ExitCode {
 /// `is_agent` is what the run decided about itself; an agent's run never
 /// reaches a terminal for approval, because an agent cannot approve its own
 /// run — it would be approving itself.
-fn selected(o: &Options, site: &check::Site, env: &str, is_agent: bool) -> ExitCode {
+fn selected(
+    o: &Options,
+    site: &check::Site,
+    env: &str,
+    is_agent: bool,
+    inputs: &[Input],
+) -> ExitCode {
     let workflow = &site.checked.workflow;
     let only: Vec<&str> = o.only.iter().map(String::as_str).collect();
     let skip: Vec<&str> = o.skip.iter().map(String::as_str).collect();
@@ -207,6 +226,12 @@ fn selected(o: &Options, site: &check::Site, env: &str, is_agent: bool) -> ExitC
                 "{}",
                 progress::kind_line(&step.name, step.kind.as_deref().unwrap_or("step"))
             );
+        }
+        // The `--input` overrides this run would carry, and nothing more: none
+        // is handed to a step yet, and a `@secret:` value stays a reference,
+        // because nothing here resolves it.
+        for line in input_lines(inputs) {
+            let _ = writeln!(out, "{line}");
         }
         let _ = render::footer(&mut out);
         return ExitCode::SUCCESS;

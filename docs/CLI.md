@@ -9,7 +9,10 @@ implemented end to end today; `run` is not.
   findings are printed, and how a run fails, is in [DIAGNOSTICS.md](DIAGNOSTICS.md).
 - `keepshipping run [FILE]` — check the file, choose an environment (`--env NAME`,
   `--event "push main"`, `--actor human|agent|ci`, `--as human|agent[:name]|ci`,
-  `--non-interactive`), print it, and stop.
+  `--non-interactive`), print it, and stop. `--input KEY=VALUE` (repeatable; a value beginning
+  `@secret:` names a secret rather than carrying one) is checked before the run starts and echoed
+  by `--dry-run`; no step is handed one yet. With `--only STEP` it names the inputs for one script
+  step — see [DIAGNOSTICS.md](DIAGNOSTICS.md) for the grammar.
   Execution is not wired to the CLI yet: the planner and executor exist in `ks-engine` and
   `run` will hand them the plan.
 - `keepshipping blocks search <QUERY>` — search the metadata-only blocks index (`--index URL` or

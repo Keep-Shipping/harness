@@ -43,7 +43,7 @@ Step families (`oci.*`, `tofu.*` / `terraform.*`, `k8s.*`, `vm.*`, `fn.*`, `appr
 | `steps/*` | — | Built-in step families (later epic) |
 | `adapters/*` | — | One crate per vendor integration (later epic) |
 | `adapters/tofu-cli` | `ks-tofu-cli` | The user's own `tofu` and `terraform` binaries, behind the `IacTool` port. Never downloads or redistributes either tool |
-| `sdk/ts` | `@keepshipping/sdk` | `@keepshipping/sdk` for TypeScript escape-hatch steps |
+| `sdk/ts` | `@keepshipping/sdk` | `@keepshipping/sdk` for TypeScript escape-hatch steps, and `@keepshipping/sdk/testing` to unit-test one in your own test runner |
 | `ventures/keepshipping` | — | The optional hosted parts (waitlist, web approvals, run-log viewer, blocks index) as a Cratefield venture (later epic) |
 
 The language and the layout are proposals until their ADRs are accepted: [#2](https://github.com/Keep-Shipping/harness/issues/2) (Rust), [#3](https://github.com/Keep-Shipping/harness/issues/3) (ports and adapters) and [#4](https://github.com/Keep-Shipping/harness/issues/4) (syntax).
