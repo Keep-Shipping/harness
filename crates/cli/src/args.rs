@@ -37,6 +37,7 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
        keepshipping runs pending
        keepshipping approve RUN-ID [--comment TEXT]
        keepshipping deny RUN-ID --reason TEXT
+       keepshipping resume RUN-ID [FILE]
        keepshipping lsp";
 
 /// Which subcommand's flags `parse_args` accepts. `--format`, `--all`,

@@ -43,6 +43,11 @@ pub enum RunEvent {
     /// Nothing after it ran, so the event closes the run with what that
     /// means — the reader, an agent included, is free to stop here.
     Waiting { step: String, on: String, notified: Option<String> },
+    /// Nobody answered the approval at `step`, so the run was written down
+    /// under `run` and the job ends there
+    /// ([#97](https://github.com/Keep-Shipping/harness/issues/97)). The line
+    /// a person reads to learn where the run left off.
+    Parked { run: String, step: String },
 }
 
 /// Something that draws a run as it happens.
@@ -236,6 +241,10 @@ impl<W: Write> Renderer for Run<W> {
                     let _ = writeln!(self.out, "{}", notified_line(who));
                 }
                 let _ = writeln!(self.out, "nothing applied. agent is free to wait.");
+            }
+            RunEvent::Parked { run, step } => {
+                self.retire();
+                let _ = writeln!(self.out, "⏸ parked at {step} (run {run})");
             }
             _ => {}
         }
