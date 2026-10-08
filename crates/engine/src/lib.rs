@@ -8,6 +8,7 @@ pub mod blocks;
 pub mod cache;
 pub mod credentials;
 pub mod decide;
+pub mod denial;
 pub mod exec;
 pub mod journal;
 pub mod k8s_rollout;

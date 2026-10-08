@@ -49,8 +49,30 @@ pub enum RunEvent {
     ApprovalRequested { step: String, channel: String, artifacts: Vec<String> },
     /// An approval was granted.
     ApprovalGranted { step: String, approver: String, channel: String, artifacts: Vec<String> },
-    /// An approval was denied.
-    ApprovalDenied { step: String, approver: String, channel: String, artifacts: Vec<String> },
+    /// An approval was denied. `reason` is the approver's own words, or the engine's one line when
+    /// they left none; what the run *made* of it is `ks_engine::denial::Reason`, and the event that
+    /// says so is beside this one ([#99](https://github.com/Keep-Shipping/harness/issues/99)).
+    ApprovalDenied {
+        step: String,
+        approver: String,
+        channel: String,
+        artifacts: Vec<String>,
+        reason: String,
+    },
+    /// Nobody answered before the deadline. A timeout is an ending like any other, never an
+    /// indefinite wait, and it is its own event so the log never reads as though a person said no
+    /// ([#99](https://github.com/Keep-Shipping/harness/issues/99)).
+    ApprovalExpired { step: String, channel: String, artifacts: Vec<String> },
+    /// The proposer called the parked run off: always allowed, never an error, and its own event so
+    /// the log says "we stopped asking" rather than "we were told to stop"
+    /// ([#99](https://github.com/Keep-Shipping/harness/issues/99)).
+    ApprovalAborted { step: String, proposer: String, channel: String, artifacts: Vec<String> },
+    /// An answer arrived that the request does not accept: the approver proposed the run, was not a
+    /// person, was not on the team, or the verdict was bound to other artifacts. Not a denial by
+    /// anybody — there is no `approver` to blame — but an ending all the same, and one that is its
+    /// own event so a run whose answer was thrown away never reads as still parked. `detail` says
+    /// which rule held ([#99](https://github.com/Keep-Shipping/harness/issues/99)).
+    ApprovalRejected { step: String, detail: String, channel: String, artifacts: Vec<String> },
     /// A decision model answered, with its probabilities and what the run did with it.
     DecideAnswered {
         step: String,
@@ -115,6 +137,9 @@ impl RunEvent {
             RunEvent::ApprovalRequested { .. } => "approval.requested",
             RunEvent::ApprovalGranted { .. } => "approval.granted",
             RunEvent::ApprovalDenied { .. } => "approval.denied",
+            RunEvent::ApprovalExpired { .. } => "approval.expired",
+            RunEvent::ApprovalAborted { .. } => "approval.aborted",
+            RunEvent::ApprovalRejected { .. } => "approval.rejected",
             RunEvent::DecideAnswered { .. } => "decide.answered",
             RunEvent::CredentialsResolved { .. } => "credentials.resolved",
             RunEvent::AttestationAttached { .. } => "attestation.attached",
@@ -160,10 +185,33 @@ impl RunEvent {
                 *channel = r.redact(channel);
                 list(artifacts);
             }
-            RunEvent::ApprovalGranted { step, approver, channel, artifacts }
-            | RunEvent::ApprovalDenied { step, approver, channel, artifacts } => {
+            RunEvent::ApprovalGranted { step, approver, channel, artifacts } => {
                 *step = r.redact(step);
                 *approver = r.redact(approver);
+                *channel = r.redact(channel);
+                list(artifacts);
+            }
+            RunEvent::ApprovalDenied { step, approver, channel, artifacts, reason } => {
+                *step = r.redact(step);
+                *approver = r.redact(approver);
+                *channel = r.redact(channel);
+                *reason = r.redact(reason);
+                list(artifacts);
+            }
+            RunEvent::ApprovalExpired { step, channel, artifacts } => {
+                *step = r.redact(step);
+                *channel = r.redact(channel);
+                list(artifacts);
+            }
+            RunEvent::ApprovalAborted { step, proposer, channel, artifacts } => {
+                *step = r.redact(step);
+                *proposer = r.redact(proposer);
+                *channel = r.redact(channel);
+                list(artifacts);
+            }
+            RunEvent::ApprovalRejected { step, detail, channel, artifacts } => {
+                *step = r.redact(step);
+                *detail = r.redact(detail);
                 *channel = r.redact(channel);
                 list(artifacts);
             }
@@ -296,6 +344,29 @@ mod tests {
                 RunEvent::ApprovalDenied {
                     step: s(),
                     approver: s(),
+                    channel: s(),
+                    artifacts: hashes(),
+                    reason: s(),
+                },
+            ),
+            (
+                "approval.expired",
+                RunEvent::ApprovalExpired { step: s(), channel: s(), artifacts: hashes() },
+            ),
+            (
+                "approval.aborted",
+                RunEvent::ApprovalAborted {
+                    step: s(),
+                    proposer: s(),
+                    channel: s(),
+                    artifacts: hashes(),
+                },
+            ),
+            (
+                "approval.rejected",
+                RunEvent::ApprovalRejected {
+                    step: s(),
+                    detail: s(),
                     channel: s(),
                     artifacts: hashes(),
                 },

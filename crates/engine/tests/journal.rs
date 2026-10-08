@@ -143,7 +143,14 @@ fn each_transition_emits_exactly_one_event() {
         ("run.started", |j| Box::pin(j.run_started("sha256:f", "push", "ada", false))),
         ("approval.requested", |j| Box::pin(j.approval_requested("d", "tty", hashes()))),
         ("approval.granted", |j| Box::pin(j.approval_granted("d", "ada", "tty", hashes()))),
-        ("approval.denied", |j| Box::pin(j.approval_denied("d", "ada", "tty", hashes()))),
+        ("approval.denied", |j| {
+            Box::pin(j.approval_denied("d", "ada", "tty", hashes(), "no, not on a Friday"))
+        }),
+        ("approval.expired", |j| Box::pin(j.approval_expired("d", "tty", hashes()))),
+        ("approval.aborted", |j| Box::pin(j.approval_aborted("d", "ada", "tty", hashes()))),
+        ("approval.rejected", |j| {
+            Box::pin(j.approval_rejected("d", "mallory is not on @platform", "tty", hashes()))
+        }),
         ("decide.answered", |j| {
             Box::pin(j.decide_answered(
                 "d",
@@ -210,6 +217,11 @@ fn a_secret_value_never_reaches_the_log() {
 
     block_on(j.run_started(SECRET, "push", SECRET, true)).expect("lands");
     block_on(j.approval_granted("deploy", SECRET, SECRET, vec![SECRET.into()])).expect("lands");
+    block_on(j.approval_denied("deploy", SECRET, SECRET, vec![SECRET.into()], SECRET))
+        .expect("lands");
+    block_on(j.approval_expired("deploy", SECRET, vec![SECRET.into()])).expect("lands");
+    block_on(j.approval_aborted("deploy", SECRET, SECRET, vec![SECRET.into()])).expect("lands");
+    block_on(j.approval_rejected("deploy", SECRET, SECRET, vec![SECRET.into()])).expect("lands");
     block_on(j.decide_answered(
         "deploy",
         SECRET,
