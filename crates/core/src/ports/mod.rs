@@ -6,6 +6,7 @@
 //! laptop and in CI — only the adapters change. The ports defined here:
 //!
 //! - [`approval`] — asking a team, and the two rules that bind the answer to the artifacts ([#53](https://github.com/Keep-Shipping/harness/issues/53));
+//! - [`approval_inbox`] — the approver's side: what is waiting for me, and here is my answer ([#95](https://github.com/Keep-Shipping/harness/issues/95));
 //! - [`run_context`] — who and where a run is (actor, repo, environment);
 //! - [`secrets`] — resolving named secrets and redacting their values ([#49](https://github.com/Keep-Shipping/harness/issues/49));
 //! - [`supply_chain`] — signing, attestations and digests ([#50](https://github.com/Keep-Shipping/harness/issues/50));
@@ -29,7 +30,9 @@
 //! [`run_log`], [`block_source`] and [`policy`] are the ports a step never sees
 //! — the engine and the CLI hold them, not a step — so none of the three is in
 //! the `Port` enum or in `define_ports!`, and `STEP_API` does not move when
-//! they change. `check` in particular stays pure and I/O-free: it reads a
+//! they change. [`approval_inbox`] is a fourth of that kind: the CLI holds the
+//! approver's end of an approval, so a run's author cannot reach it. `check` in
+//! particular stays pure and I/O-free: it reads a
 //! block's *digest* and a baseline's rules, and never resolves a version or
 //! fetches a document. The remaining ports from the crate map (image building,
 //! registry, cluster, approvals, …) land here with their issues.
@@ -52,6 +55,7 @@ use core::pin::Pin;
 pub type BoxFuture<'a, T> = Pin<Box<dyn core::future::Future<Output = T> + Send + 'a>>;
 
 pub mod approval;
+pub mod approval_inbox;
 pub mod block_source;
 pub mod blocks;
 pub mod clock;

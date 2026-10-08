@@ -31,6 +31,22 @@ Newest first, one heading per contract version, dated.
 
 ## STEP_API 6
 
+- **2026-10-08** — `ApprovalInbox`
+  ([#95](https://github.com/Keep-Shipping/harness/issues/95)) added, in
+  [`crates/core/src/ports/approval_inbox.rs`](../crates/core/src/ports/approval_inbox.rs):
+  the approver's end of an approval, next to `ApprovalChannel` — what is
+  waiting for me (`pending`) and here is my answer (`decide`). The inbox builds
+  the `Verdict` itself, bound to the request's own artifacts, and checks it
+  with `ApprovalRequest::accepts` before handing it over, so a proposer
+  clicking approve on their own run fails at the click; a run with nothing
+  open against it is the new `ApprovalError::NoOpenRequest`, which
+  `ApprovalError` gained here. Like `BlockSource` and `PolicyStore` below, it
+  is engine/CLI-only — the CLI holds the approver's side, so a run's author
+  cannot reach it — and it is in neither `Port` nor `define_ports!`, so no
+  step-facing surface changed and `STEP_API` does not move. The fingerprint
+  covers every trait in `ports/`, so the digest is re-pinned under
+  `STEP_API 6` without a bump.
+
 - **2026-10-07** — [`ScriptHost::run`](https://github.com/Keep-Shipping/harness/blob/main/crates/core/src/ports/script_host.rs)
   takes a fourth argument, `log: &StepLog`
   ([#91](https://github.com/Keep-Shipping/harness/issues/91)): a script's log
