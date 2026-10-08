@@ -37,6 +37,7 @@ mod check;
 pub mod context;
 pub mod decision_guard;
 mod env;
+pub mod env_guard;
 pub mod format;
 pub mod harness;
 pub mod ids;
@@ -68,6 +69,7 @@ pub use check::{
 };
 pub use context::{CheckContext, ContextName, UnmetStep, run_order, unmet_steps};
 pub use env::{EnvChoice, select_env};
+pub use env_guard::{CiOnlyRefusal, ci_only_refusal, is_ci_only};
 pub use format::{BUILTIN as BUILTIN_FORMATS, Formats};
 pub use k8s::{Auth, Cluster, ExecPlugin, Target};
 pub use policy::{

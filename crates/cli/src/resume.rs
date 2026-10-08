@@ -39,7 +39,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ks_core::ports::policy::effective_baseline;
 use ks_core::ports::run_context::ActorKind;
 use ks_core::step::{ActionClass, ActionKind};
-use ks_core::{ContextName, Step, ids::RunId};
+use ks_core::{ContextName, Step, ci_only_refusal, ids::RunId};
 use ks_engine::policy_gate::{PolicyGate, PreflightStep};
 use ks_engine::state::{CompletedStep, LocalStateStore, ResumeError, RunState};
 
@@ -250,6 +250,10 @@ pub fn resume(args: &[String]) -> ExitCode {
         Ok(steps) => steps,
         Err(code) => return code,
     };
+    let recorded_env = state.context.get(ENVIRONMENT).map(String::as_str);
+    if let Err(code) = refuses_ci_only(&site, &outstanding, context, recorded_env) {
+        return code;
+    }
     if let Err(code) = refuses_by_policy(&site, &outstanding, acting) {
         return code;
     }
@@ -364,6 +368,38 @@ fn remaining_steps(
     let names: Vec<String> = outstanding.iter().map(|step| step.name.clone()).collect();
     crate::refuses_to_run_at(site, &names, false, context)?;
     Ok(outstanding)
+}
+
+/// The environment gate ([#123](https://github.com/Keep-Shipping/harness/issues/123)):
+/// an environment that is `ci-only` — by `ci-only: true`, or by being named
+/// `prod` — does not let a laptop apply or deploy into it, and a resume that
+/// skipped this would be the way around the gate `run` applies: park on a CI
+/// runner, resume on a laptop. Over the steps left to run, and before the
+/// approval is taken or anything is recorded.
+fn refuses_ci_only(
+    site: &check::Site,
+    steps: &[Step],
+    context: ContextName,
+    env: Option<&str>,
+) -> Result<(), ExitCode> {
+    if context == ContextName::Ci {
+        return Ok(());
+    }
+    let Some(name) = env else { return Ok(()) };
+    let Some(target) = site.checked.workflow.envs().iter().find(|e| e.name == name) else {
+        return Ok(());
+    };
+    let running: Vec<&str> = steps.iter().map(|step| step.name.as_str()).collect();
+    let refusal = ci_only_refusal(&site.checked.workflow, target, &running);
+    if refusal.is_empty() {
+        return Ok(());
+    }
+    eprintln!("{refusal}");
+    eprintln!(
+        "  hint: run it in CI (`--context ci`), or from an approval someone else gives — \
+         a local `y` is not a substitute"
+    );
+    Err(ExitCode::from(1))
 }
 
 /// The policy gate ([#103](https://github.com/Keep-Shipping/harness/issues/103)):

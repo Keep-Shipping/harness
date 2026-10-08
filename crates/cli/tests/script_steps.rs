@@ -7,6 +7,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use ks_core::ports::run_context::{AGENT_TYPICAL_ENV, KNOWN_AGENT_MARKERS};
+
 /// A directory holding one valid `ship.ks`, the hero file and its script.
 const HERO: &str = "tests/fixtures/hero";
 
@@ -53,7 +55,15 @@ fn run(name: &str, src: &str, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_keepshipping"));
     cmd.args(args).arg(&path);
     // The environment under test is the one these tests describe, not the one
-    // they happen to run in.
+    // they happen to run in: no CI, and nothing that would make the process
+    // look like an agent — a detected marker outranks a declared `--actor
+    // human`, so a test that means a human has to take the markers away.
+    for marker in KNOWN_AGENT_MARKERS {
+        cmd.env_remove(marker);
+    }
+    for (name, _) in AGENT_TYPICAL_ENV {
+        cmd.env_remove(*name);
+    }
     let out = cmd
         .env_remove("CI")
         .env_remove("GITHUB_ACTIONS")
@@ -108,14 +118,21 @@ fn an_agent_in_production_is_refused_before_the_run_starts() {
 #[test]
 fn what_gets_the_agent_past_the_gate_is_the_step_not_the_run() {
     // A human is never gated, and neither is a step that says what it does.
-    for (name, src, actor) in [
-        ("human.ks", SITE, "human"),
-        ("declared.ks", DECLARED, "agent"),
-        ("staging.ks", SITE, "agent"),
+    // The step that declares `action: apply` gets its context from the same
+    // file: an apply into `prod` is CI's, and the environment guard says so
+    // before this one has anything to say (#123). It still gets past the
+    // *script* gate, which is what this test is about.
+    for (name, src, actor, context) in [
+        ("human.ks", SITE, "human", "local"),
+        ("declared.ks", DECLARED, "agent", "ci"),
+        ("staging.ks", SITE, "agent", "local"),
     ] {
         let env = if name == "staging.ks" { "staging" } else { "prod" };
-        let (code, stdout, stderr) =
-            run(name, src, &["run", "--actor", actor, "--env", env, "--only", "migrate"]);
+        let (code, stdout, stderr) = run(
+            name,
+            src,
+            &["run", "--actor", actor, "--env", env, "--only", "migrate", "--context", context],
+        );
         assert_started(&stdout, &stderr);
         // It runs, and stops at the script step — on the runtime, not the gate.
         assert_eq!(code, 1, "{stdout}{stderr}");

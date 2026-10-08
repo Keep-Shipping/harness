@@ -11,6 +11,7 @@ use ks_lang::{Atom, Code, Diagnostic, Entry, Span};
 
 use crate::catalog::{AFTER, Catalog, StepTypes, WHEN};
 use crate::check::{annotation_default, env_gate, secret_keys, value_text};
+use crate::script_step::is_script_kind;
 use crate::step::{ActionClass, ActionKind, StepCapabilities};
 use crate::types::Type;
 
@@ -109,9 +110,11 @@ impl BlockSignature {
     }
 
     /// The action classes of one internal step: the nested block's own, whole,
-    /// where the step uses a block; else the action its kind is, in the
-    /// environment its `when: env is <name>` binds it to. A kind the catalog
-    /// does not know asserts nothing.
+    /// where the step uses a block; else the action the step declares — its
+    /// kind's when the catalog knows it, the `action:` a script step writes
+    /// when it does not — in the environment its `when: env is <name>` binds it
+    /// to. A kind the catalog does not know and that is not a script asserts
+    /// nothing.
     fn actions_of(
         step: Entry<'_>,
         catalog: &Catalog,
@@ -121,12 +124,22 @@ impl BlockSignature {
         if let Some(block) = nested.get(kind) {
             return block.actions.clone();
         }
-        if catalog.step(kind).is_none() {
-            return Vec::new();
-        }
+        let action = if catalog.step(kind).is_some() {
+            Some(ActionKind::of_kind(kind))
+        } else if is_script_kind(kind) {
+            // A script step says what it does with `action:` ([#89]), and that
+            // is the same claim the checker reads on the step itself
+            // ([`crate::check`]). A use of a block that carries one must not
+            // see less than a use of the same script written out in full, or a
+            // block becomes the way to drop a declared apply ([#123]).
+            declared_action(step)
+        } else {
+            None
+        };
+        let Some(action) = action else { return Vec::new() };
         let class = match env_gate(step) {
-            Some(env) => ActionClass::new(ActionKind::of_kind(kind)).in_env(env),
-            None => ActionClass::new(ActionKind::of_kind(kind)),
+            Some(env) => ActionClass::new(action).in_env(env),
+            None => ActionClass::new(action),
         };
         vec![(class, kind.to_string())]
     }
@@ -319,6 +332,19 @@ fn all_uses(parse: &ks_lang::Parse) -> Vec<(String, Span)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The action a script step declares under `action:`, as
+/// [`ActionKind::parse`] reads it.
+///
+/// `None` when the step declares none — the kind reads as
+/// [`ActionKind::Other`](ActionKind::Other) and asserts nothing — and when it
+/// declares a name no kind takes. The name is not validated here: the checker
+/// reports an unknown one where it reports every other one, on the file that
+/// writes it.
+fn declared_action(step: Entry<'_>) -> Option<ActionKind> {
+    let p = step.children().find(|c| c.key_name() == Some("action"))?;
+    ActionKind::parse(&value_text(&p.expr()?)?)
 }
 
 /// The step's kind word, as written, and where it is.
