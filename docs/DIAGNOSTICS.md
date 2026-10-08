@@ -13,11 +13,15 @@ Every finding carries a stable `KSxxxx` code — what each one means lives in
 | 2 | usage: an unknown flag or format, a missing value, a file that cannot be checked (missing, a directory, not UTF-8, permission denied), or no `ship.ks` to check |
 | 3 | internal: an unexpected I/O error, or a panic — a bug in keepshipping, never in your file |
 
-`run` keeps the same scale: 1 when the file fails the check, when a step
-fails, or when an approval is declined; 2 for usage and environment-selection
-problems. The full list, including the codes a *run* will add once `run` is
-wired to the engine (4 waiting for an approval, 5 policy refused, 130
-cancelled), is in [CLI.md](CLI.md).
+`run` keeps the same scale and adds three of its own: 1 when the file
+fails the check or a step fails, 2 for usage and environment-selection
+problems, 10 when the run stops at an approval **nobody could answer**, 11
+when a person answered it and said no, and 12 when policy refused the run.
+10 and 11 are separate codes because they are different things: one is a
+state a person has to move, the other a verdict they already gave. The full
+list, including 130 for a cancelled run, is in [CLI.md](CLI.md), which also
+says what an agent should do about 10 — report the run id and the team, and
+stop, rather than retry.
 
 ## `fmt --upgrade`
 
@@ -160,13 +164,22 @@ declares, one line per step:
 - An approval writes its question on the step's own line and waits for `y` or
   `yes`. The approver's name, from `$USER` or `$USERNAME` and falling back to
   `local`, is carried on the run's answer for the run log to record. A
-  declined approval writes `✗ declined at {step}` and nothing after it runs.
-  A run with nobody to ask — a pipe, `--non-interactive`, CI, a closed
-  stdin — always declines, and writes the answer itself so the prompt is not
-  left open.
+  person answering anything else writes `✗ declined at {step}` and nothing
+  after it runs.
+- A run with nobody to ask — a pipe, `--non-interactive`, CI, a closed
+  stdin, or `--actor agent` — is not a decline. Nobody refused anything, so
+  the run **waits** at the approval and exits 10. It writes
+  `⏸ waiting at {step} for {team} — run {id}`, naming the approval's `from:`
+  handle when it declared one, then `  check: keepshipping runs status {id}`;
+  `{id}` is the run's own id, so a parked run can be found later. No answer is
+  written to the question, so the waiting line closes the prompt itself.
 - A failing step writes `✗ {step:<8}{error}` and the run stops there.
 
-One renderer reads the events, and the same lines come out either way. At a
+One renderer reads the events, and the same lines come out either way. With
+`--format json` a third one reads them as JSON Lines instead: every line is
+an object carrying `"version":1` and a `"type"`, the first is `run.started`
+and the last is `run.finished`, and nothing else — no banner, no spinner, no
+footer — reaches stdout. The schemas are in [CLI.md](CLI.md). At a
 terminal, the step in flight gets a spinner and a running clock, redrawn in
 place and replaced by its summary and its real duration. Anywhere else — a
 pipe, a CI log, `TERM=dumb` — the same lines are written once each, with no
@@ -181,6 +194,7 @@ a captured run reads like a terminal's.
 | `--only STEP` | run `STEP` and the steps it depends on; repeatable |
 | `--skip STEP` | drop `STEP` and everything downstream of it; repeatable |
 | `--dry-run` | graph the run and check it; run nothing |
+| `--format human\|json` | the report, or one JSON object per line for a tool; `github` is a usage error |
 | `-v` | stream each step's own output |
 
 `--skip` takes the consumers with the step: skipping an approval can never

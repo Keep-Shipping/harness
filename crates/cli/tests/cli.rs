@@ -240,9 +240,79 @@ fn missing_files_and_bad_flags_are_usage_errors() {
     let (code, _, stderr) = keepshipping(&["check", "--format", "xml"]);
     assert_eq!(code, 2);
     assert!(stderr.contains("usage: keepshipping"), "{stderr}");
-    let (code, _, stderr) = keepshipping(&["run", "--format", "json"]);
+    let (code, _, stderr) = keepshipping(&["run", "--format", "dot"]);
     assert_eq!(code, 2);
     assert!(stderr.contains("usage: keepshipping"), "{stderr}");
+    // `run` takes `--format human|json`; github annotations describe source
+    // spans, and a run reports steps, so it stays the usage error.
+    let (code, _, stderr) = keepshipping(&["run", "--format", "github"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("usage: keepshipping"), "{stderr}");
+}
+
+/// `run --format json` is for a program, so stdout is the stream and nothing
+/// else: no banner, no spinner, no footer, every line an object.
+#[test]
+fn a_json_run_is_nothing_but_json_lines() {
+    let path = temp_site("json.ks", HERO);
+    let (code, stdout, stderr) = keepshipping(&["run", "--format", "json", path.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&path);
+    // No step kind is executable yet, so the run fails at its first step.
+    assert_eq!(code, 1, "{stderr}");
+    assert!(!stdout.contains("environment:"), "the banner is a JSON line now: {stdout}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(lines.len() >= 3, "{stdout}");
+    let values: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("{line:?} is not JSON: {e}"))
+        })
+        .collect();
+    for value in &values {
+        assert_eq!(value["version"], 1, "{value}");
+        assert!(value["type"].is_string(), "{value} has no `type`");
+    }
+    // The stream opens and closes with the run, so a reader that reads only
+    // those two lines knows the id and the outcome.
+    assert_eq!(values[0]["type"], "run.started", "{stdout}");
+    assert!(values[0]["run"].is_string(), "{stdout}");
+    assert_eq!(values[0]["env"], "default", "{stdout}");
+    let last = values.last().expect("a closing line");
+    assert_eq!(last["type"], "run.finished", "{stdout}");
+    assert_eq!(last["status"], "failed", "{stdout}");
+    assert_eq!(last["exit_code"], 1, "and the code it exited with: {stdout}");
+    assert_eq!(last["step"], "build", "{stdout}");
+    // A failing step says why, on the step's own line.
+    assert!(
+        values.iter().any(|v| v["type"] == "step.failed"
+            && v["error"] == "`oci.image` steps are not built in yet"),
+        "{stdout}"
+    );
+}
+
+/// A run refused before it starts — here by the check — never opens the
+/// stream: stdout has nothing on it at all, not even a half-written object.
+#[test]
+fn a_json_run_of_a_file_with_errors_writes_no_stdout_at_all() {
+    let path = temp_site("json-broken.ks", BROKEN);
+    let (code, stdout, stderr) = keepshipping(&["run", "--format", "json", path.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 1);
+    assert!(stdout.is_empty(), "the findings went to stderr: {stdout}");
+    assert!(stderr.contains("deploy.image"), "{stderr}");
+}
+
+/// A dry run lists its steps for a person; under `--format json` that listing
+/// is a person reading stderr, and stdout stays the stream's alone.
+#[test]
+fn a_json_dry_run_keeps_its_listing_off_stdout() {
+    let path = temp_site("json-dry.ks", HERO);
+    let (code, stdout, stderr) =
+        keepshipping(&["run", "--dry-run", "--format", "json", path.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("▸ build   oci.image"), "{stderr}");
 }
 
 #[test]

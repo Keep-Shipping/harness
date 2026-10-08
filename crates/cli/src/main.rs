@@ -12,6 +12,7 @@ mod blocks;
 mod blocks_index;
 mod check;
 mod drive;
+mod exit;
 mod fmt;
 // The GitHub Actions run context (#150) is built and tested here, but the
 // command dispatch still has no run context to hand it: wiring CI-versus-local
@@ -23,15 +24,18 @@ mod graph;
 mod log;
 mod progress;
 mod render;
+mod run_id;
 mod run_log;
 mod upgrade;
 
-use std::io::{IsTerminal, Write as _};
+use std::collections::HashMap;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use ks_core::ports::run_context::ActorKind;
 use ks_core::{ContextName, Step, Trigger, TriggerKind};
 // The binary shares the adapter with the OCI distribution crate's tests, which
 // link this package as a library; the module is declared once, in `lib.rs`.
@@ -40,7 +44,7 @@ use ks_cli::http_client;
 use ks_cli::test_server;
 
 use crate::args::{Command, Options, USAGE, context_of, parse_args};
-use crate::drive::{Done, Outcome, StepRunner};
+use crate::drive::{Done, StepRunner};
 use crate::progress::Renderer;
 
 fn main() -> ExitCode {
@@ -49,7 +53,7 @@ fn main() -> ExitCode {
     std::panic::set_hook(Box::new(|info| eprintln!("internal error: {info}")));
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(dispatch)) {
         Ok(code) => code,
-        Err(_) => ExitCode::from(3),
+        Err(_) => ExitCode::from(exit::INTERNAL),
     }
 }
 
@@ -84,9 +88,10 @@ fn run(args: &[String]) -> ExitCode {
         Ok(site) => site,
         Err(code) => return code,
     };
+    let json = o.format == render::Format::Json;
     let diags = &site.checked.diagnostics;
     if !diags.is_empty() {
-        let mut out = std::io::stdout().lock();
+        let mut out = report_out(json);
         let _ = render::human(&mut out, path, &site.src, diags, render::use_color());
     }
     if check::fails(&o, diags) {
@@ -134,9 +139,21 @@ fn run(args: &[String]) -> ExitCode {
     }
 }
 
+/// Where a report written for people goes: stdout for one, and stderr in a
+/// JSON run, whose stdout is the stream and nothing else. Still rendered for
+/// people either way — only the destination moves.
+fn report_out(json: bool) -> Box<dyn Write> {
+    if json { Box::new(std::io::stderr()) } else { Box::new(std::io::stdout()) }
+}
+
 /// The environment is chosen: print the run the file describes, and run it.
 fn selected(o: &Options, site: &check::Site, env: &str) -> ExitCode {
-    println!("environment: {env}");
+    // A JSON run's stdout is the stream and nothing else: the human banner
+    // becomes the `run.started` line, so a reader never has to skip a line.
+    let json = o.format == render::Format::Json;
+    if !json {
+        println!("environment: {env}");
+    }
     let workflow = &site.checked.workflow;
     let only: Vec<&str> = o.only.iter().map(String::as_str).collect();
     let skip: Vec<&str> = o.skip.iter().map(String::as_str).collect();
@@ -150,7 +167,7 @@ fn selected(o: &Options, site: &check::Site, env: &str) -> ExitCode {
     if o.dry_run {
         // The graph and the check, and nothing else: the promise `check`
         // makes still holds, so it closes the report.
-        let mut out = std::io::stdout().lock();
+        let mut out = report_out(json);
         for step in &steps {
             let _ = writeln!(
                 out,
@@ -159,36 +176,89 @@ fn selected(o: &Options, site: &check::Site, env: &str) -> ExitCode {
             );
         }
         let _ = render::footer(&mut out);
-        return ExitCode::SUCCESS;
+        return ExitCode::from(exit::SHIPPED);
     }
 
     let what = workflow.name().map(str::to_string).unwrap_or_else(|| stem(&site.file));
+    // A dry run has no id to report and nothing to be found later; a real one
+    // does, and every line of its output carries it.
+    let run_id = run_id::mint();
+    let teams = approval_teams(&site.src);
+    let run = drive::RunInfo { what: &what, id: &run_id, teams: &teams };
     let tty = std::io::stdout().is_terminal() && std::env::var("TERM").is_ok_and(|t| t != "dumb");
-    let shared = Mutex::new(renderer(tty, o.verbose));
+    let shared = Mutex::new(renderer(tty, o.verbose, json, &run_id, env));
     let mut approver: Box<dyn drive::Approver> = if interactive(o) {
         Box::new(drive::TtyApprover::new(std::io::stdin().lock()))
     } else {
         Box::new(drive::Declines)
     };
     let started = Instant::now();
-    let outcome = drive::with_spinner(tty, &shared, |renderer| {
+    let outcome = drive::with_spinner(tty && !json, &shared, |renderer| {
         drive::drive(
             &steps,
             &mut Unbuilt,
             approver.as_mut(),
             renderer,
             &mut || started.elapsed(),
-            &what,
+            &run,
         )
     });
-    if outcome == Outcome::Shipped { ExitCode::SUCCESS } else { ExitCode::from(1) }
+    ExitCode::from(outcome.exit_code())
 }
 
-/// The renderer the run's lines go through: animated at a terminal, plain
-/// everywhere else.
-fn renderer(tty: bool, verbose: bool) -> Box<dyn Renderer + Send> {
+/// The `from:` handle of each `approval` step, by step name. Read off the
+/// parse tree the way `check` reads the Dockerfiles an image step names: the
+/// workflow's steps carry their kind but not their inputs, so the handle only
+/// exists here in the source.
+fn approval_teams(src: &str) -> HashMap<String, String> {
+    let parse = ks_lang::parse(src);
+    let mut teams = HashMap::new();
+    for entry in parse.file().entries().filter(|e| e.key_name() == Some("steps")) {
+        for step in entry.children() {
+            // Only an approval carries a team; `oci.image`'s `from:` is a path.
+            if step.expr().as_ref().and_then(handle) != Some("approval") {
+                continue;
+            }
+            let Some(from) = step.children().find(|i| i.key_name() == Some("from")) else {
+                continue;
+            };
+            let team_expr = from.expr();
+            let Some(team) = team_expr.as_ref().and_then(handle) else { continue };
+            if let Some(name) = step.key_name() {
+                teams.insert(name.to_string(), team.to_string());
+            }
+        }
+    }
+    teams
+}
+
+/// A bare `@handle`, the one word an expression is when it is a handle at all.
+/// An approval that names no team has none, and its team is reported as null.
+fn handle<'a>(expr: &'a ks_lang::Expr<'a>) -> Option<&'a str> {
+    match expr {
+        ks_lang::Expr::Atom { atom: ks_lang::Atom::Word(w), .. } => {
+            let text = w.text();
+            text.starts_with('@').then_some(text)
+        }
+        _ => None,
+    }
+}
+
+/// The renderer the run's lines go through: JSON Lines where a tool is
+/// reading, and the animated-at-a-terminal, plain-everywhere-else report
+/// otherwise.
+fn renderer(
+    tty: bool,
+    verbose: bool,
+    json: bool,
+    run_id: &ks_core::ids::RunId,
+    env: &str,
+) -> Box<dyn Renderer + Send> {
     // `Stdout` is `Send`, `StdoutLock` is not: the ticker thread holds the
     // renderer behind a lock of its own.
+    if json {
+        return Box::new(progress::Json::new(std::io::stdout(), run_id, env));
+    }
     Box::new(progress::Run::new(std::io::stdout(), verbose, tty))
 }
 
@@ -260,8 +330,17 @@ fn refuses_to_run(site: &check::Site, o: &Options, context: ContextName) -> Resu
 }
 
 /// A terminal to ask, the user having allowed it, and no CI in charge.
+/// `--actor agent` never asks: an agent cannot answer an approval, so it
+/// waits for a person instead of blocking on a prompt nobody will ever see.
+/// `--format json` never asks either — a prompt on stdout would be a line a
+/// JSON reader cannot parse — so an ambiguous file is the usage error it is
+/// everywhere else without one.
 fn interactive(o: &Options) -> bool {
-    std::io::stdin().is_terminal() && !o.non_interactive && std::env::var_os("CI").is_none()
+    o.actor != ActorKind::Agent
+        && o.format != render::Format::Json
+        && std::io::stdin().is_terminal()
+        && !o.non_interactive
+        && std::env::var_os("CI").is_none()
 }
 
 fn prompt(offered: &str, names: &[String]) -> Option<String> {

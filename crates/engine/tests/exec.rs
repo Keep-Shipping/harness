@@ -390,7 +390,7 @@ fn a_refusal_is_not_retried() {
     assert_eq!(status(&log, "apply"), StepStatus::PolicyRefused);
     assert_eq!(reason(&log, "apply"), "needs an approval");
     assert_eq!(run.runner.calls("apply"), 1);
-    assert_eq!(log.exit_code(), 5);
+    assert_eq!(log.exit_code(), 12);
 }
 
 #[test]
@@ -489,7 +489,7 @@ fn a_step_waiting_for_an_approval_is_not_a_failure() {
     assert_eq!(status(&log, "deploy"), StepStatus::WaitingForApproval);
     assert_eq!(status(&log, "notify"), StepStatus::Skipped);
     assert_eq!(log.status, RunStatus::WaitingForApproval);
-    assert_eq!(log.exit_code(), 4, "waiting is not failing: nothing broke, nothing was refused");
+    assert_eq!(log.exit_code(), 10, "waiting is not failing: nothing broke, nothing was refused");
 }
 
 #[test]

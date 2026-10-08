@@ -13,6 +13,8 @@
 use std::io::Write;
 use std::time::{Duration, Instant};
 
+use ks_core::ids::RunId;
+
 /// One thing that happened in a run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunEvent {
@@ -35,6 +37,10 @@ pub enum RunEvent {
     Shipped { what: String, took: Duration },
     /// The approval at `step` was declined; nothing after it ran.
     Declined { step: String },
+    /// The run is parked at `step`: the approval needs a person, and there
+    /// was nobody to ask. `team` is the step's `from:` handle when it named
+    /// one, and `run` the id the run reports itself under.
+    Waiting { step: String, team: Option<String>, run: String },
 }
 
 /// Something that draws a run as it happens.
@@ -92,6 +98,28 @@ pub fn prompt_line(step: &str, question: &str) -> String {
     format!("▸ {step:<NAME_WIDTH$}{question} ")
 }
 
+/// The line a run parked at an approval leaves: where it stopped, and for
+/// whom. An approval with no `from:` names no team, so the line says only
+/// where it is.
+pub fn wait_line(step: &str, team: Option<&str>, run: &str) -> String {
+    let where_ = match team {
+        Some(team) => format!("at {step} for {team}"),
+        None => format!("at {step}"),
+    };
+    format!("⏸ waiting {where_} — run {run}")
+}
+
+/// The command that reports where a parked run got to, named once because a
+/// report and the JSON both have to spell it the same way.
+fn status_command(run: &str) -> String {
+    format!("keepshipping runs status {run}")
+}
+
+/// The follow-up: what to run next to find out where the run got to.
+pub fn check_line(run: &str) -> String {
+    format!("  check: {}", status_command(run))
+}
+
 /// What an approval answered, in the answer's place.
 fn answer(approved: bool) -> &'static str {
     if approved { "y" } else { "n" }
@@ -111,12 +139,16 @@ pub struct Run<W> {
     tty: bool,
     /// The step in flight, if any; always `None` when `tty` is false.
     live: Option<Live>,
+    /// An approval was asked and nothing has closed its line yet. A person who
+    /// answered echoed their own newline; a run parked at the approval never
+    /// will, so the waiting lines have to close it themselves.
+    prompted: bool,
     frame: usize,
 }
 
 impl<W: Write> Run<W> {
     pub fn new(out: W, verbose: bool, tty: bool) -> Self {
-        Self { out, verbose, tty, live: None, frame: 0 }
+        Self { out, verbose, tty, live: None, prompted: false, frame: 0 }
     }
 
     /// Erases the line, whatever is on it.
@@ -130,6 +162,15 @@ impl<W: Write> Run<W> {
     fn retire(&mut self) {
         if self.live.take().is_some() {
             self.wipe();
+        }
+    }
+
+    /// Closes an approval's open line, if one is open, so what is written
+    /// next starts on its own line rather than trailing the question.
+    fn close_prompt(&mut self) {
+        if self.prompted {
+            self.prompted = false;
+            let _ = writeln!(self.out);
         }
     }
 
@@ -170,6 +211,7 @@ impl<W: Write> Renderer for Run<W> {
             RunEvent::Asking { step, question } => {
                 self.retire();
                 let _ = write!(self.out, "{}", prompt_line(step, question));
+                self.prompted = true;
                 let _ = self.out.flush();
             }
             // A terminal echoed what the user typed, newline and all, and
@@ -178,13 +220,22 @@ impl<W: Write> Renderer for Run<W> {
             // and a pipe has no echo to lean on either way.
             RunEvent::Answered { approved, typed, .. } if !self.tty || !typed => {
                 let _ = writeln!(self.out, "{}", answer(*approved));
+                self.prompted = false;
             }
-            RunEvent::Answered { .. } => {}
+            RunEvent::Answered { .. } => self.prompted = false,
             RunEvent::Shipped { what, took } => {
                 let _ = writeln!(self.out, "✓ shipped {what} in {}", duration(*took));
             }
             RunEvent::Declined { step } => {
                 let _ = writeln!(self.out, "✗ declined at {step}");
+            }
+            // Waiting is neither ✓ nor ✗: nothing broke, and nobody refused.
+            // The person reading it has to know there is something to go and
+            // do, and which team has to do it.
+            RunEvent::Waiting { step, team, run } => {
+                self.close_prompt();
+                let _ = writeln!(self.out, "{}", wait_line(step, team.as_deref(), run));
+                let _ = writeln!(self.out, "{}", check_line(run));
             }
             _ => {}
         }
@@ -198,6 +249,160 @@ impl<W: Write> Renderer for Run<W> {
         self.wipe();
         self.draw();
     }
+}
+
+/// The run as JSON Lines, schema v1: one self-contained object per line, and
+/// nothing else on stdout — no banner, no spinner, no footer — so an agent can
+/// read the stream with `jq` while it is still running.
+///
+/// Every line carries `"version":1` and a `"type"` naming what happened. The
+/// first is `run.started` and the last `run.finished`, so a reader that only
+/// reads those two knows the run's id and its outcome without tracking state.
+/// `run.finished` carries the `status` an agent branches on and the `exit_code`
+/// the process itself will return, so the two can never disagree. Fields are
+/// only ever added within a version; a rename or a removal bumps it. The
+/// schemas are in `docs/CLI.md`.
+pub struct Json<W> {
+    out: W,
+    /// This run's id. `run.started` and `run.finished` carry it, so lines from
+    /// two runs interleaved in one log can still be told apart.
+    run: String,
+}
+
+impl<W: Write> Json<W> {
+    /// A new stream, which opens by saying which run this is and where it is
+    /// running — the one line a reader needs before it can follow anything.
+    pub fn new(out: W, run: &RunId, env: &str) -> Self {
+        let mut json = Self { out, run: run.to_string() };
+        let started = run_started(&json.run, env);
+        let _ = writeln!(json.out, "{started}");
+        json
+    }
+
+    /// The `"run":"…"` key the closing lines carry.
+    fn run_key(&self) -> String {
+        format!(",\"run\":{}", crate::render::json_str(&self.run))
+    }
+
+    /// One line: an object whose first two keys are always `version` and
+    /// `type`, so a reader can dispatch on it without a schema lookup.
+    fn line(&mut self, fields: &str) {
+        let _ = writeln!(self.out, "{{\"version\":1,\"type\":{fields}}}");
+        let _ = self.out.flush();
+    }
+}
+
+/// `"step":"review"` — the key every event but `run.started` and
+/// `run.finished` starts with.
+fn step_key(step: &str) -> String {
+    format!(",\"step\":{}", crate::render::json_str(step))
+}
+
+/// A string, or `null` when it is absent — an approval that named no team
+/// says so rather than omitting the key.
+fn opt_str(value: Option<&str>) -> String {
+    value.map_or_else(|| "null".to_string(), crate::render::json_str)
+}
+
+/// The `waiting` object of a `run.finished`: where the run stopped, who has to
+/// move it, and how to check. The last is the command a human runs — and the
+/// one an agent reports back — when the run is parked.
+fn waiting(step: &str, team: Option<&str>, run: &str) -> String {
+    format!(
+        "{{\"step\":{},\"team\":{},\"check\":{}}}",
+        crate::render::json_str(step),
+        opt_str(team),
+        crate::render::json_str(&status_command(run))
+    )
+}
+
+impl<W: Write> Renderer for Json<W> {
+    fn event(&mut self, e: &RunEvent) {
+        let json_str = crate::render::json_str;
+        match e {
+            RunEvent::Started { step } => self.line(&format!("\"step.started\"{}", step_key(step))),
+            RunEvent::Log { step, line } => {
+                self.line(&format!("\"step.log\"{},\"line\":{}", step_key(step), json_str(line)));
+            }
+            RunEvent::Finished { step, summary, took } => self.line(&format!(
+                "\"step.finished\"{},\"summary\":{},\"took_ms\":{}",
+                step_key(step),
+                json_str(summary),
+                took.as_millis()
+            )),
+            // A failure is terminal, so it closes the stream here rather than waiting
+            // for an event that will not come: an agent must not have to know
+            // that `step.failed` means the run is over.
+            RunEvent::Failed { step, error, took } => {
+                self.line(&format!(
+                    "\"step.failed\"{},\"error\":{},\"took_ms\":{}",
+                    step_key(step),
+                    json_str(error),
+                    took.as_millis()
+                ));
+                let run_key = self.run_key();
+                self.line(&format!(
+                    "\"run.finished\"{run_key},\"status\":\"failed\",\"exit_code\":{},\
+                     \"step\":{}",
+                    crate::exit::FAILED,
+                    json_str(step)
+                ));
+            }
+            RunEvent::Asking { step, question } => self.line(&format!(
+                "\"approval.asked\"{},\"question\":{}",
+                step_key(step),
+                json_str(question)
+            )),
+            RunEvent::Answered { step, approved, by, .. } => self.line(&format!(
+                "\"approval.answered\"{},\"approved\":{},\"by\":{}",
+                step_key(step),
+                approved,
+                opt_str(by.as_deref())
+            )),
+            RunEvent::Shipped { what, took } => {
+                let run_key = self.run_key();
+                self.line(&format!(
+                    "\"run.finished\"{run_key},\"status\":\"shipped\",\"exit_code\":{},\
+                     \"what\":{},\"took_ms\":{}",
+                    crate::exit::SHIPPED,
+                    json_str(what),
+                    took.as_millis()
+                ));
+            }
+            RunEvent::Declined { step } => {
+                let run_key = self.run_key();
+                self.line(&format!(
+                    "\"run.finished\"{run_key},\"status\":\"denied\",\"exit_code\":{},\
+                     \"step\":{}",
+                    crate::exit::DENIED,
+                    json_str(step)
+                ));
+            }
+            RunEvent::Waiting { step, team, run } => {
+                let run_key = self.run_key();
+                self.line(&format!(
+                    "\"run.finished\"{run_key},\"status\":\"waiting_for_approval\",\
+                     \"exit_code\":{},\"waiting\":{}",
+                    crate::exit::WAITING,
+                    waiting(step, team.as_deref(), run)
+                ));
+            }
+        }
+    }
+
+    /// A JSON stream has no cursor to redraw: a spinner would be a line of
+    /// escape codes between two objects, and the objects are the whole point.
+    fn tick(&mut self) {}
+}
+
+/// `run.started` goes out before the first step, so the stream opens with the
+/// run's id and the environment it chose.
+pub fn run_started(run: &str, env: &str) -> String {
+    format!(
+        "{{\"version\":1,\"type\":\"run.started\",\"run\":{},\"env\":{}}}",
+        crate::render::json_str(run),
+        crate::render::json_str(env)
+    )
 }
 
 /// What a person would be left looking at: the bytes with `\r\x1b[2K`

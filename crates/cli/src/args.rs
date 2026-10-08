@@ -23,7 +23,7 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
        keepshipping run [FILE] [--env NAME] [--event \"push main\"] [--actor human|agent|ci]
                         [--context local|ci] [--non-interactive] [--until STEP]
                         [--only STEP]... [--skip STEP]... [--allow-partial]
-                        [--dry-run] [-v]
+                        [--dry-run] [--format human|json] [-v]
        keepshipping graph [FILE] [--env NAME] [--event \"push main\"] [--format text|dot|json]
        keepshipping fmt [PATH...] [--check]
        keepshipping fmt -
@@ -33,10 +33,13 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
        keepshipping log verify [RUN-ID]
        keepshipping lsp";
 
-/// Which subcommand's flags `parse_args` accepts. `--format`, `--all`,
+/// Which subcommand's flags `parse_args` accepts. `--all`,
 /// `--warnings-as-errors`, `--secrets`, `--fix` and `--repro` belong to `check` alone; `run`
 /// rejects them like any other unrecognized option. `--until`, `--skip` and
-/// `--allow-partial` belong to `run` alone, and `--context` to both.
+/// `--allow-partial` belong to `run` alone, and `--context` to both. `--format`
+/// belongs to `check`, `run` and `blocks search`; the names are the same
+/// (`human|json|github`) and the ones each command cannot use are a usage
+/// error below.
 /// `blocks search` has its own `--format` (human or json, no github
 /// annotations), `--index` and `--limit`. `graph` has its own `--format` —
 /// `text|dot|json`, not the diagnostic formats, so `check --format dot` stays
@@ -147,7 +150,9 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
             "--format" if command == Command::Graph => {
                 o.graph_format = GraphFormat::parse(&flag_value(&mut rest)?)?
             }
-            "--format" if matches!(command, Command::Check | Command::BlocksSearch) => {
+            "--format"
+                if matches!(command, Command::Check | Command::BlocksSearch | Command::Run) =>
+            {
                 o.format = Format::parse(&flag_value(&mut rest)?)?
             }
             "--all" if command == Command::Check => o.all = true,
@@ -200,8 +205,10 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
             _ => return None,
         }
     }
-    // GitHub annotations describe source spans; a search result has none.
-    if command == Command::BlocksSearch && o.format == Format::Github {
+    // GitHub annotations describe source spans; a search result has none, and
+    // a run reports steps rather than findings, so `run --format github` is
+    // the same usage error `run --format xml` has always been.
+    if o.format == Format::Github && matches!(command, Command::BlocksSearch | Command::Run) {
         return None;
     }
     Some(o)

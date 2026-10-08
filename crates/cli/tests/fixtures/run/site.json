@@ -1,0 +1,11 @@
+{"version":1,"type":"run.started","run":"01ARZ3NDEKTSV4RRFFQ69G5FAV","env":"prod"}
+{"version":1,"type":"step.started","step":"build"}
+{"version":1,"type":"step.log","step":"build","line":"build: working"}
+{"version":1,"type":"step.finished","step":"build","summary":"sha256:9f2c…e1  signed","took_ms":38000}
+{"version":1,"type":"step.started","step":"plan"}
+{"version":1,"type":"step.log","step":"plan","line":"plan: working"}
+{"version":1,"type":"step.finished","step":"plan","summary":"+2 ~1 -0","took_ms":11000}
+{"version":1,"type":"step.started","step":"review"}
+{"version":1,"type":"step.log","step":"review","line":"review: working"}
+{"version":1,"type":"approval.asked","step":"review","question":"approve 3 changes?"}
+{"version":1,"type":"run.finished","run":"01ARZ3NDEKTSV4RRFFQ69G5FAV","status":"waiting_for_approval","exit_code":10,"waiting":{"step":"review","team":"@platform","check":"keepshipping runs status 01ARZ3NDEKTSV4RRFFQ69G5FAV"}}

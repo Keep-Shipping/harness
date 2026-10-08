@@ -18,6 +18,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use ks_core::ids::RunId;
 use ks_core::{Step, Workflow};
 
 use crate::progress::{Renderer, RunEvent};
@@ -56,18 +57,47 @@ pub trait Approver {
     fn ask(&mut self, question: &str) -> Answer;
 }
 
-/// Nobody was asked: the run declined itself.
+/// Nobody was asked, so nothing was approved.
 pub const NOBODY_ANSWERED: Answer = Answer { approved: false, by: None, typed: false };
 
 /// How a run ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// Every selected step ran.
     Shipped,
-    /// An approval was declined; nothing after it ran.
+    /// An approval was declined by a person; nothing after it ran.
     Declined,
     /// A step failed; nothing after it ran.
     Failed,
+    /// The run stopped at an approval nobody could answer, and is parked
+    /// there — a state, not a verdict. `team` is the approval's `from:`, when
+    /// it declared one.
+    Waiting { step: String, team: Option<String> },
+}
+
+impl Outcome {
+    /// The code this outcome exits with. Waiting and denied are separate
+    /// codes on purpose: one is a state a person has to move, the other a
+    /// verdict they already gave.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Outcome::Shipped => crate::exit::SHIPPED,
+            Outcome::Failed => crate::exit::FAILED,
+            Outcome::Declined => crate::exit::DENIED,
+            Outcome::Waiting { .. } => crate::exit::WAITING,
+        }
+    }
+}
+
+/// What a run is called, and who may answer its approvals.
+pub struct RunInfo<'a> {
+    /// The run's subject: the workflow's name, or the file's stem.
+    pub what: &'a str,
+    /// The id the run reports itself under, so a parked run can be found.
+    pub id: &'a RunId,
+    /// Each approval step's `from:` handle, by step name. An approval that
+    /// declares none is absent, and its team is reported as null.
+    pub teams: &'a HashMap<String, String>,
 }
 
 /// The steps a run covers, in the order it runs them: all of them,
@@ -176,15 +206,15 @@ fn reach(adj: &[Vec<usize>], seeds: &[usize]) -> HashSet<usize> {
 
 /// Runs `steps` in order, telling `renderer` what happens and reading time
 /// from `clock` — a function returning how long the run has been going, so
-/// the site's timings replay exactly. Stops at the first failure or declined
-/// approval; a declined one answers itself when nobody was there to type.
+/// the site's timings replay exactly. Stops at the first failure, declined
+/// approval, or approval nobody could answer.
 pub fn drive(
     steps: &[&Step],
     runner: &mut dyn StepRunner,
     approver: &mut dyn Approver,
     renderer: &mut dyn Renderer,
     clock: &mut dyn FnMut() -> Duration,
-    what: &str,
+    run: &RunInfo<'_>,
 ) -> Outcome {
     let start = clock();
     for step in steps {
@@ -207,6 +237,19 @@ pub fn drive(
                 renderer
                     .event(&RunEvent::Asking { step: name.clone(), question: question.clone() });
                 let answer = approver.ask(&question);
+                // Nobody to ask is not a "no": the run is parked at an
+                // approval, waiting for whoever the step named, and there is
+                // no answer to report. A person who said no is a verdict, and
+                // it ends the run.
+                if answer == NOBODY_ANSWERED {
+                    let team = run.teams.get(name.as_str()).cloned();
+                    renderer.event(&RunEvent::Waiting {
+                        step: name.clone(),
+                        team: team.clone(),
+                        run: run.id.to_string(),
+                    });
+                    return Outcome::Waiting { step: name.clone(), team };
+                }
                 renderer.event(&RunEvent::Answered {
                     step: name.clone(),
                     approved: answer.approved,
@@ -228,8 +271,10 @@ pub fn drive(
             }
         }
     }
-    renderer
-        .event(&RunEvent::Shipped { what: what.to_string(), took: clock().saturating_sub(start) });
+    renderer.event(&RunEvent::Shipped {
+        what: run.what.to_string(),
+        took: clock().saturating_sub(start),
+    });
     Outcome::Shipped
 }
 
@@ -336,7 +381,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::progress::{Run, prompt_line, screen};
+    use crate::progress::{Json, Run, prompt_line, run_started, screen};
 
     /// The site's run: the same five steps, the same approval in the middle.
     const SITE: &str = include_str!("../tests/fixtures/site/ship.ks");
@@ -433,20 +478,50 @@ steps:
         steps.iter().map(|s| s.name.clone()).collect()
     }
 
+    /// The run id every run here reports itself under. Fixed, so a golden that
+    /// carries the id is the same bytes on every machine.
+    const RUN_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+    /// The site's approval team, as `review:`'s `from:` says it.
+    fn site_teams() -> HashMap<String, String> {
+        HashMap::from([("review".to_string(), "@platform".to_string())])
+    }
+
     /// The whole site's run into a string, animated at a terminal and plain
-    /// everywhere else, with the script's clock.
+    /// everywhere else, with the script's clock. `approved`/`typed` script the
+    /// approver: `typed` false is nobody at the keyboard at all.
     fn site_run(approved: bool, typed: bool, tty: bool) -> (String, Outcome, Rc<Cell<Duration>>) {
+        let (raw, outcome, now, _) = site_run_with(approved, typed, tty, false, &site_teams());
+        (raw, outcome, now)
+    }
+
+    /// The site's run as a [`Json`] stream rather than a report: the same run,
+    /// the same script and the same clock, read by a tool. `teams` is who may
+    /// answer each approval, so a run can be made without one.
+    fn site_run_with(
+        approved: bool,
+        typed: bool,
+        tty: bool,
+        json: bool,
+        teams: &HashMap<String, String>,
+    ) -> (String, Outcome, Rc<Cell<Duration>>, RunId) {
         let steps = site_steps();
         let by: Vec<&Step> = steps.iter().collect();
         let now = Rc::new(Cell::new(Duration::ZERO));
         let mut runner = Scripted { now: now.clone() };
         let mut approver = ScriptedApprover(approved, typed);
         let mut out = Vec::new();
-        let mut renderer = Run::new(&mut out, false, tty);
+        let id = RunId::parse(RUN_ID).expect("a fixed ULID");
+        let run = RunInfo { what: "api@a41c9e", id: &id, teams };
         let mut clock = || now.get();
-        let outcome =
-            drive(&by, &mut runner, &mut approver, &mut renderer, &mut clock, "api@a41c9e");
-        (String::from_utf8(out).expect("utf-8"), outcome, now)
+        let outcome = if json {
+            let mut renderer = Json::new(&mut out, &id, "prod");
+            drive(&by, &mut runner, &mut approver, &mut renderer, &mut clock, &run)
+        } else {
+            let mut renderer = Run::new(&mut out, false, tty);
+            drive(&by, &mut runner, &mut approver, &mut renderer, &mut clock, &run)
+        };
+        (String::from_utf8(out).expect("utf-8"), outcome, now, id)
     }
 
     #[test]
@@ -497,8 +572,10 @@ steps:
     }
 
     #[test]
-    fn declining_stops_the_run_before_apply() {
-        let (raw, outcome, now) = site_run(false, false, false);
+    fn a_person_saying_no_stops_the_run_before_apply() {
+        // Typed, so this is a verdict from a human: nobody at the keyboard is
+        // a wait, and is covered by `an_approval_nobody_answered_parks`.
+        let (raw, outcome, now) = site_run(false, true, false);
         assert_eq!(outcome, Outcome::Declined);
         assert_eq!(now.get(), Duration::from_secs(69), "nothing after the review ran");
         assert_eq!(
@@ -510,6 +587,80 @@ steps:
                 "✗ declined at review\n",
             )
         );
+        assert_eq!(Outcome::Declined.exit_code(), crate::exit::DENIED);
+    }
+
+    /// The site's run under an agent: nothing to ask, so the run parks at the
+    /// approval and says who has to move it. Golden because an agent reads
+    /// exactly these lines.
+    #[test]
+    fn an_approval_nobody_answered_parks_the_run_on_its_team() {
+        let (raw, outcome, now, id) = site_run_with(false, false, false, false, &site_teams());
+        assert_eq!(
+            outcome,
+            Outcome::Waiting { step: "review".into(), team: Some("@platform".into()) }
+        );
+        assert_eq!(outcome.exit_code(), crate::exit::WAITING);
+        assert_eq!(now.get(), Duration::from_secs(69), "nothing after the review ran");
+        // No answer line: nobody answered, so there is nothing to write after
+        // the prompt, and a `n` here would read as a person refusing.
+        assert_eq!(
+            raw,
+            format!(
+                concat!(
+                    "▸ build   sha256:9f2c…e1  signed    38s\n",
+                    "▸ plan    +2 ~1 -0                  11s\n",
+                    "▸ review  approve 3 changes? \n",
+                    "⏸ waiting at review for @platform — run {}\n",
+                    "  check: keepshipping runs status {}\n",
+                ),
+                id, id
+            )
+        );
+    }
+
+    /// The same run as JSON Lines: one object per line, opening with the run
+    /// and closing with the state the process exits in.
+    #[test]
+    fn the_json_run_is_a_stream_that_starts_and_stops_with_the_run() {
+        let (json, outcome, _, id) = site_run_with(false, false, false, true, &site_teams());
+        assert_eq!(
+            outcome,
+            Outcome::Waiting { step: "review".into(), team: Some("@platform".into()) }
+        );
+        let lines: Vec<&str> = json.lines().collect();
+        assert_eq!(lines.first().copied(), Some(run_started(&id.to_string(), "prod").as_str()));
+        // Every line is an object, and every object is schema v1 and says
+        // what it is — an agent dispatches on `type` alone.
+        for line in &lines {
+            let value: serde_json::Value =
+                serde_json::from_str(line).unwrap_or_else(|e| panic!("{line:?} is not JSON: {e}"));
+            assert_eq!(value["version"], 1, "{line}");
+            assert!(value["type"].is_string(), "{line} has no `type`");
+        }
+        let last: serde_json::Value =
+            serde_json::from_str(lines.last().expect("a closing line")).expect("JSON");
+        assert_eq!(last["type"], "run.finished");
+        assert_eq!(last["status"], "waiting_for_approval");
+        assert_eq!(last["exit_code"], crate::exit::WAITING);
+        assert_eq!(last["run"], id.to_string());
+        assert_eq!(last["waiting"]["team"], "@platform");
+        assert_eq!(
+            last["waiting"]["check"],
+            format!("keepshipping runs status {id}"),
+            "the command that reports where the run got to"
+        );
+        assert_eq!(json, read_or_update("site.json", &json));
+    }
+
+    /// An approval that names no team reports none, rather than naming the
+    /// wrong one.
+    #[test]
+    fn an_approval_with_no_team_waits_without_one() {
+        let (raw, outcome, _, id) = site_run_with(false, false, false, false, &HashMap::new());
+        assert_eq!(outcome, Outcome::Waiting { step: "review".into(), team: None });
+        assert!(raw.contains(&format!("⏸ waiting at review — run {id}")), "{raw}");
+        assert!(!raw.contains("@platform"), "no team was named, so none is reported");
     }
 
     #[test]

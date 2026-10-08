@@ -20,10 +20,13 @@ use ks_core::step::{ActionKind, CancellationToken};
 
 /// A step failed or ran out of time: exit 1, the code `check` has always used.
 pub const EXIT_FAILED: u8 = 1;
-/// The run stopped for an approval nobody gave: exit 4.
-pub const EXIT_WAITING_FOR_APPROVAL: u8 = 4;
-/// Policy refused the run: exit 5.
-pub const EXIT_POLICY_REFUSED: u8 = 5;
+/// The run stopped at an approval nobody gave: exit 10. A state, not a
+/// failure — the run is parked, and an agent should report it rather than
+/// retry. Shares its number with the CLI's `WAITING`.
+pub const EXIT_WAITING_FOR_APPROVAL: u8 = 10;
+/// Policy refused the run: exit 12. Shares its number with the CLI's
+/// `REFUSED`.
+pub const EXIT_POLICY_REFUSED: u8 = 12;
 /// The run was cancelled (Ctrl-C, a cancelled CI job): 128 + `SIGINT`, as a shell reports it.
 pub const EXIT_CANCELLED: u8 = 130;
 
