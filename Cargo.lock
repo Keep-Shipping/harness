@@ -1142,6 +1142,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ks-module-runlog"
+version = "0.0.0"
+dependencies = [
+ "ed25519-dalek",
+ "ks-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "ks-oci-distribution"
 version = "0.0.0"
 dependencies = [
