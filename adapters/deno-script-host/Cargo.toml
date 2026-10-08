@@ -1,0 +1,25 @@
+[package]
+name = "ks-deno-script-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+ks-core.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+# Deflate *decompression* only: the release archive is one deflated entry and
+# nothing here ever compresses, so the zopfli/aes/time features of the default
+# set would be dead weight in every `keepshipping` binary.
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# `mkfifo`, for the secret pipe. Safe API; the crate forbids `unsafe`.
+nix = { version = "0.31", default-features = false, features = ["fs"] }
+
+[dev-dependencies]
+ks-testing.workspace = true
+
+[lints]
+workspace = true
