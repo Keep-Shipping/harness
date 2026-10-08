@@ -4,14 +4,17 @@
 //! Two functions, and the split is ADR 0011's: [`update`] is *online* — it is
 //! what `keepshipping blocks update` does, and the only thing that asks a
 //! [`BlockSource`] what exists — and [`verify`] is the gate a run puts in front
-//! of bytes it did not choose.
+//! of bytes it did not choose. A run does not put it there yet: nothing
+//! resolves a block at run time, so [`verify`] has no production caller and the
+//! wiring lands with block resolution. What exists today is the rule and the
+//! refusal, fail-closed, under test.
 //!
 //! ```text
 //!   ship.ks                update()                ship.lock
 //!   acme/web-service@v3 ──────────────▶  version = "3.4.1", digest = "sha256:…"
 //!
 //!   check  reads the digest, offline, out of the cache
-//!   run    fetch(digest) ──▶ verify(entry, package) ──▶ use, or refuse
+//!   run    fetch(digest) ──▶ verify(entry, package, signer, baseline) ──▶ use, or refuse
 //! ```
 //!
 //! "Resolved once" is a rule about *repositories*, not processes: an entry the
@@ -20,10 +23,12 @@
 
 use std::fmt;
 
+use ks_core::block_trust::Untrusted;
 use ks_core::lock::{BlockRef, Lock, LockEntry, Version, select};
 use ks_core::ports::block_source::{BlockPackage, BlockSource, BlockSourceError};
 use ks_core::ports::blocks::{BlockVersion, SignatureStatus};
-use ks_core::ports::supply_chain::Digest;
+use ks_core::ports::policy::Baseline;
+use ks_core::ports::supply_chain::{Digest, SignerIdentity};
 
 /// Resolves `references` into a `ship.lock`, asking `source` only about the
 /// ones the lock has never seen.
@@ -122,14 +127,35 @@ fn versions_of(published: &[BlockVersion]) -> Vec<String> {
 /// - the package's digest must be the locked digest, the same fail-closed rule
 ///   [`Registry`](ks_core::ports::supply_chain::Registry) states for images;
 /// - it must be [`SignatureStatus::Signed`] — unsigned content is refused, as
-///   ADR 0011 requires for secrets and `ci-only`.
+///   ADR 0011 requires for secrets and `ci-only`;
+/// - and the identity behind that signature must be one
+///   [`Baseline::publishers`] lists, which is what
+///   [`ks_core::block_trust::verify`] decides.
 ///
-/// What it does *not* do is decide *which* identities are acceptable or check a
-/// signature itself: the port reports a status, and the policy that turns it
-/// into an accept or a refusal is
-/// [#84](https://github.com/Keep-Shipping/harness/issues/84). Until then the
-/// narrow rule is the safe one.
-pub fn verify(entry: &LockEntry, package: &BlockPackage) -> Result<(), VerifyError> {
+/// The signature *status* is the adapter's statement and says nothing about
+/// *who*: the [`BlockSource`] adapter has no idea what your organization's
+/// publishers are ([ADR
+/// 0011](https://github.com/Keep-Shipping/harness/blob/main/docs/adr/0011-block-distribution.md)),
+/// so it reports signed-or-unsigned and no more. The identity therefore arrives
+/// separately, from [`Signer::verify`](ks_core::ports::supply_chain::Signer::verify)
+/// on the supply-chain port, and is a parameter here rather than a field on
+/// [`BlockPackage`]: a package is what the adapter hands over, and folding an
+/// organization's allowlist into that struct would let the thing being checked
+/// declare its own verdict.
+///
+/// Every rule fails closed, and the identity rule is the one that matters most —
+/// a compromised publisher's block clears the digest and the signature just as
+/// cleanly as an honest one, and only the baseline tells the two apart.
+///
+/// Returns the identity the block was accepted under, so a caller records who
+/// published what it is about to run. No caller does that yet — the gate is
+/// defined and tested, and a run reaches it when block resolution lands.
+pub fn verify(
+    entry: &LockEntry,
+    package: &BlockPackage,
+    signer: Option<&SignerIdentity>,
+    baseline: &Baseline,
+) -> Result<SignerIdentity, VerifyError> {
     if package.digest != entry.digest {
         return Err(VerifyError::DigestMismatch {
             reference: entry.to_string(),
@@ -143,7 +169,8 @@ pub fn verify(entry: &LockEntry, package: &BlockPackage) -> Result<(), VerifyErr
             digest: entry.digest.clone(),
         });
     }
-    Ok(())
+    ks_core::block_trust::verify(signer, baseline)
+        .map_err(|reason| VerifyError::Untrusted { reference: entry.to_string(), reason })
 }
 
 /// Why [`update`] could not write a lock.
@@ -236,6 +263,17 @@ pub enum VerifyError {
         /// The digest that is unsigned.
         digest: Digest,
     },
+    /// The content is signed, but by an identity the baseline does not list.
+    /// Signatures from *anybody* satisfy the rule above, so this is the refusal
+    /// that keeps a compromised publisher's block from being used
+    /// ([#125](https://github.com/Keep-Shipping/harness/issues/125)).
+    Untrusted {
+        /// The reference it was fetched for, as written.
+        reference: String,
+        /// Why the organization does not trust it, as
+        /// [`ks_core::block_trust`] words it.
+        reason: Untrusted,
+    },
 }
 
 impl fmt::Display for VerifyError {
@@ -251,6 +289,9 @@ impl fmt::Display for VerifyError {
                 "{reference} at {digest} carries no verified signature, and an unsigned block is \
                  not used"
             ),
+            VerifyError::Untrusted { reference, reason } => {
+                write!(f, "{reference} is not used: {reason}")
+            }
         }
     }
 }

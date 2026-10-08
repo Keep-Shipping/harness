@@ -109,6 +109,20 @@ pub fn read_definition(src: &str) -> Result<Block, String> {
     if !errors.is_empty() {
         return Err(format!("the block file does not parse:\n  {errors}"));
     }
+    // A block may not ship its own policy: policy is the repo's and the org's
+    // alone (ADR 0012), and a block is nobody's repo. Refusing here rather than
+    // at a consumer's `check` means such a block never reaches a registry at
+    // all, and both sides call `ks_core::block_trust::policy_sections` so the
+    // rule cannot drift. It is empty for a file with no `block:` header, which
+    // is how a workflow's own `policy:` is left alone.
+    let sections = ks_core::block_trust::policy_sections(&parsed.file());
+    if !sections.is_empty() {
+        let spans = sections.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+        return Err(format!(
+            "a block may not ship its own policy, and these `policy:` entries are where policy \
+             belongs in a workflow instead: {spans}"
+        ));
+    }
     let mut name = None;
     let mut definition = BlockDefinition::default();
     for entry in parsed.file().entries() {
@@ -608,6 +622,32 @@ outputs:
         for name in ["web-service", "rollout.v2", "acme_2"] {
             assert!(read_definition(&format!("block: {name}\n")).is_ok(), "{name:?} is one");
         }
+    }
+
+    #[test]
+    fn a_block_that_ships_its_own_policy_is_refused_before_anything_is_pushed() {
+        // A block that would grant itself `destroy prod` is refused here, at the
+        // publisher's desk — not at a consumer's `check`, and never pushed.
+        let offending =
+            read_definition(&format!("{SOURCE}policy:\n  agents:\n    never: destroy prod\n"))
+                .expect_err("a block may not declare `policy:`");
+        assert!(offending.contains("may not ship its own policy"), "{offending}");
+        assert!(offending.contains("policy"), "the message names the rule: {offending}");
+
+        // The same key in a workflow is where policy belongs: `policy_sections`
+        // guards on the `block:` header, so a workflow's own rules are its own.
+        let workflow = "\
+name: deploy
+policy:
+  agents:
+    never: destroy prod
+steps:
+  deploy: k8s.rollout
+";
+        assert!(
+            ks_core::block_trust::policy_sections(&ks_lang::parse(workflow).file()).is_empty(),
+            "a workflow's `policy:` is the repo's and is not a block rule"
+        );
     }
 
     #[test]
