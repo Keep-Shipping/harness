@@ -94,16 +94,72 @@ impl Journal {
         self.emit(e).await
     }
 
+    /// Records that the team said no, and why. The code an agent branches on is not in the log: it
+    /// is what the caller does with the [`Reason`](crate::denial::Reason) it gets back
+    /// ([#99](https://github.com/Keep-Shipping/harness/issues/99)).
     pub async fn approval_denied(
         &self,
         step: &str,
         approver: &str,
         channel: &str,
         artifacts: Vec<String>,
+        reason: &str,
     ) -> Result<(), RunLogError> {
         let e = RunEvent::ApprovalDenied {
             step: step.into(),
             approver: approver.into(),
+            channel: channel.into(),
+            artifacts,
+            reason: reason.into(),
+        };
+        self.emit(e).await
+    }
+
+    /// Records that nobody answered before the deadline: an ending like a denial, with no approver,
+    /// because no person decided anything ([#99](https://github.com/Keep-Shipping/harness/issues/99)).
+    pub async fn approval_expired(
+        &self,
+        step: &str,
+        channel: &str,
+        artifacts: Vec<String>,
+    ) -> Result<(), RunLogError> {
+        let e = RunEvent::ApprovalExpired { step: step.into(), channel: channel.into(), artifacts };
+        self.emit(e).await
+    }
+
+    /// Records that the proposer called the parked run off. Distinct from the denial above because
+    /// nobody refused anything, and a log that said otherwise would blame a teammate
+    /// ([#99](https://github.com/Keep-Shipping/harness/issues/99)).
+    pub async fn approval_aborted(
+        &self,
+        step: &str,
+        proposer: &str,
+        channel: &str,
+        artifacts: Vec<String>,
+    ) -> Result<(), RunLogError> {
+        let e = RunEvent::ApprovalAborted {
+            step: step.into(),
+            proposer: proposer.into(),
+            channel: channel.into(),
+            artifacts,
+        };
+        self.emit(e).await
+    }
+
+    /// Records that an answer arrived which the request does not accept — the approver proposed the
+    /// run, was not a person, was not on the team, or the verdict was bound to other artifacts. A
+    /// distinct event from the denials above because nobody refused anything, so there is no
+    /// approver to name ([#99](https://github.com/Keep-Shipping/harness/issues/99)).
+    pub async fn approval_rejected(
+        &self,
+        step: &str,
+        detail: &str,
+        channel: &str,
+        artifacts: Vec<String>,
+    ) -> Result<(), RunLogError> {
+        let e = RunEvent::ApprovalRejected {
+            step: step.into(),
+            detail: detail.into(),
             channel: channel.into(),
             artifacts,
         };

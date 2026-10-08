@@ -222,10 +222,33 @@ fn event_fields(event: &RunEvent) -> Result<Map<String, Value>, RunLogError> {
             put("channel", text(channel));
             put("artifacts", strings(artifacts));
         }
-        RunEvent::ApprovalGranted { step, approver, channel, artifacts }
-        | RunEvent::ApprovalDenied { step, approver, channel, artifacts } => {
+        RunEvent::ApprovalGranted { step, approver, channel, artifacts } => {
             put("step", text(step));
             put("approver", text(approver));
+            put("channel", text(channel));
+            put("artifacts", strings(artifacts));
+        }
+        RunEvent::ApprovalDenied { step, approver, channel, artifacts, reason } => {
+            put("step", text(step));
+            put("approver", text(approver));
+            put("channel", text(channel));
+            put("artifacts", strings(artifacts));
+            put("reason", text(reason));
+        }
+        RunEvent::ApprovalExpired { step, channel, artifacts } => {
+            put("step", text(step));
+            put("channel", text(channel));
+            put("artifacts", strings(artifacts));
+        }
+        RunEvent::ApprovalAborted { step, proposer, channel, artifacts } => {
+            put("step", text(step));
+            put("proposer", text(proposer));
+            put("channel", text(channel));
+            put("artifacts", strings(artifacts));
+        }
+        RunEvent::ApprovalRejected { step, detail, channel, artifacts } => {
+            put("step", text(step));
+            put("detail", text(detail));
             put("channel", text(channel));
             put("artifacts", strings(artifacts));
         }
@@ -430,6 +453,30 @@ mod tests {
                 channel: "github".into(),
                 artifacts: vec!["sha256:bb".into()],
             },
+            RunEvent::ApprovalDenied {
+                step: "deploy".into(),
+                approver: "grace".into(),
+                channel: "github".into(),
+                artifacts: vec!["sha256:bb".into()],
+                reason: "denied by grace: not today".into(),
+            },
+            RunEvent::ApprovalExpired {
+                step: "deploy".into(),
+                channel: "github".into(),
+                artifacts: vec!["sha256:bb".into()],
+            },
+            RunEvent::ApprovalAborted {
+                step: "deploy".into(),
+                proposer: "agent-runtime".into(),
+                channel: "github".into(),
+                artifacts: vec!["sha256:bb".into()],
+            },
+            RunEvent::ApprovalRejected {
+                step: "deploy".into(),
+                detail: "mallory is not a member of @platform".into(),
+                channel: "github".into(),
+                artifacts: vec!["sha256:bb".into()],
+            },
             RunEvent::RunFinished { status: "shipped".into(), shipped: vec!["sha256:cc".into()] },
         ]
     }
@@ -470,7 +517,7 @@ mod tests {
         let (log, run) = log("golden");
         append_all(&log, &run);
         let actual = written(&log, &run);
-        assert_eq!(verify(&actual).expect("chain intact"), 5);
+        assert_eq!(verify(&actual).expect("chain intact"), 9);
 
         let golden =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/run-log/golden.jsonl");
@@ -505,7 +552,7 @@ mod tests {
 
         let text =
             std::fs::read_to_string(JsonlRunLog::path_for(&dir, &run)).expect("the run's log");
-        assert_eq!(verify(&text).expect("chain intact"), 6);
+        assert_eq!(verify(&text).expect("chain intact"), 10);
     }
 
     /// A secret is scrubbed by the journal before the append, so the bytes on disk cannot carry
@@ -523,11 +570,18 @@ mod tests {
         // A plan.stale stop, whose digests are strings like any other and so are scrubbed too.
         block_on(journal.plan_stale(SECRET, "state", SECRET, Some(SECRET), Some(true)))
             .expect("append");
+        block_on(journal.approval_denied("deploy", SECRET, SECRET, vec![SECRET.into()], SECRET))
+            .expect("append");
+        block_on(journal.approval_expired("deploy", SECRET, vec![SECRET.into()])).expect("append");
+        block_on(journal.approval_aborted("deploy", SECRET, SECRET, vec![SECRET.into()]))
+            .expect("append");
+        block_on(journal.approval_rejected("deploy", SECRET, SECRET, vec![SECRET.into()]))
+            .expect("append");
 
         let bytes = std::fs::read_to_string(path).expect("the run's log");
         assert!(!bytes.contains(SECRET), "a secret reached the log bytes: {bytes}");
         assert!(bytes.contains("***"), "it was redacted, not dropped: {bytes}");
-        assert_eq!(verify(&bytes).expect("chain intact"), 3);
+        assert_eq!(verify(&bytes).expect("chain intact"), 7);
     }
 
     /// Every event a run can emit has a wire form, and `plan.stale` is one of them — the guard

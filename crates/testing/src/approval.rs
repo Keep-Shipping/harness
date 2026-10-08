@@ -48,11 +48,13 @@ struct State {
 }
 
 /// The directory fake's mutable state: team handle -> roster, in insertion
-/// order (`with_member` sorts on read instead).
+/// order (`with_member` sorts on read instead), and the answer every lookup
+/// gives back once the backend is scripted as down.
 #[derive(Default)]
 struct Roster {
     teams: BTreeMap<String, Vec<Identity>>,
     calls: usize,
+    error: Option<DirectoryError>,
 }
 
 /// An [`ApprovalChannel`] you script per test — the stand-in for the real
@@ -133,6 +135,25 @@ impl FakeApprovalChannel {
             Outcome::Approved,
             request.artifacts.clone(),
         );
+        self.state.lock().expect("fake approval state").queue.push_back(verdict);
+    }
+
+    /// Scripts a refusal by `approver`, bound to exactly `request`'s artifacts — the counterpart
+    /// to [`approving`](FakeApprovalChannel::approving). `comment` is the approver's own words
+    /// when they left any and `None` when they did not, which is a real shape: plenty of people
+    /// press "no" without typing a reason, and the engine has to report that too
+    /// ([#99](https://github.com/Keep-Shipping/harness/issues/99)).
+    pub fn refusing(&self, approver: Identity, request: &ApprovalRequest, comment: Option<&str>) {
+        let verdict = Verdict::new(
+            approver,
+            SystemTime::UNIX_EPOCH,
+            Outcome::Refused,
+            request.artifacts.clone(),
+        );
+        let verdict = match comment {
+            Some(comment) => verdict.with_comment(comment),
+            None => verdict,
+        };
         self.state.lock().expect("fake approval state").queue.push_back(verdict);
     }
 
@@ -266,6 +287,15 @@ impl FakeDirectory {
         FakeDirectory::default()
     }
 
+    /// A roster whose backend answers `error` to every lookup — the shape of a
+    /// directory that is unreachable, which is *not* an answer of "nobody is on
+    /// this team" and must never be mistaken for one
+    /// ([#99](https://github.com/Keep-Shipping/harness/issues/99)).
+    pub fn failing(self, error: DirectoryError) -> FakeDirectory {
+        self.state.lock().expect("fake roster").error = Some(error);
+        self
+    }
+
     /// Adds one member to a team; repeatable, and the same identity added
     /// twice is one member.
     pub fn with_member(self, team: &Team, identity: Identity) -> FakeDirectory {
@@ -300,13 +330,18 @@ impl Directory for FakeDirectory {
         &'a self,
         team: &'a Team,
     ) -> BoxFuture<'a, Result<Vec<Identity>, DirectoryError>> {
-        // An unknown team has no members; that is an answer, not a failure.
+        // An unknown team has no members; that is an answer, not a failure —
+        // unless the backend itself is down, which outranks every answer.
         let result = {
             let mut state = self.state.lock().expect("fake roster");
             state.calls += 1;
-            let mut members = state.teams.get(team.handle()).cloned().unwrap_or_default();
-            members.sort_by(|left, right| left.handle.cmp(&right.handle));
-            Ok(members)
+            if let Some(error) = &state.error {
+                Err(error.clone())
+            } else {
+                let mut members = state.teams.get(team.handle()).cloned().unwrap_or_default();
+                members.sort_by(|left, right| left.handle.cmp(&right.handle));
+                Ok(members)
+            }
         };
         Box::pin(std::future::ready(result))
     }
@@ -319,7 +354,13 @@ impl Directory for FakeDirectory {
         let result = {
             let mut state = self.state.lock().expect("fake roster");
             state.calls += 1;
-            Ok(state.teams.get(team.handle()).is_some_and(|members| members.contains(identity)))
+            // A roster that will not answer must not answer `false`: the engine
+            // treats `false` as a decision about a person, and an outage is not.
+            if let Some(error) = &state.error {
+                Err(error.clone())
+            } else {
+                Ok(state.teams.get(team.handle()).is_some_and(|members| members.contains(identity)))
+            }
         };
         Box::pin(std::future::ready(result))
     }

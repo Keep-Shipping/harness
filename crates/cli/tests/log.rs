@@ -61,6 +61,10 @@ fn a_run_prints_one_line_per_event() {
 22:13:20  step.started  step=build
 22:13:20  step.finished  duration_ms=1.2s  ok=true  outputs=digest  step=build
 22:13:20  approval.requested  artifacts=sha256:bb  channel=github  step=deploy
+22:13:20  approval.denied  approver=grace  artifacts=sha256:bb  channel=github  reason=denied by grace: not today  step=deploy
+22:13:20  approval.expired  artifacts=sha256:bb  channel=github  step=deploy
+22:13:20  approval.aborted  artifacts=sha256:bb  channel=github  proposer=agent-runtime  step=deploy
+22:13:20  approval.rejected  artifacts=sha256:bb  channel=github  detail=mallory is not a member of @platform  step=deploy
 22:13:20  run.finished  shipped=sha256:cc  status=shipped
 "
     );
@@ -93,7 +97,7 @@ fn verify_passes_on_an_untouched_log() {
     let (code, stdout, stderr) = keepshipping(&dir, &["verify", RUN]);
     assert_eq!(code, 0, "{stderr}");
     assert!(stderr.is_empty(), "{stderr}");
-    assert_eq!(stdout, "ok: 5 entries, chain intact\n");
+    assert_eq!(stdout, "ok: 9 entries, chain intact\n");
 }
 
 /// The acceptance criterion: change one field of one line and `verify` fails, naming that line.
