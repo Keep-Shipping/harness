@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use ks_core::ports::BoxFuture;
 use ks_core::ports::cluster::{
-    AuthMethod, Cluster, ClusterError, ClusterRef, Manifest, Revision, Rollout,
+    AuthMethod, ChartUpgrade, Cluster, ClusterError, ClusterRef, Manifest, Revision, Rollout,
 };
 use ks_core::ports::health::{Health, HealthReport};
 
@@ -30,16 +30,22 @@ const NOTHING_TO_REPORT: &str = "the fake has no observation for this workload";
 /// One call a test can observe on the [`FakeCluster`], oldest first via
 /// [`FakeCluster::calls`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+// `Upgrade` holds a whole `ChartUpgrade` where the other variants hold a name
+// and a revision. Boxing it would make a test assert through a pointer for no
+// gain: the vector is per-test and short-lived, and the sizes that would be
+// saved are the ones a fake records, not the ones a deploy spends.
+#[allow(clippy::large_enum_variant)]
 pub enum ClusterCall {
     /// [`Cluster::apply`] was given these manifest names, in the order given.
     Apply {
         /// The manifest names passed to `apply`.
         names: Vec<String>,
     },
-    /// [`Cluster::upgrade`] upgraded this release.
+    /// [`Cluster::upgrade`] was given this request — the chart, values and
+    /// overrides the release was installed or upgraded from.
     Upgrade {
-        /// The release that was upgraded.
-        release: String,
+        /// The whole request, exactly as it was handed to `upgrade`.
+        request: ChartUpgrade,
     },
     /// [`Cluster::rollout`] read this workload's rollout.
     Rollout {
@@ -329,13 +335,16 @@ impl Cluster for FakeCluster {
         Box::pin(std::future::ready(result))
     }
 
-    fn upgrade<'a>(&'a self, release: &'a str) -> BoxFuture<'a, Result<Rollout, ClusterError>> {
+    fn upgrade<'a>(
+        &'a self,
+        request: &'a ChartUpgrade,
+    ) -> BoxFuture<'a, Result<Rollout, ClusterError>> {
         let result = {
             let mut state = self.state.lock().expect("fake cluster state");
-            state.calls.push(ClusterCall::Upgrade { release: release.to_string() });
+            state.calls.push(ClusterCall::Upgrade { request: request.clone() });
             match state.upgrade_error.clone() {
                 Some(error) => Err(error),
-                None => Ok(self.releases.get(release).cloned().unwrap_or_else(|| {
+                None => Ok(self.releases.get(request.release()).cloned().unwrap_or_else(|| {
                     Rollout::new(FakeCluster::latest_revision(&state), Health::Progressing)
                 })),
             }
@@ -513,6 +522,8 @@ pub async fn conformance(cluster: &dyn Cluster, name: &str, manifest: &Manifest)
 mod tests {
     use super::*;
     use crate::block_on;
+    use ks_core::ports::cluster::{Chart, ImagePin, Values};
+    use ks_core::ports::supply_chain::ImageRef;
 
     fn manifest() -> Manifest {
         Manifest::new("Deployment/api", b"kind: Deployment").expect("non-empty manifest")
@@ -524,6 +535,31 @@ mod tests {
             Health::Progressing,
             Health::Healthy,
         ])
+    }
+
+    const SHA256_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    /// The stand-in secret document, assembled from fragments so the fixture
+    /// never appears in source as one literal.
+    const SECRET_DOC: &str = concat!("dbPassword: ", "hunter2");
+
+    /// A release upgrade from an OCI chart at a digest, with values, two
+    /// `--set` overrides and a pinned image — every part of the request the
+    /// fake must record unchanged.
+    fn upgrade_request() -> ChartUpgrade {
+        let chart = Chart::oci(
+            ImageRef::parse(&format!("reg.example.com/team/chart@sha256:{SHA256_HEX}"))
+                .expect("a digest reference"),
+        )
+        .expect("a digest chart");
+        let image =
+            ImageRef::parse(&format!("reg.example.com/team/api@sha256:{SHA256_HEX}")).expect("pin");
+        ChartUpgrade::new("api", chart)
+            .expect("named release")
+            .with_namespace("production")
+            .with_values(Values::secret(SECRET_DOC))
+            .with_set("ingress.host", "api.example.com")
+            .with_image(ImagePin::new(image).expect("a digest pin"))
     }
 
     #[test]
@@ -644,16 +680,83 @@ mod tests {
         let second = block_on(cluster.apply(&[manifest()])).expect("the second apply");
         assert_eq!(first, second);
 
-        let rollout = block_on(cluster.upgrade("api")).expect("the release upgrades");
+        let request = ChartUpgrade::new("api", Chart::path("./charts/api").expect("a path"))
+            .expect("named release");
+        let rollout = block_on(cluster.upgrade(&request)).expect("the release upgrades");
         assert_eq!(rollout.revision(), Revision::new(7));
         assert_eq!(rollout.state(), Health::Progressing);
 
+        let missing = ChartUpgrade::new("missing", Chart::path("./charts/api").expect("a path"))
+            .expect("named release");
         let failed = FakeCluster::new()
             .with_upgrade_error(ClusterError::Upgrade { message: "chart not found".to_string() });
         assert!(matches!(
-            block_on(failed.upgrade("missing")),
+            block_on(failed.upgrade(&missing)),
             Err(ClusterError::Upgrade { message }) if message == "chart not found"
         ));
+    }
+
+    #[test]
+    fn an_upgrade_records_the_exact_request_it_was_given() {
+        let cluster = FakeCluster::new();
+        let request = upgrade_request();
+        let rollout = block_on(cluster.upgrade(&request)).expect("the release installs");
+        assert_eq!(rollout.revision(), Revision::new(FIRST_REVISION));
+        assert_eq!(rollout.state(), Health::Progressing);
+
+        assert_eq!(
+            cluster.calls(),
+            vec![ClusterCall::Upgrade { request: upgrade_request() }],
+            "the whole request must survive the round trip, not just the release name"
+        );
+        let ClusterCall::Upgrade { request: recorded } = &cluster.calls()[0] else {
+            panic!("expected an upgrade call");
+        };
+        assert_eq!(recorded.release(), "api");
+        assert_eq!(recorded.namespace(), Some("production"));
+        assert_eq!(
+            recorded.chart().reference().map(ImageRef::repository),
+            Some("reg.example.com/team/chart")
+        );
+        let values = recorded.values().expect("the values survive the round trip");
+        assert!(values.is_secret(), "a secret value stays flagged as one");
+        assert_eq!(values.document(), SECRET_DOC);
+        assert_eq!(recorded.set().get("ingress.host").map(String::as_str), Some("api.example.com"));
+        assert_eq!(recorded.image().map(ImagePin::key), Some("image.digest"));
+        assert_eq!(
+            recorded
+                .image()
+                .map(ImagePin::image)
+                .and_then(ImageRef::digest)
+                .map(|digest| digest.hex()),
+            Some(SHA256_HEX)
+        );
+    }
+
+    #[test]
+    fn a_recorded_call_debug_does_not_print_the_secret_values_it_carries() {
+        // `assert_eq!(cluster.calls(), …)` Debug-prints both sides on failure, so
+        // a mismatch anywhere in this crate's own tests would have put the whole
+        // secret document into a CI log.
+        let cluster = FakeCluster::new();
+        block_on(cluster.upgrade(&upgrade_request())).expect("the release installs");
+
+        let calls = format!("{:?}", cluster.calls());
+        assert!(calls.contains("Upgrade"), "the call is recorded: {calls}");
+        assert!(!calls.contains("hunter2"), "the secret leaked into the Debug output: {calls}");
+        assert!(calls.contains("redacted"), "{calls}");
+    }
+
+    #[test]
+    fn a_failed_upgrade_reports_the_scripted_error_and_no_rollout() {
+        let cluster = FakeCluster::new()
+            .with_upgrade_error(ClusterError::Upgrade { message: "chart not found".to_string() });
+        let outcome = block_on(cluster.upgrade(&upgrade_request()));
+        assert_eq!(outcome, Err(ClusterError::Upgrade { message: "chart not found".to_string() }));
+        // The call is still recorded — a failed upgrade happened, and a test
+        // must be able to see that it was the request it wrote.
+        assert_eq!(cluster.calls().len(), 1);
+        assert_eq!(cluster.calls(), vec![ClusterCall::Upgrade { request: upgrade_request() }]);
     }
 
     #[test]
@@ -699,7 +802,7 @@ mod tests {
         block_on(cluster.health("Deployment/api")).expect("a report");
         block_on(cluster.rollback("Deployment/api", Revision::new(FIRST_REVISION)))
             .expect("rollback");
-        block_on(cluster.upgrade("api")).expect("upgrade");
+        block_on(cluster.upgrade(&upgrade_request())).expect("upgrade");
         assert_eq!(
             cluster.calls(),
             vec![
@@ -709,7 +812,7 @@ mod tests {
                     name: "Deployment/api".to_string(),
                     revision: Revision::new(FIRST_REVISION),
                 },
-                ClusterCall::Upgrade { release: "api".to_string() },
+                ClusterCall::Upgrade { request: upgrade_request() },
             ]
         );
         // `handle` is a synchronous read of the adapter's identity, not a call

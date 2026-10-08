@@ -29,6 +29,41 @@ comment edits do not need any of that — the fingerprint normalises them away.
 
 Newest first, one heading per contract version, dated.
 
+## STEP_API 4
+
+- **2026-10-07** — Breaking: the [`Cluster`](https://github.com/Keep-Shipping/harness/blob/main/crates/core/src/ports/cluster.rs)
+  port's `upgrade` no longer takes a release *name*
+  ([#74](https://github.com/Keep-Shipping/harness/issues/74)). A name cannot
+  express "install this chart at this digest with these values", so the
+  signature is now `fn upgrade(&self, request: &ChartUpgrade)`, and a
+  `ChartUpgrade` carries the whole request: a `Chart` — an `ImageRef` by
+  **digest** for an OCI chart, or a directory or packaged `.tgz` for a `Path` —
+  an optional `namespace`, a `Values` document, a `--set` map, and an optional
+  `ImagePin` that writes the container image's digest into the chart's values
+  at a configurable key (`image.digest` by default).
+
+  `Values` carries the security contract, which is why it is a type rather
+  than a `String`: values built with `Values::secret` MUST be handed to the
+  chart tooling by a temporary file with `0600` permissions, deleted once the
+  call returns, and MUST NOT appear on a command line where another process
+  could read them. A `set` entry is passed as a `--set` *argument*, so it must
+  not carry a secret.
+
+  `upgrade` is also now explicitly install-or-upgrade — an adapter installs a
+  release the cluster does not have — and must roll back rather than report
+  failure when an upgrade would leave the cluster worse than it found it.
+
+  **Breaking for adapters**: every `impl Cluster` must be recompiled and its
+  `upgrade` updated to read the request off `ChartUpgrade`.
+
+- **2026-10-07** — Breaking: the "digest, never a tag" promise above is now
+  enforced rather than documented. `ImagePin::new` returns
+  `Result<Self, ClusterError>` (it was infallible) and both it and
+  `ImagePin::at` reject a tag with the new `ClusterError::NotPinned { what }`;
+  `Chart::oci(..) -> Result<Chart, ClusterError>` does the same for an OCI
+  chart. `Values` no longer derives `Debug` — its hand-written one redacts the
+  document, so an `assert_eq!` on a `ChartUpgrade` cannot print a secret.
+
 ## STEP_API 3
 
 - **2026-10-08** — Additive: the `Port` enum gained a `DecisionModel` variant

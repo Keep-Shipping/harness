@@ -11,7 +11,7 @@ each is at. Each is bumped only for a breaking change.
 | Contract | Version | What it versions | Enforced by |
 | --- | --- | --- | --- |
 | `FORMAT_VERSION` | 1 | the `ship.ks` file format | `ks_core::check`, which reads the file's `keepshipping:` header |
-| `STEP_API` | 3 | the `StepKind` trait a step implements | `HarnessBuilder::build`, which refuses a step built against another version |
+| `STEP_API` | 4 | the `StepKind` trait a step implements | `HarnessBuilder::build`, which refuses a step built against another version |
 | `SCRIPT_PROTOCOL` | 1 | the JSON-stdio protocol between the harness and a TypeScript script | declared and versioned, not yet enforced — nothing reads it at runtime yet |
 
 `FORMAT_VERSION` and `STEP_API` have a runtime gate today.
@@ -19,7 +19,7 @@ each is at. Each is bumped only for a breaking change.
 host — so a step author bumping it is making a promise this
 repository has not yet made the tooling keep.
 
-## Port contract digest: `3757dfab41d016d8`
+## Port contract digest: `4e54439ddf021455`
 
 A digest of the port traits in `crates/core/src/ports/` — the method
 signatures only, with comments and formatting normalised away. It is

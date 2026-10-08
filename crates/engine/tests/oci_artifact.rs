@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use ks_core::harness::Harness;
-use ks_core::ports::cluster::Cluster;
+use ks_core::ports::cluster::{Chart, ChartUpgrade, Cluster};
 use ks_core::ports::script_host::{Value, ValueType};
 use ks_core::ports::secrets::Redactor;
 use ks_core::ports::supply_chain::{
@@ -215,12 +215,15 @@ fn a_helm_chart_pushes_in_the_helm_oci_layout_and_the_ref_is_what_an_install_tak
     // step returned, which carries the digest, not the mutable tag.
     let release = ImageRef::parse(&reference).expect("the ref parses");
     assert_eq!(release.digest(), Some(&digest), "a release takes a pinned digest");
-    let _rollout = block_on(f.cluster.upgrade(&reference)).expect("the chart installs");
+    let request = ChartUpgrade::new("app", Chart::oci(release.clone()).expect("a pinned chart"))
+        .expect("a named release");
+    let _rollout = block_on(f.cluster.upgrade(&request)).expect("the chart installs");
     assert_eq!(
         f.cluster.calls(),
-        vec![ClusterCall::Upgrade { release: reference.clone() }],
+        vec![ClusterCall::Upgrade { request: request.clone() }],
         "the install names the repo@digest, through the Cluster port"
     );
+    assert_eq!(request.chart().reference(), Some(&release), "the chart is the pinned ref");
 
     let record = f
         .sink
