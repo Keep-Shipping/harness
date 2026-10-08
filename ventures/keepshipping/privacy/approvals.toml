@@ -1,0 +1,72 @@
+# Privacy declaration for the hosted approvals adapter.
+#
+# Read by `cratefield-module-privacy` (the upstream Cratefield crate), under the
+# convention that a module states what it holds so that access and erasure
+# requests can be answered against a declared contract rather than a discovered
+# schema. This is a declaration of FACT about the module, not configuration:
+# nothing in this repository reads this file, and the crate it is written for is
+# not a dependency here.
+#
+# The status below is the honest one: no hosted approvals SERVICE is deployed.
+# What exists is the in-process adapter ks-hosted-approvals, whose ticket store
+# is a Mutex<BTreeMap<String, Entry>> holding exactly Entry { seq, request,
+# verdict, channel }. These are the fields an Entry holds, and what a deployed
+# service holding them would owe.
+#
+# `holds` is what the ticket STORE keeps, not everything crossing the wire.
+# Per ADR 0005 a hosted service also RECEIVES the plan digest and a masked
+# PlanSummary -- counts, and each entry's kind, address, reason and path, before,
+# after, forces_replacement -- which is a real disclosure of resource addresses
+# and non-secret values, not a digest alone. A reader must not conclude from this
+# file that only hashes travel.
+#
+# A key containing a dot is QUOTED. Unquoted, TOML reads `a.b` as a dotted key
+# and builds a nested table, which is not the flat shape here. Strip the quotes
+# to recover the field name.
+#
+# Identity, for the same reason it is not a section below: the core Identity is
+# { handle, kind } with kind Human or Service -- no email, display name, avatar
+# or account id. GitHubSession is built by an unrestricted `pub fn new(login)`;
+# the documented intent that only the venture's OAuth exchange may construct one
+# is NOT enforced by any code in this repository, and no OAuth exchange exists
+# here. Slack's (team_id, user_id) are resolved to a handle at submit time and
+# only the handle is kept.
+#
+# Every file in this directory has exactly three sections: [holds], [retention]
+# and [erasure], so one small reader parses all of them.
+
+module = "approvals"
+title = "Hosted approvals"
+status = "adapter, not a deployed service"
+stores = "in-memory ticket store, per process: Entry { seq, request, verdict, channel }"
+inventory = "docs/PRIVACY.md"
+
+[holds]
+seq = "Monotonic ticket counter behind ticket ids ha-1, ha-2, ...; not a credential and free of run-controlled text"
+"request.run" = "Run id the request belongs to"
+"request.step" = "Step name awaiting a decision"
+"request.summary" = "FREE PROSE rendered for a person to read; an approver cannot judge a diff from a hash"
+"request.artifacts" = "(kind, digest) pairs; the digest is the identity an approval binds to"
+"request.from" = "The team that asked; an approval is scoped to a team"
+"request.reason" = "FREE PROSE, the proposer's case for why now"
+"request.proposed_by" = "Identity: handle plus Human or Service. No email, display name, avatar or account id"
+"verdict.approver" = "Identity of the person who answered; names who said yes"
+"verdict.at" = "SystemTime of the verdict"
+"verdict.outcome" = "Outcome::Approved or Outcome::Refused; Granted and Denied are the run-log wire names, a different vocabulary"
+"verdict.comment" = "FREE TEXT the approver wrote. The one field here most likely to contain anything personal"
+"verdict.bound_artifacts" = "The (kind, digest) pairs the verdict was bound to"
+channel = "web or slack; which front end the answer arrived through"
+"GitHubSession.login" = "NOT STORED. The GitHub login on the session; the submit handler converts it to Identity::human and drops the session, so it is held for the request only"
+"slack.team_id" = "NOT STORED. Slack's own workspace identifier; resolved to a handle at submit time and only the handle is kept"
+"slack.user_id" = "NOT STORED. Slack's own member identifier; resolved to a handle at submit time and only the handle is kept"
+
+[retention]
+state = "process lifetime"
+schedule = "none; the store is memory and has no sweep because it has nothing to sweep"
+window_setting = "none; there is no store that outlives the process to hold a window"
+
+[erasure]
+disposition = "process lifetime"
+statement = "none; there is no durable store to delete from"
+identifier = "ticket id (ha-<seq>)"
+reason = "the store is in memory and dies with the process, so there is no erasure to run; this field records that fact rather than a promise about a service that does not exist yet"
