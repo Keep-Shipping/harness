@@ -53,7 +53,10 @@ mod types;
 pub mod version;
 mod workflow;
 
-pub use auto_rule::{Decision, auto_approves, guards_destroys};
+pub use auto_rule::{
+    AUTO_VERB, Answered, Decision, DecisionSource, Facts, POLICY_AUTO, Resolution, Why,
+    auto_approves, baseline_allows_auto, guards_destroys, resolve,
+};
 pub use catalog::{Catalog, CatalogError, StepTypes, action_kind};
 pub use check::{
     CheckOptions, Checked, EnvSecrets, SecretRequirement, SecretUse, check, check_with,
