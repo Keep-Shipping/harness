@@ -1,0 +1,59 @@
+name: SDK
+
+# The SDK only moves when `sdk/ts/**` or this workflow does, so a Rust-only
+# change must not spend a Node runner's minutes.
+on:
+  pull_request:
+    paths:
+      - 'sdk/ts/**'
+      - '.github/workflows/sdk.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'sdk/ts/**'
+      - '.github/workflows/sdk.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Node strips the types in `test/*.ts` itself; it is default-on since
+  # v22.18.0, and the flag keeps an older v22 runner honest.
+  NODE_OPTIONS: --experimental-strip-types
+
+jobs:
+  sdk:
+    name: type-check, build and test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/ts
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: sdk/ts/package-lock.json
+
+      - run: npm ci
+
+      - name: Type-check src, test and examples
+        run: |
+          npm run check \
+            || { echo "::error::the SDK does not type-check. Fix: run 'npm run check' in sdk/ts locally and commit the result."; exit 1; }
+
+      - name: Build dist
+        run: |
+          npm run build \
+            || { echo "::error::the SDK does not build. Fix: run 'npm run build' in sdk/ts locally and repair what tsc reports."; exit 1; }
+
+      - name: Tests
+        run: |
+          npm test \
+            || { echo "::error::SDK tests failed. Fix: run 'npm test' in sdk/ts locally, make it pass, and commit."; exit 1; }
