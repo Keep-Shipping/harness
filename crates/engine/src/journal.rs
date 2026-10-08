@@ -157,6 +157,29 @@ impl Journal {
         self.emit(e).await
     }
 
+    /// Records that an approved plan could not be applied as approved and the run stopped to ask
+    /// again: `cause` (`"state"` or `"drift"`), the digest of the plan the approval was for, and
+    /// the digest of the fresh plan now in front of approvers with whether the two change sets
+    /// differ. `replanned` and `differs` are `None` when the run stopped before it had a fresh
+    /// plan to compare — the re-plan itself failed — so a stop is always recorded.
+    pub async fn plan_stale(
+        &self,
+        step: &str,
+        cause: &str,
+        approved: &str,
+        replanned: Option<&str>,
+        differs: Option<bool>,
+    ) -> Result<(), RunLogError> {
+        let e = RunEvent::PlanStale {
+            step: step.into(),
+            cause: cause.into(),
+            approved: approved.into(),
+            replanned: replanned.map(str::to_string),
+            differs,
+        };
+        self.emit(e).await
+    }
+
     pub async fn run_finished(
         &self,
         status: &str,

@@ -260,6 +260,15 @@ fn event_fields(event: &RunEvent) -> Result<Map<String, Value>, RunLogError> {
             put("predicate_type", text(predicate_type));
             put("attestation", text(attestation));
         }
+        RunEvent::PlanStale { step, cause, approved, replanned, differs } => {
+            put("step", text(step));
+            put("cause", text(cause));
+            put("approved", text(approved));
+            // `None` is written as JSON null, not dropped: a reader must be able to tell "the
+            // re-plan failed" from "this build does not know the field".
+            put("replanned", replanned.as_deref().map_or(Value::Null, Value::from));
+            put("differs", differs.map_or(Value::Null, Value::from));
+        }
         RunEvent::PolicyRefused { step, rule } => {
             if let Some(step) = step {
                 put("step", text(step));
@@ -503,11 +512,69 @@ mod tests {
         block_on(journal.run_started(SECRET, SECRET, SECRET, true)).expect("append");
         block_on(journal.approval_granted("deploy", SECRET, SECRET, vec![SECRET.into()]))
             .expect("append");
+        // A plan.stale stop, whose digests are strings like any other and so are scrubbed too.
+        block_on(journal.plan_stale(SECRET, "state", SECRET, Some(SECRET), Some(true)))
+            .expect("append");
 
         let bytes = std::fs::read_to_string(path).expect("the run's log");
         assert!(!bytes.contains(SECRET), "a secret reached the log bytes: {bytes}");
         assert!(bytes.contains("***"), "it was redacted, not dropped: {bytes}");
+        assert_eq!(verify(&bytes).expect("chain intact"), 3);
+    }
+
+    /// Every event a run can emit has a wire form, and `plan.stale` is one of them — the guard
+    /// fails closed when the log refuses an entry, so a stop that cannot be written is a stop.
+    /// It is checked here rather than in the golden `events()` list because that list pins the
+    /// committed fixture byte for byte.
+    #[test]
+    fn a_plan_stale_stop_has_a_wire_form() {
+        let (log, run) = log("plan-stale");
+        block_on(log.append(
+            &run,
+            RunEvent::PlanStale {
+                step: "infra.apply".into(),
+                cause: "drift".into(),
+                approved: "sha256:aa".into(),
+                replanned: Some("sha256:bb".into()),
+                differs: Some(true),
+            },
+        ))
+        .expect("append");
+        // And the stop where the re-plan itself failed: no fresh plan, so both facts are `None`.
+        block_on(log.append(
+            &run,
+            RunEvent::PlanStale {
+                step: "infra.apply".into(),
+                cause: "state".into(),
+                approved: "sha256:aa".into(),
+                replanned: None,
+                differs: None,
+            },
+        ))
+        .expect("append");
+
+        let bytes = written(&log, &run);
         assert_eq!(verify(&bytes).expect("chain intact"), 2);
+        let entries: Vec<Map<String, Value>> = bytes
+            .lines()
+            .map(|line| match serde_json::from_str(line).expect("one object") {
+                Value::Object(entry) => entry,
+                _ => panic!("an entry is an object"),
+            })
+            .collect();
+        let drift = &entries[0];
+        assert_eq!(drift["type"], Value::from("plan.stale"));
+        assert_eq!(drift["step"], Value::from("infra.apply"));
+        assert_eq!(drift["cause"], Value::from("drift"));
+        assert_eq!(drift["approved"], Value::from("sha256:aa"));
+        assert_eq!(drift["replanned"], Value::from("sha256:bb"));
+        assert_eq!(drift["differs"], Value::from(true));
+        // An absent fact is `null`, not a dropped key: a reader must be able to tell "the re-plan
+        // failed" from "this build does not know the field".
+        let failed = &entries[1];
+        assert_eq!(failed["cause"], Value::from("state"));
+        assert_eq!(failed["replanned"], Value::Null);
+        assert_eq!(failed["differs"], Value::Null);
     }
 
     /// An attestation that was attached has a wire form like any other event: the step, the image
