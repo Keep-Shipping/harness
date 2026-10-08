@@ -15,10 +15,12 @@ use std::time::{Duration, SystemTime};
 use ks_core::harness::Harness;
 use ks_core::ids::RunId;
 use ks_core::ports::BoxFuture;
+use ks_core::ports::approval::ArtifactKind;
 use ks_core::ports::iac::SavedPlan;
 use ks_core::ports::script_host::{Value, ValueType};
 use ks_core::ports::secrets::Redactor;
 use ks_core::ports::state_store::StateStore;
+use ks_core::ports::supply_chain::Digest;
 use ks_core::step::{
     ActionClass, ActionKind, CancellationToken, Field, Inputs, LogRecord, LogSink, Outputs, Port,
     Ports, StepCtx, StepError, StepKind, StepSchema, TypeRef, Version,
@@ -32,6 +34,7 @@ use ks_testing::clock::FakeClock;
 use ks_testing::iac::FakeIacTool;
 use ks_testing::secrets::FakeSecrets;
 use ks_testing::state_store::{MemoryStateStore, conformance};
+use serde_json::json;
 
 /// The `ship.ks` both jobs read — the binding the parked record carries.
 const SHIP_KS: &[u8] =
@@ -457,6 +460,260 @@ fn a_rebuilt_plan_after_the_approval_refuses_the_resume() {
     for fragment in [APPROVAL, &replanned, "nothing was deployed"] {
         assert!(message.contains(fragment), "{fragment} missing from {message}");
     }
+}
+
+/// A `sha256:` digest of 64 hex copies of `hex` — the content digest shape a
+/// step output carries.
+fn content_digest(hex: char) -> Digest {
+    Digest::sha256_from_hex(&hex.to_string().repeat(64)).expect("64 lowercase hex digits")
+}
+
+/// A run holding one artifact of each kind, parked at the approval, and then
+/// answered by `ada`: the approval binds all three at once, so a test can take
+/// one away and see what the refusal says about it.
+///
+/// The kinds are the point. `recorded_artifacts` labels an output by its key, so
+/// the plan is a `PlanFile` and the two step outputs are `Other("image")` and
+/// `Other("chart")` — which is exactly the kind of label an approval has to be
+/// bound to, since a digest that reappears under another label is a different
+/// thing wearing the same hex.
+fn answered_run() -> RunState {
+    let mut state = RunState::new(run_id(), SHIP_KS, "push");
+    state.record(CompletedStep {
+        name: PLAN_STEP.to_string(),
+        outputs: BTreeMap::from([("sha256".to_string(), sha256_hex(PLAN_BYTES))]),
+        plans: vec![PlanRef { step: PLAN_STEP.to_string(), sha256: sha256_hex(PLAN_BYTES) }],
+    });
+    state.record(CompletedStep {
+        name: "build".to_string(),
+        outputs: BTreeMap::from([
+            ("image".to_string(), content_digest('a').to_string()),
+            ("chart".to_string(), content_digest('c').to_string()),
+        ]),
+        plans: Vec::new(),
+    });
+    state.park_at(APPROVAL).expect("the run parks at the approval");
+    state.approve(APPROVAL, "ada").expect("the run is waiting on exactly this step");
+    assert_eq!(state.approvals[0].artifacts.len(), 3, "the plan and both outputs are bound");
+    state
+}
+
+#[test]
+fn a_plan_file_that_moved_after_the_approval_is_refused_and_named_as_a_plan_file() {
+    let mut state = answered_run();
+
+    // The plan step runs again for different bytes. The approval was bound to a
+    // plan file, and the run no longer holds that plan file, so the resume is
+    // refused — and the refusal has to say *plan file*, or the operator is left
+    // holding a hex string and no idea which file it belongs to.
+    let replanned = sha256_hex(b"# a different plan\n");
+    state.record(CompletedStep {
+        name: PLAN_STEP.to_string(),
+        outputs: BTreeMap::new(),
+        plans: vec![PlanRef { step: PLAN_STEP.to_string(), sha256: replanned.clone() }],
+    });
+
+    let error = state.check_bound(APPROVAL).expect_err("the plan was re-planned");
+    assert!(matches!(error, ResumeError::ArtifactsChanged { .. }), "{error:?}");
+    match &error {
+        ResumeError::ArtifactsChanged { step, artifact, using } => {
+            assert_eq!(step, APPROVAL);
+            assert_eq!(artifact.kind, ArtifactKind::PlanFile, "the kind is part of the identity");
+            // A plan is recorded as bare hex and re-read as a content digest, so
+            // the artifact carries the `sha256:` prefix the plan ref does not.
+            assert_eq!(artifact.digest.hex(), sha256_hex(PLAN_BYTES), "what was approved");
+            // What the run holds now names the replacement plan, so the
+            // refusal reads as "this became that" rather than as a bare
+            // mismatch. The original plan is not among them — a rebuild
+            // supersedes it, which is the whole reason the resume is refused.
+            let held = using.iter().map(|held| held.digest.hex().to_string()).collect::<Vec<_>>();
+            assert!(held.contains(&replanned), "{replanned} is not named in {held:?}");
+            assert!(
+                !held.contains(&sha256_hex(PLAN_BYTES).to_string()),
+                "the superseded plan is not what the run holds any more: {held:?}"
+            );
+        }
+        other => panic!("a re-planned plan must be ArtifactsChanged, got {other:?}"),
+    }
+    let message = error.to_string();
+    for fragment in [
+        APPROVAL,
+        "plan file",
+        &sha256_hex(PLAN_BYTES),
+        &replanned,
+        "nothing was deployed",
+        "ask again",
+    ] {
+        assert!(message.contains(fragment), "{fragment} missing from {message}");
+    }
+}
+
+#[test]
+fn an_image_output_that_moved_after_the_approval_is_refused_and_named_by_its_kind() {
+    let mut state = answered_run();
+
+    // The build step runs again for another image. Only the `image` output
+    // moved; the plan and the chart are still exactly what was approved, and
+    // saying so in the refusal is the point of naming the artifact rather than
+    // dumping two lists.
+    state.record(CompletedStep {
+        name: "build".to_string(),
+        outputs: BTreeMap::from([
+            ("image".to_string(), content_digest('b').to_string()),
+            ("chart".to_string(), content_digest('c').to_string()),
+        ]),
+        plans: Vec::new(),
+    });
+
+    let error = state.check_bound(APPROVAL).expect_err("the image was rebuilt");
+    match &error {
+        ResumeError::ArtifactsChanged { artifact, .. } => {
+            assert_eq!(
+                artifact.kind,
+                ArtifactKind::Other("image".to_string()),
+                "an output is named by its own key"
+            );
+            assert_eq!(artifact.digest, content_digest('a'), "the image that was approved");
+        }
+        other => panic!("a rebuilt image must be ArtifactsChanged, got {other:?}"),
+    }
+    let message = error.to_string();
+    // The artifact at fault is named as one clause — "output `image` <digest
+    // a>" — so a reader can tell it from the untouched chart the same message
+    // also lists as still held.
+    assert!(
+        message.contains(&format!("approved output `image` {}", content_digest('a'))),
+        "{message}"
+    );
+    for fragment in [&content_digest('b').to_string(), "nothing was deployed", "ask again"] {
+        assert!(message.contains(fragment), "{fragment} missing from {message}");
+    }
+}
+
+#[test]
+fn an_output_digest_that_moved_after_the_approval_is_refused_and_named_by_its_key() {
+    let mut state = answered_run();
+
+    // The same rule for the other output, so the refusal has to name the key:
+    // two artifacts of the same `Other` kind are told apart by their name, and
+    // the chart that did not move is still the chart.
+    state.record(CompletedStep {
+        name: "build".to_string(),
+        outputs: BTreeMap::from([
+            ("image".to_string(), content_digest('a').to_string()),
+            ("chart".to_string(), content_digest('d').to_string()),
+        ]),
+        plans: Vec::new(),
+    });
+
+    let error = state.check_bound(APPROVAL).expect_err("the chart was rebuilt");
+    match &error {
+        ResumeError::ArtifactsChanged { artifact, .. } => {
+            assert_eq!(artifact.kind, ArtifactKind::Other("chart".to_string()));
+            assert_eq!(artifact.digest, content_digest('c'), "the chart that was approved");
+        }
+        other => panic!("a rebuilt chart must be ArtifactsChanged, got {other:?}"),
+    }
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("approved output `chart` {}", content_digest('c'))),
+        "{message}"
+    );
+    for fragment in [&content_digest('d').to_string(), "ask again"] {
+        assert!(message.contains(fragment), "{fragment} missing from {message}");
+    }
+}
+
+#[test]
+fn the_same_digest_under_a_different_kind_is_not_what_was_approved() {
+    let state = answered_run();
+
+    // The plan's bytes come back as a step *output* instead of as a plan. The
+    // image and the chart are still held exactly as they were, so the digest
+    // the approval named is not missing at all — only its *kind* changed. The
+    // digest is byte-identical, so a check that compared digest strings alone
+    // would wave this through and apply a plan the approver was shown under a
+    // different heading. The approval was bound to a plan file; the run now
+    // holds an output, and those are not the same thing to deploy.
+    let mut next = state.clone();
+    next.completed.retain(|step| step.name == "build");
+    next.record(CompletedStep {
+        name: "stash".to_string(),
+        outputs: BTreeMap::from([(
+            "plan".to_string(),
+            format!("sha256:{}", sha256_hex(PLAN_BYTES)),
+        )]),
+        plans: Vec::new(),
+    });
+
+    let error = next.check_bound(APPROVAL).expect_err("the plan was relabelled an output");
+    match &error {
+        ResumeError::ArtifactsChanged { artifact, .. } => {
+            assert_eq!(
+                artifact.kind,
+                ArtifactKind::PlanFile,
+                "the approved side is still a plan file"
+            );
+        }
+        other => panic!("a relabelled plan must be ArtifactsChanged, got {other:?}"),
+    }
+    let message = error.to_string();
+    assert!(
+        message.contains("plan file") && message.contains("output `plan`"),
+        "the refusal must show both sides: {message}"
+    );
+    // Sanity: the run was not refused for want of an approval.
+    assert!(state.check_bound(APPROVAL).is_ok(), "the untouched run still holds what was approved");
+}
+
+#[test]
+fn a_record_whose_plan_digest_is_not_a_sha256_is_refused_as_a_corrupt_record() {
+    let run = run_id();
+    let store = MemoryStateStore::new();
+
+    // A hand-written record whose plan sha256 was truncated — by a writer that
+    // got cut off, or by something that edited the file. Decoding it would
+    // leave `recorded_artifacts` to drop the plan, quietly shrinking the set
+    // every approval is checked against: a record that has lost its binding
+    // would look like a record whose plan never changed. So it is a decode
+    // failure naming the step, not an empty artifact list.
+    let record = json!({
+        "version": 1,
+        "run": run.as_str(),
+        "file_sha256": sha256_hex(SHIP_KS),
+        "event": "push",
+        "completed": [{
+            "name": PLAN_STEP,
+            "outputs": {},
+            "plans": [{ "step": PLAN_STEP, "sha256": &"a".repeat(63) }],
+        }],
+        "approvals": [{
+            "step": APPROVAL,
+            "by": "ada",
+            "artifacts": [{ "kind": "PlanFile", "digest": format!("sha256:{}", "a".repeat(64)) }],
+        }],
+        "next": null,
+    });
+    ks_testing::block_on(store.put(&run, "state.json", &serde_json::to_vec(&record).unwrap()))
+        .expect("the corrupt record writes");
+
+    let error =
+        ks_testing::block_on(resume(&store, &run, SHIP_KS)).expect_err("a truncated digest");
+    assert!(matches!(error, ResumeError::Decode { .. }), "{error:?}");
+    let message = error.to_string();
+    for fragment in [PLAN_STEP, "not a sha256 digest", "start a new run"] {
+        assert!(message.contains(fragment), "{fragment} missing from {message}");
+    }
+
+    // The whole digest decodes, so the refusal is about this record's shape and
+    // not about the rule refusing every plan.
+    let mut good = record.clone();
+    good["completed"][0]["plans"][0]["sha256"] = json!("a".repeat(64));
+    ks_testing::block_on(store.put(&run, "state.json", &serde_json::to_vec(&good).unwrap()))
+        .expect("the whole-digest record writes");
+    let resumed =
+        ks_testing::block_on(resume(&store, &run, SHIP_KS)).expect("a whole digest decodes");
+    assert_eq!(resumed.plans_for(PLAN_STEP).len(), 1);
 }
 
 #[test]
