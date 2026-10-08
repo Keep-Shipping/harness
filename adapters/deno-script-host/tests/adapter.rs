@@ -111,7 +111,11 @@ fn the_argv_grants_only_the_sandbox_the_adapter_means_to_grant() {
 }
 
 #[test]
-fn net_is_granted_only_when_a_step_declared_it() {
+fn net_reaches_nothing_unless_the_host_allowlist_says_so() {
+    // The argv shape alone: `--allow-net` is emitted for exactly the hosts it is
+    // given, in one `=` argument, and describe carries none of it. The gate
+    // that decides which hosts those may be is `DenoScriptHost::with_net_allowlist`
+    // and is exercised below, on a host.
     let quiet = argv_of(&invocation(&[], Manifest::None, Mode::Describe));
     assert!(!quiet.iter().any(|argument| argument.contains("net")), "{quiet:?}");
     assert!(!quiet.iter().any(|argument| argument == FIFO), "describe reads no secrets");
@@ -372,6 +376,95 @@ fn a_link_out_of_the_workspace_is_denied_in_the_argv_rather_than_refused() {
     let _ = std::fs::remove_dir_all(&workspace);
     let _ = std::fs::remove_dir_all(&outside);
     let _ = std::fs::remove_dir_all(&inward);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn a_step_cannot_reach_a_host_the_operator_did_not_allow() {
+    // A step's `net` export is its own words about where it wants to go, in the
+    // same invocation that carries its secrets. With no allowlist — the default
+    // — nothing is permitted, so a declaration is refused before Deno is
+    // started rather than honoured. Offline, because `invocation` builds the
+    // argv and spawns nothing.
+    let workspace = scratch("net-refused");
+    step(&workspace);
+    let host = DenoScriptHost::new(&workspace)
+        .expect("a workspace root")
+        .with_cache_root(scratch("net-refused-cache"));
+    let error = host
+        .invocation(
+            &ScriptRef::new("step.ts"),
+            Mode::Run,
+            Some(Path::new(FIFO)),
+            &["api.example:443".to_string()],
+        )
+        .expect_err("no allowlist means no egress at all");
+    assert!(matches!(error, ScriptHostError::Protocol { .. }), "{error}");
+    let message = error.to_string();
+    assert!(message.contains("api.example:443"), "the refusal names the host: {message}");
+    // What is refused is the `run` invocation; the `describe` spawn that read
+    // the declaration has already happened, and the message says which grants
+    // that child did not get rather than claiming nothing ran at all.
+    assert!(message.contains("was never started"), "{message}");
+    assert!(message.contains("neither the secret channel"), "{message}");
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn the_allowlist_grants_a_declared_host_and_nothing_else() {
+    let workspace = scratch("net-allowlist");
+    step(&workspace);
+    let cache = || scratch("net-allowlist-cache");
+    let host = || {
+        DenoScriptHost::new(&workspace)
+            .expect("a workspace root")
+            .with_cache_root(cache())
+            .with_net_allowlist(["api.example:443"])
+    };
+    let net = |hosts: &[&str]| hosts.iter().map(|host| host.to_string()).collect::<Vec<_>>();
+
+    // The permitted half: declared *and* allowed, so it reaches the argv.
+    let granted = host()
+        .invocation(
+            &ScriptRef::new("step.ts"),
+            Mode::Run,
+            Some(Path::new(FIFO)),
+            &net(&["api.example:443"]),
+        )
+        .expect("a declared host the operator allowed");
+    let argv = argv_of(&granted);
+    assert!(argv.iter().any(|argument| argument == "--allow-net=api.example:443"), "{argv:?}");
+
+    // A non-empty allowlist is not a general permission: a different host is
+    // still refused, and naming the allowlist must not become a way around it.
+    let error = host()
+        .invocation(
+            &ScriptRef::new("step.ts"),
+            Mode::Run,
+            Some(Path::new(FIFO)),
+            &["evil.example:443".to_string()],
+        )
+        .expect_err("the allowlist permits one host, not all of them");
+    assert!(error.to_string().contains("evil.example:443"), "{error}");
+
+    // A host with a comma cannot be spelled on a comma-separated flag with no
+    // escaping, so it is refused even when it is on the allowlist: the refusal
+    // here is about the spelling, and a grant that came out as a different set
+    // of hosts than were asked for would be worse than no grant.
+    let error = DenoScriptHost::new(&workspace)
+        .expect("a workspace root")
+        .with_cache_root(cache())
+        .with_net_allowlist(["api.example:443,evil.example:443"])
+        .invocation(
+            &ScriptRef::new("step.ts"),
+            Mode::Run,
+            Some(Path::new(FIFO)),
+            &["api.example:443,evil.example:443".to_string()],
+        )
+        .expect_err("a host with a comma in it has no spelling");
+    let message = error.to_string();
+    assert!(message.contains("comma"), "{message}");
+    assert!(message.contains("was never started"), "{message}");
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
