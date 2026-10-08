@@ -7,11 +7,13 @@
 //! log that will not take an entry fails the transition rather than dropping it, because a run
 //! whose log has a hole in it is not a run you can prove anything about.
 //!
-//! [`step`](Journal::step) is the additive wrapper over [`run_step`], whose signature is untouched
-//! so callers that do not journal keep using it.
+//! [`step`](Journal::step) is the additive wrapper over [`run_step`](crate::run::run_step), whose
+//! signature is untouched so callers that do not journal keep using it. Only the journaled path
+//! knows the run id and the `ship.ks` hash, so it is the one that hands them to the step
+//! ([#114](https://github.com/Keep-Shipping/harness/issues/114)).
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ks_core::harness::Harness;
@@ -20,11 +22,11 @@ use ks_core::ports::decision_model::{Question, RedactedState};
 use ks_core::ports::run_log::{RunEvent, RunLog, RunLogError};
 use ks_core::ports::secrets::Redactor;
 use ks_core::step::{
-    CancellationToken, Inputs, LogSink, Outputs, Rollback, RollbackPolicy, StepError,
+    CancellationToken, Inputs, LogSink, Outputs, Rollback, RollbackPolicy, RunFacts, StepError,
 };
 
 use crate::credentials::StepCredentials;
-use crate::run::run_step;
+use crate::run::run_step_in;
 
 /// Writes one run's transitions to a [`RunLog`]. Holds the run's id, the log, and the redactor
 /// every event is scrubbed with — the same one the run's secrets were registered with, so no value
@@ -34,17 +36,29 @@ pub struct Journal {
     log: Arc<dyn RunLog>,
     redactor: Arc<Redactor>,
     run: RunId,
+    /// The `ship.ks` hash [`run_started`](Self::run_started) was given, kept so a step can attest
+    /// to the file this run came from: shared across clones because a `Journal` is cloned into
+    /// every gated step ([#114](https://github.com/Keep-Shipping/harness/issues/114)).
+    file_hash: Arc<Mutex<Option<String>>>,
 }
 
 impl Journal {
     /// Journals `run` into `log`, scrubbing every event through `redactor`.
     pub fn new(log: Arc<dyn RunLog>, redactor: Arc<Redactor>, run: RunId) -> Journal {
-        Journal { log, redactor, run }
+        Journal { log, redactor, run, file_hash: Arc::new(Mutex::new(None)) }
     }
 
     /// The run being journaled.
     pub fn run_id(&self) -> &RunId {
         &self.run
+    }
+
+    /// The run's facts, once [`run_started`](Self::run_started) has said what the `ship.ks` hashed
+    /// to. `None` before that — a step that needs them writes no attestation rather than a made-up
+    /// one ([#114](https://github.com/Keep-Shipping/harness/issues/114)).
+    pub(crate) fn run_facts(&self) -> Option<RunFacts> {
+        let file_sha256 = self.file_hash.lock().ok()?.clone()?;
+        Some(RunFacts { run: self.run.clone(), file_sha256 })
     }
 
     /// Scrubs `event` and appends it: the single funnel every transition below goes through, so
@@ -60,6 +74,11 @@ impl Journal {
         actor: &str,
         is_agent: bool,
     ) -> Result<(), RunLogError> {
+        // Remembered before the emit: the hash is a fact about the run, not only about this
+        // event, and a step that attests needs it whether or not the log took the entry.
+        if let Ok(mut held) = self.file_hash.lock() {
+            *held = Some(file_hash.to_string());
+        }
         let e = RunEvent::RunStarted {
             file_hash: file_hash.into(),
             event: event.into(),
@@ -338,10 +357,10 @@ impl Journal {
     /// not a property of how the step ended.
     ///
     /// Called from [`exec::execute`](crate::exec::execute), where the policy and the
-    /// [`Rollback`] it produced are in hand. `Journal` wraps [`run_step`] and never sees a
-    /// `StepRecord`, and `execute` has no production caller to take a `Journal` yet — this is the
-    /// emitter those two meet on, so the mapping is proved here rather than at a wiring point
-    /// that does not exist.
+    /// [`Rollback`] it produced are in hand. `Journal` wraps [`run_step`](crate::run::run_step) and
+    /// never sees a `StepRecord`, and `execute` has no production caller to take a `Journal` yet —
+    /// this is the emitter those two meet on, so the mapping is proved here rather than at a
+    /// wiring point that does not exist.
     pub async fn step_rolled_back(
         &self,
         step: &str,
@@ -358,12 +377,16 @@ impl Journal {
         self.emit(e).await
     }
 
-    /// Runs `name` through [`run_step`], bracketing it in `step.started` and `step.finished` — in
-    /// that order, whatever the step does. The finished event carries the *names* of the outputs,
-    /// sorted (`Outputs` is a `BTreeMap`, so its keys already are), the duration from the
+    /// Runs `name` through [`run_step`](crate::run::run_step), bracketing it in `step.started` and
+    /// `step.finished` — in that order, whatever the step does. The finished event carries the
+    /// *names* of the outputs, sorted (`Outputs` is a `BTreeMap`, so its keys already are), the
+    /// duration from the
     /// harness's [`Clock`](ks_core::ports::clock::Clock), and the error's message when it failed.
     /// Output *values* never go near the log. Fails closed: a log that refuses an entry fails the
     /// step, before it runs or after it ran, as [`StepError::Failed`], whose message names the log.
+    ///
+    /// This is the one path that knows which run it is in, so it hands the step the run's facts:
+    /// a step that attests can only do so here ([#114](https://github.com/Keep-Shipping/harness/issues/114)).
     pub async fn step(
         &self,
         harness: &Harness,
@@ -374,8 +397,16 @@ impl Journal {
     ) -> Result<Outputs, StepError> {
         self.emit(RunEvent::StepStarted { step: name.into() }).await.map_err(log_failure)?;
         let started = harness.clock().now();
-        let outcome =
-            run_step(harness, name, inputs, cancel, log, Arc::clone(&self.redactor)).await;
+        let outcome = run_step_in(
+            harness,
+            name,
+            inputs,
+            cancel,
+            log,
+            Arc::clone(&self.redactor),
+            self.run_facts(),
+        )
+        .await;
         // The Clock port guarantees time never moves backwards within a run, so this subtraction
         // cannot fail; a zero duration is the honest floor anyway.
         let elapsed = harness.clock().now().duration_since(started).unwrap_or(Duration::ZERO);

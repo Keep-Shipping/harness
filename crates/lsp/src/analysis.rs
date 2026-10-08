@@ -652,7 +652,10 @@ steps:
     fn a_partial_dotted_name_offers_that_step_outputs() {
         let src = "steps:\n  build: oci.image\n  deploy: k8s.rollout\n    image: build.";
         let (doc, at) = typing(src, "build.");
-        assert_eq!(labels(&doc, at), ["digest", "ref", "tag", "signed", "sbom", "platforms"]);
+        assert_eq!(
+            labels(&doc, at),
+            ["digest", "ref", "tag", "signed", "sbom", "provenance", "platforms"]
+        );
     }
 
     #[test]

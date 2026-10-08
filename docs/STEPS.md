@@ -66,7 +66,7 @@ Builds a container image from a Dockerfile, pushes it, and reports the digest th
 
 - Action: build
 - Requires: ImageBuilder, Registry
-- Optional: Signer
+- Optional: Signer, RunContext
 
 Inputs:
 
@@ -92,6 +92,7 @@ Outputs:
 | `tag` | oci.Tag | the reference that was pushed |
 | `signed` | bool | whether it was signed |
 | `sbom` | oci.Artifact | the SBOM artifact's digest, or empty when there is none |
+| `provenance` | oci.Artifact | the attached SLSA provenance envelope's digest, or empty when there is none |
 | `platforms` | list | the platforms the image was built for |
 
 ## `oci.verify` (v1.0.0)

@@ -109,7 +109,7 @@ impl Statement {
 }
 
 /// What the run knows about the build it is attesting to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Provenance {
     /// The step that built the image.
     pub step: String,
@@ -123,6 +123,15 @@ pub struct Provenance {
     pub file_sha256: String,
     /// The pinned builder's id, as the adapter names it.
     pub builder_id: String,
+    /// The Keep Shipping version that built this, so a verifier can tell a predicate written by
+    /// one release from one written by another.
+    pub version: String,
+    /// The build type's own parameters, resolved and *non-secret*: which base, which context,
+    /// which args, which platforms. A verifier needs these to know whether this image is what
+    /// this Dockerfile was supposed to produce; it is the caller's job to leave out anything
+    /// secret, because this module signs whatever it is handed
+    /// ([#114](https://github.com/Keep-Shipping/harness/issues/114)).
+    pub inputs: Value,
 }
 
 /// SLSA v1 provenance for an image build. `externalParameters` is whatever the
@@ -137,6 +146,7 @@ pub fn provenance(subject: Subject, build: &Provenance) -> Statement {
                 "step": build.step,
                 "shipFile": {"sha256": build.file_sha256},
                 "source": {"gitRef": build.git_ref},
+                "inputs": build.inputs,
             },
             "resolvedDependencies": [{
                 "uri": format!("git+{}", build.git_ref),
@@ -144,7 +154,7 @@ pub fn provenance(subject: Subject, build: &Provenance) -> Statement {
             }],
         },
         "runDetails": {
-            "builder": {"id": build.builder_id},
+            "builder": {"id": build.builder_id, "version": {"keepshipping": build.version}},
             "metadata": {"invocationId": build.run},
         },
     });

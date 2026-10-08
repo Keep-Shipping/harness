@@ -13,8 +13,10 @@ use std::sync::Arc;
 
 use ks_core::Catalog;
 use ks_core::harness::{Harness, HarnessBuilder};
+use ks_core::ids::RunId;
+use ks_core::ports::run_context::{Actor, ActorKind, Establishment, Event, GitInfo, Trigger};
 use ks_core::ports::script_host::Value;
-use ks_core::ports::secrets::Redactor;
+use ks_core::ports::secrets::{Redactor, SecretValue};
 use ks_core::ports::supply_chain::{
     BuildCache, Digest, ImageBuilder, ImageRef, OciLayoutContents, Reference, Registry, Signer,
 };
@@ -22,11 +24,15 @@ use ks_core::step::{
     CacheInput, Caching, CancellationToken, Inputs, LogSink, Outputs, Port, Ports, StepError,
     StepKind,
 };
+use ks_engine::attestation::{PREDICATE_TYPE_ANNOTATION, SLSA_PROVENANCE};
 use ks_engine::cache::{CacheOutcome, DirCache, cache_key, run_step_cached};
+use ks_engine::journal::Journal;
 use ks_engine::oci_image::{NAME, OciImage};
 use ks_engine::run::run_step;
 use ks_testing::block_on;
 use ks_testing::clock::FakeClock;
+use ks_testing::run_context::{FAKE_SHA, FakeRunContext};
+use ks_testing::run_log::RecordingRunLog;
 use ks_testing::step::{RecordingSink, StepCase, step_conformance};
 use ks_testing::supply_chain::{FakeImageBuilder, FakeRegistry, FakeSigner};
 
@@ -38,6 +44,10 @@ const TAG: &str = "v1.2.3";
 const SECRET: &str = "not-a-real-npm-token";
 /// The index media type a multi-platform build has to report.
 const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
+/// The run a journalled step attests under.
+const RUN: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+/// The `ship.ks` hash that run started from.
+const FILE_SHA256: &str = "cd3d0a1e5b9f8c7e6d5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a3928170";
 
 /// The composition `oci.image` needs: the built-in types its schema names, and the step itself.
 fn harness_for(ports: Ports) -> HarnessBuilder {
@@ -108,6 +118,46 @@ fn fixture_with(builder: FakeImageBuilder, signer: Option<FakeSigner>) -> Fixtur
         context: context.0.clone(),
         scratch: vec![context, cache_root],
     }
+}
+
+/// As [`fixture_with`], with a run whose identity an OIDC token vouched for: the only place a
+/// commit and a builder identity both come from ([#114](...)).
+fn fixture_ci() -> Fixture {
+    fixture_on(ci_run())
+}
+
+/// As [`fixture_ci`], with a run whose `git_ref` is empty.
+fn fixture_refless() -> Fixture {
+    fixture_on(ci_run_with_ref(""))
+}
+
+/// [`fixture_ci`] against one particular run, signed and CI-verified either way.
+fn fixture_on(run: FakeRunContext) -> Fixture {
+    let f = fixture_with(FakeImageBuilder::new(), Some(FakeSigner::keyless("iss", "sub")));
+    Fixture { harness: f.with_port(|ports| ports.with_run_context(Arc::new(run))), ..f }
+}
+
+/// A CI run on `refs/heads/main`, built under the one establishment strong enough to name.
+fn ci_run() -> FakeRunContext {
+    ci_run_with_ref("refs/heads/main")
+}
+
+/// The same run with no ref: a local checkout that never pushed anything, whose commit is real
+/// but whose `uri: "git+"` would be `git+` — so nothing may be attested to it.
+fn ci_run_with_ref(git_ref: &str) -> FakeRunContext {
+    FakeRunContext::new()
+        .with_actor(Actor {
+            kind: ActorKind::Ci,
+            established: Establishment::CiOidc {
+                issuer: "https://token.actions.githubusercontent.com".into(),
+                subject: "repo:Keep-Shipping/harness:workflow".into(),
+            },
+            display_name: "github-actions".into(),
+        })
+        .with_event(Event {
+            git: GitInfo { sha: FAKE_SHA.into(), git_ref: git_ref.into() },
+            trigger: Trigger::Push,
+        })
 }
 
 impl Fixture {
@@ -395,6 +445,84 @@ fn build_err(fixture: &Fixture, inputs: Inputs) -> Result<Outputs, StepError> {
     drive(&fixture.harness, inputs, Arc::clone(&fixture.sink) as Arc<dyn LogSink>)
 }
 
+/// Drives the step the way a run does: through the [`Journal`], which is the only path that knows
+/// the run id and the `ship.ks` hash, and hands them to the step
+/// ([#114](https://github.com/Keep-Shipping/harness/issues/114)).
+fn drive_journalled(
+    fixture: &Fixture,
+    inputs: Inputs,
+    file_hash: &str,
+) -> Result<Outputs, StepError> {
+    // As `secrets::resolve_step_secrets` does before a step is called: every resolved value is
+    // registered with the run's redactor, which is then the only evidence a step has of which of
+    // its plain-text inputs came from the resolver.
+    let mut redactor = Redactor::new();
+    if let Some(Value::Map(mounts)) = inputs.get("secrets") {
+        for value in mounts.values() {
+            if let Value::String(text) = value {
+                redactor.register(&SecretValue::new(text.clone().into_bytes()));
+            }
+        }
+    }
+    let journal = Journal::new(
+        Arc::new(RecordingRunLog::new()),
+        Arc::new(redactor),
+        RunId::parse(RUN).expect("a ULID"),
+    );
+    block_on(journal.run_started(file_hash, "push", "github-actions", false)).expect("logged");
+    block_on(journal.step(
+        &fixture.harness,
+        NAME,
+        inputs,
+        CancellationToken::new(),
+        Arc::clone(&fixture.sink) as Arc<dyn LogSink>,
+    ))
+}
+
+/// The one SLSA v1 referrer the registry holds against `digest`, and the statement its envelope
+/// carries — read the way a verifier would, so the test does not trust the encoder.
+fn provenance(registry: &FakeRegistry, digest: &Digest) -> (Digest, serde_json::Value) {
+    let referrers = block_on(registry.referrers(REPOSITORY, digest)).expect("referrers");
+    let slsa: Vec<_> = referrers
+        .iter()
+        .filter(|r| {
+            r.annotations.get(PREDICATE_TYPE_ANNOTATION).map(String::as_str)
+                == Some(SLSA_PROVENANCE)
+        })
+        .collect();
+    assert_eq!(slsa.len(), 1, "exactly one provenance referrer: {referrers:?}");
+    // The referrer is a manifest whose layer is the DSSE envelope, and this run attached one
+    // envelope only, so the stored blob that parses as one is it.
+    let envelopes: Vec<serde_json::Value> = registry
+        .stored_digests(REPOSITORY)
+        .into_iter()
+        .filter_map(|stored| block_on(registry.pull(REPOSITORY, &stored)).ok())
+        .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter(|value| value["payload"].is_string())
+        .collect();
+    let payload = envelopes[0]["payload"].as_str().expect("the payload is base64 text");
+    (slsa[0].digest.clone(), serde_json::from_slice(&decode_base64(payload)).expect("a statement"))
+}
+
+/// Standard base64, decoded — the mirror of the hand-rolled encoder in
+/// [`ks_engine::attestation`](ks_engine::attestation).
+fn decode_base64(text: &str) -> Vec<u8> {
+    let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::new();
+    let mut held = 0u32;
+    let mut bits = 0u32;
+    for byte in text.bytes() {
+        let Some(sextet) = table.iter().position(|c| *c == byte) else { break };
+        held = (held << 6) | sextet as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((held >> bits) as u8);
+        }
+    }
+    out
+}
+
 #[test]
 fn the_cache_follows_the_context_and_a_secret_never_joins_it() {
     let fixture = fixture();
@@ -466,4 +594,104 @@ fn the_catalog_entry_and_the_step_schema_are_the_same_contract() {
     let catalog = builtin.step(NAME).expect("built in");
     assert_eq!(step.inputs, catalog.inputs, "the inputs drifted");
     assert_eq!(step.outputs, catalog.outputs, "the outputs drifted");
+}
+
+/// A signed build in a run the engine knows about attaches SLSA v1 provenance saying what built
+/// it, and the predicate is a document the registry serves to anyone — so it names the resolved
+/// inputs and the secret *names*, never a secret's value
+/// ([#114](https://github.com/Keep-Shipping/harness/issues/114)).
+#[test]
+fn a_signed_build_in_a_known_run_attaches_provenance_naming_the_build() {
+    let fixture = fixture_ci();
+    let mut inputs = fixture.case_with_secret();
+    inputs.insert("sign".to_string(), Value::from(true));
+    inputs.insert("platforms".to_string(), Value::List(vec![Value::from("linux/arm64")]));
+    // An arg value is ordinary text that may *be* a secret: nothing upstream proves otherwise, so
+    // the step treats any value the redactor knows as one.
+    inputs.insert(
+        "args".to_string(),
+        Value::Map(BTreeMap::from([
+            ("NPM_TOKEN".to_string(), Value::from(SECRET)),
+            ("VERSION".to_string(), Value::from("1.2.3")),
+        ])),
+    );
+    let outputs = drive_journalled(&fixture, inputs, FILE_SHA256).expect("the step runs");
+
+    let digest = Digest::parse(text(&outputs, "digest")).expect("a canonical digest");
+    let (envelope, statement) = provenance(&fixture.registry, &digest);
+    assert_eq!(
+        text(&outputs, "provenance"),
+        envelope.to_string(),
+        "the output names the envelope the registry stored"
+    );
+
+    let predicate = &statement["predicate"];
+    let params = &predicate["buildDefinition"]["externalParameters"];
+    let details = &predicate["runDetails"];
+    assert_eq!(params["shipFile"]["sha256"], serde_json::json!(FILE_SHA256));
+    assert_eq!(params["source"]["gitRef"], "refs/heads/main");
+    assert_eq!(
+        predicate["buildDefinition"]["resolvedDependencies"][0]["digest"]["gitCommit"],
+        FAKE_SHA
+    );
+    assert_eq!(details["metadata"]["invocationId"], RUN);
+    // The identity an OIDC token vouched for, in the same `issuer#subject` a keyless signature is
+    // filed under — and no display name anywhere.
+    assert_eq!(
+        details["builder"]["id"],
+        "https://token.actions.githubusercontent.com#repo:Keep-Shipping/harness:workflow"
+    );
+    assert_eq!(details["builder"]["version"]["keepshipping"], env!("CARGO_PKG_VERSION"));
+
+    // The resolved inputs, as the build saw them: the platform list the step actually built, not
+    // the empty one the schema defaults to.
+    let inputs = &params["inputs"];
+    assert_eq!(inputs["platforms"], serde_json::json!(["linux/arm64"]));
+    assert_eq!(inputs["from"], fixture.dockerfile_text());
+    assert_eq!(inputs["push"], format!("{REPOSITORY}:{TAG}"));
+    assert_eq!(inputs["target"], serde_json::Value::Null, "an absent optional is null");
+    // The mount's *name* is recorded and its value is not: a verifier can tell a build that used
+    // a secret from one that did not, without the predicate becoming a place a secret leaks.
+    assert_eq!(inputs["secrets"], serde_json::json!(["npm"]));
+    // An arg that *is* a secret keeps its name and loses its value; one that is provably not is
+    // recorded whole, or the predicate could not tell a pinned version from an absent one.
+    assert_eq!(inputs["args"]["NPM_TOKEN"], serde_json::Value::Null, "a secret is not published");
+    assert_eq!(inputs["args"]["VERSION"], "1.2.3");
+    assert!(!statement.to_string().contains(SECRET), "a secret reached the provenance");
+}
+
+/// An attestation that names facts nobody established is worse than none, so anything the run
+/// cannot vouch for skips it and says which fact was missing
+/// ([#114](https://github.com/Keep-Shipping/harness/issues/114)).
+#[test]
+fn no_fact_is_invented_to_fill_the_predicate() {
+    let signer = Some(FakeSigner::with_key("cosign-key"));
+    for (case, fixture, journalled, missing) in [
+        ("unsigned", fixture_ci(), true, ""),
+        ("driven outside a run", fixture_ci(), false, "missing=the run's own facts"),
+        (
+            "no RunContext",
+            fixture_with(FakeImageBuilder::new(), signer),
+            true,
+            "missing=a RunContext port",
+        ),
+        ("no ref", fixture_refless(), true, "missing=the ref this run was triggered for"),
+    ] {
+        let mut inputs = fixture.case();
+        inputs.insert("sign".to_string(), Value::from(case != "unsigned"));
+        let outputs = match journalled {
+            true => drive_journalled(&fixture, inputs, FILE_SHA256).expect("the step runs"),
+            false => build(&fixture, inputs),
+        };
+        assert_eq!(text(&outputs, "provenance"), "", "{case}: no fact, no attestation");
+
+        // Nothing beside the image either, and where a fact was missing the log says which.
+        let digest = Digest::parse(text(&outputs, "digest")).expect("a canonical digest");
+        let referrers = block_on(fixture.registry.referrers(REPOSITORY, &digest)).expect("listing");
+        assert!(referrers.is_empty(), "{case}: an unattested image carries nothing: {referrers:?}");
+        if !missing.is_empty() {
+            let lines = logged(&fixture);
+            assert!(lines.iter().any(|line| line.contains(missing)), "{case}: {lines:?}");
+        }
+    }
 }

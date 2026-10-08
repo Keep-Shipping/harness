@@ -145,6 +145,7 @@ impl Catalog {
                 ("tag", named("oci.Tag")),
                 ("signed", Type::Bool),
                 ("sbom", named("oci.Artifact")),
+                ("provenance", named("oci.Artifact")),
                 ("platforms", Type::List(Box::new(Type::Any))),
             ],
             false,

@@ -76,13 +76,22 @@ there because comparing two cached builds proves nothing.
 ## Status today
 
 The attestation layout exists, and is not yet on the wire from a
-build. An in-toto v1 statement, a SLSA v1 provenance predicate and a
+production build. An in-toto v1 statement, a SLSA v1 provenance predicate and a
 DSSE envelope are built, signed and pushed against the image digest in
 `ks_engine::attestation` (#63): the envelope is an OCI artifact whose
 `subject` is the image, so `referrers` will list provenance and SBOM side
 by side. The run log has the transition for it —
-`RunEvent::AttestationAttached` and `Journal::attestation_attached` — but
-nothing emits it yet: that is the `oci.image` step and its BuildKit adapter
+`RunEvent::AttestationAttached` and `Journal::attestation_attached` — though
+nothing emits it yet. What `oci.image` does today
+([#114](https://github.com/Keep-Shipping/harness/issues/114)) is attach, after
+signing a digest: it pushes a SLSA v1 provenance statement naming the output, the
+ref and the commit that produced it as a DSSE envelope beside the image, and
+reports the envelope's digest as its `provenance` output. The attach itself is
+not journalled; the step log line is the only record of it.
+[PROVENANCE.md](PROVENANCE.md) has the field-by-field contents and the
+[SLSA v1.0 Build](https://slsa.dev/spec/v1.0/levels) assessment — **no Build
+level is claimed**, for reasons that are the same reasons below. Still missing
+is the BuildKit `ImageBuilder` adapter
 ([#59](https://github.com/Keep-Shipping/harness/issues/59),
 [ADR 0010](adr/0010-image-build-backend.md)), which also carries the `sbom`
 input the catalog now declares. Until the real `Signer` and `ImageBuilder`
@@ -92,9 +101,10 @@ is honest about not being cryptography.
 
 | Claim | Status |
 |---|---|
-| `oci.image` sets these knobs by default (`SOURCE_DATE_EPOCH` from the commit time, `rewrite-timestamp=true`, one pinned builder) | Planned — lands with the `oci.image` step and [ADR 0010](adr/0010-image-build-backend.md). No builder adapter exists yet: `builtin_steps()` returns no step kinds and [STEPS.md](STEPS.md) says so. |
+| `oci.image` sets these knobs by default (`SOURCE_DATE_EPOCH` from the commit time, `rewrite-timestamp=true`, one pinned builder) | Planned — lands with the builder adapter and [ADR 0010](adr/0010-image-build-backend.md). `oci.image` is a built-in step, but no real `ImageBuilder` adapter exists yet — `builtin_steps()` registers the step kind and every build in the tree goes through `ks-testing`'s `FakeImageBuilder` ([STEPS.md](STEPS.md)). |
 | `reproducible: strict` — fail the run when a CI rebuild of the same commit yields a different digest | Planned, off by default. Needs the adapter before it can mean anything. |
 | The run log records whether a digest was rebuilt or reused | Planned — depends on the run log ([#46](https://github.com/Keep-Shipping/harness/issues/46)) |
+| The pushed image carries a provenance statement | Partly — `oci.image` builds a SLSA v1 statement and attaches it beside the digest ([PROVENANCE.md](PROVENANCE.md)). No SLSA Build level is claimed; the tests reach it only through `ks-testing`'s fakes. |
 | Cross-OS CI comparison of digests from one commit | Planned — needs a builder on both hosts, which [ADR 0010](adr/0010-image-build-backend.md) is still waiting to be accepted |
 
 ## Checking a Dockerfile today
