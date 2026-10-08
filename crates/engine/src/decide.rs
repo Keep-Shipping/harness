@@ -17,12 +17,21 @@
 //! the evidence. So `reason` is a pure function of the answer, the confidence
 //! and the plan's own risky entries — `high 0.91 replaces
 //! aws_db_instance.main` — and a model that returned a different string for it
-//! would be ignored. Only plan changes are summarised into a state so far
+//! would be ignored.
+//!
+//! **A state carrying an instruction-shaped glyph is escalated, not asked
+//! about.** Redaction masks secrets; it does not promise the rest is data, so
+//! a rendered state that still bears a bidi override or a zero-width space
+//! means the renderer let something through (#120). The model is never shown
+//! one, because an answer read off it is not an answer about the plan.
+//!
+//! Only plan changes are summarised into a state so far
 //! (#107), and the step is registered behind the `decide` cargo feature until
 //! the Jev adapter lands (#8) and its confidence is calibrated (#108).
 
 use std::collections::BTreeMap;
 
+use ks_core::decision_guard;
 use ks_core::plan_summary::{Kind, Limits, PlanChange, PlanSummary, Target, summarize};
 use ks_core::ports::BoxFuture;
 use ks_core::ports::decision_model::{
@@ -123,6 +132,31 @@ impl StepKind for Decide {
             check_pinned(&profile, model, wanted)?;
 
             let state = RedactedState::summarise(&summary, Target::Plain, &Limits::default());
+            // Redaction masks the values the plan marks secret; it does not
+            // promise the rest is data. A glyph that survived rendering — a
+            // bidi override, a zero-width space — can still reorder or hide
+            // what the model reads, so a state carrying one means the renderer
+            // let something through. An answer read off that state is not an
+            // answer about the plan, so the model is never asked (#120). Checked
+            // on the whole state, before `fit`: truncation cutting the glyph
+            // away is not a fix, it is a plan where the evidence depends on how
+            // long it happened to be.
+            // The state quotes every plan string (#107), which escapes some of
+            // these glyphs into visible `\u` sequences, so the plan's own text is
+            // checked as well: a plan that carries one is not sent, escaped or not.
+            let plain = summary.render(Target::Plain, &Limits::default());
+            if let Some(defect) = decision_guard::first_defect(state.as_str())
+                .or_else(|| decision_guard::first_defect(&plain))
+            {
+                let what = defect.describe();
+                ctx.log().info(
+                    "plan text carries a glyph that can hide an instruction, escalating",
+                    &[("glyph", &what)],
+                );
+                return Ok(escalated(&format!(
+                    "the plan's text carries {what}, so it was not sent to {model}"
+                )));
+            }
             let fit = state.fit(profile.max_state_bytes);
             // The port cannot log on an adapter's behalf, and a state trimmed
             // with nothing in the log is the worst failure mode a decision
