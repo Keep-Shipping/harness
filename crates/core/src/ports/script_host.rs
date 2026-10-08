@@ -145,6 +145,41 @@ impl fmt::Display for ValueType {
     }
 }
 
+impl fmt::Display for Value {
+    /// The value as JSON — the form it crossed the port in, and the form a run
+    /// log shows. A string is quoted, as JSON writes it, so a run log never
+    /// reads as though a value ended early.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Null => f.write_str("null"),
+            Value::Bool(true) => f.write_str("true"),
+            Value::Bool(false) => f.write_str("false"),
+            Value::Number(n) => write!(f, "{n}"),
+            Value::String(s) => write!(f, "{s:?}"),
+            Value::List(items) => {
+                f.write_str("[")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                f.write_str("]")
+            }
+            Value::Map(entries) => {
+                f.write_str("{")?;
+                for (i, (key, value)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{key:?}: {value}")?;
+                }
+                f.write_str("}")
+            }
+        }
+    }
+}
+
 /// The values handed to or returned by a script, keyed by field name
 /// (iterates sorted, so runs are reproducible in the log).
 pub type Values = BTreeMap<String, Value>;
@@ -441,6 +476,25 @@ mod tests {
         ));
         values.remove("surprise");
         assert_eq!(schema.validate_outputs(&values), Ok(()));
+    }
+
+    #[test]
+    fn values_display_as_the_json_they_crossed_the_port_as() {
+        assert_eq!(Value::Null.to_string(), "null");
+        assert_eq!(Value::from(true).to_string(), "true");
+        assert_eq!(Value::from(3.0).to_string(), "3");
+        assert_eq!(Value::from(1.5).to_string(), "1.5");
+        assert_eq!(Value::from("hi").to_string(), "\"hi\"");
+        assert_eq!(Value::List(vec![Value::from(1.0), Value::from("a")]).to_string(), "[1, \"a\"]");
+        assert_eq!(
+            Value::Map(BTreeMap::from([
+                ("applied".to_string(), Value::from(3.0)),
+                ("db".to_string(), Value::from("local")),
+            ]))
+            .to_string(),
+            "{\"applied\": 3, \"db\": \"local\"}"
+        );
+        assert_eq!(Value::List(vec![]).to_string(), "[]");
     }
 
     #[test]

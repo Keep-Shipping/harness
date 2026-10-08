@@ -232,6 +232,22 @@ Reading `apply.digest` on a run-time-only kind is an error pointing at
 `apply.out.`. Misspelled steps, outputs, context values and enum answers get
 a did-you-mean hint.
 
+**Script steps.** A step whose kind is a relative path to a `.ts` file
+(`./ship/migrate.ts`, read against the directory holding the `ship.ks`) is a
+script step: the escape hatch for the work the language has no name for. The
+path may not reach outside that directory — a `..` component or an absolute
+path is an error (KS0101). Its inputs are unchecked for now and its outputs
+type `any`, like any unknown kind; both come from the script's own schema
+(ADR 0009).
+
+A script step's `action:` says what kind of run it is — one of `build`,
+`plan`, `apply`, `deploy`, `destroy`, `read-secrets`, `other`. It defaults to
+`other`, and declaring it is what lets an agent run one in `prod` or
+`production`: a run of either environment as an agent refuses to start when a
+script step declares no `action:` and no `approval` step comes before it.
+`action:` is reserved on script steps only; on every other kind it is an
+ordinary input.
+
 **Typed IaC outputs.** When the `tofu.plan` a `tofu.apply` applies has a
 literal `dir:`, `check` reads the `*.tf` files in that directory (no tofu, no
 network) and types `<step>.out.<name>` from what they declare, so a missing

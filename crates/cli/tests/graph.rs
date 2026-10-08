@@ -39,14 +39,17 @@ fn the_text_report_is_the_site_route() {
     let (code, stdout, stderr) = graph(HERO, &[]);
     assert_eq!(code, 0, "{stderr}");
     assert!(stderr.is_empty(), "{stderr}");
-    assert!(stdout.contains("route: push → build → plan → review → apply → deploy\n"), "{stdout}");
+    assert!(
+        stdout.contains("route: push → build → plan → review → apply → migrate → deploy\n"),
+        "{stdout}"
+    );
     assert!(stdout.ends_with("0 steps ran. Nothing was touched.\n"), "{stdout}");
     // One line per step, in sequence order, with the dependencies it waits on.
     let rows: Vec<&str> = stdout.lines().skip(2).take_while(|line| !line.is_empty()).collect();
-    assert_eq!(rows.len(), 5, "{stdout}");
-    assert!(rows[0].contains("1  build   oci.image"), "{stdout}");
+    assert_eq!(rows.len(), 6, "{stdout}");
+    assert!(rows[0].contains("1  build    oci.image"), "{stdout}");
     assert!(rows[3].contains("plan, review"), "{stdout}");
-    assert!(rows[4].contains("build, apply"), "{stdout}");
+    assert!(rows[5].contains("build, apply, migrate"), "{stdout}");
     assert!(rows.iter().all(|row| row.contains("run")), "{stdout}");
 }
 
@@ -58,7 +61,7 @@ fn dot_is_a_digraph_with_a_node_and_an_edge_per_step() {
     assert!(stdout.ends_with("}\n"), "{stdout}");
     assert!(stdout.contains("\"build\" [label=\"1 build\"];"), "{stdout}");
     assert!(stdout.contains("\"plan\" -> \"apply\";"), "{stdout}");
-    assert_eq!(stdout.lines().filter(|l| l.contains("->")).count(), 5, "{stdout}");
+    assert_eq!(stdout.lines().filter(|l| l.contains("->")).count(), 6, "{stdout}");
 }
 
 #[test]
@@ -108,8 +111,8 @@ fn the_columns_line_up() {
         }
         out
     };
-    let rows: Vec<Vec<usize>> = lines.iter().skip(1).take(6).map(|l| starts(l)).collect();
-    assert_eq!(rows.len(), 6, "{stdout}");
+    let rows: Vec<Vec<usize>> = lines.iter().skip(1).take(7).map(|l| starts(l)).collect();
+    assert_eq!(rows.len(), 7, "{stdout}");
     for (row, line) in rows.iter().zip(lines.iter().skip(1)).skip(1) {
         // Every column but the sequence numbers starts where the header's
         // does; the numbers are right-aligned under `seq`.
@@ -167,7 +170,10 @@ fn an_event_no_trigger_reaches_is_a_usage_error() {
     // An event the file does declare still plans.
     let (code, stdout, stderr) = graph(HERO, &["--event", "push main"]);
     assert_eq!(code, 0, "{stderr}");
-    assert!(stdout.contains("route: push → build → plan → review → apply → deploy\n"), "{stdout}");
+    assert!(
+        stdout.contains("route: push → build → plan → review → apply → migrate → deploy\n"),
+        "{stdout}"
+    );
 }
 
 /// A file with no `on:` has no event to lead the route: the steps are the

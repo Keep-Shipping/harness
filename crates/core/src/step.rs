@@ -252,6 +252,26 @@ impl ActionKind {
         }
     }
 
+    /// The kind named by `name`, the inverse of [`as_str`](Self::as_str):
+    /// how a site file spells one (`action: apply`). `None` for any other
+    /// word, so a checker can name the kinds it does accept.
+    pub fn parse(name: &str) -> Option<ActionKind> {
+        Some(match name {
+            "build" => ActionKind::Build,
+            "plan" => ActionKind::Plan,
+            "apply" => ActionKind::Apply,
+            "deploy" => ActionKind::Deploy,
+            "destroy" => ActionKind::Destroy,
+            "read-secrets" => ActionKind::ReadSecrets,
+            "other" => ActionKind::Other,
+            _ => return None,
+        })
+    }
+
+    /// Every kind's name, as `parse` accepts them, sorted for a hint.
+    pub const NAMES: [&'static str; 7] =
+        ["apply", "build", "deploy", "destroy", "other", "plan", "read-secrets"];
+
     /// The action a step *kind* is, from its name alone: what the checker
     /// reads before a step runs, and what a block's signature carries for
     /// the steps it hides ([#80](https://github.com/Keep-Shipping/harness/issues/80)).

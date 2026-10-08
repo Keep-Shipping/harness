@@ -32,9 +32,14 @@ mod upgrade;
 use std::io::{IsTerminal, Write as _};
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use ks_core::ports::run_context::ActorKind;
+use ks_core::ports::script_host::{ScriptHost, ScriptRef, Values};
+use ks_core::ports::secrets::SecretBundle;
+use ks_core::script_step::{is_script_kind, needing_approval, script_path};
+use ks_core::step::ActionKind;
 use ks_core::{ContextName, Step, Trigger, TriggerKind};
 // The binary shares the adapter with the OCI distribution crate's tests, which
 // link this package as a library; the module is declared once, in `lib.rs`.
@@ -43,6 +48,7 @@ use ks_cli::http_client;
 use ks_cli::test_server;
 
 use crate::args::{Command, Options, USAGE, context_of, parse_args};
+use crate::blocks::wait;
 use crate::drive::{Done, Outcome, StepRunner};
 use crate::progress::Renderer;
 
@@ -140,7 +146,6 @@ fn run(args: &[String]) -> ExitCode {
 
 /// The environment is chosen: print the run the file describes, and run it.
 fn selected(o: &Options, site: &check::Site, env: &str) -> ExitCode {
-    println!("environment: {env}");
     let workflow = &site.checked.workflow;
     let only: Vec<&str> = o.only.iter().map(String::as_str).collect();
     let skip: Vec<&str> = o.skip.iter().map(String::as_str).collect();
@@ -151,6 +156,14 @@ fn selected(o: &Options, site: &check::Site, env: &str) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // A script step that says nothing about what it does, about to change
+    // production as an agent, stops here — over the steps this run actually
+    // covers, and before a word is printed, the way the policy gate above
+    // stops.
+    if refuses_scripts(workflow, o.actor, env, &steps) {
+        return ExitCode::from(1);
+    }
+    println!("environment: {env}");
     if o.dry_run {
         // The graph and the check, and nothing else: the promise `check`
         // makes still holds, so it closes the report.
@@ -178,7 +191,7 @@ fn selected(o: &Options, site: &check::Site, env: &str) -> ExitCode {
     let outcome = drive::with_spinner(tty, &shared, |renderer| {
         drive::drive(
             &steps,
-            &mut Unbuilt,
+            &mut Steps::default(),
             approver.as_mut(),
             renderer,
             &mut || started.elapsed(),
@@ -203,16 +216,84 @@ fn stem(file: &Path) -> String {
         .unwrap_or_else(|| file.to_string_lossy().into_owned())
 }
 
-/// No step kind is executable yet: the engine's built-in steps are still
-/// empty, so a run stops on its first step and says why. That is the honest
-/// report — a run that claimed to have shipped would not have.
-struct Unbuilt;
+/// The runner the binary runs steps through. A script step goes to the
+/// [`ScriptHost`] the run was built with; every other kind stops the run and
+/// says why — the engine's built-in steps are still empty, so a run that
+/// claimed to have shipped would not have. That is the honest report.
+#[derive(Default)]
+struct Steps {
+    scripts: Option<Arc<dyn ScriptHost>>,
+}
 
-impl StepRunner for Unbuilt {
+impl Steps {
+    /// A runner that sends script steps to `host`
+    /// ([#90](https://github.com/Keep-Shipping/harness/issues/90)'s adapter).
+    // Built and tested here, but the binary has no host to hand it: the Deno
+    // adapter is #90's. Until then the run says so, which the test above pins.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn with_scripts(mut self, host: Arc<dyn ScriptHost>) -> Steps {
+        self.scripts = Some(host);
+        self
+    }
+}
+
+impl StepRunner for Steps {
     fn run(&mut self, step: &Step, _log: &mut dyn FnMut(&str)) -> Result<Done, String> {
         let kind = step.kind.as_deref().unwrap_or("steps");
-        Err(format!("`{kind}` steps are not built in yet"))
+        if !is_script_kind(kind) {
+            return Err(format!("`{kind}` steps are not built in yet"));
+        }
+        // The kind is `./ship/migrate.ts`; the script is at `ship/migrate.ts`
+        // relative to the run's workspace root.
+        let Some(path) = script_path(kind) else {
+            return Err(format!(
+                "`{kind}`: script steps need the script runtime, which is not built in yet"
+            ));
+        };
+        let Some(host) = self.scripts.as_deref() else {
+            return Err(format!(
+                "`{kind}`: script steps need the script runtime, which is not built in yet"
+            ));
+        };
+        // Inputs are passed empty: the step's schema is not read at run time
+        // yet (#88), so there is nothing to hand over and nothing to check.
+        let outputs = wait(host.run(&ScriptRef::new(path), &Values::new(), &SecretBundle::new()))
+            .map_err(|e| e.to_string())?;
+        Ok(Done::Summary(
+            outputs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "),
+        ))
     }
+}
+
+/// The script-step gate ([#89](https://github.com/Keep-Shipping/harness/issues/89)):
+/// an agent about to change production through a script step that never said
+/// what it does, with no approval before it, does not start. True when the run
+/// was refused; every offending step is named on stderr.
+fn refuses_scripts(
+    workflow: &ks_core::Workflow,
+    actor: ActorKind,
+    env: &str,
+    steps: &[&Step],
+) -> bool {
+    let running: Vec<&str> = steps.iter().map(|s| s.name.as_str()).collect();
+    let refused = needing_approval(workflow, actor, Some(env), &running);
+    if refused.is_empty() {
+        return false;
+    }
+    for step in refused {
+        let kind = step.kind.as_deref().unwrap_or("steps");
+        eprintln!(
+            "refusing to start: step `{}` runs `{kind}`, which declares no `action:`; \
+             an agent needs an `approval` step before it in {env}",
+            step.name
+        );
+    }
+    eprintln!(
+        "  hint: declare `action:` on the script step (one of {}), or put an \
+         `approval` step before it",
+        ActionKind::NAMES.join(", ")
+    );
+    true
 }
 
 /// The steps a run would take, in run order, narrowed by `--until`, `--only`
@@ -288,4 +369,51 @@ pub(crate) fn parse_event(text: &str) -> Result<Trigger, String> {
         None => return Err("empty event".into()),
     };
     Ok(Trigger { kind, glob: parts.next().map(String::from), span: Default::default() })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use ks_core::ports::script_host::{StepSchema, Value, ValueType};
+    use ks_testing::script_host::FakeScriptHost;
+
+    use super::*;
+
+    /// The one script step these tests run, checked into a step.
+    fn migrate() -> Step {
+        ks_core::check(&ks_lang::parse("steps:\n  migrate: ./ship/migrate.ts\n"))
+            .workflow
+            .step("migrate")
+            .expect("the step")
+            .clone()
+    }
+
+    #[test]
+    fn a_script_step_without_a_host_says_so_in_its_own_words() {
+        let Err(error) = Steps::default().run(&migrate(), &mut |_| {}) else {
+            panic!("no runtime yet")
+        };
+        assert_eq!(
+            error,
+            "`./ship/migrate.ts`: script steps need the script runtime, which is not built in yet"
+        );
+    }
+
+    #[test]
+    fn a_script_step_with_a_host_reports_its_outputs_as_a_summary() {
+        let host: Arc<dyn ScriptHost> = Arc::new(FakeScriptHost::new().with_script(
+            &ScriptRef::new("ship/migrate.ts"),
+            StepSchema {
+                inputs: BTreeMap::new(),
+                outputs: BTreeMap::from([("applied".to_string(), ValueType::Number)]),
+            },
+            BTreeMap::from([("applied".to_string(), Value::from(3.0))]),
+        ));
+        let mut steps = Steps::default().with_scripts(host);
+        match steps.run(&migrate(), &mut |_| {}).expect("the script runs") {
+            Done::Summary(summary) => assert_eq!(summary, "applied=3"),
+            Done::Ask(question) => panic!("a script step does not ask: {question}"),
+        }
+    }
 }
