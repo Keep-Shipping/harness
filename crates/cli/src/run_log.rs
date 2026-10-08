@@ -11,8 +11,9 @@
 //! before it: editing line 3 changes its hash, deleting it makes line 4 point at the wrong
 //! predecessor, reordering two puts each `prev` where it cannot be. [`verify`] reports the first
 //! line that does not hold — the one to look at. This is where the chain lives; nothing else
-//! restates it. What it cannot see is a truncation from the end, which leaves an intact prefix,
-//! nor a writer that recomputes the chain as it goes: both need a signature over the tip
+//! restates it. What it cannot see — a truncation from the end, which leaves an intact prefix, and
+//! a writer that recomputes the chain as it goes — needs a signature over the tip, which
+//! [`seal`](crate::seal) holds beside the log
 //! ([#112](https://github.com/Keep-Shipping/harness/issues/112)).
 //!
 //! The hash is over a canonical form with every object's keys sorted by hand: `crates/cli` does not
