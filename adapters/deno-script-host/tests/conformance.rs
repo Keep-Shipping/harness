@@ -245,16 +245,24 @@ fn a_symlink_that_stays_inside_the_workspace_still_runs() {
 }
 
 #[test]
-fn net_is_refused_unless_the_step_declared_the_host() {
+fn net_reaches_only_a_host_the_step_declared_and_the_operator_allowed() {
     if !gated() {
         return;
     }
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
     let port = listener.local_addr().expect("its address").port();
-    // Exactly one connection may arrive: the refused fetch never opens one, and
-    // Deno's refusal happens before the socket, not after it. So the thread
-    // answers once and drops the listener — anything else would hang here
-    // rather than fail the assertion.
+    // The listener exists for the permitted run, and answers the one connection
+    // that run makes — so the `pong` below is a socket a real Deno child was
+    // permitted to open, not a stubbed response.
+    //
+    // It deliberately does *not* also count connections. A watch would read
+    // stronger than it is: the refused run is stopped in `invocation()` before
+    // any child of it exists, and the third run asks for `example.invalid`,
+    // which cannot reach a loopback port whatever it is granted. So "exactly one
+    // connection" cannot fail while the two error assertions below hold, and an
+    // assertion that cannot fail is not evidence. The refusals are evidenced by
+    // what they are instead — a `Protocol` error raised where no child has been
+    // started, and a `NotCapable` from inside the one that did.
     let answer = std::thread::spawn(move || {
         let Ok((mut stream, _)) = listener.accept() else { return };
         let mut request = [0u8; 1024];
@@ -270,41 +278,188 @@ fn net_is_refused_unless_the_step_declared_the_host() {
     });
 
     let workspace = workspace("net");
-    let fetch_step = |declares: bool| {
+    // Egress has two halves — the operator's allowlist and the step's own `net`
+    // export — and the two steps below take them apart. Both *declare* the
+    // loopback, so the operator's answer to that declaration is the same for
+    // both; the difference is what the step then reaches for.
+    let fetch_step = |fetched: &str| {
         format!(
             r#"export default {{
-  inputs: {{ url: "string" }},
+  inputs: {{}},
   outputs: {{ body: "string" }},
-  net: [{}{}],
-  async run(inputs: Record<string, any>) {{
-    const response = await fetch(inputs.url as string);
+  net: ["127.0.0.1:{port}"],
+  async run() {{
+    const response = await fetch("{fetched}");
     return {{ body: await response.text() }};
   }},
 }};
-"#,
-            if declares { format!("\"127.0.0.1:{port}\"") } else { String::new() },
-            if declares { "" } else { "\"example.invalid\"" },
+"#
         )
     };
-    write(&workspace, "declared.ts", &fetch_step(true));
-    write(&workspace, "undeclared.ts", &fetch_step(false));
+    write(&workspace, "declared.ts", &fetch_step(&format!("http://127.0.0.1:{port}/")));
+    write(&workspace, "undeclared.ts", &fetch_step("http://example.invalid/"));
 
-    let host = host(&workspace);
-    let url: Values = [("url".to_string(), Value::from(format!("http://127.0.0.1:{port}/")))]
-        .into_iter()
-        .collect();
+    let run = |host: &DenoScriptHost, name: &str| {
+        block_on(host.run(&ScriptRef::new(name), &Values::new(), &SecretBundle::new(), &quiet()))
+    };
 
-    let declared =
-        block_on(host.run(&ScriptRef::new("declared.ts"), &url, &SecretBundle::new(), &quiet()))
-            .expect("a declared host is reachable");
+    // The permitted half: declared by the step and permitted by the operator.
+    let allowed = host(&workspace).with_net_allowlist([format!("127.0.0.1:{port}")]);
+    let declared = run(&allowed, "declared.ts").expect("a declared, allowed host is reachable");
     assert_eq!(declared["body"], Value::from("pong"));
 
-    let error =
-        block_on(host.run(&ScriptRef::new("undeclared.ts"), &url, &SecretBundle::new(), &quiet()))
-            .expect_err("an undeclared host is not");
+    // The refused half: the same step, the same declaration, an operator who
+    // granted no egress. The refusal is the adapter's own, and it is raised in
+    // `invocation()` — where the `run` argv is assembled and its child has not
+    // been started — which is why it is a `Protocol` error and not Deno's
+    // mid-step `NotCapable`. The step has run once by then, in `describe`, and
+    // the message says so: what is being refused is the invocation that would
+    // have carried the FIFO and the grant.
+    let error = run(&host(&workspace), "declared.ts").expect_err("a declaration is not a grant");
+    assert!(matches!(error, ScriptHostError::Protocol { .. }), "{error}");
+    let message = error.to_string();
+    assert!(message.contains(&format!("127.0.0.1:{port}")), "{message}");
+    assert!(message.contains("was never started"), "{message}");
+
+    // And the half that is Deno's: permitted and declared, but the step reaches
+    // for a host it did not declare, so the grant — which is exactly the
+    // declaration — does not cover it.
+    let error = run(&allowed, "undeclared.ts").expect_err("an undeclared host is not reachable");
+    assert!(matches!(error, ScriptHostError::ScriptFailed { .. }), "{error}");
     assert!(error.to_string().contains("NotCapable"), "{error}");
 
     let _ = answer.join();
+}
+
+// The capabilities `adapter.rs` can only assert the *absence* of a flag for:
+// subprocess, write, ffi and sys. Asserting that the adapter does not emit
+// `--allow-run` proves the adapter has not been edited to emit it; it does not
+// prove Deno refuses it. So each one is run against real Deno here, through
+// [`escape`], with no try/catch anywhere — the permission error *is* the result
+// under test, and the bootstrap turns it into a nonzero exit with the message
+// on stderr.
+#[test]
+fn a_step_cannot_start_a_subprocess_or_write_the_marker_it_was_asked_to_write() {
+    if !gated() {
+        return;
+    }
+    // The marker goes outside the workspace, where the read grant cannot reach
+    // it either: `--allow-write` is never passed, so a refusal that arrived
+    // after the process ran would still leave the file. Asserting it does not
+    // exist is what makes this a proof about the permission layer rather than
+    // about the wording of the error.
+    let outside = workspace("subprocess-outside");
+    let marker = outside.join("marker.txt");
+    // Quoted, because the marker path comes from `$TMPDIR` and an unquoted
+    // redirect through a path with a space in it fails in the shell — leaving
+    // the file unwritten and this test passing for the wrong reason. Single
+    // quotes are the shell's literal form, which is what a path wants here.
+    let (_, error) = escape(
+        "subprocess",
+        &format!(
+            r#"    const output = new Deno.Command("/bin/sh", {{
+      args: ["-c", "echo ran > '{}'"],
+    }}).outputSync();
+    return {{ ok: output.stdout.toString() }};"#,
+            marker.display()
+        ),
+    );
+    let message = error.to_string();
+    assert!(message.contains("NotCapable"), "{message}");
+    assert!(message.contains("--allow-run"), "{message}");
+    assert!(!marker.exists(), "the shell must never have run: {}", marker.display());
+}
+
+#[test]
+fn a_step_cannot_write_a_file_even_inside_its_own_workspace() {
+    if !gated() {
+        return;
+    }
+    // A relative path, resolved against the workspace the adapter set as the
+    // child's working directory: the one place a step is most likely to expect
+    // to be able to write, so the refusal is about the capability and not about
+    // where the path points.
+    let (workspace, error) = escape(
+        "write",
+        r#"    Deno.writeTextFileSync("written.txt", "no");
+    return { ok: "wrote" };"#,
+    );
+    let message = error.to_string();
+    assert!(message.contains("NotCapable"), "{message}");
+    assert!(message.contains("--allow-write"), "{message}");
+    assert!(!workspace.join("written.txt").exists(), "inside its own workspace, and absent");
+}
+
+#[test]
+fn a_step_cannot_load_a_shared_library_through_ffi() {
+    if !gated() {
+        return;
+    }
+    // A real library and a real symbol: a refusal here is Deno's permission
+    // check, not a path that does not resolve. (`f64`/`parameters` are the
+    // spellings 2.9.7 wants; `number`/`params` are `TypeError`s before the
+    // permission is ever consulted.)
+    let (_, error) = escape(
+        "ffi",
+        r#"    const lib = Deno.dlopen("/lib/x86_64-linux-gnu/libm.so.6", {
+      sin: { symbol: "sin", result: "f64", parameters: [] },
+    });
+    return { ok: String(lib.symbols.sin(0)) };"#,
+    );
+    let message = error.to_string();
+    assert!(message.contains("NotCapable"), "{message}");
+    assert!(message.contains("--allow-ffi"), "{message}");
+    assert!(message.contains("libm.so.6"), "the refusal names the library: {message}");
+}
+
+#[test]
+fn a_step_cannot_ask_the_operating_system_anything() {
+    if !gated() {
+        return;
+    }
+    // `Deno.hostname`, not `Deno.osHostname`: on 2.9.7 the latter is not a
+    // function at all, so it would have thrown a `TypeError` and proved
+    // nothing about permissions.
+    let (_, error) = escape("sys", r#"    return { ok: Deno.hostname() };"#);
+    let message = error.to_string();
+    assert!(message.contains("NotCapable"), "{message}");
+    assert!(message.contains("--allow-sys"), "{message}");
+}
+
+/// Writes `body` as the whole of a generated step's `run`, runs it, and returns
+/// the workspace and the error — after checking that the error is a script
+/// failure rather than one of the adapter's own refusals, because the difference
+/// is the whole point: a step that reaches its capability and is denied by Deno
+/// mid-run is a working sandbox, and a step the adapter never started is a
+/// different claim.
+fn escape(name: &str, body: &str) -> (PathBuf, ScriptHostError) {
+    let workspace = workspace(name);
+    write(
+        &workspace,
+        "step.ts",
+        &format!(
+            r#"export default {{
+  inputs: {{}},
+  outputs: {{ ok: "string" }},
+  async run() {{
+{body}
+  }},
+}};
+"#
+        ),
+    );
+    let error = block_on(host(&workspace).run(
+        &ScriptRef::new("step.ts"),
+        &Values::new(),
+        &SecretBundle::new(),
+        &quiet(),
+    ))
+    .expect_err("the capability is not granted");
+    assert!(
+        matches!(error, ScriptHostError::ScriptFailed { .. }),
+        "the step starts and Deno refuses it mid-run, not the adapter before it: {error}"
+    );
+    (workspace, error)
 }
 
 #[test]

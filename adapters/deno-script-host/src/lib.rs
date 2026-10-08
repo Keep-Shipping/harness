@@ -40,8 +40,18 @@
 //!   workspace an attacker can write to while a step runs is not a sandbox this
 //!   flag makes sound; the walk is a closure of the ordinary hole, not of every
 //!   way a path can be made to lie.
-//! - **Net**: `--allow-net` with exactly the hosts the step *declared* in its
-//!   default export, and nothing at all when it declared none.
+//! - **Net**: nothing at all, unless the operator says otherwise. A step
+//!   declares the hosts it wants in its own `default.net` export, and that
+//!   declaration is a *request*, not a grant: it is the untrusted code choosing
+//!   where its own sandbox is pierced, in the same invocation that hands it the
+//!   secret FIFO. So every declared host must also appear on the host's
+//!   allowlist ([`DenoScriptHost::with_net_allowlist`]) or the `run` is refused
+//!   before its child starts, and with no allowlist — the default — no step
+//!   reaches any host. Reading the declaration does mean the step has run once,
+//   in a `describe` spawn that holds neither the FIFO nor any network grant;
+//   `NET_REFUSAL_CONTEXT` is the sentence every such refusal ends on, because
+//!   "nothing ran" would be the wrong thing to tell somebody asking what a
+//!   refused step can reach.
 //! - **Dependencies**: a `deno.json`/`package.json` beside a step requires a
 //!   `deno.lock` beside it and runs `--frozen-lockfile`; with no manifest the
 //!   step runs `--no-config --no-lock --no-remote --no-npm`, so an un-locked
@@ -138,6 +148,20 @@ const STDERR_TAIL: usize = 4 * 1024;
 /// Distinguishes concurrent temp files within one process.
 static NEXT_TEMP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// What has and has not run by the time a `net` declaration is refused.
+///
+/// A step's `net` export can only be read by running `describe` first, so by
+/// the time the allowlist is consulted the step's top-level code has already
+/// executed once. Claiming "nothing was run" would be false, and false in the
+/// direction that matters to somebody reasoning about what a step can reach:
+/// the describe spawn is a real Deno child, and the honest sentence is which
+/// grants that child did *not* get. So every net refusal ends here, and says
+/// the same thing — the step ran once, with no secret channel and no network,
+/// and the invocation that would have carried both was never started.
+const NET_REFUSAL_CONTEXT: &str = "The describe spawn that read the declaration has already run, and it holds neither the \
+     secret channel nor any network grant; the run that would have carried both was never \
+     started";
+
 /// Which of the two modes a child process runs in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -189,7 +213,9 @@ pub struct Invocation {
     /// applies these over it: the links inside the workspace whose targets are
     /// outside it. Empty means no `--deny-read` at all.
     pub deny_read: Vec<PathBuf>,
-    /// The hosts the step declared. Empty means no `--allow-net` at all.
+    /// The hosts the step declared *and* the operator allowed, in the order the
+    /// step declared them, so the argv is the same for the same step. Empty
+    /// means no `--allow-net` at all.
     pub net_grants: Vec<String>,
     /// How dependencies are pinned.
     pub manifest: Manifest,
@@ -266,6 +292,7 @@ pub struct DenoScriptHost {
     cache_root: Option<PathBuf>,
     deno: Option<PathBuf>,
     fetch: Arc<dyn Fetcher>,
+    net_allowlist: BTreeSet<String>,
 }
 
 impl DenoScriptHost {
@@ -295,6 +322,7 @@ impl DenoScriptHost {
             cache_root: install::default_cache_root(),
             deno: None,
             fetch: Arc::new(CurlFetcher),
+            net_allowlist: BTreeSet::new(),
         })
     }
 
@@ -314,6 +342,25 @@ impl DenoScriptHost {
     /// Fetches the release archive with `fetch` instead of `curl`.
     pub fn with_fetcher(mut self, fetch: Arc<dyn Fetcher>) -> DenoScriptHost {
         self.fetch = fetch;
+        self
+    }
+
+    /// Lets `net` reach `hosts` — and nothing else.
+    ///
+    /// A step declares the network hosts it wants in its own `default.net`
+    /// export. That declaration is the untrusted code choosing where its own
+    /// sandbox is pierced, so it is a *request*, not a grant: every host in it
+    /// must also appear here or the `run` is refused before its child starts.
+    /// (The `describe` spawn that reads the declaration has already run, and
+    /// holds neither the FIFO nor any network grant — see
+    /// `NET_REFUSAL_CONTEXT`.) With no allowlist — the default — no step
+    /// reaches any host.
+    pub fn with_net_allowlist<I, S>(mut self, hosts: I) -> DenoScriptHost
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.net_allowlist = hosts.into_iter().map(Into::into).collect();
         self
     }
 
@@ -424,7 +471,9 @@ impl DenoScriptHost {
     }
 
     /// The step's declared schema *and* the net hosts it declared: `run` needs
-    /// both, and the schema alone is what `check` sees.
+    /// both, and the schema alone is what `check` sees. A declaration here is
+    /// only a request — it becomes a grant, or a refusal, in
+    /// [`Self::permitted_net`].
     fn describe(&self, script: &ScriptRef) -> Result<(StepSchema, Vec<String>), ScriptHostError> {
         let invocation = self.invocation(script, Mode::Describe, None, &[])?;
         let frames = self.spawn(&invocation, None, &Redactor::new())?;
@@ -481,6 +530,17 @@ impl DenoScriptHost {
         secrets: Option<&Path>,
         net: &[String],
     ) -> Result<Invocation, ScriptHostError> {
+        // First, because it is the cheapest refusal there is and nothing below
+        // it has happened yet: an unpermitted host costs no walk of the
+        // workspace and no bootstrap written to the cache. It is here rather
+        // than in `spawn` for the same reason as the walk below — this is the
+        // one place every spawned process passes through, and the argv is the
+        // only record of a grant there is.
+        //
+        // `describe` passes an empty slice, so it is never gated here: that
+        // spawn has no secret channel and no `--allow-net` either, which is
+        // what `NET_REFUSAL_CONTEXT` says out loud.
+        self.permitted_net(net)?;
         let bootstrap = self.bootstrap()?;
         let mut read_grants = vec![self.workspace.clone(), bootstrap.clone()];
         if let Some(secrets) = secrets {
@@ -595,6 +655,46 @@ impl DenoScriptHost {
         Ok(denied.into_iter().collect())
     }
 
+    /// The declared `net` hosts, or the refusal for one this host does not
+    /// permit.
+    ///
+    /// `net` is a `default.net` export — the step's own words about where it
+    /// wants to go, and the only place that says so is a `describe` spawn, so a
+    /// step's top-level code has run once by the time this is reached. What has
+    /// *not* run is the invocation carrying the consequences: the allowlist is
+    /// the operator's half of the decision, and a host absent from it is granted
+    /// to nothing and started for nothing.
+    ///
+    /// A host with a comma in it is refused for the reason [`Self::deniable`]
+    /// gives for a path with one: `--allow-net` is a comma-separated list with
+    /// no escaping, so the value cannot be spelled at all. There is no shorter
+    /// spelling of it and no ancestor to deny instead — the comma is in the host
+    /// itself — so refusing is the one thing here that still stops the run.
+    fn permitted_net(&self, net: &[String]) -> Result<(), ScriptHostError> {
+        for host in net {
+            if host.contains(',') {
+                return Err(ScriptHostError::Protocol {
+                    message: format!(
+                        "the step declared the network host {host:?}, which cannot be granted: \
+                         --allow-net takes a comma-separated list with no escaping, and this \
+                         host has a comma in it. {NET_REFUSAL_CONTEXT}"
+                    ),
+                });
+            }
+            if !self.net_allowlist.contains(host) {
+                return Err(ScriptHostError::Protocol {
+                    message: format!(
+                        "the step declared the network host {host:?}, which this host does not \
+                         allow: a step's net declaration is a request, not a grant, and this \
+                         one was not granted. Pass with_net_allowlist to permit it. \
+                         {NET_REFUSAL_CONTEXT}"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// `path` as a `--deny-read` grant, or the refusal for one that has no
     /// spelling.
     ///
@@ -609,6 +709,14 @@ impl DenoScriptHost {
     /// That leaves refusing, which is the one thing here that still stops a
     /// step, and it should: there is no grant to hand over, and a silently
     /// dropped path would be a hole wearing the shape of a fix.
+    ///
+    /// The refusal says the invocation was not started rather than that
+    /// nothing ran, because that is the part that is true of every caller: it
+    /// is raised while the argv is being assembled, and this invocation's child
+    /// is spawned after that. Whether an *earlier* invocation ran is the
+    /// caller's business — on a `run` the `describe` spawn normally finds the
+    /// same link and refuses before anything starts at all — and it is not
+    /// something this message should claim.
     fn deniable(&self, path: &Path) -> Result<PathBuf, ScriptHostError> {
         if !path.to_string_lossy().contains(',') {
             return Ok(path.to_path_buf());
@@ -616,7 +724,9 @@ impl DenoScriptHost {
         Err(ScriptHostError::Protocol {
             message: format!(
                 "the workspace link {} cannot be denied: --deny-read takes a comma-separated \
-                 list with no escaping, and this path has a comma in it. Nothing was run",
+                 list with no escaping, and this path has a comma in it. The invocation that \
+                 would have carried the deny list was refused as its arguments were being \
+                 built, before any child of it was started",
                 path.display()
             ),
         })
@@ -698,6 +808,7 @@ impl std::fmt::Debug for DenoScriptHost {
             .field("workspace", &self.workspace)
             .field("cache_root", &self.cache_root)
             .field("deno", &self.deno)
+            .field("net_allowlist", &self.net_allowlist)
             .finish()
     }
 }
