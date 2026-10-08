@@ -27,6 +27,8 @@ implemented end to end today; `run` is not.
 - `keepshipping deny RUN-ID --reason TEXT` — refuse it. `--reason` is required. The run stays parked
   — what a refusal means for the run is the engine's decision, not this command's — and the
   refusal is recorded as `approval.denied` in the run log.
+- `keepshipping resume RUN-ID [FILE]` — carry on a run that parked (exit 4), from the `ship.ks` it
+  parked from (default `ship.ks`). [Parking and resuming](#parking-and-resuming) below.
 - `keepshipping policy explain [FILE]` — the effective policy for one actor (`--as agent|human|ci`,
   default `agent`; `--env NAME`), each row attributed to the document that decided it. Below.
 
@@ -114,8 +116,10 @@ adapter is wired into the CLI, so a published block carries no signature.
 
 ## Exit codes
 
-Codes 0–3 are the CLI's own and are stable. 4, 5 and 130 come from `ks_engine::exec::RunStatus`
-— they are what a run will return once `run` is wired to the executor.
+Codes 0–3 are the CLI's own and are stable. 4, 5 and 130 come from `ks_engine::exec::RunStatus`.
+4 is what a run returns when it parks, and `keepshipping resume` returns it for a run that is
+still waiting; 5 is what `resume` returns when policy refuses what is left of the run. Otherwise
+they are what a run will return once `run` is wired to the executor.
 
 | Code | Status | Meaning |
 |---|---|---|
@@ -123,9 +127,60 @@ Codes 0–3 are the CLI's own and are stable. 4, 5 and 130 come from `ks_engine:
 | 1 | `failed` | `check` found errors (or warnings with `--warnings-as-errors`); a run failed: a step failed, a step timed out, or the run hit its own timeout |
 | 2 | — | usage: an unknown flag or format, a missing value, a file that cannot be read, or no environment could be chosen |
 | 3 | — | internal: an unexpected I/O error or a panic — a bug in keepshipping, never in your file |
-| 4 | `waiting_for_approval` | a step needs an approval nobody gave; its dependants were skipped, the rest of the run carried on — except in an agent's run (`--as agent`), which waits on a human and stops there: nothing after the approval ran |
+| 4 | `waiting_for_approval` | a step needs an approval nobody gave: the run wrote itself down and stopped there, and nothing after the approval ran. `keepshipping resume <run>` carries it on; an agent's run (`--as agent`) needs `keepshipping approve <run>` from a human first |
 | 5 | `policy_refused` | policy refused the run: the refused step and everything that needs it are skipped, and anything else in the run still runs |
 | 130 | `cancelled` | the run was cancelled (Ctrl-C, a cancelled CI job) — 128 + `SIGINT`, as a shell reports it |
+
+## Parking and resuming
+
+A run that reaches an approval it cannot have answered does not wait. It writes the run down under
+`.keepshipping/runs/<run>/state.json`, prints where it left off, and **exits 4**. Nothing is running
+while it waits: a CI job that sat on an approval would spend runner minutes and run into its own
+timeout, so carrying on is a *new* job. Two kinds of run park, and the record says which:
+
+- **nobody to ask** — CI, a pipe, `--non-interactive`, a closed stdin. Whoever runs
+  `keepshipping resume <run>` is the approver: the resume records the approval, with who gave it,
+  an expiry 24 hours on (`expires_at`, RFC 3339) and the artifacts it covers, then carries on.
+- **an agent's run** (`--as agent`, or detected) parks at its first approval, because an agent may
+  not answer its own. `resume` will not answer it: a human runs `keepshipping approve <run>`, and
+  `resume` then carries on past the recorded answer. Nor does a resume an agent is running answer
+  anything — it exits 4 and says who can.
+
+At a terminal a person's run still asks, and a typed `n` declines; a person watching is not a park.
+Once step kinds are built in, a run nobody is watching ends like this:
+
+```
+$ keepshipping run --non-interactive
+▸ build   sha256:9f2c…e1  signed    38s
+▸ plan    +2 ~1 -0                  11s
+▸ review  approve 3 changes? n
+⏸ parked at review (run 01HF7YAT00R3M2XK7A9B4CDEF)
+parked at review; run 01HF7YAT00R3M2XK7A9B4CDEF is waiting for an approval
+nothing is running while it waits — approve and continue with:
+  keepshipping resume 01HF7YAT00R3M2XK7A9B4CDEF
+$ echo $?
+4
+```
+
+Before `resume` changes anything it re-checks, and any refusal leaves the record exactly as it was,
+so the same run can still be resumed where it can finish:
+
+- **the binding** — `ship.ks` must still hash to what the run started with, no approval in the
+  record may have expired, and every approval must still cover the artifacts the run holds (a
+  rebuilt image or a re-planned plan is refused). Exit 1.
+- **the context** — a run parked on a runner and resumed on a laptop is refused the way a fresh
+  `run` on the laptop would be. The gate covers the approval step itself: a `ci-only` approval is
+  not granted without CI. Exit 1.
+- **policy** — the steps left are decided again against the organisation's baseline and the
+  file's own `never:` rules ([#103](https://github.com/Keep-Shipping/harness/issues/103)), for the
+  actor the run was recorded as (an agent if an agent is resuming). A step policy refuses refuses
+  the resume. Exit 5. No `PolicyStore` adapter exists yet, so the baseline is the conservative
+  built-in, which never lets a step read secrets.
+
+A resume that passes drives what is left; an approval further on parks the run again. Steps the
+record says are done are not run again. No step kind is executable from the CLI yet, so today a
+resumed run stops at its first remaining step with `` `{kind}` steps are not built in yet `` and
+exits 1 — past the approval, which is the part this covers.
 
 ## Failure semantics
 

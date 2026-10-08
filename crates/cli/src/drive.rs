@@ -18,6 +18,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use ks_core::ids::RunId;
 use ks_core::{Step, Workflow};
 
 use crate::progress::{Renderer, RunEvent};
@@ -58,23 +59,72 @@ pub trait Approver {
     /// That this approver cannot answer at all: the run waits on someone
     /// else instead of asking. `None` for every approver that can answer —
     /// a person at the keyboard, or a pipe that declines on its own.
-    fn waits_on(&self) -> Option<Waiting> {
+    fn waits_on(&self) -> Option<WaitReason> {
+        None
+    }
+
+    /// Writes the run down parked at `step`, waiting `on`, with `completed`
+    /// as the steps it has already done, and returns the run's id — or
+    /// `None`, which is what an approver with nowhere to write the run down
+    /// returns ([`Declines`]).
+    ///
+    /// A run that has to wait parks rather than holds the process open
+    /// ([#97](https://github.com/Keep-Shipping/harness/issues/97)): the record
+    /// is persisted, the process exits 4, and `keepshipping resume` is a new
+    /// job. This has to return at once — a CI job that sits here waiting for
+    /// a human burns runner minutes and runs into its own timeout.
+    fn park(&mut self, _step: &str, _completed: &[&Step], _on: &WaitReason) -> Option<RunId> {
         None
     }
 }
 
-/// Who a run that cannot answer is waiting on, and who has been told.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Waiting {
-    pub on: String,
-    pub notified: Option<String>,
+/// Somewhere a waiting run is written down. The approvers that park
+/// ([`AgentRun`], [`Unwatched`]) hand the writing to one of these, so the
+/// state store stays out of this module and a test can park in memory.
+pub trait Parking {
+    /// As [`Approver::park`].
+    fn park(&mut self, step: &str, completed: &[&Step], on: &WaitReason) -> Option<RunId>;
 }
+
+/// Why a run stopped at an approval and is waiting rather than running on.
+/// Both are the same outcome, [`Outcome::Waiting`], parked the same way;
+/// what differs is who may let the run go on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WaitReason {
+    /// An approval nobody was there to answer — CI, a pipe,
+    /// `--non-interactive`, a closed stdin
+    /// ([#97](https://github.com/Keep-Shipping/harness/issues/97)). `question`
+    /// is what the approval asked. Whoever resumes the run answers it.
+    Approval { question: String },
+    /// The run is an agent's own, and an agent may not decide its own
+    /// approval: that would be approving itself
+    /// ([#102](https://github.com/Keep-Shipping/harness/issues/102)). A human
+    /// has to — `keepshipping approve` — before the run may be resumed.
+    /// `notified` is whoever the policy's `ask:` has already told.
+    AgentDecision { notified: Option<String> },
+}
+
+impl WaitReason {
+    /// The word the parked record keeps for this reason, under
+    /// [`WAITING_ON`]: `approval` or `agent`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WaitReason::Approval { .. } => "approval",
+            WaitReason::AgentDecision { .. } => "agent",
+        }
+    }
+}
+
+/// The key in a parked record's `context` that says why the run waits, as
+/// [`WaitReason::as_str`] spells it. `resume` reads it back: an agent's run
+/// is not one a resume may approve.
+pub const WAITING_ON: &str = "waiting_on";
 
 /// Nobody was asked: the run declined itself.
 pub const NOBODY_ANSWERED: Answer = Answer { approved: false, by: None, typed: false };
 
 /// How a run ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// Every selected step ran.
     Shipped,
@@ -82,9 +132,11 @@ pub enum Outcome {
     Declined,
     /// A step failed; nothing after it ran.
     Failed,
-    /// An approval nobody could answer: the run waits on a human, and
-    /// nothing after it ran.
-    Waiting,
+    /// The run parked at `step`, waiting `on` an answer, and was written
+    /// down as `run`. Nothing after the approval ran, and nothing will until
+    /// `keepshipping resume <run>`: the job is over, so no process is held
+    /// open waiting for a human.
+    Waiting { run: RunId, step: String, on: WaitReason },
 }
 
 /// The steps a run covers, in the order it runs them: all of them,
@@ -193,9 +245,11 @@ fn reach(adj: &[Vec<usize>], seeds: &[usize]) -> HashSet<usize> {
 
 /// Runs `steps` in order, telling `renderer` what happens and reading time
 /// from `clock` — a function returning how long the run has been going, so
-/// the site's timings replay exactly. Stops at the first failure or declined
-/// approval; a declined one answers itself when nobody was there to type, and
-/// an approver that cannot answer at all makes the run wait instead.
+/// the site's timings replay exactly. Stops at the first failure, declined
+/// approval or park. An approver that cannot answer at all (an agent's run)
+/// parks without being asked; one nobody answered parks if it has somewhere
+/// to write the run down, and declines if it has not. Only a typed `no`
+/// declines outright.
 pub fn drive(
     steps: &[&Step],
     runner: &mut dyn StepRunner,
@@ -205,6 +259,7 @@ pub fn drive(
     what: &str,
 ) -> Outcome {
     let start = clock();
+    let mut completed: Vec<&Step> = Vec::new();
     for step in steps {
         let name = &step.name;
         let at = clock();
@@ -216,21 +271,38 @@ pub fn drive(
             runner.run(step, &mut log)
         };
         match result {
-            Ok(Done::Summary(summary)) => renderer.event(&RunEvent::Finished {
-                step: name.clone(),
-                summary,
-                took: clock().saturating_sub(at),
-            }),
+            Ok(Done::Summary(summary)) => {
+                completed.push(step);
+                renderer.event(&RunEvent::Finished {
+                    step: name.clone(),
+                    summary,
+                    took: clock().saturating_sub(at),
+                });
+            }
             Ok(Done::Ask(question)) => {
-                // An approver that cannot answer is not asked: the run
-                // waits, and everything after the approval is left alone.
-                if let Some(waiting) = approver.waits_on() {
+                // An approver that cannot answer is not asked: the run parks,
+                // and everything after the approval is left alone.
+                if let Some(on) = approver.waits_on() {
+                    let Some(run) = approver.park(name, &completed, &on) else {
+                        // A wait with no record is a run nobody can pick up
+                        // again, so it is a failure, not a wait.
+                        renderer.event(&RunEvent::Failed {
+                            step: name.clone(),
+                            error: "the run could not be written down to wait".to_string(),
+                            took: clock().saturating_sub(at),
+                        });
+                        return Outcome::Failed;
+                    };
+                    let notified = match &on {
+                        WaitReason::AgentDecision { notified } => notified.clone(),
+                        WaitReason::Approval { .. } => None,
+                    };
                     renderer.event(&RunEvent::Waiting {
                         step: name.clone(),
-                        on: waiting.on,
-                        notified: waiting.notified,
+                        on: "a human".to_string(),
+                        notified,
                     });
-                    return Outcome::Waiting;
+                    return Outcome::Waiting { run, step: name.clone(), on };
                 }
                 renderer
                     .event(&RunEvent::Asking { step: name.clone(), question: question.clone() });
@@ -242,6 +314,19 @@ pub fn drive(
                     typed: answer.typed,
                 });
                 if !answer.approved {
+                    // Nobody answered: a run that can be written down parks
+                    // and the job ends; one that cannot has declined, as it
+                    // always has. A typed `no` is an answer, and declines.
+                    if !answer.typed {
+                        let on = WaitReason::Approval { question };
+                        if let Some(run) = approver.park(name, &completed, &on) {
+                            renderer.event(&RunEvent::Parked {
+                                run: run.to_string(),
+                                step: name.clone(),
+                            });
+                            return Outcome::Waiting { run, step: name.clone(), on };
+                        }
+                    }
                     renderer.event(&RunEvent::Declined { step: name.clone() });
                     return Outcome::Declined;
                 }
@@ -293,7 +378,7 @@ impl<R: BufRead> Approver for TtyApprover<R> {
 
 /// Who the local run is: `$USER`, then `$USERNAME`, then `local`. A name is
 /// a label for the run log, not a credential.
-fn local_user() -> String {
+pub(crate) fn local_user() -> String {
     ["USER", "USERNAME"]
         .into_iter()
         .find_map(|var| std::env::var(var).ok())
@@ -301,8 +386,11 @@ fn local_user() -> String {
         .unwrap_or_else(|| "local".to_string())
 }
 
-/// The approver of a run nobody is watching: it declines, always. A run that
-/// needs a person cannot get one from a pipe.
+/// The approver of a run nobody is watching that has nowhere to write the run
+/// down: it declines, always. A run that needs a person cannot get one from a
+/// pipe. The binary parks instead ([`Unwatched`]), so only the tests build
+/// this; it stays as the reference for what "nowhere to park" means.
+#[allow(dead_code)]
 pub struct Declines;
 
 impl Approver for Declines {
@@ -311,23 +399,44 @@ impl Approver for Declines {
     }
 }
 
-/// An agent's own run. An agent cannot approve the run it is making — that
-/// would be approving itself — so its first approval is a wait, not a
-/// question. `notified` is whoever the policy's `ask:` has already been told
-/// to tell, which the run says so a reader can go and find them.
-pub struct AgentRun {
-    pub notified: Option<String>,
+/// The approver of a run nobody is watching — CI, a pipe,
+/// `--non-interactive`: nobody answers, so the run parks through `P` and the
+/// job ends ([#97](https://github.com/Keep-Shipping/harness/issues/97)).
+pub struct Unwatched<P>(pub P);
+
+impl<P: Parking> Approver for Unwatched<P> {
+    fn ask(&mut self, _question: &str) -> Answer {
+        NOBODY_ANSWERED
+    }
+
+    fn park(&mut self, step: &str, completed: &[&Step], on: &WaitReason) -> Option<RunId> {
+        self.0.park(step, completed, on)
+    }
 }
 
-impl Approver for AgentRun {
+/// An agent's own run. An agent cannot approve the run it is making — that
+/// would be approving itself — so its first approval is a wait, not a
+/// question, and the run parks through `parking` like any other wait.
+/// `notified` is whoever the policy's `ask:` has already been told to tell,
+/// which the run says so a reader can go and find them.
+pub struct AgentRun<P> {
+    pub notified: Option<String>,
+    pub parking: P,
+}
+
+impl<P: Parking> Approver for AgentRun<P> {
     fn ask(&mut self, _question: &str) -> Answer {
         // Unreachable in practice: `waits_on` sends the run to a human
         // before anything is ever asked.
         NOBODY_ANSWERED
     }
 
-    fn waits_on(&self) -> Option<Waiting> {
-        Some(Waiting { on: "a human".to_string(), notified: self.notified.clone() })
+    fn waits_on(&self) -> Option<WaitReason> {
+        Some(WaitReason::AgentDecision { notified: self.notified.clone() })
+    }
+
+    fn park(&mut self, step: &str, completed: &[&Step], on: &WaitReason) -> Option<RunId> {
+        self.parking.park(step, completed, on)
     }
 }
 
@@ -382,6 +491,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
+    use std::time::Instant;
 
     use super::*;
     use crate::progress::{Run, prompt_line, screen};
@@ -517,7 +627,8 @@ steps:
         let by: Vec<&Step> = steps.iter().collect();
         let now = Rc::new(Cell::new(Duration::ZERO));
         let mut runner = Scripted { now: now.clone(), script: &AGENT_SCRIPT };
-        let mut approver = AgentRun { notified: notified.map(str::to_string) };
+        let mut approver =
+            AgentRun { notified: notified.map(str::to_string), parking: InMemory::new() };
         let mut out = Vec::new();
         let mut renderer = Run::new(&mut out, false, tty);
         let mut clock = || now.get();
@@ -537,10 +648,53 @@ steps:
         "nothing applied. agent is free to wait.\n",
     );
 
+    /// Parks in memory: names a fixed run and remembers what it was handed,
+    /// the way the CLI's `Park` writes it to a state store.
+    struct InMemory {
+        run: RunId,
+        parked: Rc<Cell<bool>>,
+    }
+
+    impl InMemory {
+        fn new() -> InMemory {
+            InMemory { run: parked_run(), parked: Rc::new(Cell::new(false)) }
+        }
+    }
+
+    impl Parking for InMemory {
+        fn park(&mut self, _step: &str, _completed: &[&Step], _on: &WaitReason) -> Option<RunId> {
+            self.parked.set(true);
+            Some(self.run.clone())
+        }
+    }
+
+    /// Nowhere to write anything: every park fails.
+    struct Nowhere;
+
+    impl Parking for Nowhere {
+        fn park(&mut self, _step: &str, _completed: &[&Step], _on: &WaitReason) -> Option<RunId> {
+            None
+        }
+    }
+
+    /// The id the in-memory runs park under.
+    fn parked_run() -> RunId {
+        RunId::from_parts(1_700_000_000_000, 7)
+    }
+
+    /// The outcome an agent's run waiting at the site's review has.
+    fn agent_waiting(notified: Option<&str>) -> Outcome {
+        Outcome::Waiting {
+            run: parked_run(),
+            step: "review".into(),
+            on: WaitReason::AgentDecision { notified: notified.map(str::to_string) },
+        }
+    }
+
     #[test]
     fn the_agent_run_is_the_sites_agent_run_line_for_line() {
         let (plain, outcome, now) = agent_run(Some("@platform"), false);
-        assert_eq!(outcome, Outcome::Waiting);
+        assert_eq!(outcome, agent_waiting(Some("@platform")));
         assert_eq!(now.get(), Duration::ZERO, "nothing after the review ran");
         // Not just the golden: the site's lines, so a stray UPDATE_GOLDEN
         // cannot redefine them.
@@ -549,7 +703,7 @@ steps:
         // The terminal animates the steps and rewrites them; whoever is
         // watching is left with the same lines.
         let (raw, outcome, _) = agent_run(Some("@platform"), true);
-        assert_eq!(outcome, Outcome::Waiting);
+        assert_eq!(outcome, agent_waiting(Some("@platform")));
         assert_eq!(screen(raw.as_bytes()), AGENT_RUN);
     }
 
@@ -557,7 +711,7 @@ steps:
     #[test]
     fn an_agent_run_with_nobody_to_notify_waits_without_naming_a_person() {
         let (plain, outcome, _) = agent_run(None, false);
-        assert_eq!(outcome, Outcome::Waiting);
+        assert_eq!(outcome, agent_waiting(None));
         assert_eq!(
             plain,
             concat!(
@@ -568,6 +722,113 @@ steps:
                 "nothing applied. agent is free to wait.\n",
             )
         );
+    }
+
+    /// An agent's run that cannot be written down cannot wait either: there
+    /// would be nothing for a human to approve or for `resume` to pick up.
+    #[test]
+    fn an_agent_run_with_nowhere_to_park_fails_rather_than_waits() {
+        let steps = site_steps();
+        let by: Vec<&Step> = steps.iter().collect();
+        let now = Rc::new(Cell::new(Duration::ZERO));
+        let mut runner = Scripted { now: now.clone(), script: &AGENT_SCRIPT };
+        let mut approver = AgentRun { notified: None, parking: Nowhere };
+        let mut out = Vec::new();
+        let mut renderer = Run::new(&mut out, false, false);
+        let mut clock = || now.get();
+        let outcome = drive(&by, &mut runner, &mut approver, &mut renderer, &mut clock, "api");
+        assert_eq!(outcome, Outcome::Failed);
+        let out = String::from_utf8(out).expect("utf-8");
+        assert!(out.contains("could not be written down"), "{out}");
+        assert!(!out.contains("free to wait"), "{out}");
+    }
+
+    /// A run nobody is watching parks: it returns at once, names the step it
+    /// is waiting on and why, and nothing after the approval ran (#97).
+    #[test]
+    fn an_unwatched_run_parks_at_the_approval_instead_of_declining_or_waiting() {
+        let steps = site_steps();
+        let by: Vec<&Step> = steps.iter().collect();
+        let now = Rc::new(Cell::new(Duration::ZERO));
+        let mut runner = Scripted { now: now.clone(), script: &SCRIPT };
+        let parking = InMemory::new();
+        let parked = Rc::clone(&parking.parked);
+        let mut approver = Unwatched(parking);
+        let mut out = Vec::new();
+        let mut renderer = Run::new(&mut out, false, false);
+        let mut clock = || now.get();
+        let started = Instant::now();
+        let outcome =
+            drive(&by, &mut runner, &mut approver, &mut renderer, &mut clock, "api@a41c9e");
+
+        let run = parked_run();
+        assert_eq!(
+            outcome,
+            Outcome::Waiting {
+                run: run.clone(),
+                step: "review".into(),
+                on: WaitReason::Approval { question: "approve 3 changes?".into() },
+            }
+        );
+        assert!(parked.get(), "the run was written down");
+        assert_eq!(
+            String::from_utf8(out).expect("utf-8"),
+            format!(
+                concat!(
+                    "▸ build   sha256:9f2c…e1  signed    38s\n",
+                    "▸ plan    +2 ~1 -0                  11s\n",
+                    "▸ review  approve 3 changes? n\n",
+                    "⏸ parked at review (run {run})\n",
+                ),
+                run = run,
+            )
+        );
+        // The acceptance criterion: the call came back. The work between the
+        // two clock reads is in memory, so anything near a second is a loop
+        // or a sleep.
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "parking blocks for {:?}; it must return at once",
+            started.elapsed()
+        );
+        assert_eq!(now.get(), Duration::from_secs(69), "nothing after the review ran");
+    }
+
+    /// Parking is for nobody answering. A person who typed `n` answered, and
+    /// the run declines even with somewhere to park.
+    #[test]
+    fn a_typed_no_declines_even_where_the_run_could_park() {
+        struct TypedNo(InMemory);
+        impl Approver for TypedNo {
+            fn ask(&mut self, _question: &str) -> Answer {
+                Answer { approved: false, by: None, typed: true }
+            }
+            fn park(&mut self, step: &str, done: &[&Step], on: &WaitReason) -> Option<RunId> {
+                self.0.park(step, done, on)
+            }
+        }
+        let steps = site_steps();
+        let by: Vec<&Step> = steps.iter().collect();
+        let now = Rc::new(Cell::new(Duration::ZERO));
+        let mut runner = Scripted { now: now.clone(), script: &SCRIPT };
+        let parking = InMemory::new();
+        let parked = Rc::clone(&parking.parked);
+        let mut approver = TypedNo(parking);
+        let mut out = Vec::new();
+        let mut renderer = Run::new(&mut out, false, false);
+        let mut clock = || now.get();
+        let outcome = drive(&by, &mut runner, &mut approver, &mut renderer, &mut clock, "api");
+        assert_eq!(outcome, Outcome::Declined);
+        assert!(!parked.get(), "a typed answer is not a park");
+    }
+
+    /// The approver with nowhere to park still declines.
+    #[test]
+    fn an_approver_with_nowhere_to_park_still_declines() {
+        let on = WaitReason::Approval { question: "approve?".into() };
+        assert!(Declines.park("review", &[], &on).is_none());
+        let (_, outcome, _) = site_run(false, false, false);
+        assert_eq!(outcome, Outcome::Declined);
     }
 
     #[test]

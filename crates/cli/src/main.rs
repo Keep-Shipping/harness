@@ -28,6 +28,7 @@ mod log;
 mod policy;
 mod progress;
 mod render;
+mod resume;
 mod run_log;
 mod upgrade;
 
@@ -86,6 +87,9 @@ fn dispatch() -> ExitCode {
         // argument list, command word and all — `approve` reads the word itself, since which word
         // it is is what picks the form.
         Some("runs" | "approve" | "deny") => approve::approve(&args),
+        // The job that carries a parked run on (#97): it re-checks the
+        // record's binding, the context gate and policy, then drives the rest.
+        Some("resume") => resume::resume(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
@@ -211,14 +215,27 @@ fn selected(o: &Options, site: &check::Site, env: &str, is_agent: bool) -> ExitC
     let what = workflow.name().map(str::to_string).unwrap_or_else(|| stem(&site.file));
     let tty = std::io::stdout().is_terminal() && std::env::var("TERM").is_ok_and(|t| t != "dumb");
     let shared = Mutex::new(renderer(tty, o.verbose));
+    // Where a run that has to wait is written down, so the job can end and
+    // `keepshipping resume` pick it up (#97). Nothing touches the disk unless
+    // the run actually parks.
+    let parking = resume::Park::new(
+        resume::run_id(),
+        site.src.as_bytes(),
+        o.event.clone().unwrap_or_else(|| "manual".to_string()),
+    )
+    .with_context(resume::ACTOR, resume::actor_word(actor))
+    .with_context(resume::ENVIRONMENT, env);
     let mut approver: Box<dyn drive::Approver> = if is_agent {
-        // Who to tell comes from the approval's own `ask:`; until that is
+        // An agent's run parks at its first approval: it may not answer its
+        // own. Who to tell comes from the approval's own `ask:`; until that is
         // read here, the run waits without naming anyone.
-        Box::new(drive::AgentRun { notified: None })
+        Box::new(drive::AgentRun { notified: None, parking })
     } else if interactive(o) {
         Box::new(drive::TtyApprover::new(std::io::stdin().lock()))
     } else {
-        Box::new(drive::Declines)
+        // Nobody watching: the run parks rather than declines, and the job
+        // ends instead of holding a runner open until it times out (#97).
+        Box::new(drive::Unwatched(parking))
     };
     if is_agent {
         // An agent reads the run and acts on it, so its run opens with the
@@ -240,9 +257,9 @@ fn selected(o: &Options, site: &check::Site, env: &str, is_agent: bool) -> ExitC
     });
     match outcome {
         Outcome::Shipped => ExitCode::SUCCESS,
-        // Waiting is not failing: the run stopped for an approval nobody
-        // gave, which is the engine's own exit 4.
-        Outcome::Waiting => ExitCode::from(ks_engine::exec::EXIT_WAITING_FOR_APPROVAL),
+        // Waiting is not failing: the run parked at an approval, which is the
+        // engine's own exit 4, and the notice says what carries it on.
+        Outcome::Waiting { run, step, on } => resume::park_notice(&run, &step, &on),
         Outcome::Declined | Outcome::Failed => ExitCode::from(1),
     }
 }
@@ -391,6 +408,20 @@ fn refuses_to_run(site: &check::Site, o: &Options, context: ContextName) -> Resu
             return Err(ExitCode::from(2));
         }
     };
+    refuses_to_run_at(site, &selected, o.allow_partial, context)
+}
+
+/// The gate itself, over an already-chosen selection: a run does not start in
+/// a context that cannot run a step it covers. Split from [`refuses_to_run`]
+/// so `resume` asks the same question of the steps *it* is about to drive: a
+/// run parked on a runner and resumed on a laptop is exactly the case the gate
+/// exists for.
+fn refuses_to_run_at(
+    site: &check::Site,
+    selected: &[String],
+    allow_partial: bool,
+    context: ContextName,
+) -> Result<(), ExitCode> {
     let ctx = context.context();
     // `site.unmet` came from the check that already printed the warnings, so
     // the gate agrees with them rather than re-asking the catalog.
@@ -400,7 +431,7 @@ fn refuses_to_run(site: &check::Site, o: &Options, context: ContextName) -> Resu
     // Counted in run order, like `--until` and the warning's own stop point.
     let order = ks_core::run_order(&site.checked.workflow);
     let at = order.iter().position(|n| *n == step.name).unwrap_or(order.len()) + 1;
-    if o.allow_partial {
+    if allow_partial {
         eprintln!(
             "note: continuing with --allow-partial; step `{}` will be skipped or fail",
             step.name
