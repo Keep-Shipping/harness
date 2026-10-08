@@ -303,5 +303,6 @@ a plain statement of why the report is not one.
 - [REGISTRIES.md](REGISTRIES.md) — digests, attestations and the honesty rule
 - [ADR 0005](adr/0005-local-first-core-with-optional-hosted-services.md) — local core, optional hosted services
 - [ADR 0008](adr/0008-github-actions-first.md) — running inside a CI system
+- [TELEMETRY.md](TELEMETRY.md) and [ADR 0015](adr/0015-telemetry-policy.md) — no telemetry ships, and what a payload may contain if it ever does
 - [ADR 0009](adr/0009-typescript-escape-hatch-runtime.md) — the script sandbox and its limits
 - [ADR 0012](adr/0012-policy-authority.md) — a workflow file is a claim, not a control
