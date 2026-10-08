@@ -30,6 +30,7 @@
 
 pub mod auto_rule;
 pub mod block;
+pub mod block_diff;
 mod catalog;
 mod check;
 pub mod context;
