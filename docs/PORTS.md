@@ -31,6 +31,31 @@ Newest first, one heading per contract version, dated.
 
 ## STEP_API 6
 
+- **2026-10-08** — `Event` gained `provenance`
+  ([#126](https://github.com/Keep-Shipping/harness/issues/126)), with a
+  [`Provenance`](https://github.com/Keep-Shipping/harness/blob/main/crates/core/src/ports/run_context.rs)
+  enum beside it in
+  [`crates/core/src/ports/run_context.rs`](../crates/core/src/ports/run_context.rs):
+  where the code a run is *about* came from, as distinct from
+  [`Establishment`](https://github.com/Keep-Shipping/harness/blob/main/crates/core/src/ports/run_context.rs),
+  which says who is running it. `Repository`, `Fork` and `Target`
+  (`pull_request_target`, `workflow_run` and `merge_group` — the events a
+  privileged workflow follows untrusted code on) — the last two answer
+  `is_untrusted()`. A push to the
+  default branch and a fork pull request are both a `Ci` actor with an OIDC
+  identity from GitHub's OIDC endpoint (which the adapter does not verify the
+  signature of), and they are not the same amount of trust: the second runs a
+  `ship.ks` somebody outside the organisation wrote, so a policy that gated on
+  identity alone would hand it repository secrets and a cloud credential. The
+  default is `Repository`, but the only value that grants those capabilities is
+  the one an adapter has to claim affirmatively, so a missing value fails
+  closed. This is source-breaking for anyone constructing an `Event` literally,
+  so it is recorded here rather than landed as a silent change; `Event` is data
+  a step reads rather than a trait it implements, so no trait signature moved
+  and the fingerprint — which covers `pub trait` blocks in `ports/` — is
+  unchanged, and it stays pinned under `STEP_API 6` rather than forcing a bump
+  for a field the gate cannot see.
+
 - **2026-10-08** — `ApprovalInbox`
   ([#95](https://github.com/Keep-Shipping/harness/issues/95)) added, in
   [`crates/core/src/ports/approval_inbox.rs`](../crates/core/src/ports/approval_inbox.rs):

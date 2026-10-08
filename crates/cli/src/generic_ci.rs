@@ -59,8 +59,8 @@ use std::path::{Path, PathBuf};
 
 use ks_core::ports::BoxFuture;
 use ks_core::ports::run_context::{
-    Actor, ActorKind, Capabilities, Establishment, Event, GitInfo, NetworkScope, RunContext,
-    RunContextError, Trigger, Workspace,
+    Actor, ActorKind, Capabilities, Establishment, Event, GitInfo, NetworkScope, Provenance,
+    RunContext, RunContextError, Trigger, Workspace,
 };
 use ks_core::ports::secrets::SecretValue;
 
@@ -232,7 +232,13 @@ impl GenericCiRunContext {
         GenericCiRunContext {
             system,
             actor,
-            event: Event { git: GitInfo { sha, git_ref }, trigger },
+            // Generic mode reads no fork marker it could trust, so it states the
+            // repository's own code; fork detection is the native adapters' (#126).
+            event: Event {
+                git: GitInfo { sha, git_ref },
+                trigger,
+                provenance: Provenance::Repository,
+            },
             capabilities: Capabilities {
                 // Honest: there is no token endpoint this adapter can reach and
                 // verify, so it does not claim one. `oidc_token` answers

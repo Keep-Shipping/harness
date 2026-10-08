@@ -50,8 +50,8 @@ use std::path::{Path, PathBuf};
 
 use ks_core::ports::BoxFuture;
 use ks_core::ports::run_context::{
-    Actor, ActorKind, Capabilities, Establishment, Event, GitInfo, NetworkScope, RunContext,
-    RunContextError, Trigger, Workspace,
+    Actor, ActorKind, Capabilities, Establishment, Event, GitInfo, NetworkScope, Provenance,
+    RunContext, RunContextError, Trigger, Workspace,
 };
 use ks_core::ports::secrets::SecretValue;
 
@@ -179,7 +179,13 @@ impl GitlabCiRunContext {
         };
         Ok(GitlabCiRunContext {
             actor,
-            event: Event { git: GitInfo { sha: env[CI_COMMIT_SHA].clone(), git_ref }, trigger },
+            // Fork merge-request detection for GitLab is not built yet (#126 covers
+            // GitHub), so this adapter states the repository's own code.
+            event: Event {
+                git: GitInfo { sha: env[CI_COMMIT_SHA].clone(), git_ref },
+                trigger,
+                provenance: Provenance::Repository,
+            },
             capabilities: Capabilities {
                 // The constructor requires the token, so `oidc` and the token
                 // variable agree by construction.

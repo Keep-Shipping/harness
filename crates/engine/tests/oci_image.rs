@@ -14,7 +14,9 @@ use std::sync::Arc;
 use ks_core::Catalog;
 use ks_core::harness::{Harness, HarnessBuilder};
 use ks_core::ids::RunId;
-use ks_core::ports::run_context::{Actor, ActorKind, Establishment, Event, GitInfo, Trigger};
+use ks_core::ports::run_context::{
+    Actor, ActorKind, Establishment, Event, GitInfo, Provenance, Trigger,
+};
 use ks_core::ports::script_host::Value;
 use ks_core::ports::secrets::{Redactor, SecretValue};
 use ks_core::ports::supply_chain::{
@@ -157,6 +159,7 @@ fn ci_run_with_ref(git_ref: &str) -> FakeRunContext {
         .with_event(Event {
             git: GitInfo { sha: FAKE_SHA.into(), git_ref: git_ref.into() },
             trigger: Trigger::Push,
+            provenance: Provenance::Repository,
         })
 }
 

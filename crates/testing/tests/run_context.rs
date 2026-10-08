@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use ks_core::ports::run_context::{
     Actor, ActorKind, Capabilities, Establishment, Event, GitInfo, IdentityStrength, LocalRunFacts,
-    NetworkScope, RunContext, RunContextError, Trigger, UnknownRunPolicy, Workspace,
+    NetworkScope, Provenance, RunContext, RunContextError, Trigger, UnknownRunPolicy, Workspace,
     agent_typical_evidence, detect_local_actor,
 };
 use ks_testing::block_on;
@@ -51,6 +51,8 @@ fn the_default_fake_passes_conformance_and_models_a_local_run() {
     assert_eq!(event.git.git_ref, "refs/heads/main");
     assert_eq!(event.trigger, Trigger::Push);
     assert_eq!(event.pr_number(), None);
+    assert_eq!(event.provenance, Provenance::Repository);
+    assert!(!event.is_untrusted());
 
     let capabilities = fake.capabilities();
     assert!(!capabilities.oidc);
@@ -76,6 +78,7 @@ fn an_oidc_enabled_ci_fake_passes_conformance_and_serves_tokens() {
         .with_event(Event {
             git: GitInfo { sha: "b".repeat(64), git_ref: "refs/pull/48/merge".to_string() },
             trigger: Trigger::PullRequest { number: 48 },
+            provenance: Provenance::Repository,
         })
         .with_capabilities(ci_capabilities())
         .with_oidc_token(b"oidc-token-bytes".to_vec());
@@ -93,8 +96,27 @@ fn a_tag_event_names_its_ref_and_passes_conformance() {
     let fake = FakeRunContext::new().with_event(Event {
         git: GitInfo { sha: SHA40.to_string(), git_ref: "refs/tags/v1.2.3".to_string() },
         trigger: Trigger::Tag { name: "v1.2.3".to_string() },
+        provenance: Provenance::Repository,
     });
     block_on(conformance(&fake));
+}
+
+#[test]
+fn only_repository_provenance_is_trusted_and_the_default_is_repository() {
+    assert_eq!(Provenance::default(), Provenance::Repository);
+
+    for (provenance, untrusted) in
+        [(Provenance::Repository, false), (Provenance::Fork, true), (Provenance::Target, true)]
+    {
+        assert_eq!(provenance.is_untrusted(), untrusted, "{provenance:?}");
+        let fake = FakeRunContext::new().with_event(Event {
+            git: GitInfo { sha: SHA40.to_string(), git_ref: "refs/pull/48/merge".to_string() },
+            trigger: Trigger::PullRequest { number: 48 },
+            provenance,
+        });
+        block_on(conformance(&fake));
+        assert_eq!(fake.event().is_untrusted(), untrusted, "{provenance:?}");
+    }
 }
 
 #[test]
@@ -103,6 +125,7 @@ fn conformance_rejects_a_git_ref_that_is_not_a_ref() {
     let fake = FakeRunContext::new().with_event(Event {
         git: GitInfo { sha: SHA40.to_string(), git_ref: "main".to_string() },
         trigger: Trigger::Push,
+        provenance: Provenance::Repository,
     });
     block_on(conformance(&fake));
 }
@@ -113,6 +136,7 @@ fn conformance_rejects_a_tag_trigger_whose_ref_disagrees() {
     let fake = FakeRunContext::new().with_event(Event {
         git: GitInfo { sha: SHA40.to_string(), git_ref: "refs/heads/main".to_string() },
         trigger: Trigger::Tag { name: "v1.2.3".to_string() },
+        provenance: Provenance::Repository,
     });
     block_on(conformance(&fake));
 }
