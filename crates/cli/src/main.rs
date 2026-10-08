@@ -30,6 +30,10 @@ mod generic_ci;
 // binary names this module.
 #[allow(dead_code)]
 mod github_actions_run_context;
+// The GitLab CI run context (#131), on the same terms: the command dispatch
+// still has no run context to hand it, so nothing in the binary names it yet.
+#[allow(dead_code)]
+mod gitlab_ci_run_context;
 mod graph;
 // The local ed25519 `Signer` for the signed run log (#112).
 mod local_key;
