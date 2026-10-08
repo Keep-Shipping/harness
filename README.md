@@ -64,6 +64,15 @@ cosign signature on `SHA256SUMS` and the archive's digest before it installs
 anything. The steps, and the `cosign verify-blob` and `gh attestation verify`
 commands to check one by hand, are in [docs/INSTALL.md](docs/INSTALL.md).
 
+## Getting started
+
+One typed file, from zero to a checked plan: install the binary, type-check the example service, break it on purpose and read the error it gives you. **`run` cannot execute a step yet**, so the walkthrough ends at a plan rather than a deploy — [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) walks the [example service](examples/example-api/) end to end, and is honest about where it stops.
+
+```sh
+cargo build --release -p ks-cli --bin keepshipping   # there is no `cargo install`: ADR 0014
+cd examples/example-api && keepshipping check         # → ✓ ship.ks
+```
+
 ## Contributing
 
 Conventions follow the Cratefield harness:
