@@ -1,6 +1,13 @@
 //! The GitHub Actions run context: the [`RunContext`] adapter for a job on a
 //! runner ([#150](https://github.com/Keep-Shipping/harness/issues/150)).
 //!
+//! A job run by an agent is still a job: the identity is whatever the token
+//! says, so [`Establishment::CiOidc`] stands either way. What the event payload
+//! changes is the *kind* — a pull request opened by an account GitHub or the
+//! organisation calls an agent's is an [`ActorKind::Agent`] run, since the thing
+//! proposing the change is an agent even though the thing testing it is a
+//! runner. A payload this run cannot read leaves the job a plain CI run.
+//!
 //! Where the laptop adapter answers from git config and TTY state, this one
 //! answers from the variables GitHub Actions sets and from the job's own OIDC
 //! ID token. To learn *who* the job is, the adapter mints a token from the
@@ -53,6 +60,8 @@ use ks_core::ports::run_context::{
 };
 use ks_core::ports::secrets::SecretValue;
 
+use crate::actor::{ActorBaseline, is_agent_account};
+
 /// The documented accept header for the token endpoint: version 2.0 of the
 /// response shape.
 const ACCEPT: &str = "application/json; api-version=2.0";
@@ -68,6 +77,8 @@ const GITHUB_WORKSPACE: &str = "GITHUB_WORKSPACE";
 const GITHUB_EVENT_NAME: &str = "GITHUB_EVENT_NAME";
 /// The login that started the job.
 const GITHUB_ACTOR: &str = "GITHUB_ACTOR";
+/// The file the runner writes the event payload to.
+const GITHUB_EVENT_PATH: &str = "GITHUB_EVENT_PATH";
 /// The runner's scratch directory for the job.
 const RUNNER_TEMP: &str = "RUNNER_TEMP";
 /// Where the runner accepts ID token requests.
@@ -175,8 +186,8 @@ pub struct GithubActionsRunContext {
 
 impl GithubActionsRunContext {
     /// Builds the run context from a snapshot of the job's environment and the
-    /// policy-checked `http` client it should mint tokens through.
-    ///
+    /// policy-checked `http` client it should mint tokens through, under an
+    /// empty baseline.
     /// The environment is passed in rather than read here, as
     /// [`LocalRunFacts`](ks_core::ports::run_context::LocalRunFacts) is: the
     /// decision stays pure and tests can script it. Returns
@@ -187,6 +198,17 @@ impl GithubActionsRunContext {
     pub async fn from_env(
         env: &BTreeMap<String, String>,
         http: Arc<dyn HttpClient>,
+    ) -> Result<GithubActionsRunContext, GithubActionsError> {
+        Self::from_env_with(env, http, &ActorBaseline::default()).await
+    }
+
+    /// As [`GithubActionsRunContext::from_env`], but under the organisation's
+    /// `baseline` — what turns a bot-authored pull request into an
+    /// [`ActorKind::Agent`] run.
+    pub async fn from_env_with(
+        env: &BTreeMap<String, String>,
+        http: Arc<dyn HttpClient>,
+        baseline: &ActorBaseline,
     ) -> Result<GithubActionsRunContext, GithubActionsError> {
         if env.get(GITHUB_ACTIONS).map(String::as_str) != Some("true") {
             return Err(GithubActionsError::NotGithubActions { missing: vec![GITHUB_ACTIONS] });
@@ -217,18 +239,20 @@ impl GithubActionsRunContext {
             .filter(|name| !name.is_empty())
             .cloned()
             .unwrap_or_else(|| subject.clone());
+        // The runner is the runner either way: what the payload adds is who
+        // proposed the work, and an agent proposing it makes the run an agent's
+        // without weakening the establishment (see the module documentation).
+        let established = Establishment::CiOidc { issuer, subject };
+        let actor = match proposer(env) {
+            Some((login, user_type))
+                if is_agent_account(&login, user_type.as_deref(), baseline) =>
+            {
+                Actor { kind: ActorKind::Agent, established, display_name: login }
+            }
+            _ => Actor { kind: ActorKind::Ci, established, display_name },
+        };
         Ok(GithubActionsRunContext {
-            actor: Actor {
-                kind: ActorKind::Ci,
-                // `CiOidc`/`Strong` reflect *only* that these claims came
-                // from GitHub's dedicated OIDC token endpoint — NOT that the
-                // JWT was verified. This adapter does not check the signature
-                // or `aud`/`exp` (see the module documentation), so a caller
-                // relying on this for access control must verify the token
-                // against GitHub's JWKS independently.
-                established: Establishment::CiOidc { issuer, subject },
-                display_name,
-            },
+            actor,
             event: Event {
                 git: GitInfo { sha: env[GITHUB_SHA].clone(), git_ref: git_ref.clone() },
                 trigger: trigger_of(event_name, &git_ref),
@@ -252,6 +276,27 @@ impl GithubActionsRunContext {
             http,
         })
     }
+}
+
+/// The account that proposed the job's work, with its GitHub account type: the
+/// pull request's author when the payload carries one, else the sender — the
+/// account that triggered the run at all.
+///
+/// Best-effort by design: no `GITHUB_EVENT_PATH`, an unreadable file, or a body
+/// that is not JSON is [`None`], leaving the identity on the OIDC token alone —
+/// the safe direction, since an unrecognised proposer stays a plain CI run.
+fn proposer(env: &BTreeMap<String, String>) -> Option<(String, Option<String>)> {
+    let path = env.get(GITHUB_EVENT_PATH).filter(|path| !path.is_empty())?;
+    let body = std::fs::read_to_string(path).ok()?;
+    let payload: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let user = payload
+        .get("pull_request")
+        .and_then(|pull_request| pull_request.get("user"))
+        .or_else(|| payload.get("sender"))?;
+    let login =
+        user.get("login").and_then(serde_json::Value::as_str).filter(|login| !login.is_empty())?;
+    let user_type = user.get("type").and_then(serde_json::Value::as_str).map(str::to_string);
+    Some((login.to_string(), user_type))
 }
 
 /// Prints the job's identity and nothing that opens a door: the endpoint URL
@@ -715,6 +760,68 @@ mod tests {
         for unusable in ["", "/work/repo"] {
             let env = BTreeMap::from([(RUNNER_TEMP.to_string(), unusable.to_string())]);
             assert_eq!(scratch_dir(&env, &root), PathBuf::from("/work/repo/.ks/scratch"));
+        }
+    }
+
+    #[test]
+    fn the_proposer_decides_the_kind_and_never_the_establishment() {
+        let base = "http://token.example/id?x=1";
+        let http = http_with_identity(
+            base,
+            HttpResponse { status: 200, headers: vec![], body: Vec::new() },
+        );
+        let oidc =
+            || Establishment::CiOidc { issuer: ISSUER.to_string(), subject: SUBJECT.to_string() };
+        // A bot-authored pull request is an agent's run, and its display name is
+        // the bot's login; a person's is not. The organisation may say a person's
+        // login is an agent's too — the baseline is what says so.
+        let baseline =
+            ActorBaseline { agents: BTreeSet::from(["ada".to_string()]), require_human: false };
+        for (fixture, baseline, kind, display_name) in [
+            ("pull_request.bot.json", None, ActorKind::Agent, "keepshipping-agent[bot]"),
+            ("pull_request.human.json", None, ActorKind::Ci, "octocat"),
+            ("pull_request.human.json", Some(&baseline), ActorKind::Agent, "ada"),
+        ] {
+            let mut env = job_env(base);
+            env.insert(GITHUB_EVENT_NAME.to_string(), "pull_request".to_string());
+            env.insert(GITHUB_REF.to_string(), "refs/pull/412/merge".to_string());
+            env.insert(
+                GITHUB_EVENT_PATH.to_string(),
+                format!("{}/tests/fixtures/github/{fixture}", env!("CARGO_MANIFEST_DIR")),
+            );
+            let context = match baseline {
+                Some(baseline) => block_on(GithubActionsRunContext::from_env_with(
+                    &env,
+                    Arc::clone(&http),
+                    baseline,
+                )),
+                None => block_on(GithubActionsRunContext::from_env(&env, Arc::clone(&http))),
+            }
+            .expect("a job with an id token endpoint builds");
+            assert_eq!(context.actor().kind, kind, "{fixture}");
+            assert_eq!(context.actor().display_name, display_name, "{fixture}");
+            // An agent proposing the work does not weaken the token the runner
+            // minted for it, and the trigger is still the one `GITHUB_REF`
+            // names — not the payload's.
+            assert_eq!(context.actor().established, oidc(), "{fixture}");
+            assert_eq!(context.event().trigger, Trigger::PullRequest { number: 412 }, "{fixture}");
+        }
+
+        // A payload the run cannot read leaves the actor exactly as it was.
+        let here = env!("CARGO_MANIFEST_DIR");
+        for (what, path) in [
+            ("no event path", None),
+            ("a path that is not there", Some("/nonexistent/event-payload.json".to_string())),
+            ("a file that is not json", Some(format!("{here}/Cargo.toml"))),
+        ] {
+            let mut env = job_env(base);
+            if let Some(path) = path {
+                env.insert(GITHUB_EVENT_PATH.to_string(), path);
+            }
+            let context =
+                block_on(GithubActionsRunContext::from_env(&env, Arc::clone(&http))).expect(what);
+            assert_eq!(context.actor().kind, ActorKind::Ci, "{what}");
+            assert_eq!(context.actor().display_name, "octocat", "{what}");
         }
     }
 

@@ -54,6 +54,20 @@ pub struct Answer {
 /// Asks the approval question.
 pub trait Approver {
     fn ask(&mut self, question: &str) -> Answer;
+
+    /// That this approver cannot answer at all: the run waits on someone
+    /// else instead of asking. `None` for every approver that can answer —
+    /// a person at the keyboard, or a pipe that declines on its own.
+    fn waits_on(&self) -> Option<Waiting> {
+        None
+    }
+}
+
+/// Who a run that cannot answer is waiting on, and who has been told.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Waiting {
+    pub on: String,
+    pub notified: Option<String>,
 }
 
 /// Nobody was asked: the run declined itself.
@@ -68,6 +82,9 @@ pub enum Outcome {
     Declined,
     /// A step failed; nothing after it ran.
     Failed,
+    /// An approval nobody could answer: the run waits on a human, and
+    /// nothing after it ran.
+    Waiting,
 }
 
 /// The steps a run covers, in the order it runs them: all of them,
@@ -177,7 +194,8 @@ fn reach(adj: &[Vec<usize>], seeds: &[usize]) -> HashSet<usize> {
 /// Runs `steps` in order, telling `renderer` what happens and reading time
 /// from `clock` — a function returning how long the run has been going, so
 /// the site's timings replay exactly. Stops at the first failure or declined
-/// approval; a declined one answers itself when nobody was there to type.
+/// approval; a declined one answers itself when nobody was there to type, and
+/// an approver that cannot answer at all makes the run wait instead.
 pub fn drive(
     steps: &[&Step],
     runner: &mut dyn StepRunner,
@@ -204,6 +222,16 @@ pub fn drive(
                 took: clock().saturating_sub(at),
             }),
             Ok(Done::Ask(question)) => {
+                // An approver that cannot answer is not asked: the run
+                // waits, and everything after the approval is left alone.
+                if let Some(waiting) = approver.waits_on() {
+                    renderer.event(&RunEvent::Waiting {
+                        step: name.clone(),
+                        on: waiting.on,
+                        notified: waiting.notified,
+                    });
+                    return Outcome::Waiting;
+                }
                 renderer
                     .event(&RunEvent::Asking { step: name.clone(), question: question.clone() });
                 let answer = approver.ask(&question);
@@ -280,6 +308,26 @@ pub struct Declines;
 impl Approver for Declines {
     fn ask(&mut self, _question: &str) -> Answer {
         NOBODY_ANSWERED
+    }
+}
+
+/// An agent's own run. An agent cannot approve the run it is making — that
+/// would be approving itself — so its first approval is a wait, not a
+/// question. `notified` is whoever the policy's `ask:` has already been told
+/// to tell, which the run says so a reader can go and find them.
+pub struct AgentRun {
+    pub notified: Option<String>,
+}
+
+impl Approver for AgentRun {
+    fn ask(&mut self, _question: &str) -> Answer {
+        // Unreachable in practice: `waits_on` sends the run to a human
+        // before anything is ever asked.
+        NOBODY_ANSWERED
+    }
+
+    fn waits_on(&self) -> Option<Waiting> {
+        Some(Waiting { on: "a human".to_string(), notified: self.notified.clone() })
     }
 }
 
@@ -361,6 +409,17 @@ steps:
         ("deploy", "4/4 pods healthy", 27),
     ];
 
+    /// The agent run's script: the same five steps with the agent's own
+    /// numbers, and every step free of time — a run that waits reports what
+    /// it did, not how long it is taking.
+    const AGENT_SCRIPT: [(&str, &str, u64); 5] = [
+        ("build", "sha256:4be1…07  signed", 0),
+        ("plan", "+1 ~0 -1  1 destroy", 0),
+        ("review", "approve 1 change?", 0),
+        ("apply", "1 resource", 0),
+        ("deploy", "1/1 pods healthy", 0),
+    ];
+
     /// What `select` chooses out of `src`, by name.
     fn chosen(
         src: &str,
@@ -399,11 +458,13 @@ steps:
     /// log line, which the runs here are quiet enough to drop.
     struct Scripted {
         now: Rc<Cell<Duration>>,
+        script: &'static [(&'static str, &'static str, u64)],
     }
 
     impl StepRunner for Scripted {
         fn run(&mut self, step: &Step, log: &mut dyn FnMut(&str)) -> Result<Done, String> {
-            let Some((_, summary, secs)) = SCRIPT.iter().find(|(name, _, _)| *name == step.name)
+            let Some((_, summary, secs)) =
+                self.script.iter().find(|(name, _, _)| *name == step.name)
             else {
                 return Err(format!("no scripted step `{name}`", name = step.name));
             };
@@ -439,7 +500,7 @@ steps:
         let steps = site_steps();
         let by: Vec<&Step> = steps.iter().collect();
         let now = Rc::new(Cell::new(Duration::ZERO));
-        let mut runner = Scripted { now: now.clone() };
+        let mut runner = Scripted { now: now.clone(), script: &SCRIPT };
         let mut approver = ScriptedApprover(approved, typed);
         let mut out = Vec::new();
         let mut renderer = Run::new(&mut out, false, tty);
@@ -447,6 +508,66 @@ steps:
         let outcome =
             drive(&by, &mut runner, &mut approver, &mut renderer, &mut clock, "api@a41c9e");
         (String::from_utf8(out).expect("utf-8"), outcome, now)
+    }
+
+    /// The site's run as an agent runs it: the check it stands on, then the
+    /// steps it may take on its own, then the approval it may not answer.
+    fn agent_run(notified: Option<&str>, tty: bool) -> (String, Outcome, Rc<Cell<Duration>>) {
+        let steps = site_steps();
+        let by: Vec<&Step> = steps.iter().collect();
+        let now = Rc::new(Cell::new(Duration::ZERO));
+        let mut runner = Scripted { now: now.clone(), script: &AGENT_SCRIPT };
+        let mut approver = AgentRun { notified: notified.map(str::to_string) };
+        let mut out = Vec::new();
+        let mut renderer = Run::new(&mut out, false, tty);
+        let mut clock = || now.get();
+        renderer.event(&RunEvent::Checked { path: "ship.ks".to_string() });
+        let outcome =
+            drive(&by, &mut runner, &mut approver, &mut renderer, &mut clock, "api@a41c9e");
+        (String::from_utf8(out).expect("utf-8"), outcome, now)
+    }
+
+    /// The site's agent run, in the one form it is written down here.
+    const AGENT_RUN: &str = concat!(
+        "✓ check   ship.ks is valid\n",
+        "▸ build   sha256:4be1…07  signed\n",
+        "▸ plan    +1 ~0 -1  1 destroy\n",
+        "⏸ review  waiting on a human\n",
+        "          @platform notified, plan attached\n",
+        "nothing applied. agent is free to wait.\n",
+    );
+
+    #[test]
+    fn the_agent_run_is_the_sites_agent_run_line_for_line() {
+        let (plain, outcome, now) = agent_run(Some("@platform"), false);
+        assert_eq!(outcome, Outcome::Waiting);
+        assert_eq!(now.get(), Duration::ZERO, "nothing after the review ran");
+        // Not just the golden: the site's lines, so a stray UPDATE_GOLDEN
+        // cannot redefine them.
+        assert_eq!(plain, AGENT_RUN);
+        assert_eq!(plain, read_or_update("site.agent.plain", &plain));
+        // The terminal animates the steps and rewrites them; whoever is
+        // watching is left with the same lines.
+        let (raw, outcome, _) = agent_run(Some("@platform"), true);
+        assert_eq!(outcome, Outcome::Waiting);
+        assert_eq!(screen(raw.as_bytes()), AGENT_RUN);
+    }
+
+    /// A run nobody was told about says so by leaving the notification out.
+    #[test]
+    fn an_agent_run_with_nobody_to_notify_waits_without_naming_a_person() {
+        let (plain, outcome, _) = agent_run(None, false);
+        assert_eq!(outcome, Outcome::Waiting);
+        assert_eq!(
+            plain,
+            concat!(
+                "✓ check   ship.ks is valid\n",
+                "▸ build   sha256:4be1…07  signed\n",
+                "▸ plan    +1 ~0 -1  1 destroy\n",
+                "⏸ review  waiting on a human\n",
+                "nothing applied. agent is free to wait.\n",
+            )
+        );
     }
 
     #[test]

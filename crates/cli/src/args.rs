@@ -21,6 +21,7 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
                           [--warnings-as-errors] [--env NAME] [--event \"push main\"]
                           [--actor human|agent|ci] [--context local|ci] [--secrets] [--fix] [--repro]
        keepshipping run [FILE] [--env NAME] [--event \"push main\"] [--actor human|agent|ci]
+                        [--as human|agent[:name]|ci]
                         [--context local|ci] [--non-interactive] [--until STEP]
                         [--only STEP]... [--skip STEP]... [--allow-partial]
                         [--dry-run] [-v]
@@ -84,6 +85,12 @@ pub struct Options {
     /// otherwise. Policy rules that bind the actor are enforced at check
     /// time.
     pub actor: ActorKind,
+    /// What `--actor`/`--as` declared, if either did: `None` when neither was
+    /// given, so what the environment says decides instead of a default.
+    pub declared: Option<ActorKind>,
+    /// The agent named by `--as agent:<name>`: which agent proposed this run,
+    /// for the run log. Only an `--as` invocation can name one.
+    pub actor_name: Option<String>,
     pub secrets: bool,
     pub non_interactive: bool,
     /// `--context local|ci`: what a run here could do. `None` means
@@ -149,6 +156,8 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
         // that says nothing about an agent reads as "ask", and that answer
         // is the one worth seeing by default.
         actor: if command == Command::PolicyExplain { ActorKind::Agent } else { ActorKind::Human },
+        declared: None,
+        actor_name: None,
         secrets: false,
         non_interactive: false,
         context: None,
@@ -194,7 +203,16 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
                 o.actor = actor_kind(&flag_value(&mut rest)?)?
             }
             "--actor" if command != Command::Fmt && command != Command::PolicyExplain => {
-                o.actor = actor_kind(&flag_value(&mut rest)?)?
+                o.actor = actor_kind(&flag_value(&mut rest)?)?;
+                o.declared = Some(o.actor);
+            }
+            // `--as` is `--actor` plus a name for the agent: which agent is
+            // proposing this run, not just what kind of thing it is.
+            "--as" if command != Command::Fmt => {
+                let (kind, name) = crate::actor::parse_as(&flag_value(&mut rest)?)?;
+                o.actor = kind;
+                o.declared = Some(kind);
+                o.actor_name = name;
             }
             "--non-interactive" if command != Command::Fmt && command != Command::PolicyExplain => {
                 o.non_interactive = true

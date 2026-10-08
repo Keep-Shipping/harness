@@ -1,0 +1,6 @@
+✓ check   ship.ks is valid
+▸ build   sha256:4be1…07  signed
+▸ plan    +1 ~0 -1  1 destroy
+⏸ review  waiting on a human
+          @platform notified, plan attached
+nothing applied. agent is free to wait.
