@@ -21,7 +21,9 @@ jobs:
     name: fuzz (10 min)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install nightly (minimal profile)
         run: |
@@ -29,14 +31,17 @@ jobs:
           rustup run nightly rustc --version
 
       - name: Restore the cargo build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: fuzz
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
-          tool: cargo-fuzz
+          # Pinned for the same reason as cargo-deny in ci.yml: the fuzzer's
+          # flags and defaults move between releases, and the `--target` on the
+          # run below is written against this version.
+          tool: cargo-fuzz@0.13.2
 
       - name: Seed the corpus from the test fixtures
         run: |
@@ -58,7 +63,7 @@ jobs:
 
       - name: Upload fuzzing artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts
@@ -68,7 +73,9 @@ jobs:
     name: bench (500-line parse under 5 ms)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install the Rust toolchain pinned in rust-toolchain.toml
         run: |
@@ -76,7 +83,7 @@ jobs:
           rustup show
 
       - name: Restore the cargo build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: benchmark
         run: |

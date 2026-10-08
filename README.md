@@ -57,6 +57,13 @@ The language and the layout are proposals until their ADRs are accepted: [#2](ht
 | **M2 Early-access alpha** | The same file runs locally and on GitHub Actions. An agent run waits for a human. The first invite batch can follow the docs alone |
 | **M3 Public beta** | Every step and claim on the site is implemented or removed from the site |
 
+## Installing
+
+A tagged release ships signed binaries; [`install.sh`](install.sh) verifies the
+cosign signature on `SHA256SUMS` and the archive's digest before it installs
+anything. The steps, and the `cosign verify-blob` and `gh attestation verify`
+commands to check one by hand, are in [docs/INSTALL.md](docs/INSTALL.md).
+
 ## Contributing
 
 Conventions follow the Cratefield harness:
