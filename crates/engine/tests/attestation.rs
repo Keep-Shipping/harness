@@ -38,6 +38,12 @@ fn build() -> Provenance {
         git_ref: "refs/heads/main".into(),
         file_sha256: "cd".repeat(32),
         builder_id: "keepshipping-buildkit-v0.33.1".into(),
+        version: "0.0.0".into(),
+        inputs: serde_json::json!({
+            "from": "Dockerfile",
+            "platforms": ["linux/amd64"],
+            "secrets": ["npm"],
+        }),
     }
 }
 
@@ -79,6 +85,18 @@ fn provenance_names_the_run_the_commit_the_file_and_the_builder() {
     );
     assert_eq!(at(&value, "predicate.runDetails.builder.id"), "keepshipping-buildkit-v0.33.1");
     assert_eq!(at(&value, "predicate.runDetails.metadata.invocationId"), build().run);
+
+    // The build type's own parameters, and the Keep Shipping version that produced the predicate:
+    // a verifier needs to know which release wrote this and what it was asked to build.
+    assert_eq!(
+        at(&value, "predicate.buildDefinition.externalParameters.inputs.from"),
+        "Dockerfile"
+    );
+    assert_eq!(
+        value["predicate"]["buildDefinition"]["externalParameters"]["inputs"]["secrets"][0],
+        Value::from("npm")
+    );
+    assert_eq!(at(&value, "predicate.runDetails.builder.version.keepshipping"), "0.0.0");
 }
 
 /// The bytes that get signed have their keys sorted, so a signature over them does not depend

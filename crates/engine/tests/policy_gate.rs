@@ -21,7 +21,7 @@ use ks_core::ports::secrets::{Redactor, SecretRef, Secrets, SecretsError};
 use ks_core::step::ActionKind::{Build, Deploy, Destroy, ReadSecrets};
 use ks_core::step::{
     ActionClass, ActionKind, CancellationToken, Field, Inputs, LogSink, Outputs, Port, Ports,
-    StepCtx, StepError, StepKind, StepSchema, TypeRef, Version,
+    RunFacts, StepCtx, StepError, StepKind, StepSchema, TypeRef, Version,
 };
 use ks_engine::journal::Journal;
 use ks_engine::policy_gate::{GateCtx, GatedRun, PolicyGate, PreflightStep};
@@ -263,6 +263,26 @@ fn a_step_is_never_handed_a_port_it_did_not_declare() {
     assert!(!observed.secrets, "the secret store is provided but not handed over");
 }
 
+/// A gated step runs inside a run, so it is handed that run's own facts — a step that attests
+/// (`oci.image` writing provenance) can only do so through the gate, and the facts are not an
+/// input a workflow could have written ([#114](https://github.com/Keep-Shipping/harness/issues/114)).
+#[test]
+fn a_gated_step_is_handed_the_runs_own_facts() {
+    let f = fixture();
+    let gate = f.gate();
+
+    // Before `run.started` there is no `ship.ks` hash yet, so there is no run to name: the gate
+    // says so rather than passing a half-filled fact down.
+    f.drive(&gate, "sample.sneaky", Inputs::new(), true);
+    assert_eq!(f.spy.saw_facts(), None, "no run has started, so no facts");
+
+    block_on(f.journal.run_started(&"ab".repeat(32), "push", "ada", false)).expect("logged");
+    f.drive(&gate, "sample.sneaky", Inputs::new(), true);
+    let facts = f.spy.saw_facts().expect("the run's facts reach the step");
+    assert_eq!(facts.run, f.journal.run_id().clone());
+    assert_eq!(facts.file_sha256, "ab".repeat(32));
+}
+
 /// The port a run resolves secrets through refuses what policy refuses for the run's actor, even
 /// when the step holds it legitimately — the boundary check is not the only thing standing in the
 /// way, and it does not depend on which kind of actor is running.
@@ -473,6 +493,7 @@ impl StepKind for FakeStep {
         // Every step looks at its own context; with the IaC port `None` there is no apply to make
         // at all, so a step cannot do the thing it was written to do, whatever it decides here.
         self.spy.record_ports(ctx.ports().iac_tool().is_some(), ctx.ports().secrets().is_some());
+        self.spy.record_facts(ctx.run());
         Box::pin(std::future::ready(Ok(Outputs::new())))
     }
 }
@@ -482,6 +503,7 @@ impl StepKind for FakeStep {
 struct Spy {
     runs: Arc<Mutex<BTreeMap<String, u32>>>,
     ports: Arc<Mutex<Observed>>,
+    facts: Arc<Mutex<Option<RunFacts>>>,
 }
 
 /// What a step found in its context: was it handed the ports it did not declare?
@@ -498,6 +520,16 @@ impl Spy {
 
     fn record_ports(&self, iac: bool, secrets: bool) {
         *self.ports.lock().expect("the spy") = Observed { iac, secrets };
+    }
+
+    /// Whether the step was handed the run's own facts, and what they said.
+    fn record_facts(&self, facts: Option<&RunFacts>) {
+        *self.facts.lock().expect("the spy") = facts.cloned();
+    }
+
+    /// What the last step to run was told about the run it is in.
+    fn saw_facts(&self) -> Option<RunFacts> {
+        self.facts.lock().expect("the spy").clone()
     }
 
     fn ran(&self, name: &str) -> u32 {

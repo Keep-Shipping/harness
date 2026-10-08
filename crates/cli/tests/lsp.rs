@@ -262,7 +262,10 @@ fn completion_offers_kinds_inputs_and_outputs() {
     // `build.` is one of that step's outputs.
     client.change(HERO_URI, "steps:\n  build: oci.image\n  deploy: k8s.rollout\n    image: build.");
     let answer = client.request("textDocument/completion", at(HERO_URI, 3, 17));
-    assert_eq!(labels(&answer), ["digest", "ref", "tag", "signed", "sbom", "platforms"]);
+    assert_eq!(
+        labels(&answer),
+        ["digest", "ref", "tag", "signed", "sbom", "provenance", "platforms"]
+    );
     assert_eq!(client.shutdown_and_exit(), 0);
 }
 

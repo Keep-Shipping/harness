@@ -14,6 +14,10 @@
 //! - **Caching keys on the context.** A build of the same context is the same bytes, so the
 //!   context is what the cache key covers — and a run that mounts secrets opts out entirely (see
 //!   [`OciImage::caching`]).
+//! - **A signed image is an attested one.** Alongside the signature the step attaches SLSA v1
+//!   provenance naming the run, the commit, the `ship.ks` and the resolved, non-secret inputs
+//!   ([#114](https://github.com/Keep-Shipping/harness/issues/114)). Only a run that knows all of
+//!   those attaches one: a fact is never invented to fill the predicate.
 //!
 //! The BuildKit/buildx adapter this step talks to is not here yet; ADR
 //! `0010-image-build-backend.md` describes it. Everything below is exercised against the
@@ -23,6 +27,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ks_core::ports::BoxFuture;
+use ks_core::ports::run_context::Establishment;
 use ks_core::ports::script_host::{Value, ValueType};
 use ks_core::ports::secrets::SecretValue;
 use ks_core::ports::supply_chain::{
@@ -33,6 +38,9 @@ use ks_core::step::{
     ActionClass, ActionKind, CacheCheck, CacheInput, Caching, Field, Inputs, Outputs, Port,
     StepCtx, StepError, StepKind, StepSchema, TypeRef, Version,
 };
+use serde_json::{Map, Value as Json, json};
+
+use crate::attestation::{self, Provenance, Subject};
 
 /// The step's registered name; what a workflow writes as `build: oci.image`.
 pub const NAME: &str = "oci.image";
@@ -116,6 +124,11 @@ impl StepKind for OciImage {
                     "the SBOM artifact's digest, or empty when there is none",
                 ),
                 Field::new(
+                    "provenance",
+                    TypeRef::Named("oci.Artifact"),
+                    "the attached SLSA provenance envelope's digest, or empty when there is none",
+                ),
+                Field::new(
                     "platforms",
                     TypeRef::Builtin(ValueType::List),
                     "the platforms the image was built for",
@@ -129,9 +142,10 @@ impl StepKind for OciImage {
     }
 
     fn optional(&self) -> &'static [Port] {
-        // Only `sign: true` needs a signer; a run that does not sign must not be blocked by a
-        // composition that provides none.
-        &[Port::Signer]
+        // Only `sign: true` needs a signer, and only a signed build attests, so a run that does
+        // neither must not be blocked by a composition that provides none. `RunContext` is where
+        // the commit and the runner's identity come from (#114).
+        &[Port::Signer, Port::RunContext]
     }
 
     fn action(&self, _inputs: &Inputs) -> ActionClass {
@@ -264,9 +278,24 @@ impl StepKind for OciImage {
                 false
             };
 
+            // Provenance rides on the signature: an unsigned image gets no attestation, and a
+            // signed one gets exactly what the run actually knows. A missing fact skips the
+            // attestation with a line in the log rather than a half-invented predicate
+            // (#114).
+            let provenance = if signed {
+                attest(&ctx, registry.as_ref(), &repository, &digest, &push, &inputs, &platforms)
+                    .await?
+            } else {
+                String::new()
+            };
+
             ctx.log().info(
                 &format!("pushed {push}"),
-                &[("digest", &digest.to_string()), ("signed", &signed.to_string())],
+                &[
+                    ("digest", &digest.to_string()),
+                    ("signed", &signed.to_string()),
+                    ("provenance", &provenance),
+                ],
             );
 
             let mut outputs = Outputs::new();
@@ -278,6 +307,7 @@ impl StepKind for OciImage {
             // is declared (a step may not invent outputs) and empty means "none": once the
             // BuildKit adapter lands, ADR 0010 has it push the SBOM and report its digest.
             outputs.insert("sbom".to_string(), Value::from(""));
+            outputs.insert("provenance".to_string(), Value::from(provenance));
             outputs.insert(
                 "platforms".to_string(),
                 Value::List(
@@ -287,6 +317,135 @@ impl StepKind for OciImage {
             Ok(outputs)
         })
     }
+}
+
+/// The builder's id for a run whose identity is not verified: one fixed value for every laptop
+/// run, because a display name or a username is a person's name in a signature nobody should
+/// read twice.
+const LOCAL_BUILDER: &str = "urn:keepshipping:builder:local";
+
+/// Signs the SLSA provenance for this build and attaches it to `repository`, returning the digest
+/// the envelope was stored under — or an empty string when a fact the predicate needs is not
+/// known ([#114](https://github.com/Keep-Shipping/harness/issues/114)).
+///
+/// A fact is never invented: an attestation that names a commit nobody checked out, or a builder
+/// identity nobody vouched for, is worse than none, because a verifier will believe it. So a
+/// missing [`RunContext`](ks_core::ports::run_context::RunContext), a run with no commit or no ref,
+/// or a step driven outside a run each skip the attestation and say which one was missing.
+async fn attest(
+    ctx: &StepCtx,
+    registry: &dyn Registry,
+    repository: &str,
+    digest: &Digest,
+    push: &str,
+    inputs: &Inputs,
+    platforms: &[String],
+) -> Result<String, StepError> {
+    let missing = |fact: &str| -> Result<String, StepError> {
+        ctx.log().info("no provenance attached", &[("missing", fact)]);
+        Ok(String::new())
+    };
+
+    let Some(run) = ctx.run() else { return missing("the run's own facts") };
+    let Some(runner) = ctx.ports().run_context() else { return missing("a RunContext port") };
+    let event = runner.event();
+    if event.git.sha.is_empty() {
+        return missing("the commit this run was triggered for");
+    }
+    // The ref names the source in `uri: "git+"`, so an empty one would attest to a build from
+    // nowhere. A local run that never checked anything out has no ref and says so.
+    if event.git.git_ref.is_empty() {
+        return missing("the ref this run was triggered for");
+    }
+
+    // A CI adapter that verified an OIDC token vouches for who built this, so the builder is
+    // named under that identity — the same `issuer#subject` a keyless signature is filed under,
+    // so the attestation and the signature name the same builder. Anything weaker is a laptop,
+    // and a laptop has one builder id.
+    let builder_id = match &runner.actor().established {
+        Establishment::CiOidc { issuer, subject } => format!("{issuer}#{subject}"),
+        _ => LOCAL_BUILDER.to_string(),
+    };
+
+    let build = Provenance {
+        step: NAME.to_string(),
+        run: run.run.to_string(),
+        commit: event.git.sha.clone(),
+        git_ref: event.git.git_ref.clone(),
+        file_sha256: run.file_sha256.clone(),
+        builder_id,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        inputs: resolved_inputs(ctx, inputs, platforms),
+    };
+    let signer = ctx.ports().signer().ok_or_else(|| StepError::Port {
+        port: Port::Signer,
+        message: "attaching provenance needs the Signer port the signature used".to_string(),
+    })?;
+    let subject = Subject::image(push, digest)
+        .map_err(|error| StepError::Failed(format!("provenance subject: {error}")))?;
+    let statement = attestation::provenance(subject.clone(), &build);
+    let attached = attestation::attach(registry, repository, signer.as_ref(), &subject, &statement)
+        .await
+        .map_err(|error| {
+            StepError::Failed(format!("attaching provenance to {repository} failed: {error}"))
+        })?;
+    Ok(attached.to_string())
+}
+
+/// The build type's `externalParameters.inputs`: the inputs as the build actually saw them, so a
+/// verifier can tell which base, context, args and platforms this image came from.
+///
+/// A predicate is a document the registry serves to anyone who asks, so nothing here may be a
+/// secret. The `secrets` *names* are recorded and their values are not; and an `args` value is
+/// recorded only when the run's [`Redactor`](ks_core::ports::secrets::Redactor) proves it carries
+/// no secret — see [`redacted_args`]. An absent optional is `null` rather than missing, so a
+/// verifier reads one shape either way.
+fn resolved_inputs(ctx: &StepCtx, inputs: &Inputs, platforms: &[String]) -> Json {
+    // The secret *names*, and nothing else: `map` drops the values on the way, and a `BTreeMap`
+    // sorts them, so the predicate is the same document whichever order the mounts arrived in.
+    let names: Vec<String> = map(inputs, "secrets").into_keys().collect();
+    // The context is the *resolved* one, not the raw input: omitting `context` means the
+    // Dockerfile's own directory, and a predicate that recorded the empty string would not say
+    // which directory was actually built.
+    let context = context_of(inputs);
+    json!({
+        "from": text(inputs, "from"),
+        "context": context.to_string_lossy(),
+        "args": redacted_args(ctx, inputs),
+        "platforms": platforms,
+        "target": non_empty(text(inputs, "target")),
+        "push": text(inputs, "push"),
+        "cache": text(inputs, "cache"),
+        "sbom": matches!(inputs.get("sbom"), Some(Value::Bool(true))),
+        "secrets": names,
+    })
+}
+
+/// The build args with every value the redactor can find a secret in replaced by `null`.
+///
+/// An arg value is ordinary text by the time a step sees it, and nothing upstream proves it is
+/// secret-free: the checker does not yet walk the entries of a map input such as `args`, and no
+/// production path builds a step's `Inputs` from a `ship.ks` at all. So this is defence in depth,
+/// not the thing keeping a token out — and the only evidence available is the run's
+/// [`Redactor`](ks_core::ports::secrets::Redactor), the same one every log line goes through. A
+/// value redaction *changes* is therefore recorded as its name with no value, rather than the
+/// value itself.
+///
+/// Fail-closed, deliberately: an arg a verifier cannot read is a smaller loss than a signed,
+/// world-readable referrer carrying a token.
+fn redacted_args(ctx: &StepCtx, inputs: &Inputs) -> Json {
+    let args: Map<String, Json> = map(inputs, "args")
+        .into_iter()
+        .map(|(name, value)| {
+            let safe = ctx.log().redact(&value);
+            let recorded = match safe == value {
+                true => Json::from(value),
+                false => Json::Null,
+            };
+            (name, recorded)
+        })
+        .collect();
+    Json::Object(args)
 }
 
 /// The platform this build runs on, as BuildKit spells it. `ARCH` is the Rust-level name;

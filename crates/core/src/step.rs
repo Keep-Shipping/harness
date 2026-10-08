@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::ids::RunId;
 use crate::ports::BoxFuture;
 use crate::ports::clock::Clock;
 use crate::ports::run_context::NetworkScope;
@@ -812,6 +813,22 @@ fn value_has_secret(redactor: &Redactor, value: &Value) -> bool {
     }
 }
 
+/// What the engine knows about the run a step belongs to
+/// ([#114](https://github.com/Keep-Shipping/harness/issues/114)).
+///
+/// A step that attests to what it built — `oci.image` writing SLSA provenance — has to name the
+/// run and the `ship.ks` it came from, and neither is an input a workflow writes: they are facts
+/// about the run itself. They travel on the context rather than in `Inputs` so they cannot be
+/// forged from a workflow, and they are optional because only the journaled path knows them — a
+/// step driven directly by a caller, or a cache verification, has no run to name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunFacts {
+    /// The run the step is part of.
+    pub run: RunId,
+    /// The sha256 of the `ship.ks` file that run was started from, hex without the prefix.
+    pub file_sha256: String,
+}
+
 /// What the harness hands a step when it runs: the ports the step declared, the harness clock,
 /// the run's cancellation token and its redacting logger.
 #[derive(Clone)]
@@ -820,17 +837,31 @@ pub struct StepCtx {
     clock: Arc<dyn Clock>,
     cancel: CancellationToken,
     log: StepLog,
+    run: Option<RunFacts>,
 }
 
 impl StepCtx {
-    /// Assembles a context; the engine does this, steps receive it.
+    /// Assembles a context; the engine does this, steps receive it. No run facts: only the
+    /// journaled path knows which run it is in ([`RunFacts`]).
     pub fn new(
         ports: Ports,
         clock: Arc<dyn Clock>,
         cancel: CancellationToken,
         log: StepLog,
     ) -> StepCtx {
-        StepCtx { ports, clock, cancel, log }
+        StepCtx { ports, clock, cancel, log, run: None }
+    }
+
+    /// The same context, told which run it is in.
+    #[must_use]
+    pub fn with_run(self, facts: RunFacts) -> StepCtx {
+        StepCtx { run: Some(facts), ..self }
+    }
+
+    /// The run's own facts, when the caller knew them. A step that needs them to attest must
+    /// treat `None` as "no attestation", never as an excuse to invent one.
+    pub fn run(&self) -> Option<&RunFacts> {
+        self.run.as_ref()
     }
 
     /// The ports this step declared. Nothing else is reachable.

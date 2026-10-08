@@ -271,6 +271,7 @@ impl<'a> PolicyGate<'a> {
             Arc::clone(&ctx.log),
             Arc::clone(&ctx.redactor),
             self.ports_for(ctx.harness, step.as_ref()),
+            ctx.journal.run_facts(),
         )
         .await;
         Ok(GatedRun::Ran(outputs))

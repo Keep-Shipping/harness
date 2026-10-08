@@ -14,8 +14,8 @@ use ks_core::harness::Harness;
 use ks_core::ports::BoxFuture;
 use ks_core::ports::secrets::Redactor;
 use ks_core::step::{
-    CancellationToken, Inputs, LogSink, Outputs, Port, Ports, StepCtx, StepError, StepKind,
-    StepLog, reject_secret_outputs,
+    CancellationToken, Inputs, LogSink, Outputs, Port, Ports, RunFacts, StepCtx, StepError,
+    StepKind, StepLog, reject_secret_outputs,
 };
 
 /// Runs the step `name` from `harness` with `inputs`; `log` receives every record the engine
@@ -29,13 +29,39 @@ pub fn run_step<'a>(
     log: Arc<dyn LogSink>,
     redactor: Arc<Redactor>,
 ) -> BoxFuture<'a, Result<Outputs, StepError>> {
+    run_step_in(harness, name, inputs, cancel, log, redactor, None)
+}
+
+/// [`run_step`] inside a known run, which is the only way facts reach a step at all: they travel
+/// on the [`StepCtx`] it is run with, which is what a step attests against
+/// ([#114](https://github.com/Keep-Shipping/harness/issues/114)).
+pub(crate) fn run_step_in<'a>(
+    harness: &'a Harness,
+    name: &'a str,
+    inputs: Inputs,
+    cancel: CancellationToken,
+    log: Arc<dyn LogSink>,
+    redactor: Arc<Redactor>,
+    facts: Option<RunFacts>,
+) -> BoxFuture<'a, Result<Outputs, StepError>> {
     Box::pin(async move {
         let step = harness.step(name).ok_or_else(|| StepError::UnknownStep(name.to_string()))?;
         if cancel.is_cancelled() {
             return Err(StepError::Cancelled);
         }
         let inputs = harness.prepare_inputs(step.as_ref(), inputs)?;
-        execute(harness, name, step.as_ref(), inputs, cancel, log, redactor).await
+        execute_with_ports(
+            harness,
+            name,
+            step.as_ref(),
+            inputs,
+            cancel,
+            log,
+            redactor,
+            declared_ports(harness, step.as_ref()),
+            facts,
+        )
+        .await
     })
 }
 
@@ -49,7 +75,7 @@ pub(crate) fn step_ctx(
     log: Arc<dyn LogSink>,
     redactor: Arc<Redactor>,
 ) -> StepCtx {
-    step_ctx_for(harness, declared_ports(harness, step), name, cancel, log, redactor)
+    step_ctx_for(harness, declared_ports(harness, step), name, cancel, log, redactor, None)
 }
 
 /// The ports a step gets: the ones it declared, and nothing else.
@@ -60,7 +86,9 @@ pub(crate) fn declared_ports(harness: &Harness, step: &dyn StepKind) -> Ports {
 
 /// [`step_ctx`] with the ports chosen by the caller: the policy gate hands out the same
 /// restriction with the `Secrets` port wrapped ([#103](https://github.com/Keep-Shipping/harness/issues/103)),
-/// so there is still exactly one place a step's context is assembled.
+/// so there is still exactly one place a step's context is assembled. `facts` are the run's own,
+/// or `None` where the caller has no run to name ([#114](https://github.com/Keep-Shipping/harness/issues/114)).
+#[allow(clippy::too_many_arguments)] // `step_ctx`'s arguments, plus the ports and the facts
 pub(crate) fn step_ctx_for(
     harness: &Harness,
     ports: Ports,
@@ -68,8 +96,14 @@ pub(crate) fn step_ctx_for(
     cancel: CancellationToken,
     log: Arc<dyn LogSink>,
     redactor: Arc<Redactor>,
+    facts: Option<RunFacts>,
 ) -> StepCtx {
-    StepCtx::new(ports, Arc::clone(harness.clock()), cancel, StepLog::new(name, redactor, log))
+    let ctx =
+        StepCtx::new(ports, Arc::clone(harness.clock()), cancel, StepLog::new(name, redactor, log));
+    match facts {
+        Some(facts) => ctx.with_run(facts),
+        None => ctx,
+    }
 }
 
 /// Logs the action class, runs an already-prepared step, and checks what it returned — against
@@ -92,13 +126,16 @@ pub(crate) async fn execute(
         log,
         redactor,
         declared_ports(harness, step),
+        None,
     )
     .await
 }
 
 /// [`execute`] against ports the caller chose — the policy gate passes the step's declared ports
-/// with the `Secrets` slot gated, so the same check-and-run is used either way.
-#[allow(clippy::too_many_arguments)] // `execute`'s arguments, plus the ports they choose
+/// with the `Secrets` slot gated, so the same check-and-run is used either way. `facts` are the
+/// run's own, which the gate gets from the [`Journal`](crate::journal::Journal) it is journalling
+/// to ([#114](https://github.com/Keep-Shipping/harness/issues/114)).
+#[allow(clippy::too_many_arguments)] // `execute`'s arguments, plus the ports and the facts
 pub(crate) async fn execute_with_ports(
     harness: &Harness,
     name: &str,
@@ -108,8 +145,9 @@ pub(crate) async fn execute_with_ports(
     log: Arc<dyn LogSink>,
     redactor: Arc<Redactor>,
     ports: Ports,
+    facts: Option<RunFacts>,
 ) -> Result<Outputs, StepError> {
-    let ctx = step_ctx_for(harness, ports, name, cancel, log, Arc::clone(&redactor));
+    let ctx = step_ctx_for(harness, ports, name, cancel, log, Arc::clone(&redactor), facts);
     ctx.log().info("step started", &[("action", step.action(&inputs).to_string().as_str())]);
     let outputs = step.run(ctx, inputs).await?;
     // Before the schema check, not after: `check_outputs` names an undeclared output in its
