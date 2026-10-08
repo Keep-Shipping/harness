@@ -396,8 +396,16 @@ impl PlanSummary {
         if self.add == 0 && self.change == 0 && self.destroy == 0 {
             "No changes.".to_string()
         } else {
-            format!("{} to add · {} to change · {} to destroy", self.add, self.change, self.destroy)
+            self.counts()
         }
+    }
+
+    /// The whole plan's three counts, as `tofu` prints them, whatever is
+    /// shown: `2 to add · 1 to change · 0 to destroy`. Shared with callers
+    /// outside this module so one wording says it everywhere.
+    #[must_use]
+    pub fn counts(&self) -> String {
+        format!("{} to add · {} to change · {} to destroy", self.add, self.change, self.destroy)
     }
 
     /// How `shown` entries split over the buckets (risky, ordinary, hidden);

@@ -12,6 +12,13 @@ ks-core.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 
+[features]
+# `decide` — the risk-answering step, off until the Jev adapter lands
+# (#8) and its confidence has been calibrated against real plans (#108).
+# The module always compiles; only `builtin_steps()` is gated on this, so a
+# harness or a test can register `decide::Decide` without the feature.
+decide = []
+
 [dev-dependencies]
 ks-lang.workspace = true
 ks-testing.workspace = true

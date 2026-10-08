@@ -16,14 +16,30 @@ use crate::tofu_apply::TofuApply;
 use crate::tofu_plan::TofuPlan;
 
 /// Every built-in step kind, in registration order.
+///
+/// `decide` is behind the `decide` cargo feature and so is absent here until
+/// it is switched on: the Jev adapter (#8) is not merged and the confidence it
+/// would report has not been calibrated against real plans (#108), so a
+/// shipped build must not answer a risk question nobody measured. The module
+/// itself always compiles, so a harness can register
+/// [`Decide`](crate::decide::Decide) itself and the tests can drive it.
 pub fn builtin_steps() -> Vec<Arc<dyn StepKind>> {
-    vec![
-        Arc::new(OciImage),
-        Arc::new(OciArtifactStep),
-        Arc::new(OciVerify),
-        Arc::new(TofuPlan),
-        Arc::new(TofuApply),
+    #[cfg(feature = "decide")]
+    let decide: Option<Arc<dyn StepKind>> = Some(Arc::new(crate::decide::Decide));
+    #[cfg(not(feature = "decide"))]
+    let decide: Option<Arc<dyn StepKind>> = None;
+
+    [
+        Some(Arc::new(OciImage) as Arc<dyn StepKind>),
+        Some(Arc::new(OciArtifactStep)),
+        Some(Arc::new(OciVerify)),
+        Some(Arc::new(TofuPlan)),
+        Some(Arc::new(TofuApply)),
+        decide,
     ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// The named types the built-in steps' schemas refer to, for a

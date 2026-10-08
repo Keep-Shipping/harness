@@ -63,6 +63,7 @@ pub enum Port {
     Cluster,
     RemoteShell,
     FunctionHost,
+    DecisionModel,
 }
 
 impl fmt::Display for Port {
@@ -83,6 +84,7 @@ impl fmt::Display for Port {
             Port::Cluster => "Cluster",
             Port::RemoteShell => "RemoteShell",
             Port::FunctionHost => "FunctionHost",
+            Port::DecisionModel => "DecisionModel",
         };
         f.write_str(name)
     }
@@ -159,6 +161,7 @@ define_ports! {
     (cluster, Cluster, cluster, with_cluster),
     (remote_shell, RemoteShell, remote_shell, with_remote_shell),
     (function_host, FunctionHost, function_host, with_function_host),
+    (decision_model, DecisionModel, decision_model, with_decision_model),
 }
 
 /// What a step run *is*, for policy purposes

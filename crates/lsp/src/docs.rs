@@ -23,7 +23,10 @@ pub fn kind_doc(kind: &str) -> Option<&'static str> {
         "k8s.rollout" => {
             "Roll a deployment out to a cluster. Its outputs are known only at run time."
         }
-        "decide" => "Ask a model a question, and branch on the answer it declares in `returns:`.",
+        "decide" => {
+            "Ask a model a question, and branch on the answer it declares in `returns:`. Also \
+             yields `confidence`, `probabilities` and a `reason` the engine wrote from the plan."
+        }
         _ => return None,
     })
 }

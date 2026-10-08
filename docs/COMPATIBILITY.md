@@ -11,7 +11,7 @@ each is at. Each is bumped only for a breaking change.
 | Contract | Version | What it versions | Enforced by |
 | --- | --- | --- | --- |
 | `FORMAT_VERSION` | 1 | the `ship.ks` file format | `ks_core::check`, which reads the file's `keepshipping:` header |
-| `STEP_API` | 2 | the `StepKind` trait a step implements | `HarnessBuilder::build`, which refuses a step built against another version |
+| `STEP_API` | 3 | the `StepKind` trait a step implements | `HarnessBuilder::build`, which refuses a step built against another version |
 | `SCRIPT_PROTOCOL` | 1 | the JSON-stdio protocol between the harness and a TypeScript script | declared and versioned, not yet enforced — nothing reads it at runtime yet |
 
 `FORMAT_VERSION` and `STEP_API` have a runtime gate today.
