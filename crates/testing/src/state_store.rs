@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use ks_core::ids::RunId;
 use ks_core::ports::BoxFuture;
 use ks_core::ports::state_store::{StateError, StateStore, check_key};
+use ks_core::sensitivity::{PLAN_KEY_PREFIX, Sensitivity};
 
 /// Every run's blobs, keyed by run id then key.
 type Contents = Arc<Mutex<BTreeMap<String, BTreeMap<String, Vec<u8>>>>>;
@@ -77,7 +78,8 @@ impl StateStore for MemoryStateStore {
 /// The `StateStore` conformance kit: this fake and the local
 /// `.keepshipping/runs/<id>/` one must both pass it. A round-trip, a missing key
 /// as `Ok(None)`, an overwrite, two runs that cannot see each other's objects,
-/// and the key rules that keep a blob inside its own run directory.
+/// the key rules that keep a blob inside its own run directory, and the naming
+/// rule that makes plan bytes secretish (#122).
 pub async fn conformance(store: &dyn StateStore) {
     let run = RunId::from_parts(1_700_000_000_000, 1);
     let other = RunId::from_parts(1_700_000_000_000, 2);
@@ -108,6 +110,28 @@ pub async fn conformance(store: &dyn StateStore) {
             "state_store conformance: {bad:?} must be refused, got {written:?}"
         );
     }
+
+    // Plan bytes are secretish, and the port's policy is that they live under
+    // the digest-addressed `plan-` namespace: a plan written and read back
+    // round-trips, and the key alone is what marks it (#122).
+    let digest = "ab".repeat(32);
+    let plan = format!("{PLAN_KEY_PREFIX}{digest}");
+    put(&plan, b"\x00saved-plan-bytes").await;
+    assert_eq!(
+        get(&plan, &run).await,
+        Some(b"\x00saved-plan-bytes".to_vec()),
+        "a plan blob must round-trip under its `plan-` key"
+    );
+    assert_eq!(
+        Sensitivity::of_key(&plan),
+        Sensitivity::Secretish,
+        "a `plan-` key must be secretish, or plan bytes get no owner-only storage"
+    );
+    assert_eq!(
+        Sensitivity::of_key("state.json"),
+        Sensitivity::Plain,
+        "the run record is not a secret"
+    );
 }
 
 #[cfg(test)]

@@ -50,6 +50,7 @@ pub mod registry;
 pub mod repro;
 pub mod script;
 pub mod script_step;
+pub mod sensitivity;
 pub mod step;
 pub mod tf;
 mod types;

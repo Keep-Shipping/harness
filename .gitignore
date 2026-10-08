@@ -20,3 +20,5 @@ sdk/ts/node_modules/
 .mcp.json
 # What `keepshipping check` caches beside a site file (script signatures)
 .keepshipping/
+# Saved plan files written by `tofu plan -out` — binary, and full of secrets
+.ks/
