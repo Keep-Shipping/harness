@@ -307,6 +307,26 @@ pub trait Secrets: Send + Sync {
 /// Values are stored as zeroised-on-drop copies ([`SecretValue`]), so a
 /// `Redactor` is exactly as leaky as a resolved value: no more. Its `Debug`
 /// prints a count, never a value.
+///
+/// [`register`](Redactor::register) also registers each value's common
+/// encodings — base64 (padded, unpadded and URL-safe), URL percent-encoding,
+/// and JSON string escaping — because a step that encodes a secret before
+/// printing it writes bytes the literal value never matches. Matching stays
+/// exact and best-effort, so what is *not* covered is worth naming:
+///
+/// - base64 of a secret embedded at an offset other than a multiple of three
+///   inside a longer blob: the surrounding bytes shift every triplet, so the
+///   secret's own encoding does not appear as a substring. The three aligned
+///   offsets of any longer blob are not registered either — that would mean
+///   re-encoding every possible container.
+/// - hashed, truncated, encrypted or otherwise transformed values.
+/// - a secret split across lines or re-ordered before it is printed.
+/// - non-UTF-8 values in the clear; those are skipped (see
+///   [`redact`](Redactor::redact)), though their base64 and percent-encodings
+///   are still registered.
+///
+/// Redaction is a safety net, not a guarantee: the reason `Secret` is a type
+/// is what actually keeps values out of strings.
 #[derive(Default)]
 pub struct Redactor {
     /// Registered values, longest first.
@@ -319,19 +339,53 @@ impl Redactor {
         Redactor { values: Vec::new() }
     }
 
-    /// Registers a value for redaction; empty values are ignored (they would
-    /// otherwise replace everything, or nothing, depending on the matcher —
-    /// either is useless). Registering the same value twice is harmless.
+    /// Registers a value for redaction, together with each of its common
+    /// encodings; empty values are ignored (they would otherwise replace
+    /// everything, or nothing, depending on the matcher — either is useless).
+    /// An encoding identical to the raw value is not registered twice.
+    /// Registering the same value twice is harmless.
+    ///
+    /// The encodings are the ones a step is likely to produce on its own: the
+    /// standard base64 alphabet (`+`/`/`) with and without padding, the URL-safe
+    /// alphabet (`-`/`_`), percent-encoding of every byte outside the RFC 3986
+    /// unreserved set, and the JSON string escaping `serde_json` writes. See the
+    /// type's documentation for what this does not cover.
     pub fn register(&mut self, value: &SecretValue) {
         value.with_bytes(|bytes| {
             if bytes.is_empty() {
                 return;
             }
-            let copy = SecretValue::new(bytes.to_vec());
-            let position =
-                self.values.partition_point(|existing| existing.byte_len() >= bytes.len());
-            self.values.insert(position, copy);
+            let mut patterns = vec![bytes.to_vec()];
+            let padded = base64_encode(bytes, false);
+            for encoded in [
+                padded.clone(),
+                // Unpadded base64 is the padded form minus its `=` run, and
+                // URL-safe swaps `+`/`/` for `-`/`_`.
+                base64_encode(bytes, true),
+                base64_unpadded(&padded),
+                percent_encode(bytes),
+                json_escape(bytes),
+            ] {
+                // Only what the raw value does not already match: an encoding
+                // that came out unchanged would only grow the scan.
+                if encoded != bytes && !patterns.contains(&encoded) {
+                    patterns.push(encoded);
+                }
+            }
+            for pattern in patterns {
+                self.insert_pattern(pattern);
+            }
         });
+    }
+
+    /// Inserts one pattern, keeping `values` sorted longest-first so the
+    /// longest match wins a tie in `match_spans`.
+    fn insert_pattern(&mut self, pattern: Vec<u8>) {
+        if pattern.is_empty() {
+            return;
+        }
+        let position = self.values.partition_point(|existing| existing.byte_len() >= pattern.len());
+        self.values.insert(position, SecretValue::new(pattern));
     }
 
     /// Returns `text` with every occurrence of every registered value
@@ -403,6 +457,88 @@ impl fmt::Debug for Redactor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Redactor").field("values", &self.values.len()).finish()
     }
+}
+
+/// Uppercase hex, as percent-encoding writes it.
+const HEX_UPPER: [u8; 16] = *b"0123456789ABCDEF";
+/// Lowercase hex, as `serde_json` writes its `\u00XX` escapes.
+const HEX_LOWER: [u8; 16] = *b"0123456789abcdef";
+
+/// Standard base64 (`+`/`/`) per RFC 4648 §4, or the URL-safe alphabet (`-`/`_`)
+/// per §5, with padding. Hand-rolled because `ks-core` takes no dependencies
+/// ([ADR 0004](../../../docs/adr/0004-secrets.md)).
+fn base64_encode(bytes: &[u8], url_safe: bool) -> Vec<u8> {
+    const STANDARD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const URL_SAFE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let alphabet = if url_safe { URL_SAFE } else { STANDARD };
+    let mut out = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0] as u32;
+        let second = chunk.get(1).copied().unwrap_or(0) as u32;
+        let third = chunk.get(2).copied().unwrap_or(0) as u32;
+        let bits = (first << 16) | (second << 8) | third;
+        out.push(alphabet[(bits >> 18 & 0x3F) as usize]);
+        out.push(alphabet[(bits >> 12 & 0x3F) as usize]);
+        // A short final chunk has no bits left for these groups, so it pads.
+        out.push(if chunk.len() > 1 { alphabet[(bits >> 6 & 0x3F) as usize] } else { b'=' });
+        out.push(if chunk.len() > 2 { alphabet[(bits & 0x3F) as usize] } else { b'=' });
+    }
+    out
+}
+
+/// `padded` base64 with its trailing `=` run stripped, the form a caller that
+/// knows its length omits.
+fn base64_unpadded(padded: &[u8]) -> Vec<u8> {
+    let keep = padded.iter().rposition(|byte| *byte != b'=').map_or(0, |index| index + 1);
+    padded[..keep].to_vec()
+}
+
+/// Percent-encoding of every byte outside RFC 3986's unreserved set
+/// (`ALPHA / DIGIT / "-" / "." / "_" / "~"`), as `application/x-www-form-urlencoded`
+/// and URL-building code write it. The space becomes `%20` rather than `+`,
+/// because the `+`-for-space form only appears in form bodies.
+fn percent_encode(bytes: &[u8]) -> Vec<u8> {
+    let unreserved =
+        |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~');
+    let mut out = Vec::with_capacity(bytes.len());
+    for byte in bytes {
+        if unreserved(*byte) {
+            out.push(*byte);
+        } else {
+            out.push(b'%');
+            out.push(HEX_UPPER[usize::from(byte >> 4)]);
+            out.push(HEX_UPPER[usize::from(byte & 0x0F)]);
+        }
+    }
+    out
+}
+
+/// JSON string escaping as `serde_json` writes it, without the surrounding
+/// quotes: `"` and `\` get a backslash, `\n \t \r \b \f` their two-letter
+/// forms, and any other control byte a `\u00XX` escape. Bytes outside ASCII are
+/// copied through, matching `serde_json`'s default (it escapes `/` only when the
+/// caller asks). Non-UTF-8 bytes pass through unchanged and will simply never
+/// match, exactly as the raw value does not.
+fn json_escape(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    for byte in bytes {
+        match byte {
+            b'"' => out.extend_from_slice(br#"\""#),
+            b'\\' => out.extend_from_slice(br"\\"),
+            0x08 => out.extend_from_slice(br"\b"),
+            0x0C => out.extend_from_slice(br"\f"),
+            b'\n' => out.extend_from_slice(br"\n"),
+            b'\r' => out.extend_from_slice(br"\r"),
+            b'\t' => out.extend_from_slice(br"\t"),
+            byte if *byte < 0x20 => {
+                out.extend_from_slice(br"\u00");
+                out.push(HEX_LOWER[usize::from(byte >> 4)]);
+                out.push(HEX_LOWER[usize::from(byte & 0x0F)]);
+            }
+            byte => out.push(*byte),
+        }
+    }
+    out
 }
 
 /// The policy front door for [`Secrets`]: what an actor may read.
@@ -615,8 +751,93 @@ mod tests {
         let mut redactor = Redactor::new();
         redactor.register(&SecretValue::new(b"hunter2".to_vec()));
         let debug = format!("{redactor:?}");
-        assert!(debug.contains('1'), "{debug}");
+        // A count of patterns (the raw value plus its encodings), never bytes.
+        assert!(debug.starts_with("Redactor { values: "), "{debug}");
         assert!(!debug.contains("hunter"), "{debug}");
+        assert!(!debug.contains("hunter2"), "{debug}");
+    }
+
+    #[test]
+    fn base64_matches_the_rfc_4648_vectors() {
+        // RFC 4648 §10's test vectors, and the §5 URL-safe case whose standard
+        // encoding contains both `+` and `/`.
+        for (input, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(input.as_bytes(), false), expected.as_bytes(), "{input:?}");
+            // Unpadding only ever drops the trailing `=`.
+            assert_eq!(
+                base64_unpadded(&base64_encode(input.as_bytes(), false)),
+                expected.trim_end_matches('=').as_bytes(),
+                "{input:?}"
+            );
+        }
+        // §5: bytes 0xFB 0xFF are `+/` in the standard alphabet, `-_` in the
+        // URL-safe one.
+        let standard = base64_encode(&[0xFB, 0xFF], false);
+        assert_eq!(standard, b"+/8=");
+        assert_eq!(base64_encode(&[0xFB, 0xFF], true), b"-_8=");
+    }
+
+    #[test]
+    fn percent_encoding_escapes_everything_outside_the_unreserved_set() {
+        // RFC 3986 §2.3: unreserved are ALPHA / DIGIT / "-" / "." / "_" / "~",
+        // and everything else becomes `%XX` with uppercase hex.
+        assert_eq!(percent_encode(b"abcXYZ019-._~"), b"abcXYZ019-._~");
+        assert_eq!(percent_encode(b"s3cr3t p@ss"), b"s3cr3t%20p%40ss");
+        assert_eq!(percent_encode(b"/?#[]"), b"%2F%3F%23%5B%5D");
+        // Bytes above ASCII, too.
+        assert_eq!(percent_encode(&[0xC3, 0xA9]), b"%C3%A9");
+    }
+
+    #[test]
+    fn json_escaping_matches_serde_json() {
+        assert_eq!(json_escape(b"plain"), b"plain");
+        assert_eq!(json_escape(br#"a"b\c"#), br#"a\"b\\c"#);
+        assert_eq!(json_escape(b"line\nbreak\ttab"), br"line\nbreak\ttab");
+        assert_eq!(json_escape(b"\x08\x0c\r"), br"\b\f\r");
+        // Other control characters get the \u00XX form, lowercase as serde_json writes it.
+        assert_eq!(json_escape(b"\x00\x1f\x7f"), b"\\u0000\\u001f\x7f");
+        // A solidus is left alone; that is not what serde_json does by default.
+        assert_eq!(json_escape(b"a/b"), b"a/b");
+    }
+
+    #[test]
+    fn redactor_catches_every_registered_encoding_of_a_secret() {
+        let secret = b"s3cr3t \"p@ss\"/word\n+x";
+        let mut redactor = Redactor::new();
+        redactor.register(&SecretValue::new(secret.to_vec()));
+
+        for (label, encoded) in [
+            ("raw", secret.to_vec()),
+            ("base64", base64_encode(secret, false)),
+            ("base64 url-safe", base64_encode(secret, true)),
+            ("base64 unpadded", base64_unpadded(&base64_encode(secret, false))),
+            ("percent", percent_encode(secret)),
+            ("json", json_escape(secret)),
+        ] {
+            let text = String::from_utf8(encoded.clone()).expect("these encodings are UTF-8");
+            let redacted = redactor.redact(&format!("prefix {text} suffix"));
+            assert_eq!(redacted, "prefix *** suffix", "{label} leaked: {redacted}");
+        }
+    }
+
+    #[test]
+    fn registering_an_encoding_costs_nothing_when_it_is_the_raw_value() {
+        // `hunter2` is already base64-safe, so several encodings come out
+        // unchanged; the redactor must not blow up, and must still catch it.
+        let mut redactor = Redactor::new();
+        redactor.register(&SecretValue::new(b"hunter2".to_vec()));
+        assert_eq!(redactor.redact("token hunter2"), "token ***");
+        // `Zm9vYmFy` is `foobar` base64'd; a literal that happens to look like
+        // an encoding is not mistaken for one.
+        assert_eq!(redactor.redact("Zm9vYmFy"), "Zm9vYmFy");
     }
 
     #[test]
