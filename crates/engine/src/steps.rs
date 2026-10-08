@@ -9,6 +9,7 @@ use std::sync::Arc;
 use ks_core::ports::script_host::ValueType;
 use ks_core::step::{StepKind, TypeDef};
 
+use crate::k8s_rollout::K8sRollout;
 use crate::oci_artifact::OciArtifactStep;
 use crate::oci_image::OciImage;
 use crate::oci_verify::OciVerify;
@@ -30,7 +31,8 @@ pub fn builtin_steps() -> Vec<Arc<dyn StepKind>> {
     let decide: Option<Arc<dyn StepKind>> = None;
 
     [
-        Some(Arc::new(OciImage) as Arc<dyn StepKind>),
+        Some(Arc::new(K8sRollout) as Arc<dyn StepKind>),
+        Some(Arc::new(OciImage)),
         Some(Arc::new(OciArtifactStep)),
         Some(Arc::new(OciVerify)),
         Some(Arc::new(TofuPlan)),

@@ -9,6 +9,30 @@ Every step kind the harness ships, with its declared schema. Inputs are
 checked against the schema before the step runs; outputs, after.
 
 
+## `k8s.rollout` (v1.0.0)
+
+Applies manifests to a cluster with every image pinned by digest, and waits for the workloads to become healthy.
+
+- Action: deploy
+- Requires: Cluster
+
+Inputs:
+
+| Name | Type | Default | Description |
+| --- | --- | --- | --- |
+| `to` | string | - | the cluster to deploy to: the environment's name |
+| `manifests` | path | - | a manifest file or a directory |
+| `image` | string | `` | one `repository@sha256:…` for every container running that repository |
+| `images` | map | {} | digest-pinned images by container name, for a manifest with several images |
+| `namespace` | string | `` | the namespace to deploy into |
+| `wait` | list | [`healthy`, `5m`] | the state to wait for and how long, as `healthy, 5m` |
+| `rollback` | string | `auto` | `auto` to roll back a rollout that does not settle, `none` to leave it |
+
+Outputs:
+
+| Name | Type | Description |
+| --- | --- | --- |
+
 ## `oci.artifact` (v1.0.0)
 
 Push files as an OCI artifact with an artifactType and media types.

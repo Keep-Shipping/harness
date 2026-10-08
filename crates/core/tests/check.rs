@@ -269,6 +269,29 @@ steps:
 }
 
 #[test]
+fn a_rollout_pins_what_it_deploys_by_reference_and_by_container_name() {
+    let src = "\
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  deploy: k8s.rollout
+    image: build.digest
+    manifests: ./k8s
+    namespace: prod
+    rollback: none
+    images:
+      sidecar: build.digest
+";
+    assert!(errors(src).is_empty(), "{:?}", errors(src));
+
+    // A tag typed in where a digest belongs is the same mistake as a pasted
+    // digest: the checker reads both as a string where it wanted a digest.
+    let tagged = src.replace("image: build.digest", "image: \"ghcr.io/acme/api:1.2\"");
+    let all = messages(&tagged);
+    assert!(all.iter().any(|m| m.contains("expected oci.Digest, got string")), "{all:?}");
+}
+
+#[test]
 fn a_string_is_never_another_familys_type() {
     let src = "\
 steps:
