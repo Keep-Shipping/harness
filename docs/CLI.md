@@ -50,6 +50,9 @@ implemented end to end today; `run` is not.
 - `keepshipping import shell <SCRIPT>` — read an existing deployment shell script and write a
   starting `.ks` file from the commands it recognises (`--out FILE`; default `<script stem>.ks`).
   [Importing a shell script](#importing-a-shell-script) below.
+- `keepshipping import github-actions [<workflow.yml | dir>] [--out DIR] [--force]` — translate
+  GitHub Actions workflows into site files (default input `.github/workflows`, default `--out .`),
+  best effort. [Importing from GitHub Actions](#importing-from-github-actions) below.
 
 There is **no `--as` flag** on `approve` or `deny`. The approver named in the state and the log is
 the environment's own (`$USER`, then `$USERNAME`, then `local`): a label for the run log, not a
@@ -339,6 +342,44 @@ control flow
 ...then the variables it saw, the `set` flags, the folds and flattens it did, and a short **next**
 section: run `keepshipping check` and `keepshipping fmt`, write the `.ts` if one is referenced,
 give the `k8s.rollout` a `to:`, and put an `approval` before the apply or the deploy.
+
+## Importing from GitHub Actions
+
+`keepshipping import github-actions [<workflow.yml | dir>] [--out DIR] [--force]` reads GitHub
+Actions workflows and writes site files. It is a **starting point, not a port**: what it cannot
+translate, it says so in `IMPORT-REPORT.md` rather than quietly dropping, and an un-translated
+step becomes a script whose `run` **throws** — an unported stub cannot silently pass a deploy.
+
+A file argument writes one `<out>/ship.ks`. A directory (the default, `.github/workflows`) reads
+every `*.yml`/`*.yaml` in sorted order and writes one `<out>/<stem>.ks` each; triggers are **not**
+merged across workflows, because GitHub does not run two workflows as one thing. One
+`<out>/IMPORT-REPORT.md` covers the whole run. Stubs go under `<out>/ship/`.
+
+What carries over: `push` (with branches, with tags, bare), `pull_request` as `pr`, and
+`workflow_dispatch` as `manual`; `docker/build-push-action` as `oci.image`; `cosign sign` as
+`sign: true` on it; `terraform`/`tofu plan` and `… apply` as `tofu.plan` plus an `approval`
+showing the plan and `tofu.apply`; `azure/k8s-deploy`, `kubectl apply` and `helm upgrade` as
+`k8s.rollout`; a job's `environment:` as an `approval` gating the job. `actions/checkout`,
+`docker/setup-buildx-action` and `docker/setup-qemu-action` are dropped as "not needed" —
+keepshipping checks out the repository itself. `${{ github.sha }}` becomes `{git.sha}`; an
+expression with no spelling here (another step's output, a secret) leaves the input out and
+becomes a `# TODO:` rather than a guess.
+
+`pull_request_target` is deliberately **not** carried across: it runs with a write token and the
+repository's secrets on a fork's pull request, which is not a review. An `if:` is not translated
+either, so the step says so in a `# TODO:`; where the file also runs on a pull request, the step
+additionally gets `when: pr.number == null`, which narrows it to a run that is not a review. A
+condition never widens what a step can reach.
+
+Anything else is listed in the report under **Untranslated constructs** with its location
+(`workflow › job › step`), walked generically from the YAML keys so nothing disappears quietly.
+
+A job whose steps all vanished — none declared, all dropped, or a reusable-workflow call — still
+emits one throwing stub, so `steps:` is never empty and the output always checks.
+
+Exit 1 if a file it would write already exists (pass `--force`), if there are no workflows, or if
+one will not parse — nothing is written in any of those cases. Every refusal is exit 1: exit 3 is
+for a bug in keepshipping, and a workflow somebody wrote is not one. Exit 2 for usage.
 
 ## Exit codes
 
