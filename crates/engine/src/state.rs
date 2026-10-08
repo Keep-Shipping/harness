@@ -16,13 +16,22 @@
 //! by [`resume`] against the clock it is given: the approval must not have
 //! expired ([`ResumeError::ApprovalExpired`]), and every artifact it was bound
 //! to must still be held by the run ([`RunState::check_bound`], which
-//! re-derives them with [`recorded_artifacts`](RunState::recorded_artifacts) and so refuses a rebuilt image
-//! or a re-planned plan — a rebuild replaces the approved digest, while an
-//! artifact recorded after the answer adds to what the run holds and
-//! invalidates nothing that was approved). The binding is never passed in by
-//! the caller — an approval records what the run had when the answer arrived,
-//! so "the same artifacts" is a fact about the record rather than a claim a
-//! caller could get wrong.
+//! re-derives them with [`recorded_artifacts`](RunState::recorded_artifacts) and
+//! so refuses a rebuilt image or a re-planned plan — a rebuild replaces the
+//! approved artifact, while an artifact recorded after the answer adds to what
+//! the run holds and invalidates nothing that was approved). The binding is
+//! never passed in by the caller — an approval records what the run had when
+//! the answer arrived, so "the same artifacts" is a fact about the record
+//! rather than a claim a caller could get wrong.
+//!
+//! "The same artifacts" means the same *kinds* of artifacts, not merely the same
+//! digests: an approval was bound to the plan file it showed, and a digest
+//! that reappears under another label is a different thing wearing the same
+//! hex ([#121](https://github.com/Keep-Shipping/harness/issues/121)). So the
+//! comparison is on whole [`Artifact`]s, which is also what
+//! [`ApprovalRequest::accepts`](ks_core::ports::approval::ApprovalRequest::accepts)
+//! required of every verdict at answer time — the check at resume is the same
+//! contract the port already enforces, and it used to be weaker than it.
 //!
 //! Image digests in `outputs` are **not** re-verified here — re-binding a
 //! published artifact is the producing port's job (`IacTool::apply` re-hashes
@@ -230,14 +239,17 @@ pub enum ResumeError {
     /// about to use.
     NotApproved { run: RunId, step: String },
     /// An artifact a gated step's approval was bound to is no longer what the
-    /// run holds — a rebuilt image, a re-planned plan.
+    /// run holds — a rebuilt image, a re-planned plan, or the same bytes
+    /// relabelled as something else.
     ArtifactsChanged {
         /// The gate being checked.
         step: String,
-        /// The digests the approval was bound to.
-        approved: Vec<String>,
-        /// The digests the step is about to use.
-        using: Vec<String>,
+        /// The artifact that was approved and is gone, named by kind and
+        /// digest: the one the operator has to go and look at.
+        artifact: Artifact,
+        /// What the run holds now, so the refusal reads as "this became that"
+        /// rather than as an unexplained mismatch.
+        using: Vec<Artifact>,
     },
     /// The store itself failed — a full disk, a revoked credential.
     Store { message: String },
@@ -291,13 +303,20 @@ impl fmt::Display for ResumeError {
                 f,
                 "run {run} holds no approval for {step}; ask for one before the step it gates runs"
             ),
-            ResumeError::ArtifactsChanged { step, approved, using } => write!(
-                f,
-                "an artifact of {step} was approved and is no longer what the run holds: approved \
-                 [{}], about to use [{}]; nothing was deployed — ask again on the current artifacts",
-                approved.join(", "),
-                using.join(", ")
-            ),
+            ResumeError::ArtifactsChanged { step, artifact, using } => {
+                write!(
+                    f,
+                    "an artifact of {step} was approved and is no longer what the run holds: \
+                     approved {}, but the run now has {}; nothing was deployed — ask again on \
+                     the current artifacts",
+                    artifact_label(artifact),
+                    if using.is_empty() {
+                        "nothing at all".to_string()
+                    } else {
+                        using.iter().map(artifact_label).collect::<Vec<_>>().join(", ")
+                    }
+                )
+            }
             ResumeError::Store { message } => write!(f, "the state store failed: {message}"),
             ResumeError::Plan { message } => {
                 write!(f, "the fetched plan is unusable: {message}")
@@ -481,7 +500,10 @@ impl RunState {
             }
             for plan in &step.plans {
                 // A plan's digest is recorded by [`save_plan`], which hashed
-                // the bytes itself, so it always parses.
+                // the bytes itself, and [`from_json`](Self::from_json) refuses
+                // a record whose digest is not one — so this only drops a plan
+                // a caller built in memory by hand, never one read back from a
+                // parked record.
                 if let Ok(digest) = ContentDigest::sha256_from_hex(&plan.sha256) {
                     artifacts.push(Artifact::new(ArtifactKind::PlanFile, digest));
                 }
@@ -495,15 +517,26 @@ impl RunState {
     /// run now has — the check [`resume`] makes before it releases anything
     /// through it.
     ///
-    /// The binding is a *subset* rule, not equality: every digest the approval
-    /// was given for must still be among the run's. Re-deriving with
-    /// [`recorded_artifacts`](Self::recorded_artifacts) and comparing digests
-    /// catches a rebuilt image or a re-planned plan — a rebuild replaces digest
-    /// A with digest B, so A is gone and this refuses with
-    /// [`ResumeError::ArtifactsChanged`], naming both digest lists and saying
-    /// nothing was deployed. An artifact *added* after the answer does not
-    /// invalidate anything that was approved, which is what lets the step the
-    /// approval granted go on to produce output of its own.
+    /// The binding is a *subset* rule, not equality: every artifact the
+    /// approval was given for must still be among the run's. Re-deriving with
+    /// [`recorded_artifacts`](Self::recorded_artifacts) and comparing whole
+    /// [`Artifact`]s catches a rebuilt image or a re-planned plan — a rebuild
+    /// replaces artifact A with artifact B, so A is gone and this refuses with
+    /// [`ResumeError::ArtifactsChanged`], naming the artifact by kind and
+    /// digest and saying nothing was deployed. An artifact *added* after the
+    /// answer does not invalidate anything that was approved, which is what
+    /// lets the step the approval granted go on to produce output of its own.
+    ///
+    /// The comparison is on the whole artifact, kind included, because that is
+    /// what an approval is bound to: the approver was shown a *plan file*, and
+    /// a digest that reappears under a different kind is a different thing
+    /// wearing the same hex. Treating the kind as display metadata — which this
+    /// used to do — makes the binding satisfiable by a relabelled artifact, so
+    /// the thing that runs is not the thing that was shown. This is the
+    /// check the port already demands of a verdict
+    /// ([`ApprovalRequest::accepts`](ks_core::ports::approval::ApprovalRequest::accepts));
+    /// the record has moved on since the answer, and resume is where that has
+    /// to be noticed.
     pub fn check_bound(&self, approval_step: &str) -> Result<(), ResumeError> {
         let Some(approval) = self.approvals.iter().find(|approval| approval.step == approval_step)
         else {
@@ -512,27 +545,21 @@ impl RunState {
                 step: approval_step.to_string(),
             });
         };
-        // Digests, not `Artifact`s: the kind is display metadata, and a caller
-        // binding an image it read from `show:` need not use the same label as
-        // the record does.
-        let digests = |artifacts: &[Artifact]| -> Vec<String> {
-            artifacts.iter().map(|artifact| artifact.digest.to_string()).collect()
-        };
-        let approved = digests(&approval.artifacts);
-        let using = digests(&self.recorded_artifacts());
         // Subset, not equality: what the approval was given for has to still be
         // there. The gated step may have produced more since — that is the
         // approval doing its job, not the ground shifting under it — but a
-        // rebuild replaces the approved digest rather than adding to it, and
+        // rebuild replaces the approved artifact rather than adding to it, and
         // that is a change the approver never saw.
-        if approved.iter().any(|digest| !using.contains(digest)) {
-            return Err(ResumeError::ArtifactsChanged {
-                step: approval_step.to_string(),
-                approved,
-                using,
-            });
-        }
-        Ok(())
+        let using = self.recorded_artifacts();
+        let Some(artifact) = approval.artifacts.iter().find(|artifact| !using.contains(artifact))
+        else {
+            return Ok(());
+        };
+        Err(ResumeError::ArtifactsChanged {
+            step: approval_step.to_string(),
+            artifact: artifact.clone(),
+            using,
+        })
     }
 
     /// The plan refs recorded for `step`.
@@ -605,27 +632,39 @@ impl RunState {
         let completed = list("completed")
             .iter()
             .map(|step| {
+                let name = step
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| bad("a completed step has no `name`".to_string()))?
+                    .to_string();
+                let plans = match step.get("plans").and_then(Value::as_array) {
+                    Some(plans) => plans
+                        .iter()
+                        .map(|p| {
+                            let sha256 = text(p, "sha256");
+                            // A digest that is not 64 lowercase hex characters is
+                            // a corrupt record, not an empty binding. Decoding it
+                            // as a plan with no digest would leave
+                            // `recorded_artifacts` to drop it, quietly shrinking
+                            // the set every approval is checked against — so a
+                            // truncated or tampered record would make a *changed*
+                            // plan look unchanged. Fail here instead.
+                            ContentDigest::sha256_from_hex(&sha256).map_err(|error| {
+                                bad(format!(
+                                    "step {name} recorded the plan sha256 {sha256:?}, which is not \
+                                     a sha256 digest ({error})"
+                                ))
+                            })?;
+                            Ok(PlanRef { step: text(p, "step"), sha256 })
+                        })
+                        .collect::<Result<Vec<_>, ResumeError>>()?,
+                    None => Vec::new(),
+                };
                 Ok(CompletedStep {
-                    name: step
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| bad("a completed step has no `name`".to_string()))?
-                        .to_string(),
+                    name,
                     outputs: strings_of(step.get("outputs"))
                         .map_err(|reason| bad(format!("a completed step's `outputs`: {reason}")))?,
-                    plans: step
-                        .get("plans")
-                        .and_then(Value::as_array)
-                        .map(|plans| {
-                            plans
-                                .iter()
-                                .map(|p| PlanRef {
-                                    step: text(p, "step"),
-                                    sha256: text(p, "sha256"),
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
+                    plans,
                 })
             })
             .collect::<Result<Vec<_>, ResumeError>>()?;
@@ -693,6 +732,19 @@ fn parse_artifact_kind(text: &str) -> Option<ArtifactKind> {
         "Image" => Some(ArtifactKind::Image),
         _ => text.strip_prefix("other:").map(|name| ArtifactKind::Other(name.to_string())),
     }
+}
+
+/// An [`Artifact`] as one phrase an operator can act on: the kind in words and
+/// the digest, so a refusal names *which* thing to go and look at rather than
+/// a hex string that could be any of several — ``plan file sha256:…``,
+/// ``image sha256:…``, ```output `sbom` sha256:…```.
+fn artifact_label(artifact: &Artifact) -> String {
+    let kind = match &artifact.kind {
+        ArtifactKind::PlanFile => "plan file".to_string(),
+        ArtifactKind::Image => "image".to_string(),
+        ArtifactKind::Other(name) => format!("output `{name}`"),
+    };
+    format!("{kind} {}", artifact.digest)
 }
 
 /// The artifacts an approval is bound to. Absent decodes to none — a record
@@ -1173,12 +1225,18 @@ mod tests {
         let error = state.check_bound("review").expect_err("the approved image is gone");
         assert!(matches!(error, ResumeError::ArtifactsChanged { .. }), "{error:?}");
         match &error {
-            ResumeError::ArtifactsChanged { step, approved, using } => {
+            ResumeError::ArtifactsChanged { step, artifact, using } => {
                 assert_eq!(step, "review");
-                assert_eq!(approved, &[digest_of('a')], "what was approved");
+                // Named by kind as well as digest: the refusal has to say *what*
+                // moved, or the operator is left hunting through hex.
+                assert_eq!(artifact.kind, ArtifactKind::Other("digest".to_string()));
+                assert_eq!(artifact.digest.to_string(), digest_of('a'), "what was approved");
                 // The run holds b and c, and names both, so the reader can see
                 // that adding to the list did not bring a back.
-                assert_eq!(using, &[digest_of('b'), digest_of('c')].map(String::from));
+                assert_eq!(
+                    using.iter().map(|held| held.digest.to_string()).collect::<Vec<_>>(),
+                    vec![digest_of('b'), digest_of('c')]
+                );
             }
             other => panic!("a rebuilt image must be ArtifactsChanged, got {other:?}"),
         }
