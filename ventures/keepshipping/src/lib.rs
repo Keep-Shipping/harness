@@ -56,7 +56,7 @@ use cratefield_adapter_owlpost::Owlpost;
 use cratefield_adapter_polar::{CustomerIds, Polar};
 use cratefield_adapter_resend::Resend;
 use cratefield_adapter_turnstile::Turnstile;
-use cratefield_core::{Harness, Mailer, Template, Venture};
+use cratefield_core::{Harness, HarnessBuilder, Mailer, Template, Venture};
 use cratefield_mail_templates::MailTheme;
 use cratefield_module_waitlist::Waitlist;
 use cratefield_runtime_cloudflare::{
@@ -224,6 +224,18 @@ fn mailer(env: &Env) -> Arc<dyn Mailer> {
     }
 }
 
+/// The composition without a runtime: venture, module and themed
+/// templates, in the order the builder validates them. Split out of
+/// `instance` because the runtime is the only per-isolate leg — the
+/// `Env` it reads does not exist until an event brings one — and
+/// everything else is static, so a native test can build the very
+/// composition the worker serves (`tests/harness.rs` does exactly that)
+/// rather than a parallel one.
+#[must_use]
+pub fn composition() -> HarnessBuilder {
+    Harness::builder().venture(venture()).module(module()).templates(templates())
+}
+
 /// The frozen composition: built once per isolate on first use, immutable
 /// after. The runtime is `Clone` for exactly this pattern — one clone goes
 /// into the builder (so `build()` validates the module's required ports
@@ -241,13 +253,10 @@ fn instance(env: &Env) -> Arc<(Harness, Cloudflare)> {
                 Some(captcha) => runtime.captcha_arc(Arc::new(captcha)),
                 None => runtime,
             };
-            let harness = Harness::builder()
-                .venture(venture())
-                .module(module())
-                .templates(templates())
+            let harness = composition()
                 .runtime(runtime.clone())
                 .build()
-                .expect("the waitlist composition is static and validated in CI");
+                .expect("the composition is static; `tests/harness.rs` builds the same one");
             Arc::new((harness, runtime))
         })
         .clone()

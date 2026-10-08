@@ -314,6 +314,48 @@ jobs:
           cargo test -p ks-deno-script-host --test conformance -- --nocapture \
             || { echo "::error::the Deno script host failed. Fix: run 'KS_DENO_CONFORMANCE=1 cargo test -p ks-deno-script-host' locally, make it pass, and commit."; exit 1; }
 
+  venture:
+    name: venture builds to wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain pinned in rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - name: Restore the cargo build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install worker-build
+        run: |
+          # Pinned for reproducibility: worker-build's own code generation is
+          # versioned with it, so an unpinned build tool can emit a different
+          # shim than the one a deploy was reviewed against. `cargo install`
+          # rather than install-action so the resolved version is explicit in
+          # this file. wasm-opt and esbuild are downloaded by worker-build
+          # itself, so neither is installed here.
+          cargo install worker-build --version 0.8.7 --locked \
+            || { echo "::error::worker-build would not install. Fix: check that worker-build 0.8.7 still publishes a binary for ubuntu-latest."; exit 1; }
+
+      - name: Build the waitlist Worker for wasm32
+        working-directory: ventures/keepshipping
+        run: |
+          worker-build --release \
+            || { echo "::error::the waitlist Worker did not build to wasm32. Fix: run 'worker-build --release' in ventures/keepshipping locally, make it build, and commit."; exit 1; }
+
+      - name: Fail if the build left anything behind
+        run: |
+          # worker-build writes build/, which its own .gitignore covers — a
+          # stray untracked file there would still be a hole in that cover.
+          status=$(git status --porcelain --untracked-files=all -- ventures/keepshipping)
+          if [ -n "$status" ]; then
+            echo "$status"
+            echo "::error::the wasm build left files behind under ventures/keepshipping. Fix: gitignore what worker-build wrote, or clean it up, so a deploy carries nothing stray."
+            exit 1
+          fi
+
   bench:
     name: check budget (cold 1 s, warm p95 100 ms)
     runs-on: ubuntu-latest
