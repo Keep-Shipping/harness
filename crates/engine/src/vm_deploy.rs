@@ -19,6 +19,11 @@
 //!   [`StepError::InvalidInput`], not a prompt: there is no "accept once", because the second
 //!   connect is exactly the one an attacker would win. See the [`RemoteShell`] port's own
 //!   documentation.
+//! - **An artifact is shipped only behind the identity the workflow named.** When `verify:` names
+//!   one, the digest under `image` is checked against it before any host is reached
+//!   ([#113](https://github.com/Keep-Shipping/harness/issues/113)). A run that names no identity
+//!   verifies nothing and behaves exactly as before; a run that asks and cannot be satisfied fails
+//!   rather than skipping the check.
 //!
 //! The step reaches the fleet through [`RemoteShell`]: the configured host itself when the input
 //! names it, and [`connect`](RemoteShell::connect) — each to its own pin — for the rest.
@@ -35,6 +40,8 @@ use ks_core::step::{
     ActionClass, ActionKind, Field, Inputs, Outputs, Port, StepCtx, StepError, StepKind,
     StepSchema, TypeRef, Version,
 };
+
+use crate::deploy_verify;
 
 /// The step's registered name; what a workflow writes as `deploy: vm.deploy`.
 pub const NAME: &str = "vm.deploy";
@@ -65,7 +72,7 @@ impl StepKind for VmDeploy {
     }
 
     fn version(&self) -> Version {
-        Version::new(1, 0, 0)
+        Version::new(1, 1, 0)
     }
 
     fn schema(&self) -> StepSchema {
@@ -137,6 +144,23 @@ impl StepKind for VmDeploy {
                     "the user to deploy as, for the hosts that do not name one",
                 )
                 .with_default(Value::from(DEFAULT_USER)),
+                Field::new(
+                    "image",
+                    text,
+                    "the digest-pinned artifact the deploy ships, as `repository@sha256:…`; \
+                     verification checks the signature on this digest",
+                )
+                .optional(),
+                Field::new(
+                    "verify",
+                    text,
+                    "the identity `image` must be signed by, as `signed-by <identity>`: `signed-by \
+                     key:release-key`, or `signed-by \
+                     https://token.actions.githubusercontent.com from \
+                     https://github.com/acme/api/.github/workflows/release.yml@refs/heads/main`. \
+                     An empty value verifies nothing",
+                )
+                .with_default(Value::from("")),
             ],
             outputs: vec![
                 Field::new("healthy", int, "the hosts that reached health"),
@@ -153,6 +177,17 @@ impl StepKind for VmDeploy {
 
     fn requires(&self) -> &'static [Port] {
         &[Port::RemoteShell]
+    }
+
+    /// Optional, because `optional()` is static and `verify:` is not: the
+    /// registry and the signer are only ever *used* when a run names an
+    /// identity in `verify:`, and `HarnessBuilder::build` never checks this
+    /// list. Listing them here says "a composition that has neither still
+    /// builds", which is what keeps a deploy with no `verify:` working exactly
+    /// as before. A run that asks for verification and has neither port fails
+    /// loudly instead of skipping the check — see [`crate::deploy_verify`].
+    fn optional(&self) -> &'static [Port] {
+        &[Port::Registry, Port::Signer]
     }
 
     fn action(&self, _inputs: &Inputs) -> ActionClass {
@@ -176,6 +211,16 @@ impl StepKind for VmDeploy {
             let probe = probe_of(&inputs)?;
             let budget = probe_budget(&inputs)?;
             let max_failures = whole(&inputs, "max_failures")?;
+
+            // Before a single host is reached, on the same footing as the fleet's pins: an
+            // artifact nobody signed as the identity the workflow named must stop the deploy
+            // while every host is still exactly as it was.
+            deploy_verify::verify_deploy(
+                &ctx,
+                &inputs,
+                &deploy_verify::images_of(&inputs, "image"),
+            )
+            .await?;
 
             let batches = fleet.len().div_ceil(batch_size);
             let fleet_text = fleet.len().to_string();

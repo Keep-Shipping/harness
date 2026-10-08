@@ -119,6 +119,15 @@ pub struct Env {
     /// Triggers that select this environment.
     pub triggers: Vec<Trigger>,
     pub ci_only: bool,
+    /// `require-verified: true`: every deploy that reaches this environment
+    /// has to say what verifies what it ships
+    /// ([#113](https://github.com/Keep-Shipping/harness/issues/113)).
+    ///
+    /// It is a property of the *environment*, not of a step, because the
+    /// question it answers is not "is this step careful" but "may anything
+    /// unverified reach prod". A deploy with no `verify:` is refused here
+    /// whether or not it thought to ask for one.
+    pub require_verified: bool,
     /// The secrets resolver this environment reads from.
     pub secrets: Option<String>,
     pub approvers: Vec<String>,
@@ -133,6 +142,7 @@ pub(crate) fn implicit_default() -> Env {
         span: Span::default(),
         triggers: Vec::new(),
         ci_only: false,
+        require_verified: false,
         secrets: None,
         approvers: Vec::new(),
         vars: Vec::new(),

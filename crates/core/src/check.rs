@@ -319,11 +319,19 @@ fn fixed_object(verb: &str) -> Option<&'static str> {
 
 const TRIGGER_KINDS: [&str; 5] = ["push", "pr", "tag", "manual", "schedule"];
 
-const ENV_PROPERTIES: [&str; 5] = ["secrets", "ci-only", "approvers", "on", "vars"];
+const ENV_PROPERTIES: [&str; 6] =
+    ["secrets", "ci-only", "approvers", "on", "vars", "require-verified"];
 
 /// The reserved keys under a step: read with the declaration, never checked
 /// as inputs.
 const STEP_PROPERTIES: [&str; 2] = ["ci-only", "rollback"];
+
+/// The input that says what verifies a deploy, on the two kinds that ship
+/// something ([#113](https://github.com/Keep-Shipping/harness/issues/113)).
+/// It is an input of those kinds rather than a reserved property, so the
+/// catalog is the single place that declares it; the checker names it only to
+/// ask whether a file filled it in.
+const VERIFY: &str = "verify";
 
 /// The kinds that apply a plan and produce its run-time outputs, and so are
 /// the ones whose `out.` names the IaC behind their plan can answer.
@@ -402,6 +410,17 @@ struct StepInfo<'a> {
     spec: Option<&'a StepTypes>,
     /// `ci-only: true`: the step refuses to run off CI.
     ci_only: bool,
+    /// Whether the step asked for what it ships to be verified, by declaring
+    /// a `verify:` with a value ([#113](https://github.com/Keep-Shipping/harness/issues/113)).
+    ///
+    /// Captured with the declaration because [`StepInfo`] keeps no raw entry:
+    /// the answer is "did the author write down an identity", which the
+    /// catalog cannot answer (it says whether `verify` exists, not whether
+    /// this file filled it in). An empty `verify:` is `false` — the empty
+    /// string is the default a rollout that verifies nothing carries, and
+    /// reading it as a request would let a step claim verification by
+    /// spelling the word and nothing else.
+    verify: bool,
     /// The `rollback:` policy the step declared, for the executor.
     rollback: RollbackPolicy,
     /// A script step's `action:`, parsed at the declaration; `None` when it
@@ -706,6 +725,7 @@ impl<'a> Ctx<'a> {
                 .as_deref()
                 .and_then(|n| self.catalog.step(n).or_else(|| block.map(|b| b.as_step_types())));
             let ci_only = self.step_ci_only(s);
+            let verify = self.step_verify(s, block);
             let rollback = self.step_rollback(s);
             let action = self.step_action(s, kind_name.as_deref(), kind_span);
             let variants = match spec.filter(|sp| sp.decision) {
@@ -740,6 +760,7 @@ impl<'a> Ctx<'a> {
                 kind_span,
                 spec,
                 ci_only,
+                verify,
                 rollback,
                 action,
                 variants,
@@ -834,6 +855,32 @@ impl<'a> Ctx<'a> {
         value
     }
 
+    /// Whether a step asked for what it ships to be verified
+    /// ([#113](https://github.com/Keep-Shipping/harness/issues/113)): a
+    /// `verify:` carrying an identity, not the empty string.
+    ///
+    /// It is an ordinary input of the two deploy kinds, so nothing here
+    /// parses or diagnoses it — the catalog types it and `check_input`
+    /// checks it like any other. All this answers is the one question the
+    /// catalog cannot: did *this file* fill it in. An environment's
+    /// `require-verified:` is answered from that answer.
+    ///
+    /// A block use carries `verify:` through as one of the block's inputs,
+    /// so it is judged by what the use passes — defaults filled in, exactly
+    /// as the run will see them. A block that pins an identity once, in its
+    /// signature, does not have to be asked again at every use.
+    fn step_verify(&mut self, step: Entry<'_>, block: Option<&BlockSignature>) -> bool {
+        let given = match block {
+            Some(b) => block_input_values(step, b),
+            None => BTreeMap::new(),
+        };
+        // An unfilled `verify:` is the parser's finding, not a second one
+        // here, and neither shape is a request for verification.
+        literal_verify(step)
+            .or_else(|| given.get(VERIFY).cloned())
+            .is_some_and(|v| !v.trim().is_empty())
+    }
+
     /// A script step's reserved `action:` property, `None` when it declares
     /// none. Reserved on script kinds only: on any other kind `action` is an
     /// ordinary input the catalog decides ([#89](https://github.com/Keep-Shipping/harness/issues/89)).
@@ -898,6 +945,15 @@ impl<'a> Ctx<'a> {
     /// neither is `code`'s error, worded the same way for an environment and
     /// for a step.
     fn ci_only(&mut self, p: Entry<'_>, code: Code) -> bool {
+        self.boolean_property(p, "ci-only", code)
+    }
+
+    /// A `true`/`false` property, named by `name` so the refusal says which
+    /// property was written wrong. Shared by `ci-only:` and
+    /// `require-verified:` because a boolean that takes anything else is a
+    /// type error in both places, and a user who misspelled one wants to be
+    /// told about that one rather than about the vocabulary of booleans.
+    fn boolean_property(&mut self, p: Entry<'_>, name: &str, code: Code) -> bool {
         match p.expr().as_ref().and_then(value_word).as_deref() {
             Some("true") => true,
             Some("false") => false,
@@ -905,8 +961,8 @@ impl<'a> Ctx<'a> {
                 self.err_hint(
                     code,
                     p.key_span(),
-                    "`ci-only` takes `true` or `false`",
-                    "`ci-only: true`",
+                    format!("`{name}` takes `true` or `false`"),
+                    format!("`{name}: true`"),
                 );
                 false
             }
@@ -2213,6 +2269,10 @@ impl<'a> Ctx<'a> {
                 match prop {
                     "on" => env.triggers = self.triggers_of(p),
                     "ci-only" => env.ci_only = self.ci_only(p, Code::EnvProblem),
+                    "require-verified" => {
+                        env.require_verified =
+                            self.boolean_property(p, "require-verified", Code::EnvProblem)
+                    }
                     "secrets" => env.secrets = self.scalar_text(p),
                     "approvers" => {
                         if let Some(v) = p.expr() {
@@ -2783,6 +2843,62 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Every deploy that can reach an environment which demands verification
+    /// has to say what verifies what it ships
+    /// ([#113](https://github.com/Keep-Shipping/harness/issues/113)).
+    ///
+    /// Which steps are in scope for an environment is the same question
+    /// policy asks, answered from the same place: a step's action class says
+    /// what it does and, where the file said `when: env is <name>`, where it
+    /// does it.
+    ///
+    /// **A deploy with no environment gate is in scope for every
+    /// environment.** `when: env is prod` is a declaration of scope — the
+    /// author naming where a deploy goes. Its absence does not mean "not
+    /// prod": the run selects the environment, and a step that names none
+    /// runs in whichever environment was selected. So under an environment
+    /// that demands verification, an ungated deploy is exactly the case the
+    /// property exists to refuse, and treating silence as an exemption would
+    /// make the strongest declaration of intent in the file also the easiest
+    /// to evade — delete one line and the check goes quiet. The exemption is
+    /// written down instead: `when: env is dev` puts a deploy out of scope
+    /// for `prod`, visibly, and is what this asks for.
+    fn enforce_verified_deploys(&mut self) {
+        let required: Vec<String> =
+            self.envs.iter().filter(|e| e.require_verified).map(|e| e.name.clone()).collect();
+        for env in required {
+            for index in 0..self.steps.len() {
+                let step = &self.steps[index];
+                if step.verify {
+                    continue;
+                }
+                let reaches = step.actions.iter().any(|(class, _)| {
+                    class.kind == ActionKind::Deploy && class.env.as_ref().is_none_or(|e| *e == env)
+                });
+                if !reaches {
+                    continue;
+                }
+                let (name, span) = (step.name.clone(), step.span);
+                self.push(
+                    Diagnostic::error(
+                        Code::EnvProblem,
+                        span,
+                        format!(
+                            "environment `{env}` requires verified deploys, and step `{name}` says \
+                             nothing verifies what it ships"
+                        ),
+                    )
+                    .with_subject(name)
+                    .with_hint(
+                        "`verify: \"signed-by key:release-key\"` on the step, or scope it to \
+                         another environment with `when: env is <env>`"
+                            .to_string(),
+                    ),
+                );
+            }
+        }
+    }
+
     /// A verb under `can:` or `before:` that no step in this file can produce
     /// binds nothing: the rule is a claim about a workflow this file does not
     /// describe. A warning, not an error — the step that makes it real may
@@ -2911,6 +3027,7 @@ impl<'a> Ctx<'a> {
     fn finish_all(mut self) -> Checked {
         self.enforce_actor_policy();
         self.enforce_step_policy();
+        self.enforce_verified_deploys();
         self.warn_unused_policy_verbs();
         // Approval gating: an approval that shows S runs before every other
         // consumer of S, except steps the approval (transitively) depends on.
@@ -3206,6 +3323,18 @@ fn literal_input(step: Entry<'_>, name: &str) -> Option<String> {
         .and_then(|c| c.expr())
         .as_ref()
         .and_then(value_word)
+}
+
+/// A step's `verify:`, as written. Unlike other inputs it takes a quoted
+/// string too — `verify: "signed-by key:release-key"` is the ordinary
+/// spelling, since the identity carries a space — and `None` for anything
+/// that is not one value at all, which is the second pass's finding.
+fn literal_verify(step: Entry<'_>) -> Option<String> {
+    step.children()
+        .find(|c| c.key_name() == Some(VERIFY))
+        .and_then(|c| c.expr())
+        .as_ref()
+        .and_then(value_text)
 }
 
 /// The step an apply step's `plan:` applies: `plan: plan.file` names `plan`.

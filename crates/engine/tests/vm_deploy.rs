@@ -13,7 +13,9 @@ use ks_core::ports::health::Health;
 use ks_core::ports::remote_shell::{Host, HostKey, RemoteShell, ShellError};
 use ks_core::ports::script_host::Value;
 use ks_core::ports::secrets::Redactor;
-use ks_core::step::{CancellationToken, Inputs, LogSink, Outputs, Ports, StepError, StepKind};
+use ks_core::step::{
+    CancellationToken, Inputs, LogSink, Outputs, Port, Ports, StepError, StepKind,
+};
 use ks_engine::run::run_step;
 use ks_engine::vm_deploy::{NAME, VmDeploy};
 use ks_testing::block_on;
@@ -817,4 +819,21 @@ fn the_outputs_are_exactly_what_the_schema_declares() {
     returned.sort_unstable();
     assert_eq!(returned, declared);
     assert_eq!(returned, ["healthy", "summary", "total"]);
+}
+
+/// `image` and `verify` are both optional, so a deploy that names neither
+/// behaves exactly as it did before either existed — and a composition with no
+/// registry and no signer still builds, because `optional()` is never checked by
+/// `HarnessBuilder::build` ([#113](https://github.com/Keep-Shipping/harness/issues/113)). The
+/// refusals themselves live in `deploy_verify.rs`, against a real digest.
+#[test]
+fn image_and_verify_are_optional_and_the_supply_chain_ports_are_not_required() {
+    let schema = VmDeploy.schema();
+    let field = |name: &str| schema.inputs.iter().find(|field| field.name == name);
+    let image = field("image").expect("`image` is an input");
+    assert!(image.optional, "a deploy that ships no artifact has nothing to verify");
+    let verify = field("verify").expect("`verify` is an input");
+    assert_eq!(verify.default.clone(), Some(Value::from("")), "empty means no verification");
+    assert_eq!(VmDeploy.optional(), [Port::Registry, Port::Signer], "the ports are optional");
+    assert_eq!(VmDeploy.requires(), [Port::RemoteShell], "and the shell is still the one it needs");
 }

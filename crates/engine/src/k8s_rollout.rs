@@ -5,8 +5,10 @@
 //! Everything that can refuse the deploy refuses it before the cluster is
 //! touched, because an input error after an `apply` could not be taken back: a
 //! tag never reaches the cluster (every container image must be pinned, so an
-//! unpinned sidecar fails rather than quietly running `nginx:latest`), and a
-//! document naming a different `namespace` fails rather than being rewritten.
+//! unpinned sidecar fails rather than quietly running `nginx:latest`), a
+//! document naming a different `namespace` fails rather than being rewritten,
+//! and an image `verify:` was not signed by the identity the workflow named
+//! fails before the first [`Cluster::apply`] ([#113](https://github.com/Keep-Shipping/harness/issues/113)).
 //! Waiting is the step's, not the port's: [`Cluster::apply`] returns once the
 //! API server has *accepted* the manifests, so the step records each workload's
 //! previous revision, applies, and polls [`Cluster::health`] until every
@@ -46,6 +48,8 @@ use ks_core::step::{
     StepSchema, TypeRef, Version,
 };
 use serde::Deserialize;
+
+use crate::deploy_verify;
 
 /// How long between two health polls: fixed, so a slow cluster costs polls
 /// rather than the step's judgement.
@@ -104,7 +108,7 @@ impl StepKind for K8sRollout {
     }
 
     fn version(&self) -> Version {
-        Version::new(1, 0, 0)
+        Version::new(1, 1, 0)
     }
 
     /// `to` and `image` are plain strings, though the catalog types them as
@@ -147,6 +151,16 @@ impl StepKind for K8sRollout {
                     "`auto` to roll back a rollout that does not settle, `none` to leave it",
                 )
                 .with_default(Value::from("auto")),
+                Field::new(
+                    "verify",
+                    text,
+                    "the identity every image above must be signed by, as `signed-by <identity>`: \
+                     `signed-by key:release-key`, or `signed-by \
+                     https://token.actions.githubusercontent.com from \
+                     https://github.com/acme/api/.github/workflows/release.yml@refs/heads/main`. \
+                     An empty value verifies nothing",
+                )
+                .with_default(Value::from("")),
             ],
             outputs: vec![],
         }
@@ -156,6 +170,15 @@ impl StepKind for K8sRollout {
     /// says which environment the run meant, not which API server to call.
     fn requires(&self) -> &'static [Port] {
         &[Port::Cluster]
+    }
+
+    /// Optional, because only `verify:` uses them: a rollout that names no
+    /// identity ships whatever the workflow pinned and must not be blocked by a
+    /// composition that provides no signer. A run that *does* ask for
+    /// verification and has neither port fails loudly rather than skipping the
+    /// check — see [`crate::deploy_verify`].
+    fn optional(&self) -> &'static [Port] {
+        &[Port::Registry, Port::Signer]
     }
 
     /// A deploy, in the environment the run named: `deploy prod` reads
@@ -177,6 +200,10 @@ impl StepKind for K8sRollout {
                 });
             };
             let mut prepared = prepare(&inputs)?;
+            // Before anything is asked of the cluster: an image nobody signed as the identity
+            // the workflow named must fail here, where nothing has been applied yet and the
+            // refusal still leaves the cluster as it was.
+            deploy_verify::verify_deploy(&ctx, &inputs, &prepared.images).await?;
             // What each workload was on before this run. A workload the cluster
             // has never heard of has no previous revision: a first deploy, with
             // nothing to roll back to.

@@ -1557,3 +1557,157 @@ steps:
     let by_other_output = ungated.replace("show: plan.changes", "show: plan.changes, build.tag");
     assert!(errors(&by_other_output).is_empty(), "{:?}", errors(&by_other_output));
 }
+
+// --- `require-verified:` --------------------------------------------------
+// A deploy that says nothing verifies what it ships is refused in an
+// environment that demands it (#113). The tests below are about which steps
+// that covers, not about parsing the property.
+
+/// A workflow whose only deploy is an unverified `k8s.rollout`, with the
+/// property spelling swapped in by the caller.
+const UNVERIFIED: &str = "\
+envs:
+  dev:
+    require-verified: false
+  prod:
+    require-verified: true
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  deploy: k8s.rollout
+    image: build.digest
+";
+
+#[test]
+fn an_unverified_deploy_is_refused_in_an_environment_that_demands_verification() {
+    let reported = errors(UNVERIFIED);
+    let about_step = reported
+        .iter()
+        .filter(|e| e.contains("`prod` requires verified deploys") && e.contains("`deploy`"))
+        .count();
+    assert_eq!(about_step, 1, "one finding names both the environment and the step: {reported:?}");
+    assert!(
+        reported
+            .iter()
+            .any(|e| e.contains("signed-by key:release-key") && e.contains("`when: env is <env>`")),
+        "the hint shows the fix and the exemption: {reported:?}"
+    );
+}
+
+#[test]
+fn a_verify_input_is_what_the_environment_asked_for() {
+    let verified = UNVERIFIED.replace(
+        "    image: build.digest\n",
+        "    image: build.digest\n    verify: \"signed-by key:k\"\n",
+    );
+    assert!(errors(&verified).is_empty(), "{:?}", errors(&verified));
+}
+
+#[test]
+fn an_empty_verify_is_not_a_request_for_verification() {
+    // `verify: ""` is what a rollout that verifies nothing spells. Reading it
+    // as a request would let a step claim verification by writing nothing.
+    let empty = UNVERIFIED
+        .replace("    image: build.digest\n", "    image: build.digest\n    verify: \"\"\n");
+    let reported = errors(&empty);
+    assert!(
+        reported.iter().any(|e| e.contains("`prod` requires verified deploys")),
+        "{reported:?}"
+    );
+    assert!(
+        !reported.iter().any(|e| e.contains("verify") && e.contains("KS") && e.contains("signed")),
+        "the empty value is not a type error here, it is simply not a request: {reported:?}"
+    );
+}
+
+#[test]
+fn a_deploy_gated_to_another_environment_is_out_of_scope() {
+    let dev_only = "\
+envs:
+  dev:
+    require-verified: false
+  prod:
+    require-verified: true
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  deploy: k8s.rollout
+    image: build.digest
+    when: env is dev
+";
+    assert!(errors(dev_only).is_empty(), "{:?}", errors(dev_only));
+
+    // Gated to `prod` it is in scope, and so is a deploy that names no
+    // environment at all: `when: env is prod` is a declaration of scope, and
+    // its absence is not an exemption.
+    let to_prod = dev_only.replace("when: env is dev", "when: env is prod");
+    assert!(errors(&to_prod).iter().any(|e| e.contains("requires verified deploys")));
+    let ungated = dev_only.replace("    when: env is dev\n", "");
+    assert!(
+        errors(&ungated).iter().any(|e| e.contains("requires verified deploys")),
+        "an ungated deploy runs in whichever environment was selected, prod included: {:?}",
+        errors(&ungated)
+    );
+}
+
+#[test]
+fn a_require_verified_value_is_a_boolean_and_says_which_one() {
+    let src = UNVERIFIED.replace("require-verified: true", "require-verified: maybe");
+    let reported = errors(&src);
+    assert!(
+        reported.iter().any(|e| e.contains("`require-verified` takes `true` or `false`")
+            && e.contains("`require-verified: true`")),
+        "{reported:?}"
+    );
+    // The property is not a deploy finding: the step it named is fine, the
+    // value was not read as asking for anything.
+    assert!(!reported.iter().any(|e| e.contains("requires verified deploys")), "{reported:?}");
+
+    // And it is a did-you-mean away from being missed, like every other
+    // environment property.
+    let misspelt = UNVERIFIED.replace("require-verified: true", "require-verifiedd: true");
+    let all = messages(&misspelt);
+    assert!(
+        all.iter().any(|m| m.contains("unknown environment property `require-verifiedd`")
+            && m.contains("did you mean `require-verified`?")),
+        "{all:?}"
+    );
+}
+
+#[test]
+fn require_verified_covers_vm_deploy_too_and_is_silent_with_nothing_to_refuse() {
+    // Both deploy kinds are `ActionKind::Deploy`, so both are covered: the
+    // rule is about what a run does, not which step kind spells it.
+    let vm = "\
+envs:
+  prod:
+    require-verified: true
+steps:
+  deploy: vm.deploy
+    hosts: [\"web-1\", \"web-2\"]
+";
+    let reported = errors(vm);
+    assert!(
+        reported
+            .iter()
+            .any(|e| e.contains("`prod` requires verified deploys") && e.contains("`deploy`")),
+        "{reported:?}"
+    );
+    let verified = vm.replace("    hosts: [\"web-1\", \"web-2\"]\n",
+        "    hosts: [\"web-1\", \"web-2\"]\n    image: ghcr.io/acme/api@sha256:0000\n    verify: \"signed-by key:k\"\n");
+    assert!(errors(&verified).is_empty(), "{:?}", errors(&verified));
+
+    // Nothing deploys: the property binds nothing and says nothing.
+    let no_deploys = UNVERIFIED.replace("  deploy: k8s.rollout\n    image: build.digest\n", "");
+    assert!(errors(&no_deploys).is_empty(), "{:?}", errors(&no_deploys));
+
+    // And a file that never asks for verification is untouched by any of this.
+    let plain = "\
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  deploy: k8s.rollout
+    image: build.digest
+";
+    assert!(errors(plain).is_empty(), "{:?}", errors(plain));
+}

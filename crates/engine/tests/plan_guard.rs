@@ -532,6 +532,7 @@ fn recheck_follows_the_environment_unless_the_workflow_says_otherwise() {
         span: ks_lang::Span::default(),
         triggers: Vec::new(),
         ci_only,
+        require_verified: false,
         secrets: None,
         approvers: Vec::new(),
         vars: Vec::new(),
