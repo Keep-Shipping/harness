@@ -1,0 +1,44 @@
+name: Jev smoke
+
+# The live half of `adapters/jev`: one real question to TypeSafe's Jev, behind
+# the `KS_JEV_SMOKE_KEY` repository secret. Opt-in only — an ordinary
+# `cargo test --workspace` never reaches the network (ADR 0002), and this
+# workflow is not on any push or pull request.
+#
+# `TYPESAFE_API_KEY` must be set in the repository's secrets, or the test runs
+# with an empty key and fails on the vendor's 401 rather than quietly skipping.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    name: smoke against the vendor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain pinned in rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - name: Restore the cargo build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Ask Jev one real question
+        env:
+          KS_JEV_SMOKE_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+        run: |
+          cargo test -p ks-jev --test smoke -- --nocapture \
+            || { echo "::error::the Jev smoke test failed. Fix: run 'KS_JEV_SMOKE_KEY=… cargo test -p ks-jev --test smoke -- --nocapture' locally and read the printed answer. A 401 means the secret is wrong or unset — check the TYPESAFE_API_KEY repository secret."; exit 1; }

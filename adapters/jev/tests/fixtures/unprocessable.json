@@ -1,0 +1,7 @@
+{
+  "error": {
+    "type": "invalid_request_error",
+    "message": "questions.risk.criteria must contain every option id offered",
+    "detail": "option `escalate` was offered but has no criterion"
+  }
+}

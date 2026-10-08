@@ -1,0 +1,6 @@
+{
+  "error": {
+    "type": "overloaded_error",
+    "message": "the model is currently overloaded; retry shortly"
+  }
+}
