@@ -242,7 +242,7 @@ pub fn resume(args: &[String]) -> ExitCode {
     // `KEEPSHIPPING_AGENTS` / `KEEPSHIPPING_REQUIRE_HUMAN`. Detection only ever
     // escalates to an agent, and so does the record: an agent's run stays an
     // agent's run whoever resumes it.
-    let baseline = actor::ActorBaseline::from_env(&std::env::vars().collect());
+    let baseline = actor::ActorBaseline::from_env(&crate::env_snapshot());
     let resumer = actor::for_run(None, None, interactive, &baseline).kind;
     let recorded = recorded_actor(&state);
     let acting = if resumer == ActorKind::Agent { ActorKind::Agent } else { recorded };

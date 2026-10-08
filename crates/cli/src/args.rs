@@ -22,7 +22,7 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
                           [--actor human|agent|ci] [--context local|ci] [--secrets] [--fix] [--repro]
        keepshipping run [FILE] [--env NAME] [--event \"push main\"] [--actor human|agent|ci]
                         [--as human|agent[:name]|ci] [--base REF]
-                        [--context local|ci] [--non-interactive] [--until STEP]
+                        [--context local|ci] [--non-interactive] [--ci] [--sha SHA] [--until STEP]
                         [--only STEP]... [--skip STEP]... [--input KEY=VALUE]... [--allow-partial]
                         [--dry-run] [-v]
        keepshipping graph [FILE] [--env NAME] [--event \"push main\"] [--format text|dot|json]
@@ -104,6 +104,15 @@ pub struct Options {
     /// `--context local|ci`: what a run here could do. `None` means
     /// detected from the environment (see [`detect_context`]).
     pub context: Option<ContextName>,
+    /// `run --ci`: this invocation is a CI job, whatever the environment
+    /// says. It forces the CI context and a non-interactive run, and the
+    /// detected CI becomes the run's actor
+    /// ([`generic_ci`](crate::generic_ci)).
+    pub ci: bool,
+    /// `run --sha SHA`: the commit this run is about, for a CI whose
+    /// environment names no commit. Beats what was detected. `run` refuses
+    /// the flag without `--ci`, which is the context it states it to.
+    pub sha: Option<String>,
     /// `run --until STEP`: the step and everything it depends on.
     pub until: Option<String>,
     /// `run --only STEP`: exactly these steps, repeatable.
@@ -181,6 +190,8 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
         secrets: false,
         non_interactive: false,
         context: None,
+        ci: false,
+        sha: None,
         until: None,
         only: Vec::new(),
         skip: Vec::new(),
@@ -242,6 +253,12 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
             "--context" if matches!(command, Command::Check | Command::Run) => {
                 o.context = Some(ContextName::parse(&flag_value(&mut rest)?)?)
             }
+            // `--ci` is the caller saying a CI is in charge, and `--sha` what
+            // the run is about where the CI's environment names no commit —
+            // which is why `run` rejects `--sha` without `--ci` (see
+            // [`Options::sha`]): it would have nowhere to state it.
+            "--ci" if command == Command::Run => o.ci = true,
+            "--sha" if command == Command::Run => o.sha = Some(flag_value(&mut rest)?),
             "--until" if command == Command::Run => o.until = Some(flag_value(&mut rest)?),
             "--only" if command == Command::Run => o.only.push(flag_value(&mut rest)?),
             "--skip" if command == Command::Run => o.skip.push(flag_value(&mut rest)?),
