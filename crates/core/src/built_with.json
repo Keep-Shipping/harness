@@ -1,0 +1,58 @@
+{
+  "id": "FZ-012",
+  "name": "Keep Shipping",
+  "site": "https://keepshipping.run/",
+  "page": "https://factory0.ventures/ventures/keep-shipping/",
+  "uses": [
+    {
+      "id": "FZ-004",
+      "name": "Cratefield",
+      "kind": "factory-zero",
+      "url": "https://cratefield.com/",
+      "role": "framework",
+      "phrase": "Built with",
+      "status": "planned",
+      "note": "The hosted parts (waitlist, approvals, run logs) are planned as a Cratefield venture."
+    },
+    {
+      "id": "FZ-008",
+      "name": "SupportGenius",
+      "kind": "factory-zero",
+      "url": "https://supportgeni.us/",
+      "role": "bug-reports",
+      "phrase": "Bug reports to",
+      "status": "planned",
+      "note": "Errors and bug reports become deduplicated GitHub issues, through the Cratefield error reporter."
+    },
+    {
+      "id": "polar",
+      "name": "Polar",
+      "kind": "third-party",
+      "url": "https://polar.sh",
+      "role": "payments",
+      "phrase": "Payments by",
+      "status": "planned",
+      "note": "Paid plans through Polar as Merchant of Record, via the Cratefield Payments port. Nothing is on sale yet."
+    },
+    {
+      "id": "google-fonts",
+      "name": "Google Fonts",
+      "kind": "third-party",
+      "url": "https://fonts.google.com",
+      "role": "fonts",
+      "phrase": "Typefaces from",
+      "status": "live",
+      "note": "The site’s typefaces (Bricolage Grotesque, DM Mono), loaded from Google."
+    },
+    {
+      "id": "cloudflare",
+      "name": "Cloudflare",
+      "kind": "third-party",
+      "url": "https://www.cloudflare.com",
+      "role": "hosting",
+      "phrase": "Hosted on",
+      "status": "live",
+      "note": "The site."
+    }
+  ]
+}

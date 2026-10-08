@@ -96,8 +96,8 @@ passing silently.
 
 ### What is not verified, stated plainly
 
-- **The binary's own version.** `keepshipping` has no `--version` today, so nothing
-  reads the version back off the installed file. What is proven is that the bytes match
+- **The binary's own version.** `keepshipping --version` prints the version, so scripts
+  can read it back off the installed file. What is proven is still only that the bytes match
   a checksum a release workflow signed.
 - **Anything inside the archive.** `LICENSE` and `README.md` travel with the binary
   (ADR 0006) and are extracted and discarded; only the archive's checksum is checked.

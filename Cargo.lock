@@ -1035,6 +1035,7 @@ dependencies = [
  "getrandom",
  "http",
  "insta",
+ "ks-core",
  "pollster",
  "serde_json",
  "worker",
@@ -1061,6 +1062,7 @@ name = "ks-core"
 version = "0.0.0"
 dependencies = [
  "ks-lang",
+ "serde_json",
 ]
 
 [[package]]

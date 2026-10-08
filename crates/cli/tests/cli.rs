@@ -497,3 +497,87 @@ fn a_flag_where_a_value_belongs_is_a_usage_error() {
     assert_eq!(code, 2);
     assert!(stderr.contains("usage: keepshipping"), "{stderr}");
 }
+
+#[test]
+fn about_reports_what_the_product_is_built_with() {
+    let (code, stdout, stderr) = keepshipping(&["about"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    assert!(stdout.starts_with("Keep Shipping (FZ-012)\nhttps://keepshipping.run/\n"), "{stdout}");
+    for name in ["Cratefield", "SupportGenius", "Polar", "Google Fonts", "Cloudflare"] {
+        assert!(stdout.contains(name), "{stdout}");
+    }
+    for url in [
+        "https://cratefield.com/",
+        "https://supportgeni.us/",
+        "https://polar.sh",
+        "https://fonts.google.com",
+        "https://www.cloudflare.com",
+    ] {
+        assert!(stdout.contains(url), "{stdout}");
+    }
+    assert!(
+        stdout.contains("Subprocessors: https://factory0.ventures/ventures/keep-shipping/\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Source: vendored from https://factory0.ventures/stack.json"),
+        "{stdout}"
+    );
+}
+
+/// The whole point of the labels: each entry is rendered with the status the
+/// registry gave it, and a planned entry never reads as live.
+#[test]
+fn about_never_shows_a_planned_entry_as_live() {
+    let venture = ks_core::built_with::venture();
+    let status_w = venture.uses.iter().map(|u| u.status.as_str().len()).max().unwrap_or(0);
+    let (code, stdout, _) = keepshipping(&["about"]);
+    assert_eq!(code, 0);
+    for entry in &venture.uses {
+        let line = stdout
+            .lines()
+            .find(|line| line.contains(&entry.url))
+            .unwrap_or_else(|| panic!("{} is not rendered: {stdout}", entry.name));
+        // The status is the word in its own column, right before the link —
+        // asserted there, and nowhere else on the line: a product named
+        // LiveChat or a `.live` URL must not read as a status.
+        assert!(
+            line.contains(&format!("{:<status_w$}  {}", entry.status.as_str(), entry.url)),
+            "{line}"
+        );
+        let other = match entry.status {
+            ks_core::built_with::Status::Live => "planned",
+            ks_core::built_with::Status::Planned => "live",
+        };
+        assert!(!line.contains(&format!("{:<status_w$}  {}", other, entry.url)), "{line}");
+    }
+}
+
+#[test]
+fn version_prints_the_version_and_the_built_with_line() {
+    let (code, stdout, stderr) = keepshipping(&["--version"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some(format!("keepshipping {}", env!("CARGO_PKG_VERSION")).as_str()),
+        "{stdout}"
+    );
+    let built = lines.get(1).unwrap_or_else(|| panic!("no Built with line: {stdout}"));
+    assert!(built.starts_with("Built with: "), "{stdout}");
+    assert!(built.contains("(planned)") && built.contains("(live)"), "{stdout}");
+    assert_eq!(lines.len(), 2, "the version is exactly two lines: {stdout}");
+}
+
+#[test]
+fn about_and_version_take_no_arguments() {
+    for args in [&["about", "nope"][..], &["--version", "x"][..]] {
+        let (code, stdout, stderr) = keepshipping(args);
+        assert_eq!(code, 2, "{stdout}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(stderr.contains("error: unexpected argument"), "{stderr}");
+        assert!(stderr.contains("usage: keepshipping"), "{stderr}");
+    }
+}

@@ -86,3 +86,34 @@ fn the_theme_file_round_trips() {
     let reserialized = serde_json::to_string(&parsed).expect("serialises");
     assert_eq!(MailTheme::from_json(&reserialized).expect("re-parses"), parsed);
 }
+
+/// The mail carries a "Sent with Owlpost" footer only when Owlpost actually
+/// sends the mail — that is, only when Owlpost is in the venture's Factory
+/// Zero registry entry. Today it is the transport and nothing more, so the
+/// registry entry comes first (no such use), and the confirm and confirmed
+/// bodies carry no footer either. Adding the footer before adding the entry
+/// would be claiming a sender the product is not built with.
+#[test]
+fn no_owlpost_footer_while_owlpost_is_not_a_registry_entry() {
+    let venture = ks_core::built_with::venture();
+    for entry in &venture.uses {
+        let said = format!("{} ({})", entry.name, entry.id);
+        assert!(
+            !entry.id.to_lowercase().contains("owlpost")
+                && !entry.name.to_lowercase().contains("owlpost"),
+            "Owlpost is in the registry entry now ({said}); if it also sends the \
+             mail, a 'Sent with Owlpost' footer is honest — add it and update this test"
+        );
+    }
+    for (name, rendered) in [
+        ("confirm", render("waitlist/confirm", &confirm_data())),
+        ("confirmed", render("waitlist/confirmed", &confirmed_data())),
+    ] {
+        for (part, body) in [("html", &rendered.html), ("text", &rendered.text)] {
+            assert!(
+                !body.to_lowercase().contains("sent with owlpost"),
+                "the {name} {part} body claims an Owlpost footer: {body}"
+            );
+        }
+    }
+}
