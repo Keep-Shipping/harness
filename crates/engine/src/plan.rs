@@ -8,7 +8,10 @@
 
 use std::collections::HashMap;
 
+use ks_core::step::{ActionKind, RollbackPolicy};
 use ks_core::{Condition, TriggerKind, Workflow};
+
+use crate::exec;
 
 /// What a plan is planned for: the environment the run selected, and the
 /// event that selected it, when there was one.
@@ -55,6 +58,12 @@ pub struct PlannedStep {
     /// The sequence numbers of the steps that must finish first, ascending.
     pub deps: Vec<usize>,
     pub gate: Gate,
+    /// What a deploy of this step does when it does not land: what the file's
+    /// `rollback:` said, or [`RollbackPolicy::Auto`] when it said nothing
+    /// ([#78](https://github.com/Keep-Shipping/harness/issues/78)). It rides
+    /// here rather than being read again at run time so the plan is the whole
+    /// run's answer: the executor never has to re-open the file to know.
+    pub rollback: RollbackPolicy,
 }
 
 /// A workflow planned for one environment and event.
@@ -108,6 +117,7 @@ impl Plan {
                 kind: step.and_then(|s| s.kind.clone()),
                 deps,
                 gate,
+                rollback: step.map_or(RollbackPolicy::default(), |s| s.rollback),
             });
         }
         Plan { env: ctx.env.clone(), triggers, steps }
@@ -122,6 +132,46 @@ impl Plan {
     /// The steps that will run, in plan order: everything not skipped.
     pub fn running(&self) -> impl Iterator<Item = &PlannedStep> {
         self.steps.iter().filter(|s| !s.gate.is_skipped())
+    }
+
+    /// This plan as the executor's own steps, ready for
+    /// [`execute`](crate::exec::execute): every step that will run, in plan
+    /// order, each naming what it must follow and what it does when a deploy
+    /// of it does not land.
+    ///
+    /// This is where a file's `rollback:` stops being a spelling and becomes the
+    /// executor's answer ([#78](https://github.com/Keep-Shipping/harness/issues/78)):
+    /// the [`RollbackPolicy`] travels from the workflow's step through the plan
+    /// into [`exec::PlannedStep::rollback`], which is the only thing the
+    /// executor reads.
+    ///
+    /// `action` is what each step's kind does — [`ActionKind`], which a step
+    /// computes from its own inputs rather than the file declaring it, so the
+    /// caller that knows it says so here. The executor reads it to pick the
+    /// default timeout and to know a deploy is the one thing that can roll
+    /// back.
+    ///
+    /// A step the plan ruled out is left out rather than handed over as a step
+    /// that runs: the executor has its own idea of what did not run, and two
+    /// ways of saying it would be one too many.
+    #[must_use]
+    pub fn to_exec_steps(
+        &self,
+        mut action: impl FnMut(&PlannedStep) -> ActionKind,
+    ) -> Vec<exec::PlannedStep> {
+        self.running()
+            .map(|step| {
+                let needs =
+                    step.deps.iter().filter_map(|seq| self.step(*seq)).map(|d| d.name.clone());
+                exec::PlannedStep::new(
+                    &step.name,
+                    step.kind.clone().unwrap_or_default(),
+                    action(step),
+                )
+                .needs(needs)
+                .rollback(step.rollback)
+            })
+            .collect()
     }
 }
 

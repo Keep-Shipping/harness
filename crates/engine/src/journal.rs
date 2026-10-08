@@ -17,7 +17,9 @@ use ks_core::harness::Harness;
 use ks_core::ids::RunId;
 use ks_core::ports::run_log::{RunEvent, RunLog, RunLogError};
 use ks_core::ports::secrets::Redactor;
-use ks_core::step::{CancellationToken, Inputs, LogSink, Outputs, StepError};
+use ks_core::step::{
+    CancellationToken, Inputs, LogSink, Outputs, Rollback, RollbackPolicy, StepError,
+};
 
 use crate::credentials::StepCredentials;
 use crate::run::run_step;
@@ -204,6 +206,37 @@ impl Journal {
         shipped: Vec<String>,
     ) -> Result<(), RunLogError> {
         self.emit(RunEvent::RunFinished { status: status.into(), shipped }).await
+    }
+
+    /// Records what a rollback did to `step`, and the [`RollbackPolicy`] that decided it: the
+    /// status the target reported — `reverted`, `failed`, `pending` or `unsupported` — and the
+    /// version traffic actually went back to, which the target knows and the caller never did.
+    /// `unsupported` is a runner with no rollback facility, which did not try: no version, no
+    /// reason, and nobody waiting, which is not what `pending` claims.
+    ///
+    /// A rollback is its own event rather than a field on `step.finished` because it outlives the
+    /// step in the reader's mind: what the log has to answer is where traffic is now, and that is
+    /// not a property of how the step ended.
+    ///
+    /// Called from [`exec::execute`](crate::exec::execute), where the policy and the
+    /// [`Rollback`] it produced are in hand. `Journal` wraps [`run_step`] and never sees a
+    /// `StepRecord`, and `execute` has no production caller to take a `Journal` yet — this is the
+    /// emitter those two meet on, so the mapping is proved here rather than at a wiring point
+    /// that does not exist.
+    pub async fn step_rolled_back(
+        &self,
+        step: &str,
+        policy: RollbackPolicy,
+        rollback: &Rollback,
+    ) -> Result<(), RunLogError> {
+        let e = RunEvent::StepRolledBack {
+            step: step.into(),
+            policy: policy.as_str().into(),
+            status: rollback.status().as_str().into(),
+            reverted_to: rollback.reverted_to_version().map(str::to_string),
+            reason: rollback.reason().map(str::to_string),
+        };
+        self.emit(e).await
     }
 
     /// Runs `name` through [`run_step`], bracketing it in `step.started` and `step.finished` — in

@@ -36,6 +36,15 @@ pub enum RunEvent {
         duration_ms: u64,
         error: Option<String>,
     },
+    /// A deploy that failed or timed out was rolled back. `reverted_to` is the version
+    /// traffic actually went back to, when the target reports one.
+    StepRolledBack {
+        step: String,
+        policy: String,
+        status: String,
+        reverted_to: Option<String>,
+        reason: Option<String>,
+    },
     /// An approval was asked for and is pending. `artifacts` are hashes.
     ApprovalRequested { step: String, channel: String, artifacts: Vec<String> },
     /// An approval was granted.
@@ -100,6 +109,9 @@ impl RunEvent {
             RunEvent::RunStarted { .. } => "run.started",
             RunEvent::StepStarted { .. } => "step.started",
             RunEvent::StepFinished { .. } => "step.finished",
+            // Hyphenated, not `step.rollback`: the name is the past tense of what the engine did,
+            // and its siblings all read that way.
+            RunEvent::StepRolledBack { .. } => "step.rolled-back",
             RunEvent::ApprovalRequested { .. } => "approval.requested",
             RunEvent::ApprovalGranted { .. } => "approval.granted",
             RunEvent::ApprovalDenied { .. } => "approval.denied",
@@ -135,6 +147,13 @@ impl RunEvent {
                 *step = r.redact(step);
                 list(outputs);
                 *error = error.as_deref().map(|message| r.redact(message));
+            }
+            RunEvent::StepRolledBack { step, policy, status, reverted_to, reason } => {
+                *step = r.redact(step);
+                *policy = r.redact(policy);
+                *status = r.redact(status);
+                *reverted_to = reverted_to.as_deref().map(|version| r.redact(version));
+                *reason = reason.as_deref().map(|message| r.redact(message));
             }
             RunEvent::ApprovalRequested { step, channel, artifacts } => {
                 *step = r.redact(step);
@@ -247,6 +266,16 @@ mod tests {
                     outputs: vec![s()],
                     duration_ms: 0,
                     error: Some(s()),
+                },
+            ),
+            (
+                "step.rolled-back",
+                RunEvent::StepRolledBack {
+                    step: s(),
+                    policy: s(),
+                    status: s(),
+                    reverted_to: Some(s()),
+                    reason: Some(s()),
                 },
             ),
             (

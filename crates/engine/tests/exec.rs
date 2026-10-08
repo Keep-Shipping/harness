@@ -8,16 +8,33 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::{Duration, SystemTime};
 
+use ks_core::ids::RunId;
 use ks_core::ports::BoxFuture;
 use ks_core::ports::clock::Clock;
-use ks_core::step::{ActionKind, CancellationToken};
+use ks_core::ports::run_log::{RunEvent, RunLog as RunLogPort};
+use ks_core::ports::secrets::Redactor;
+use ks_core::step::{ActionKind, CancellationToken, Rollback, RollbackPolicy, RollbackStatus};
 use ks_engine::exec::{
     Attempt, CANCEL_POLL, ExecError, ExecOptions, PlannedStep, Retry, RunLog, RunStatus,
     StepRunner, StepStatus, default_timeout, execute,
 };
+use ks_engine::journal::Journal;
+use ks_testing::run_log::RecordingRunLog;
 use ks_testing::{block_on, clock::FakeClock};
 
 const MINUTE: Duration = Duration::from_secs(60);
+
+/// The version the fake's successful rollback reports traffic going back to.
+const GOOD_VERSION: &str = "api-41";
+
+/// What the fake's rollback reports when the executor asks for one.
+#[derive(Clone, Copy)]
+enum RollbackReport {
+    /// It went back to this version, the way a target that knows where traffic went says so.
+    RevertedTo(&'static str),
+    /// It could not reach the environment; the reason names the step.
+    Unreachable,
+}
 
 /// What a scripted step does when it is run.
 #[derive(Clone)]
@@ -47,7 +64,7 @@ struct Scripted {
     /// How many times each step was run.
     calls: Mutex<HashMap<String, u32>>,
     rollbacks: Mutex<Vec<String>>,
-    rollback_fails: bool,
+    rollback: RollbackReport,
 }
 
 impl Scripted {
@@ -58,7 +75,7 @@ impl Scripted {
             script: Mutex::new(HashMap::new()),
             calls: Mutex::new(HashMap::new()),
             rollbacks: Mutex::new(Vec::new()),
-            rollback_fails: false,
+            rollback: RollbackReport::RevertedTo(GOOD_VERSION),
         }
     }
 
@@ -125,13 +142,13 @@ impl StepRunner for Scripted {
         })
     }
 
-    fn rollback<'a>(&'a self, step: &'a PlannedStep) -> BoxFuture<'a, Result<(), String>> {
-        let fails = self.rollback_fails;
+    fn rollback<'a>(&'a self, step: &'a PlannedStep) -> BoxFuture<'a, Result<Rollback, String>> {
+        let report = self.rollback;
         self.rollbacks.lock().expect("rollbacks").push(step.id.clone());
         Box::pin(async move {
-            match fails {
-                true => Err(format!("no credentials for {}", step.id)),
-                false => Ok(()),
+            match report {
+                RollbackReport::RevertedTo(version) => Ok(Rollback::reverted_to(version)),
+                RollbackReport::Unreachable => Err(format!("no credentials for {}", step.id)),
             }
         })
     }
@@ -160,7 +177,14 @@ impl Run {
 
     /// Rollback reports a failure, as a rollback that could not reach the environment would.
     fn failing_rollback(mut self) -> Run {
-        self.runner.rollback_fails = true;
+        self.runner.rollback = RollbackReport::Unreachable;
+        self
+    }
+
+    /// Rollback reports the version it sent traffic back to, the way a target that knows where
+    /// traffic went does.
+    fn reverting_to(mut self, version: &'static str) -> Run {
+        self.runner.rollback = RollbackReport::RevertedTo(version);
         self
     }
 
@@ -453,7 +477,11 @@ fn only_a_deploy_that_did_not_land_is_rolled_back() {
         let record = log.step("deploy").expect("a record");
         match rolled_back {
             true => {
-                assert_eq!(record.rollback, Some(Ok(())), "a deploy that did not land rolls back");
+                assert_eq!(
+                    record.rollback,
+                    Some(Rollback::reverted_to(GOOD_VERSION)),
+                    "a deploy that did not land rolls back"
+                );
                 assert_eq!(run.runner.rollbacks(), vec!["deploy"]);
             }
             false => assert_eq!(record.rollback, None, "a deploy that landed is not rolled back"),
@@ -471,8 +499,129 @@ fn a_rollback_that_could_not_finish_is_reported_on_the_step() {
 
     assert_eq!(
         log.step("deploy").expect("a record").rollback,
-        Some(Err("no credentials for deploy".to_string()))
+        Some(Rollback::failed("no credentials for deploy")),
+        "a rollback that did not finish is kept, with the reason and no version"
     );
+}
+
+#[test]
+fn a_deploy_that_says_nothing_rolls_back_on_its_own() {
+    let run = Run::new().script("deploy", &[Behaviour::Fail("no capacity")]);
+    let steps = vec![PlannedStep::new("deploy", "k8s.rollout", ActionKind::Deploy)];
+    assert_eq!(steps[0].rollback, RollbackPolicy::Auto, "auto is the default policy");
+
+    let log = run.ok(&steps);
+
+    // The backwards-compatibility guarantee: a plan written before rollback policies existed
+    // keeps rolling back, because `Auto` is what it was getting by accident.
+    assert_eq!(run.runner.rollbacks(), vec!["deploy"]);
+    let rollback = log.step("deploy").expect("a record").rollback.clone().expect("a rollback");
+    assert_eq!(rollback.reverted_to_version(), Some(GOOD_VERSION));
+}
+
+#[test]
+fn a_runner_that_reports_where_traffic_went_has_that_version_on_the_step() {
+    let run = Run::new().script("deploy", &[Behaviour::Fail("no capacity")]).reverting_to("api-40");
+    let steps = vec![step("deploy", ActionKind::Deploy).rollback(RollbackPolicy::Auto)];
+
+    let log = run.ok(&steps);
+
+    // The point of the change: what the target reported, not what the caller meant to revert to.
+    let record = log.step("deploy").expect("a record");
+    let rollback = record.rollback.clone().expect("a rollback");
+    assert_eq!(rollback.reverted_to_version(), Some("api-40"));
+}
+
+#[test]
+fn a_manual_rollback_leaves_the_target_alone_and_waits_for_a_human() {
+    let run = Run::new().script("deploy", &[Behaviour::Fail("no capacity")]);
+    let steps = vec![step("deploy", ActionKind::Deploy).rollback(RollbackPolicy::Manual)];
+
+    let log = run.ok(&steps);
+
+    // The runner was never asked: a rollback that rewrites data rewinds every write since,
+    // customers' included, and no automated path may do that.
+    assert!(run.runner.rollbacks().is_empty(), "nothing was rolled back, so nothing was asked for");
+    let record = log.step("deploy").expect("a record");
+    let rollback = record.rollback.clone().expect("a pending rollback");
+    assert_eq!(rollback.status(), RollbackStatus::Pending);
+    assert_eq!(rollback.reverted_to_version(), None, "nothing changed, so nothing was reached");
+}
+
+#[test]
+fn a_rollback_of_none_records_nothing_at_all() {
+    let run = Run::new().script("deploy", &[Behaviour::Fail("no capacity")]);
+    let steps = vec![step("deploy", ActionKind::Deploy).rollback(RollbackPolicy::None)];
+
+    let log = run.ok(&steps);
+
+    assert!(run.runner.rollbacks().is_empty());
+    // Not a pending rollback: nothing is waiting on anyone here. The step's own failure is on the
+    // record, and whatever has to be torn down is another step's business.
+    assert_eq!(log.step("deploy").expect("a record").rollback, None);
+}
+
+/// A runner that cannot roll anything back: it implements [`StepRunner::run`] and takes the
+/// default for [`StepRunner::rollback`], which is what every runner that has no rollback facility
+/// does.
+struct NoRollback;
+
+impl StepRunner for NoRollback {
+    fn run<'a>(
+        &'a self,
+        _step: &'a PlannedStep,
+        _attempt: u32,
+        _cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Attempt> {
+        Box::pin(async { Attempt::Failed("no capacity".to_string()) })
+    }
+}
+
+/// The default [`StepRunner::rollback`] has to be covered by a real run, not only by inspection:
+/// every other runner in this file overrides it, so the body the executor actually calls on a
+/// runner with no rollback was never executed by anything.
+#[test]
+fn a_runner_with_no_rollback_records_an_unsupported_one_rather_than_a_pending_one() {
+    let steps = vec![PlannedStep::new("deploy", "k8s.rollout", ActionKind::Deploy)];
+    assert_eq!(steps[0].rollback, RollbackPolicy::Auto, "auto is the default policy");
+
+    let log = block_on(execute(
+        &steps,
+        &NoRollback,
+        &FakeClock::new(),
+        &CancellationToken::new(),
+        ExecOptions::default(),
+    ))
+    .expect("the plan is valid");
+
+    let rollback = log.step("deploy").expect("a record").rollback.clone().expect("a rollback");
+    assert_eq!(
+        rollback.status(),
+        RollbackStatus::Unsupported,
+        "nothing was attempted, so no human is waiting: pending would claim one is"
+    );
+    assert_ne!(rollback.status(), RollbackStatus::Pending);
+    assert_eq!(rollback.reverted_to_version(), None, "no version was ever reached");
+    assert_eq!(rollback.reason(), None, "nothing was attempted, so nothing can have failed");
+}
+
+#[test]
+fn asking_for_a_human_does_not_turn_a_failed_deploy_into_a_successful_one() {
+    let run = Run::new()
+        .script("deploy", &[Behaviour::Fail("no capacity")])
+        .script("notify", &[Behaviour::Succeed]);
+    let steps = vec![
+        step("deploy", ActionKind::Deploy).rollback(RollbackPolicy::Manual),
+        step("notify", ActionKind::Other).needs(["deploy"]),
+    ];
+
+    let log = run.ok(&steps);
+
+    assert_eq!(status(&log, "deploy"), StepStatus::Failed, "the deploy still failed");
+    assert_eq!(reason(&log, "deploy"), "no capacity");
+    assert_eq!(status(&log, "notify"), StepStatus::Skipped, "and its dependants still skip");
+    assert_eq!(log.status, RunStatus::Failed);
+    assert_eq!(log.exit_code(), 1);
 }
 
 #[test]
@@ -660,4 +809,66 @@ fn a_step_that_never_yields_still_leaves_a_live_timer_behind() {
             "slice {slice} returned Pending with no live timer: nothing left to wake the task"
         );
     }
+}
+
+/// What a rollback leaves in the run log: its own event, carrying the policy that decided it, the
+/// status the target reported and the version traffic actually went back to.
+///
+/// [`Journal`] wraps `run_step` and never sees a `StepRecord`, and `execute` has no production
+/// caller to hand a journal to yet, so this proves the mapping at the point where the executor and
+/// the log meet rather than at a wiring that does not exist.
+#[test]
+fn a_rollback_reaches_the_run_log_as_its_own_event() {
+    let log = Arc::new(RecordingRunLog::new());
+    let j = Journal::new(
+        Arc::clone(&log) as Arc<dyn RunLogPort>,
+        Arc::new(Redactor::new()),
+        RunId::from_parts(0, 1),
+    );
+
+    for (policy, rollback) in [
+        (RollbackPolicy::Auto, Rollback::reverted_to(GOOD_VERSION)),
+        (RollbackPolicy::Manual, Rollback::pending()),
+        (RollbackPolicy::Auto, Rollback::failed("no credentials for deploy")),
+        (RollbackPolicy::Auto, Rollback::unsupported()),
+    ] {
+        block_on(j.step_rolled_back("deploy", policy, &rollback)).expect("the fake accepts it");
+    }
+
+    let events = log.events();
+    assert_eq!(
+        events.iter().map(RunEvent::kind).collect::<Vec<_>>(),
+        ["step.rolled-back", "step.rolled-back", "step.rolled-back", "step.rolled-back"]
+    );
+    let rolled_back = |event: &RunEvent| match event {
+        RunEvent::StepRolledBack { step, policy, status, reverted_to, reason } => {
+            (step.clone(), policy.clone(), status.clone(), reverted_to.clone(), reason.clone())
+        }
+        other => panic!("expected step.rolled-back, got {other:?}"),
+    };
+    assert_eq!(
+        rolled_back(&events[0]),
+        ("deploy".into(), "auto".into(), "reverted".into(), Some(GOOD_VERSION.into()), None)
+    );
+    assert_eq!(
+        rolled_back(&events[1]),
+        ("deploy".into(), "manual".into(), "pending".into(), None, None)
+    );
+    assert_eq!(
+        rolled_back(&events[2]),
+        (
+            "deploy".into(),
+            "auto".into(),
+            "failed".into(),
+            None,
+            Some("no credentials for deploy".into())
+        )
+    );
+    // A runner with no rollback facility did not try, so there is no version to name and no
+    // failure to explain — and it is `unsupported`, never `pending`, which would claim a human
+    // is waiting on a rollback this runner cannot perform.
+    assert_eq!(
+        rolled_back(&events[3]),
+        ("deploy".into(), "auto".into(), "unsupported".into(), None, None)
+    );
 }

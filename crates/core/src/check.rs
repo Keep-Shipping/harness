@@ -15,7 +15,7 @@ use crate::policy::{self, BLOCKS, SCRIPTS, SECRETS};
 use crate::ports::policy::{ANY_OBJECT, Disposition};
 use crate::ports::run_context::ActorKind;
 use crate::ports::secrets::SecretRef;
-use crate::step::{ActionClass, ActionKind};
+use crate::step::{ActionClass, ActionKind, RollbackPolicy};
 use crate::types::{self, LiteralFit, Type};
 use crate::workflow::{
     AskHandle, Condition, ContextTest, Env, Policy, PolicyRule, Step, Trigger, TriggerKind,
@@ -297,7 +297,7 @@ const ENV_PROPERTIES: [&str; 5] = ["secrets", "ci-only", "approvers", "on", "var
 
 /// The reserved keys under a step: read with the declaration, never checked
 /// as inputs.
-const STEP_PROPERTIES: [&str; 1] = ["ci-only"];
+const STEP_PROPERTIES: [&str; 2] = ["ci-only", "rollback"];
 
 /// The kinds that apply a plan and produce its run-time outputs, and so are
 /// the ones whose `out.` names the IaC behind their plan can answer.
@@ -370,6 +370,8 @@ struct StepInfo<'a> {
     spec: Option<&'a StepTypes>,
     /// `ci-only: true`: the step refuses to run off CI.
     ci_only: bool,
+    /// The `rollback:` policy the step declared, for the executor.
+    rollback: RollbackPolicy,
     /// `decide` only: the answers declared under `returns:`.
     variants: Vec<String>,
     /// The literal `dir:` a `tofu.plan` step reads, as the file spells it.
@@ -654,6 +656,7 @@ impl<'a> Ctx<'a> {
                 .as_deref()
                 .and_then(|n| self.catalog.step(n).or_else(|| block.map(|b| b.as_step_types())));
             let ci_only = self.step_ci_only(s);
+            let rollback = self.step_rollback(s);
             let variants = match spec.filter(|sp| sp.decision) {
                 Some(_) => s
                     .children()
@@ -686,6 +689,7 @@ impl<'a> Ctx<'a> {
                 kind_span,
                 spec,
                 ci_only,
+                rollback,
                 variants,
                 dir: literal_input(s, "dir"),
                 plan: plan_step(s),
@@ -790,6 +794,38 @@ impl<'a> Ctx<'a> {
                 false
             }
         }
+    }
+
+    /// A step's reserved `rollback:` property, defaulting to
+    /// [`RollbackPolicy::Auto`] when the step declares none. Like `ci-only`, it
+    /// is read with the declaration rather than as an input the kind must
+    /// declare; the answer travels on the workflow's step, so a file that says
+    /// `rollback: manual` reaches the executor as `manual` rather than being
+    /// accepted and then rolled back automatically.
+    fn step_rollback(&mut self, step: Entry<'_>) -> RollbackPolicy {
+        let Some(p) = step.children().find(|c| c.key_name() == Some("rollback")) else {
+            return RollbackPolicy::default();
+        };
+        // A missing value is the parser's finding, not a second one here.
+        let Some(e) = p.expr() else { return RollbackPolicy::default() };
+        // A value that is present is either a bare word spelling one of the
+        // three policies or an error — `rollback: "manual"`, `rollback: [auto]`
+        // and `rollback: auto, manual` name no policy in any reading, and the
+        // one policy that would have been guessed here (`auto`) is the one that
+        // rolls back on its own. So a shape the reader did not mean reports
+        // itself instead of silently reverting the deployment.
+        let Some(policy) = value_word(&e).as_deref().and_then(RollbackPolicy::parse) else {
+            self.subject = step.key_name().map(|n| format!("{n}.rollback"));
+            self.err_hint(
+                Code::TypeMismatch,
+                p.key_span(),
+                "`rollback` takes `auto`, `manual` or `none`",
+                "`rollback: auto`",
+            );
+            self.subject = None;
+            return RollbackPolicy::default();
+        };
+        policy
     }
 
     fn check_input(&mut self, idx: usize, iname: &str, input: Entry<'_>) {
@@ -2698,6 +2734,7 @@ impl<'a> Ctx<'a> {
                 ci_only: s.ci_only,
                 actions: s.actions.iter().map(|(a, _)| a.clone()).collect(),
                 block_inputs: s.block_inputs.clone(),
+                rollback: s.rollback,
                 when: s.when.clone(),
             })
             .collect();
