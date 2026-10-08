@@ -8,7 +8,10 @@
 //!
 //! The port's rules are enforced here: `plan` writes a saved plan under
 //! `<dir>/.ks/` and returns its sha256, and `show` and `apply` both re-hash
-//! that file before reading it. **Variables travel only as `TF_VAR_*`
+//! that file before reading it. A saved plan is secretish — it carries the
+//! passwords an apply is about to materialise — so it is written owner-only
+//! into an owner-only directory, and it is deleted once the apply it was made
+//! for has succeeded. **Variables travel only as `TF_VAR_*`
 //! environment entries**, never as `-var` arguments: a value must never
 //! appear in `argv`, where every process can read it. Every command runs
 //! non-interactively — nobody is there to answer a prompt.
@@ -35,6 +38,13 @@ use sha2::{Digest, Sha256};
 /// only a plan, so this directory's *parent* is the working directory the
 /// plan belongs to — the way back to its workspace and backend.
 const PLAN_DIR: &str = ".ks";
+
+/// Owner-only, read and write. A saved plan carries the generated passwords an
+/// apply is about to materialise, in cleartext.
+const PLAN_FILE_MODE: u32 = 0o600;
+
+/// Owner-only, so the plan names inside are not enumerable either.
+const PLAN_DIR_MODE: u32 = 0o700;
 
 /// How many plans this process has written; part of the plan file's name.
 static PLANS_WRITTEN: AtomicU64 = AtomicU64::new(0);
@@ -194,6 +204,10 @@ impl IacCli {
         plan.extend(self.var_files.iter().map(|path| format!("-var-file={}", path.display())));
         self.run(dir, &plan, &plan_env)?;
 
+        // The tool has written it and nobody else has read it: tighten before
+        // hashing, so the digest covers exactly the bytes that were secured.
+        restrict(&file, PLAN_FILE_MODE);
+
         let digest = sha256_of(&file)?;
         SavedPlan::new(file, digest)
     }
@@ -208,18 +222,53 @@ fn argv(parts: &[&str]) -> Vec<String> {
 }
 
 /// A fresh absolute plan path under `<dir>/.ks/`, whose parent directory this
-/// creates. The clock plus a counter keep two plans in the same second — or
-/// two runs at once — from overwriting each other.
+/// creates, owner-only before the tool is spawned into it. The clock plus a
+/// counter keep two plans in the same second — or two runs at once — from
+/// overwriting each other.
+///
+/// The file itself is **not** created here: the tool writes it, and we must not
+/// pre-create or truncate the tool's output. `init_and_plan` tightens it once
+/// the tool has written it.
 fn plan_file(dir: &Path) -> Result<PathBuf, IacError> {
     let plans = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf()).join(PLAN_DIR);
     std::fs::create_dir_all(&plans).map_err(|error| IacError::Tool {
         message: format!("could not create {}: {error}", plans.display()),
         exit_code: None,
     })?;
+    // Tightened here, not after the write: the tool has to be able to create a
+    // file inside this directory, and a directory another local user can list
+    // is a window even for a file whose own mode is owner-only.
+    restrict(&plans, PLAN_DIR_MODE);
     let nanos =
         SystemTime::now().duration_since(UNIX_EPOCH).map(|since| since.as_nanos()).unwrap_or(0);
     let count = PLANS_WRITTEN.fetch_add(1, Ordering::Relaxed);
     Ok(plans.join(format!("plan-{nanos}-{count}.tfplan")))
+}
+
+/// Tightens `path` to `mode`, leaving its bytes alone: the digest must cover
+/// exactly what the tool wrote, so the file is never reopened for this.
+///
+/// A failure is not fatal — the plan is still the tool's to write, and a
+/// filesystem that cannot carry a mode bit has its own answer to the
+/// customer's umask. On a platform with no unix modes this does nothing, so a
+/// Windows build still compiles.
+#[cfg(unix)]
+fn restrict(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn restrict(_path: &Path, _mode: u32) {}
+
+/// Removes a saved plan whose apply has succeeded. A file that is already gone
+/// is not a failure: somebody may have cleaned up first, and the outcome we
+/// wanted is the one we have.
+///
+/// Only ever the file. `<dir>/.ks/` is the customer's directory and may hold
+/// their own plans.
+fn discard(path: &Path) {
+    let _ = std::fs::remove_file(path);
 }
 
 /// The file's sha256, 64 lowercase hex digits — what [`SavedPlan::new`] wants.
@@ -349,7 +398,13 @@ impl IacTool for IacCli {
             if !outcome.status.success() {
                 return Err(tool_error(&outcome));
             }
-            parse_change_summary(&String::from_utf8_lossy(&outcome.stdout))
+            // Only once the apply has succeeded, and only once the summary has
+            // been read: on a stale plan or a failed apply the file must
+            // survive, because that is where the human looks before applying
+            // anything else. A plan that already applied is a plan nobody needs.
+            let summary = parse_change_summary(&String::from_utf8_lossy(&outcome.stdout))?;
+            discard(plan.path());
+            Ok(summary)
         })();
         Box::pin(std::future::ready(result))
     }
@@ -514,6 +569,75 @@ mod tests {
         assert!(one.is_absolute() && one.starts_with(&dir), "{}", one.display());
         assert_eq!(one.parent().unwrap().file_name(), Some(OsStr::new(PLAN_DIR)));
         assert_ne!(one, plan_file(&dir).expect("the plans directory"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A directory under the system temp dir, named for this process and this
+    /// test so two tests never collide, and cleaned before and after use.
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ks-tofu-cli-{}-{label}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("the scratch directory can be created");
+        dir
+    }
+
+    /// The file's own permission bits, or `None` where there are none.
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> Option<u32> {
+        use std::os::unix::fs::PermissionsExt;
+        Some(std::fs::metadata(path).ok()?.permissions().mode() & 0o777)
+    }
+
+    #[cfg(not(unix))]
+    fn mode_of(_path: &Path) -> Option<u32> {
+        None
+    }
+
+    /// The plans directory is owner-only before the tool writes anything into
+    /// it, and the plan itself is not created here — the tool owns that file,
+    /// and pre-creating it would truncate what the tool is about to write.
+    #[test]
+    fn the_plans_directory_is_owner_only_before_the_tool_writes() {
+        let dir = scratch("dir-mode");
+        let file = plan_file(&dir).expect("the plans directory");
+        assert_eq!(mode_of(file.parent().unwrap()), Some(PLAN_DIR_MODE), "{}", file.display());
+        assert!(!file.exists(), "we must not create the tool's output: {}", file.display());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Tightening is a mode change, never a rewrite: the digest must still be
+    /// the digest of exactly the bytes the tool wrote.
+    #[test]
+    fn tightening_a_plan_leaves_its_bytes_exactly_as_written() {
+        let dir = scratch("file-mode");
+        let file = plan_file(&dir).expect("the plans directory");
+        let bytes = b"a saved plan, which the tool wrote\n";
+        std::fs::write(&file, bytes).expect("the plan is written");
+        let before = sha256_of(&file).expect("a digest before");
+        restrict(&file, PLAN_FILE_MODE);
+        assert_eq!(mode_of(&file), Some(PLAN_FILE_MODE), "{}", file.display());
+        assert_eq!(sha256_of(&file).expect("a digest after"), before, "the bytes moved");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A plan that has applied is a plan nobody needs, so `discard` removes
+    /// that one file and leaves the customer's directory — and any other plan
+    /// in it — alone. Removing it twice is not an error.
+    #[test]
+    fn discarding_an_applied_plan_removes_that_file_and_nothing_else() {
+        let dir = scratch("discard");
+        let applied = plan_file(&dir).expect("the plans directory");
+        let other = plan_file(&dir).expect("the plans directory");
+        std::fs::write(&applied, b"applied").expect("the plan is written");
+        std::fs::write(&other, b"the customer's own plan").expect("the other plan is written");
+        let plans = applied.parent().unwrap().to_path_buf();
+
+        discard(&applied);
+        assert!(!applied.exists(), "{} survived its apply", applied.display());
+        assert!(other.exists(), "another plan in the same directory is not ours to delete");
+        assert!(plans.is_dir(), "the customer's `.ks` directory is not ours to delete");
+        // Somebody cleaning up first, or a rerun, is the outcome we wanted.
+        discard(&applied);
         std::fs::remove_dir_all(&dir).ok();
     }
 

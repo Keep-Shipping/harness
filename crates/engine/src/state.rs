@@ -54,6 +54,7 @@ use ks_core::ports::approval::{Artifact, ArtifactKind};
 use ks_core::ports::iac::{IacError, SavedPlan};
 use ks_core::ports::state_store::{StateError, StateStore, check_key};
 use ks_core::ports::supply_chain::Digest as ContentDigest;
+use ks_core::sensitivity::{PLAN_KEY_PREFIX, SENSITIVE_DIR_MODE, Sensitivity};
 
 /// The key the run record is parked under.
 pub const STATE_KEY: &str = "state.json";
@@ -793,9 +794,12 @@ fn strings_of(value: Option<&Value>) -> Result<BTreeMap<String, String>, String>
 
 /// The key a plan's bytes live under: `plan-<sha256>`. Content-addressed, so
 /// the key names the binding — a store returning the wrong bytes for it fails
-/// [`fetch_plan`]'s hash check rather than applying something else.
+/// [`fetch_plan`]'s hash check rather than applying something else. The
+/// [`PLAN_KEY_PREFIX`] namespace is also what makes the blob
+/// [`Sensitivity::Secretish`], so
+/// plan bytes are stored owner-only (#122).
 pub fn plan_key(sha256: &str) -> String {
-    format!("plan-{sha256}")
+    format!("{PLAN_KEY_PREFIX}{sha256}")
 }
 
 /// Stores `bytes` as `run`'s plan for `step` and returns the reference to
@@ -926,9 +930,8 @@ pub async fn fetch_plan(
             actual: Some(actual),
         });
     }
-    write_atomically(dest, &bytes).map_err(|error| ResumeError::PlanWrite {
-        dest: dest.display().to_string(),
-        message: error.to_string(),
+    write_atomically(dest, &bytes, Sensitivity::Secretish).map_err(|error| {
+        ResumeError::PlanWrite { dest: dest.display().to_string(), message: error.to_string() }
     })?;
     Ok(SavedPlan::new(dest, actual)?)
 }
@@ -968,7 +971,12 @@ fn unavailable(path: &Path, error: std::io::Error) -> StateError {
 /// ones and a crash leaves no half-written object behind. The temp name carries
 /// the process id and a counter, so two writers racing on the same path do not
 /// share one file.
-fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+///
+/// The temp file is created with `sensitivity`'s mode rather than tightened
+/// afterwards: the rename is what publishes the object, so setting the mode
+/// before it means there is no window in which plan bytes sit under the umask
+/// (#122).
+fn write_atomically(path: &Path, bytes: &[u8], sensitivity: Sensitivity) -> std::io::Result<()> {
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     let dir = path
         .parent()
@@ -981,7 +989,7 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
     ));
     let written = (|| {
-        let mut file = std::fs::File::create(&temp)?;
+        let mut file = create_with_mode(&temp, sensitivity)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
@@ -993,6 +1001,62 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     written?;
     sync_dir(dir);
     Ok(())
+}
+
+/// Creates `path` — a fresh temporary file, so the mode is this call's and the
+/// umask cannot take it away.
+#[cfg(unix)]
+fn create_with_mode(path: &Path, sensitivity: Sensitivity) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(sensitivity.file_mode())
+        .open(path)
+}
+
+/// Where there are no unix modes the file is created as the platform would; an
+/// adapter on a non-local backend must encrypt at rest instead (#122).
+#[cfg(not(unix))]
+fn create_with_mode(path: &Path, _sensitivity: Sensitivity) -> std::io::Result<std::fs::File> {
+    std::fs::File::create(path)
+}
+
+/// Restricts `dir` to its owner, so the names of the blobs inside it are not
+/// enumerable by another local user.
+#[cfg(unix)]
+fn owner_only_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(SENSITIVE_DIR_MODE))
+}
+
+/// No-op where there are no unix modes.
+#[cfg(not(unix))]
+fn owner_only_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Restricts an already-written blob to its owner, for a read that finds one
+/// left wider than it should be — written before the mode was set, or by hand.
+/// Best effort: a resume must not fail because a file it is only reading could
+/// not be chmod-ed.
+fn tighten(path: &Path, sensitivity: Sensitivity) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if sensitivity == Sensitivity::Secretish {
+            let _ = std::fs::set_permissions(
+                path,
+                std::fs::Permissions::from_mode(sensitivity.file_mode()),
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, sensitivity);
 }
 
 /// Best-effort fsync of `dir`, so the rename survives a crash too. Where a
@@ -1021,10 +1085,17 @@ impl StateStore for LocalStateStore {
     ) -> BoxFuture<'a, Result<(), StateError>> {
         let result = (|| {
             reject_key(key)?;
+            let sensitivity = Sensitivity::of_key(key);
             let dir = self.run_dir(run);
             std::fs::create_dir_all(&dir).map_err(|error| unavailable(&dir, error))?;
+            // A secretish blob's directory is owner-only, so an inherited umask
+            // cannot leave the plan files inside it enumerable (#122).
+            if sensitivity == Sensitivity::Secretish {
+                owner_only_dir(&dir).map_err(|error| unavailable(&dir, error))?;
+            }
             let final_path = dir.join(key);
-            write_atomically(&final_path, bytes).map_err(|error| unavailable(&final_path, error))
+            write_atomically(&final_path, bytes, sensitivity)
+                .map_err(|error| unavailable(&final_path, error))
         })();
         Box::pin(std::future::ready(result))
     }
@@ -1038,7 +1109,10 @@ impl StateStore for LocalStateStore {
             reject_key(key)?;
             let path = self.run_dir(run).join(key);
             match std::fs::read(&path) {
-                Ok(bytes) => Ok(Some(bytes)),
+                Ok(bytes) => {
+                    tighten(&path, Sensitivity::of_key(key));
+                    Ok(Some(bytes))
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(error) => Err(unavailable(&path, error)),
             }
