@@ -16,10 +16,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
-# The one elevation over ci.yml: a release creates a GitHub Release, so this
-# workflow needs `contents: write`. Every other gate is `contents: read`.
+# Read-only at the top level, exactly like ci.yml. The one elevation a release
+# needs — `contents: write`, to create the GitHub Release — is granted to the
+# `publish` job alone, so a build or a compromised build step never holds a
+# token that can rewrite the tag.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -50,21 +52,37 @@ jobs:
             archive: tar.xz
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install the Rust toolchain pinned in rust-toolchain.toml
         run: |
           rustup toolchain install
           rustup show
 
-      - name: Restore the cargo build cache
-        uses: Swatinem/rust-cache@v2
+      # No cargo build cache here, deliberately — unlike every ci.yml job. The
+      # ci.yml jobs restore a cache that only ci.yml ever writes, so a pull
+      # request can poison only its own build. This job is a tag push, and the
+      # artifact it produces is what gets signed and published: a cache entry
+      # written by an untrusted run and restored here would be shipped to every
+      # user. A release build is slower without the cache and that is the
+      # correct trade.
+
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-cyclonedx@0.5.9
 
       - name: Install cross for the Linux cross builds
         if: runner.os == 'Linux'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
-          tool: cross
+          # Pinned: `cross` chooses the container image it builds in, so an
+          # unpinned install would let a new release change what a *release*
+          # binary is compiled and linked against without the workflow
+          # changing. The image digest is the next boundary.
+          tool: cross@0.2.5
 
       - name: Install the target toolchain for ${{ matrix.target }}
         run: |
@@ -94,11 +112,12 @@ jobs:
           [ -x "$bin" ] \
             || { echo "::error::no keepshipping binary at '$bin'. Fix: check the '--bin keepshipping' name in crates/cli/Cargo.toml matches the build step."; exit 1; }
           out="keepshipping-${VERSION}-${{ matrix.target }}.${{ matrix.archive }}"
-          mkdir -p stage/keepshipping-${VERSION}
-          cp "$bin" "stage/keepshipping-${VERSION}/keepshipping"
+          stage="stage/keepshipping-${VERSION}"
+          mkdir -p "$stage"
+          cp "$bin" "$stage/keepshipping"
           # Keep Shipping ships LICENSE and README next to the binary so the
           # Apache-2.0 licence (ADR 0006) travels with it.
-          cp LICENSE README.md "stage/keepshipping-${VERSION}/" \
+          cp LICENSE README.md "$stage/" \
             || echo "::notice::LICENSE or README.md is missing from the tag; the archive carries the binary only."
           # .tar.gz on macOS, .tar.xz on Linux: the two platforms disagree about
           # which is native, and each platform should not need a foreign tool
@@ -116,13 +135,51 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "archive=$out" >> "$GITHUB_OUTPUT"
 
-      - name: Upload the archive
-        uses: actions/upload-artifact@v4
+      # CycloneDX SBOM for the `keepshipping` binary: every crate that went
+      # into it, with versions and licences, so a user can answer "what is in
+      # this release" without trusting us. One per target, because the
+      # dependency set is resolved per `--target` and the two Linux cross
+      # builds do not share one.
+      - name: SBOM for ${{ matrix.target }}
+        shell: bash
+        # The version comes from the tag, so it crosses into the script through
+        # the environment rather than through `${{ }}`: an expression is
+        # substituted into the script text before bash ever parses it, which
+        # would make a tag name that reads as shell its way to execution. `env`
+        # is the same string either way and is not code.
+        env:
+          VERSION: ${{ steps.archive.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          base="keepshipping-${VERSION}-${TARGET}"
+          # `--override-filename` sets the basename cargo-cyclonedx writes; it
+          # writes one file per workspace member into that member's directory,
+          # so the ks-cli copy is the one describing the release binary.
+          cargo cyclonedx --format json \
+            --target "$TARGET" \
+            --override-filename "$base" \
+            || { echo "::error::cargo cyclonedx failed for ${TARGET}. Fix: run 'cargo cyclonedx --format json --target ${TARGET}' locally in crates/cli and repair the SBOM before tagging."; exit 1; }
+          mv "crates/cli/$base.json" "$base.cdx.json"
+          # The other workspace members' SBOMs are the same crates resolved from
+          # a different root; only the binary's own SBOM ships.
+          find . -name "$base.json" ! -path "./$base.cdx.json" -delete
+          test -s "$base.cdx.json" \
+            || { echo "::error::no SBOM at '$base.cdx.json'. Fix: check that 'cargo cyclonedx' writes to crates/cli/ and that --override-filename still names the file in cargo-cyclonedx 0.5.9."; exit 1; }
+          echo "wrote $base.cdx.json"
+
+      - name: Upload the archive and its SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: keepshipping-${{ matrix.target }}
-          # The exact name the Archive step wrote, for every matrix entry:
-          # keepshipping-<version>-<target>.<archive>.
-          path: keepshipping-${{ steps.archive.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+          # The exact names the Archive and SBOM steps wrote, for every matrix
+          # entry: keepshipping-<version>-<target>.<archive> and
+          # keepshipping-<version>-<target>.cdx.json. The SBOM travels with the
+          # archive as its own asset so the release job can fold it into
+          # SHA256SUMS and the cosign signature covers it.
+          path: |
+            keepshipping-${{ steps.archive.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+            keepshipping-${{ steps.archive.outputs.version }}-${{ matrix.target }}.cdx.json
           if-no-files-found: error
           retention-days: 7
 
@@ -132,16 +189,21 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       # `cosign sign-blob` with no key is keyless: it mints an OIDC identity for
-      # this run, and minting that token requires `id-token: write`. It is
-      # granted here and not at the top level so no other job gets an OIDC
-      # token it does not need. This job needs nothing else than read access.
+      # this run, and minting that token requires `id-token: write`. The SLSA
+      # provenance attestation below is signed by Sigstore over that same OIDC
+      # token and stored in GitHub's attestation store, which needs
+      # `attestations: write`. Both are granted here and not at the top level,
+      # so no other job gets an OIDC token it does not need.
       contents: read
       id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Download every archive
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           pattern: keepshipping-*
@@ -150,15 +212,24 @@ jobs:
       - name: Write one SHA256SUMS, sorted by filename
         run: |
           shopt -s nullglob
-          files=(dist/*.tar.gz dist/*.tar.xz)
-          ((${#files[@]} == 4)) \
-            || { echo "::error::expected 4 archives, found ${#files[@]}: ${files[*]}. Fix: check the release matrix covers every target and that each 'Upload the archive' step ran."; exit 1; }
-          ( cd dist && sha256sum $(printf '%s\n' "${files[@]}" | sed 's|dist/||' | sort) > SHA256SUMS ) \
+          # 4 archives and the 4 SBOMs that sit beside them: 8 entries, so a
+          # missing SBOM fails the release rather than shipping unsigned
+          # provenance alongside signed binaries.
+          files=(dist/*.tar.gz dist/*.tar.xz dist/*.cdx.json)
+          ((${#files[@]} == 8)) \
+            || { echo "::error::expected 4 archives and 4 SBOMs (8 files), found ${#files[@]}: ${files[*]}. Fix: check the release matrix covers every target, that each 'Upload the archive and its SBOM' step ran, and that the SBOM step wrote keepshipping-<version>-<target>.cdx.json for every target."; exit 1; }
+          names=()
+          for f in "${files[@]}"; do names+=("${f#dist/}"); done
+          # Sorted so the file is byte-identical for identical inputs, which
+          # is what lets a user re-derive and compare it. xargs -0 rather than
+          # `sha256sum $(…)`: no filename is ever word-split, so a name with a
+          # space could not smuggle in a second argument.
+          ( cd dist && printf '%s\0' "${names[@]}" | sort -z | xargs -0 sha256sum > SHA256SUMS ) \
             || { echo "::error::could not write SHA256SUMS. Fix: check that 'sha256sum' is on PATH on ubuntu-latest."; exit 1; }
           cat dist/SHA256SUMS
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
 
       - name: Sign the checksums with cosign keyless
         # Keyless: the signature carries the OIDC identity of this workflow
@@ -167,8 +238,18 @@ jobs:
         # Both outputs: the .sig/.pem pair for `cosign verify-blob`, and the
         # .bundle (signature + certificate + transparency-log proof) for
         # `cosign verify-blob --bundle`.
-        # An SBOM per artifact is not here yet;
-        # https://github.com/Keep-Shipping/harness/issues/116 tracks it.
+        #
+        # Signing SHA256SUMS rather than each archive is what makes one
+        # verification cover the whole release: SHA256SUMS now names the four
+        # archives *and* their four SBOMs, so the signature reaches the SBOMs
+        # too. cosign v2.6.1 (the version cosign-installer v3.10.1 pins by
+        # default) writes and reads this bundle unchanged:
+        #
+        #   cosign verify-blob --bundle SHA256SUMS.bundle \
+        #     --certificate-identity \
+        #       https://github.com/Keep-Shipping/harness/.github/workflows/release.yml@refs/tags/<tag> \
+        #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+        #     SHA256SUMS
         run: |
           cosign sign-blob --yes \
             --output-signature dist/SHA256SUMS.sig \
@@ -177,8 +258,44 @@ jobs:
             dist/SHA256SUMS \
             || { echo "::error::cosign keyless signing failed. Fix: check that the 'checksums-and-sign' job still has 'id-token: write' in its permissions block (without it GitHub mints no OIDC token and cosign cannot sign), and that the sigstore Fulcio/Rekor endpoints are reachable from the runner."; exit 1; }
 
+      # Prove the documented verification command works before anything is
+      # published, rather than discovering on release day that it does not. This
+      # is the exact command the workflow comment above tells a user to run,
+      # with the two placeholders resolved.
+      #
+      # The repository and ref come in through `env`, not `${{ }}`: both are
+      # interpolated into the identity string, and `env` keeps them data rather
+      # than shell text before bash parses the script.
+      - name: Verify the signature the way a user would
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          # cosign prints the subject digest and the certificate identity it
+          # matched on success; keep that in the log so a later reader can see
+          # what was verified without re-running anything.
+          cosign verify-blob \
+            --bundle dist/SHA256SUMS.bundle \
+            --certificate-identity "https://github.com/${REPOSITORY}/.github/workflows/release.yml@${REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            dist/SHA256SUMS \
+            || { echo "::error::the signature did not verify against this run's own identity. Fix: check that the cosign version (v2.6.1, from cosign-installer) reads the bundle written by 'cosign sign-blob --bundle' unchanged, and that '--certificate-identity' above names the workflow path and ref GitHub actually put in the Fulcio certificate."; exit 1; }
+
+      - name: Attest the build provenance of SHA256SUMS
+        # SLSA provenance: a signed statement, from this workflow run, of what
+        # was built and by which workflow file. The subject is SHA256SUMS
+        # itself rather than each archive, so one attestation covers the whole
+        # release and `gh attestation verify <archive> --repo …` resolves
+        # through the checksums. Stored in GitHub's attestation store, where
+        # `gh attestation verify` reads it without any key from us.
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
       - name: Upload the checksums and the signature
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: checksums
           path: |
@@ -195,38 +312,62 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
           # release-plz reads the conventional commits since the last tag.
           fetch-depth: 0
 
       - name: Install release-plz
         # release-plz, from the repository that publishes it. The action has no
-        # major-version tag: it ships `v0.5.x` and no `v0` floating tag, so the
-        # pin is the exact release tag, which is how ci.yml pins too (there is
-        # no `v4` to float on).
+        # major-version tag: it ships `v0.5.x` and no `v0` floating tag, so
+        # the pin names one exact release and its commit.
+        #
+        # It needs no credential from the checkout: the action passes
+        # `GITHUB_TOKEN` explicitly to the release-plz binary and resolves the
+        # committer through `gh`, which reads the same environment variable.
+        # So the checkout above can keep `persist-credentials: false` and leave
+        # nothing in .git/config for a later step to pick up.
         #
         # Today this step is a no-op at tag time — every package is
         # `publish = false`, so release-plz has nothing to release — but the
         # pin is here and correct so that the day publishing is switched on,
         # this is not a workflow that fails on a reference that never existed.
-        uses: release-plz/action@v0.5.139
+        uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5.139
 
       - name: Download every archive plus the signed checksums
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
-          pattern: 'keepshipping-*'
+          # Two patterns, one per line: the per-target archives and SBOMs are
+          # uploaded as `keepshipping-<target>`, but SHA256SUMS and its
+          # signature are uploaded as `checksums`. A single `keepshipping-*`
+          # would silently skip them and the release would have nothing signed
+          # to attach.
+          pattern: |
+            keepshipping-*
+            checksums
           merge-multiple: true
 
       - name: Create the release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: keepshipping ${{ github.ref_name }}
-          # The notes come from GitHub's own release-notes generator, which
-          # summarises the merged pull requests and conventional commits since
-          # the previous tag — the same source release-plz would read.
+        # `gh`, which the runner already has, rather than a third-party action:
+        # the release path should carry no dependency we do not pin ourselves.
+        # `gh` authenticates from GH_TOKEN, which the workflow supplies, so the
+        # checkout above still keeps `persist-credentials: false`.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # `--verify-tag` so the release can only be cut from a tag that is
+          # already on the remote, never from a commit that merely looks like
+          # one.
+          #
+          # The notes come from GitHub's own release-notes generator
+          # (`--generate-notes`), which summarises the merged pull requests and
+          # conventional commits since the previous tag — the same source
+          # release-plz would read.
           #
           # release-plz cannot write them here. Its `release` command writes no
           # changelog file and its JSON output carries only `package_name`,
@@ -235,12 +376,18 @@ jobs:
           # it would have nothing to release anyway: `publish = false` is set
           # workspace-wide while the repository is private (ADR 0006), so
           # every package is non-publishable and `release-plz release` reports
-          # nothing to release. `body_path` is deliberately absent rather than
-          # pointing at a file nothing writes.
-          generate_release_notes: true
-          files: |
-            dist/*.tar.gz
-            dist/*.tar.xz
-            dist/SHA256SUMS
-            dist/SHA256SUMS.bundle
-          fail_on_unmatched_files: true
+          # nothing to release.
+          #
+          # The SBOMs ride along as their own assets, named for the archive
+          # they describe. SHA256SUMS names them too, so the cosign signature
+          # and the SLSA provenance attestation both cover them.
+          shopt -s nullglob
+          assets=(dist/*.tar.gz dist/*.tar.xz dist/*.cdx.json dist/SHA256SUMS dist/SHA256SUMS.bundle)
+          ((${#assets[@]} == 10)) \
+            || { echo "::error::expected 10 release assets (4 archives, 4 SBOMs, SHA256SUMS and its bundle), found ${#assets[@]}: ${assets[*]}. Fix: check the release matrix covers every target, that each 'Upload the archive and its SBOM' step ran, and that the 'Upload the checksums and the signature' step ran."; exit 1; }
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "keepshipping $TAG" \
+            --generate-notes \
+            "${assets[@]}" \
+            || { echo "::error::'gh release create' failed. Fix: check that the 'publish' job still has 'contents: write' in its permissions block (without it the token cannot create a release), and read the API error above."; exit 1; }

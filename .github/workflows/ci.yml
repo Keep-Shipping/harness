@@ -16,6 +16,66 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  workflow-lint:
+    name: workflow lint (actionlint, zizmor, shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # Every tool pinned to an exact version, and every download checked
+      # against the publisher's own checksum, so the lint cannot change under
+      # a workflow nobody reviewed. install-action fetches from GitHub Releases
+      # and verifies each checksum itself; actionlint is not one of the tools
+      # it knows, so it is fetched below against the checksum its release
+      # publishes.
+      - name: Install zizmor and shellcheck
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: |
+            zizmor@1.30.1
+            shellcheck@0.10.0
+
+      - name: Install actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=1.7.12
+          # From actionlint's published actionlint_${version}_checksums.txt at
+          # the same tag. Bump all three together.
+          sha256=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          curl -fsSL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz"
+          echo "${sha256}  actionlint.tar.gz" | sha256sum --check --strict \
+            || { echo "::error::the actionlint tarball does not match its published checksum. Fix: do not retry — treat it as a tampered download or a changed release, and re-derive the digest from https://github.com/rhysd/actionlint/releases/tag/v${version}."; exit 1; }
+          tar xzf actionlint.tar.gz actionlint
+          sudo install -m 0755 actionlint /usr/local/bin/actionlint
+          actionlint --version
+
+      - name: actionlint
+        run: |
+          actionlint -color \
+            || { echo "::error::actionlint rejected the workflows. Fix: run 'actionlint' locally, read the line it names, and repair the YAML or the shell in it."; exit 1; }
+
+      - name: zizmor
+        # `--offline` so the audit needs no token and behaves identically on a
+        # pull request from a fork, where no secret is available. The default
+        # persona is `regular` and zizmor exits non-zero on any finding it
+        # reports, so a new unpinned `uses:` fails this job rather than merging.
+        run: |
+          zizmor --offline --no-progress . \
+            || { echo "::error::zizmor found a workflow supply-chain problem. Fix: run 'zizmor --offline .' locally, follow the audit link it prints, and either repair the workflow or, if the finding is genuinely a false positive, suppress that one rule inline with '# zizmor: ignore[rule]' and a reason."; exit 1; }
+
+      - name: shellcheck install.sh
+        # Only the one shell script we own. The `run:` blocks in the workflows
+        # are already covered: actionlint extracts each one and hands it to
+        # shellcheck itself, so a second pass here would say the same things
+        # twice.
+        run: |
+          shellcheck -x install.sh \
+            || { echo "::error::shellcheck rejected install.sh. Fix: run 'shellcheck -x install.sh' locally and repair what it names."; exit 1; }
+
   gates:
     name: gates (${{ matrix.os }})
     strategy:
@@ -24,7 +84,9 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install the Rust toolchain pinned in rust-toolchain.toml
         run: |
@@ -32,12 +94,16 @@ jobs:
           rustup show
 
       - name: Restore the cargo build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
-          tool: cargo-deny
+          # Pinned: cargo-deny's config schema moves between releases, so an
+          # unpinned install makes this gate fail on a dependency bump rather
+          # than on anything in the graph. Bump it in the same PR that
+          # deliberately moves deny.toml.
+          tool: cargo-deny@0.20.2
 
       - name: rustfmt
         run: |
@@ -70,7 +136,9 @@ jobs:
     name: wasm-safety
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install the Rust toolchain pinned in rust-toolchain.toml
         run: |
@@ -78,7 +146,7 @@ jobs:
           rustup show
 
       - name: Restore the cargo build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Keep ks-lang and ks-core free of non-workspace dependencies
         shell: bash
@@ -107,7 +175,9 @@ jobs:
     name: check needs no network
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install the Rust toolchain pinned in rust-toolchain.toml
         run: |
@@ -115,7 +185,7 @@ jobs:
           rustup show
 
       - name: Restore the cargo build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build the CLI
         run: cargo build -p ks-cli
@@ -129,9 +199,12 @@ jobs:
           # carry intentional errors, so exit 1 is the one acceptable
           # outcome.
           rc=0
+          # `sudo … > file` redirects as the *unprivileged* outer shell anyway,
+          # so the output is piped through tee instead: it lands in the file
+          # and still reaches the job log, and `rc` comes from the keepshipping
+          # run rather than from tee.
           sudo unshare --net -- timeout 60 ./target/debug/keepshipping check --all \
-            crates/cli/tests/fixtures > /tmp/offline-check.out || rc=$?
-          cat /tmp/offline-check.out
+            crates/cli/tests/fixtures | tee /tmp/offline-check.out || rc=${PIPESTATUS[0]}
           if [ "$rc" -ne 1 ]; then
             echo "::error::expected exit 1 (the fixtures' diagnostics), got $rc. Fix: keep 'keepshipping check' free of network access and store reads; it may only read the files it checks."
             exit 1
@@ -155,7 +228,9 @@ jobs:
         ports:
           - "5002:5000"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install the Rust toolchain pinned in rust-toolchain.toml
         run: |
@@ -163,7 +238,7 @@ jobs:
           rustup show
 
       - name: Restore the cargo build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Wait for both registries to answer the v2 API
         run: |
@@ -204,7 +279,9 @@ jobs:
     name: script runtime (pinned Deno)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install the Rust toolchain pinned in rust-toolchain.toml
         run: |
@@ -212,10 +289,10 @@ jobs:
           rustup show
 
       - name: Restore the cargo build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Restore the pinned Deno
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/keepshipping/deno
           key: deno-${{ runner.os }}-2.9.7-x86_64-unknown-linux-gnu
@@ -236,7 +313,9 @@ jobs:
     name: check budget (cold 1 s, warm p95 100 ms)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install the Rust toolchain pinned in rust-toolchain.toml
         run: |
@@ -244,7 +323,7 @@ jobs:
           rustup show
 
       - name: Restore the cargo build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Bench the check path against its budget
         run: |
