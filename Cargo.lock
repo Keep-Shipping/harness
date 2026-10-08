@@ -1057,6 +1057,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ks-cloudflare"
+version = "0.0.0"
+dependencies = [
+ "ks-core",
+ "ks-testing",
+ "serde_json",
+]
+
+[[package]]
 name = "ks-core"
 version = "0.0.0"
 dependencies = [
