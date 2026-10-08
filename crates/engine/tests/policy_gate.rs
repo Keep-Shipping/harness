@@ -15,6 +15,10 @@ use ks_core::ports::iac::IacTool;
 use ks_core::ports::policy::Disposition::{Allow, Ask, Never};
 use ks_core::ports::policy::{ANY_OBJECT, Baseline, Disposition, Provenance, Rule, Subject};
 use ks_core::ports::run_context::ActorKind;
+// Aliased: `ks_core::ports::policy::Provenance` is where a *rule* came from and is already in
+// scope above as the `Rule.provenance` field's type. This is the other one — whose code the run is
+// about ([#126](https://github.com/Keep-Shipping/harness/issues/126)).
+use ks_core::ports::run_context::Provenance as RunProvenance;
 use ks_core::ports::run_log::{RunEvent, RunLog};
 use ks_core::ports::script_host::{Value, ValueType};
 use ks_core::ports::secrets::{Redactor, SecretRef, Secrets, SecretsError};
@@ -91,6 +95,40 @@ fn everywhere() -> Baseline {
 /// The built-in default, which is what most rows above are checked under.
 fn conservative() -> Baseline {
     Baseline::conservative()
+}
+
+/// A `ship.ks` that widens rather than narrows: `can: apply` under the same `agents:` subject.
+///
+/// A file is never entitled to widen ([`Policy::forbids`] only ever reads `never:` rules, so a `can:`
+/// line is inert to the gate), which is exactly why one is worth writing down here: a fork's file
+/// carrying one has to be refused anyway, by the thing that knows the fork is a fork
+/// ([#126](https://github.com/Keep-Shipping/harness/issues/126)).
+fn widening_file_policy() -> Policy {
+    let src = String::from(
+        "name: gated\nenvs:\n  prod:\nsteps:\n  deploy: sample.deploy\n    env: prod\n\
+         policy:\n  agents:\n    can: apply prod\n",
+    );
+    ks_core::check(&ks_lang::parse(&src)).workflow.policy().clone()
+}
+
+/// A baseline that allows an agent everything the gate can be asked about: build, apply, deploy and
+/// the read of secrets. Every fork refusal below is checked against this, so none of them can be the
+/// default happening to agree — and every fork *permission* too, so "build is allowed" is a grant
+/// this baseline made rather than a gap it left.
+fn grants_everything() -> Baseline {
+    Baseline {
+        rules: vec![
+            rule(Subject::Actor(AGENT), "build", ANY_OBJECT, Disposition::Allow),
+            rule(Subject::Actor(AGENT), "other", ANY_OBJECT, Disposition::Allow),
+            rule(Subject::Actor(AGENT), "plan", ANY_OBJECT, Disposition::Allow),
+            rule(Subject::Actor(AGENT), "apply", ANY_OBJECT, Disposition::Allow),
+            rule(Subject::Actor(AGENT), "deploy", ANY_OBJECT, Disposition::Allow),
+            rule(Subject::Actor(AGENT), "destroy", ANY_OBJECT, Disposition::Allow),
+            rule(Subject::Any, "read", "secrets", Disposition::Allow),
+        ],
+        source: None,
+        publishers: Vec::new(),
+    }
 }
 
 fn action(kind: ActionKind, env: Option<&str>) -> ActionClass {
@@ -340,6 +378,281 @@ fn the_port_refuses_what_policy_refuses_for_the_running_actor() {
         let value = value.unwrap_or_else(|error| panic!("{actor:?} must resolve: {error:?}"));
         assert!(value.with_bytes(|bytes| bytes == b"postgres://db"));
     }
+}
+
+// ---- provenance: runs about code somebody outside the organisation wrote ----
+
+/// The default is [`RunProvenance::Repository`] and the builder can say so again, and under either
+/// the decisions are exactly the ones that were there before it existed. This is the guard on
+/// `crates/cli/src/resume.rs` and on the other six `PolicyGate::new` call sites: a gate nobody
+/// classified must behave as it always did, not as a slightly stricter one.
+#[test]
+fn the_default_provenance_is_the_repository_and_changes_nothing() {
+    let baseline = grants_everything();
+    let file = file_policy(None);
+    let default = PolicyGate::new(AGENT, &baseline, &file);
+    let explicit =
+        PolicyGate::new(AGENT, &baseline, &file).with_provenance(RunProvenance::Repository);
+
+    for (gate, which) in [(&default, "the default"), (&explicit, "an explicit Repository")] {
+        let decision = gate.decide(&action(ActionKind::Apply, Some("prod")));
+        assert_eq!(decision.disposition, Allow, "{which} still allows an allowed apply");
+        assert!(
+            !decision.rule.contains("provenance"),
+            "{which} did not refuse on provenance: {}",
+            decision.rule
+        );
+
+        // And the secrets read the permissive baseline grants keeps resolving through the port.
+        let secrets =
+            Arc::new(FakeSecrets::new().with(SecretRef::new("env", "db_url"), "postgres://db"));
+        let gated = gate.secrets_port(secrets as Arc<dyn Secrets>);
+        let value = block_on(gated.resolve(&SecretRef::new("env", "db_url"), &StepId::new("s")));
+        assert!(value.is_ok(), "{which} still resolves a secret the baseline allows: {value:?}");
+    }
+}
+
+/// A fork pull request's `ship.ks` may check, build and plan — it reads the checkout the run
+/// already had — and may do nothing that reaches past it. Every refusal names the fork in the rule
+/// string, because an operator reading a run log has to be able to tell this apart from a policy
+/// refusal without going and looking at the workflow YAML.
+#[test]
+fn a_fork_pull_request_may_build_and_may_not_reach_outside_its_checkout() {
+    let baseline = grants_everything();
+    let file = file_policy(None);
+    let gate = PolicyGate::new(AGENT, &baseline, &file).with_provenance(RunProvenance::Fork);
+
+    for kind in [ActionKind::Build, ActionKind::Plan, ActionKind::Other] {
+        let decision = gate.decide(&action(kind, Some("prod")));
+        assert_eq!(
+            decision.disposition,
+            Allow,
+            "a fork run stays inside its own checkout, so {} may proceed",
+            kind.as_str()
+        );
+    }
+
+    for kind in
+        [ActionKind::Apply, ActionKind::Deploy, ActionKind::Destroy, ActionKind::ReadSecrets]
+    {
+        let decision = gate.decide(&action(kind, Some("prod")));
+        assert_eq!(decision.disposition, Never, "a fork run may not {}", kind.as_str());
+        assert!(
+            decision.rule.contains("fork"),
+            "the refusal names the provenance, not just the verb: {}",
+            decision.rule
+        );
+        assert!(
+            decision.rule.contains(kind.as_str()) || kind == ActionKind::ReadSecrets,
+            "the refusal names what it refused: {}",
+            decision.rule
+        );
+    }
+}
+
+/// `pull_request_target` is the same class of run for this question — the workflow file is the
+/// base branch's, but the code it checks out and runs is the pull request's — and is refused the
+/// same way, under a string that names *it*, because a `pull_request_target` refusal and a fork one
+/// are different events and a log line has to say which.
+#[test]
+fn a_pull_request_target_run_is_refused_the_same_way_and_says_so() {
+    let baseline = grants_everything();
+    let file = file_policy(None);
+    let gate = PolicyGate::new(AGENT, &baseline, &file).with_provenance(RunProvenance::Target);
+
+    for kind in
+        [ActionKind::Apply, ActionKind::Deploy, ActionKind::Destroy, ActionKind::ReadSecrets]
+    {
+        let decision = gate.decide(&action(kind, Some("prod")));
+        assert_eq!(decision.disposition, Never, "a target run may not {}", kind.as_str());
+        assert!(
+            decision.rule.contains("provenance"),
+            "the rule says where it came from: {}",
+            decision.rule
+        );
+        assert!(
+            decision.rule.contains("pull_request_target"),
+            "the rule says which of the two untrusted events it is: {}",
+            decision.rule
+        );
+    }
+}
+
+/// **The one that matters.** The untrusted `ship.ks` cannot widen its way out: a baseline that
+/// allows everything and a file that writes `can: apply` still do not make a fork's apply legal,
+/// because the refusal is read before either of them is. A `can:` line widens nothing on its own —
+/// a file is only ever allowed to narrow — and this is the run where that has to hold, since here
+/// the file is the attacker's.
+#[test]
+fn an_untrusted_ship_ks_cannot_widen_its_way_out() {
+    let baseline = grants_everything();
+    let file = widening_file_policy();
+
+    // The same file and the same baseline, with only the provenance differing.
+    let ours = PolicyGate::new(AGENT, &baseline, &file).with_provenance(RunProvenance::Repository);
+    let theirs = PolicyGate::new(AGENT, &baseline, &file).with_provenance(RunProvenance::Fork);
+
+    let apply = action(ActionKind::Apply, Some("prod"));
+    assert_eq!(ours.decide(&apply).disposition, Allow, "the org's own apply is unaffected");
+
+    let refused = theirs.decide(&apply);
+    assert_eq!(refused.disposition, Never, "the fork's apply is refused whatever the file says");
+    assert!(refused.rule.contains("fork"), "{}", refused.rule);
+
+    // And it is refused at the boundary too, not only where a preflight happens to look: the run's
+    // `ship.ks` can skip the preflight and drive a step straight at the gate.
+    let f = fixture();
+    let gate = f.gate().with_provenance(RunProvenance::Fork);
+    // A plan with no destroys in it, so the refusal below is the fork's apply and not the plan's
+    // contents: `sample.apply` classifies itself from this.
+    let inputs = Inputs::from_iter([("changes".to_string(), Value::from("apply"))]);
+    let outcome = f.drive(&gate, "sample.apply", inputs, true);
+    assert!(matches!(&outcome, GatedRun::Refused(rule) if rule.contains("fork")), "{outcome:?}");
+    assert_eq!(f.ran("sample.apply"), 0, "a refused step never runs");
+    assert!(f.events().iter().any(|event| matches!(
+        event,
+        RunEvent::PolicyRefused { step: Some(step), rule }
+            if step == "sample.apply" && rule.contains("fork")
+    )));
+}
+
+/// A fork run is refused before it starts, naming the step that would have reached — not parked on
+/// an approval request no one in that run can answer.
+#[test]
+fn preflight_refuses_a_fork_run_naming_the_apply_step() {
+    let baseline = grants_everything();
+    let file = file_policy(None);
+    let gate = PolicyGate::new(AGENT, &baseline, &file).with_provenance(RunProvenance::Fork);
+
+    let refused = gate
+        .preflight(&[
+            PreflightStep::new("build", action(ActionKind::Build, Some("prod"))),
+            PreflightStep::new("rollout", action(ActionKind::Apply, Some("prod"))),
+        ])
+        .expect_err("a fork run never reaches the rollout");
+    assert_eq!(refused.step, "rollout");
+    assert!(refused.rule.contains("fork"), "{}", refused.rule);
+    assert!(
+        refused.to_string().contains("rollout"),
+        "the refusal is legible on its own: {refused}"
+    );
+
+    // A fork run whose every step stays inside the checkout starts, and asks for nothing.
+    let asks = gate
+        .preflight(&[
+            PreflightStep::new("build", action(ActionKind::Build, Some("prod"))),
+            PreflightStep::new("plan", action(ActionKind::Plan, Some("prod"))),
+        ])
+        .expect("build and plan are the fork's to do");
+    assert!(asks.is_empty(), "neither step is a question: {asks:?}");
+}
+
+/// A script step has no catalog name, so the only thing the file says about what its body does
+/// is the `action:` it declared — and a fork declaring `action: build` is a fork asking, in
+/// words, for the one bucket an untrusted run keeps.
+#[test]
+fn a_fork_may_not_name_a_script_steps_action_for_itself() {
+    let baseline = grants_everything();
+    let file = file_policy(None);
+    let gate = PolicyGate::new(AGENT, &baseline, &file).with_provenance(RunProvenance::Fork);
+
+    // The same class this crate would have derived for `oci.image`, refused when the file
+    // asserted it: the word is the fork's, and nothing behind it is evidence.
+    let refused = gate
+        .preflight(&[PreflightStep::declared("migrate", action(ActionKind::Build, Some("prod")))])
+        .expect_err("a fork does not get to declare its way into the allowed bucket");
+    assert_eq!(refused.step, "migrate");
+    assert!(refused.rule.contains("fork"), "{}", refused.rule);
+
+    // Our own file may declare as much as it likes — and so may a catalog step, which this
+    // crate classified rather than believed.
+    assert!(
+        gate.preflight(&[PreflightStep::new("image", action(ActionKind::Build, None))]).is_ok()
+    );
+    let ours = PolicyGate::new(AGENT, &baseline, &file).with_provenance(RunProvenance::Repository);
+    assert!(
+        ours.preflight(&[PreflightStep::declared("migrate", ActionClass::new(ActionKind::Build))])
+            .is_ok()
+    );
+}
+
+/// The other half of that same fix, on the repository's own code. Making a declared step count
+/// means the baseline's never-rules now reach script steps too, and that is a real change on a
+/// trusted path: this crate's own `ship.ks`, declaring `action: destroy` or `action: read-secrets`
+/// on a script, used to exit 1 (it ran) and is now refused at the resume preflight. Nothing here
+/// is about provenance — the run is `Repository` — so the check that refuses a fork's `action:
+/// build` stays inert and what says `never` is the baseline. Worth pinning, because it is the
+/// conservative default's rule reaching a step it previously could not see, and because the
+/// refusal reads `baseline:` and not `provenance:`, which is what tells an operator which
+/// question was asked.
+#[test]
+fn a_trusted_script_step_may_not_destroy_either() {
+    let baseline = Baseline::conservative();
+    let file = file_policy(None);
+    let gate = PolicyGate::new(HUMAN, &baseline, &file).with_provenance(RunProvenance::Repository);
+
+    let refused = gate
+        .preflight(&[PreflightStep::declared("migrate", action(ActionKind::Destroy, Some("prod")))])
+        .expect_err("the default never destroys, whoever asked and however they asked");
+    assert_eq!(refused.step, "migrate");
+    assert!(refused.rule.contains("baseline"), "the refusal is the baseline's: {}", refused.rule);
+    assert!(
+        !refused.rule.contains("provenance"),
+        "our own code is not a provenance refusal: {}",
+        refused.rule
+    );
+
+    // The same declaration of the same forbidden class is refused the same way: it is the action
+    // the gate read, not the fact that a script declared it.
+    let refused = gate
+        .preflight(&[PreflightStep::declared("fetch", action(ActionKind::ReadSecrets, None))])
+        .expect_err("the default refuses secret reads whoever asks for them");
+    assert!(refused.rule.contains("baseline"), "{}", refused.rule);
+    assert!(!refused.rule.contains("provenance"), "{}", refused.rule);
+
+    // And the boundary agrees, so this is the gate's answer and not the preflight's alone.
+    let decision = gate.decide(&action(ActionKind::Destroy, Some("prod")));
+    assert_eq!(decision.disposition, Never);
+    assert!(
+        decision.rule.contains("baseline") && !decision.rule.contains("provenance"),
+        "{}",
+        decision.rule
+    );
+}
+
+/// The port refuses too, and it refuses *before* the run's resolver is asked for anything: a step
+/// in a fork run that holds the `Secrets` port legitimately gets the error, not the value.
+#[test]
+fn the_port_refuses_secrets_for_a_fork_run_under_a_baseline_that_allows_them() {
+    let reference = SecretRef::new("env", "db_url");
+    let secrets = Arc::new(FakeSecrets::new().with(reference.clone(), "postgres://db"));
+
+    // A baseline that allows the read and a file with no rules: nothing but the provenance refuses.
+    let baseline = grants_everything();
+    let file = file_policy(None);
+    let ours = PolicyGate::new(AGENT, &baseline, &file).with_provenance(RunProvenance::Repository);
+    let fork = PolicyGate::new(AGENT, &baseline, &file).with_provenance(RunProvenance::Fork);
+
+    let resolve = |gate: PolicyGate<'_>| {
+        let gated = gate.secrets_port(Arc::clone(&secrets) as Arc<dyn Secrets>);
+        block_on(gated.resolve(&reference, &StepId::new("sample.migrate")))
+    };
+
+    match resolve(fork) {
+        Err(SecretsError::ForbiddenForActor { reference: refused, .. }) => {
+            assert_eq!(refused, reference, "the refusal names the secret, not its value");
+        }
+        other => panic!("a fork run gets no secret, however permissive the baseline: {other:?}"),
+    }
+    assert!(secrets.calls().is_empty(), "the refusal happens before the resolver is asked");
+
+    // The same file and the same baseline, with only the provenance differing — so what refuses the
+    // fork above is the provenance and nothing else.
+    assert!(
+        resolve(ours).is_ok(),
+        "under the same baseline and the same file the org's own run reads the secret"
+    );
+    assert_eq!(secrets.calls().len(), 1, "and it is that run's own read, once");
 }
 
 // ---- the steps and the composition the tests above run against ----

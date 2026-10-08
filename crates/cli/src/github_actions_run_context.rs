@@ -40,12 +40,24 @@
 //! `permissions: id-token: write` cannot be described honestly: the
 //! constructor refuses it ([`GithubActionsError::NotGithubActions`]) rather
 //! than dressing a weak actor up as a job, and the caller falls back to the
-//! local path. Every context this adapter does build has [`Capabilities::oidc`]
-//! set, and speaks HTTP through the [`HttpClient`] port it is handed, whose
-//! [`HttpPolicy`](ks_core::ports::http::HttpPolicy) must allow the token
-//! endpoint's host (production needs a client that speaks https; the
-//! plain-http [`TcpHttpClient`](crate::http_client::TcpHttpClient) is a
-//! development stand-in).
+//! local path.
+//!
+//! # Provenance decides who the code is, not just who ran the job
+//!
+//! A verified identity says the job is GitHub's; it says nothing about whose
+//! `ship.ks` it just checked out. The adapter therefore answers that
+//! separately, and a fork pull request or a `pull_request_target` run — both
+//! [`Provenance::is_untrusted`] — is built with [`Capabilities::oidc`] off and
+//! no token to mint with. The job still gets its own identity token: knowing
+//! *who is running* is a self-report the adapter reads and drops, whereas a
+//! token minted for an arbitrary audience is a credential handed to code the
+//! organisation did not write. See [`Event::provenance`].
+//!
+//! Every context this adapter does build speaks HTTP through the [`HttpClient`]
+//! port it is handed, whose [`HttpPolicy`](ks_core::ports::http::HttpPolicy)
+//! must allow the token endpoint's host (production needs a client that speaks
+//! https; the plain-http [`TcpHttpClient`](crate::http_client::TcpHttpClient) is
+//! a development stand-in).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
@@ -55,8 +67,8 @@ use std::sync::Arc;
 use ks_core::ports::BoxFuture;
 use ks_core::ports::http::{HttpClient, HttpError, HttpMethod, HttpRequest};
 use ks_core::ports::run_context::{
-    Actor, ActorKind, Capabilities, Establishment, Event, GitInfo, NetworkScope, RunContext,
-    RunContextError, Trigger, Workspace,
+    Actor, ActorKind, Capabilities, Establishment, Event, GitInfo, NetworkScope, Provenance,
+    RunContext, RunContextError, Trigger, Workspace,
 };
 use ks_core::ports::secrets::SecretValue;
 
@@ -75,6 +87,12 @@ const GITHUB_REF: &str = "GITHUB_REF";
 const GITHUB_WORKSPACE: &str = "GITHUB_WORKSPACE";
 /// What triggered the job, e.g. `push`, `pull_request`.
 const GITHUB_EVENT_NAME: &str = "GITHUB_EVENT_NAME";
+/// The repository the workflow is *defined* in (`owner/name`) — the trusted
+/// one.
+const GITHUB_REPOSITORY: &str = "GITHUB_REPOSITORY";
+/// The repository the checkout came *from* (`owner/name`) — the one whose code
+/// runs. The same as [`GITHUB_REPOSITORY`] unless the head lives elsewhere.
+const GITHUB_HEAD_REPOSITORY: &str = "GITHUB_HEAD_REPOSITORY";
 /// The login that started the job.
 const GITHUB_ACTOR: &str = "GITHUB_ACTOR";
 /// The file the runner writes the event payload to.
@@ -234,6 +252,11 @@ impl GithubActionsRunContext {
         let git_ref = env[GITHUB_REF].clone();
         let root = PathBuf::from(&env[GITHUB_WORKSPACE]);
         let event_name = env.get(GITHUB_EVENT_NAME).map(String::as_str).unwrap_or_default();
+        let provenance = provenance_of(
+            event_name,
+            env.get(GITHUB_HEAD_REPOSITORY).map(String::as_str),
+            env.get(GITHUB_REPOSITORY).map(String::as_str),
+        );
         let display_name = env
             .get(GITHUB_ACTOR)
             .filter(|name| !name.is_empty())
@@ -256,11 +279,19 @@ impl GithubActionsRunContext {
             event: Event {
                 git: GitInfo { sha: env[GITHUB_SHA].clone(), git_ref: git_ref.clone() },
                 trigger: trigger_of(event_name, &git_ref),
+                provenance,
             },
             capabilities: Capabilities {
                 // The constructor requires the endpoint, so `oidc` and the
-                // token variables agree by construction.
-                oidc: true,
+                // token variables agree by construction — except where the code
+                // is not ours. An untrusted run still had its own identity
+                // token minted above, which is how we know who is running; what
+                // it must not be is a token factory for the code it is testing,
+                // or a fork's `ship.ks` asks for
+                // `role: arn:aws:iam::…:role/ks-apply` and gets one minted for
+                // it. Withholding the capability here is the adapter honouring
+                // the port, not only the workflow refusing.
+                oidc: !provenance.is_untrusted(),
                 // A runner has no person attached mid-flight.
                 interactive: false,
                 // GitHub Actions offers every job its cache service.
@@ -272,8 +303,13 @@ impl GithubActionsRunContext {
                 // `github-actions` one is the store behind `ci-only`
                 // environments. Spelled out rather than imported from
                 // `env_secrets`, which this file's two crate roots (lib and
-                // bin) cannot both name.
-                secret_resolvers: BTreeSet::from(["env".to_string(), "github-actions".to_string()]),
+                // bin) cannot both name. Code that is not ours gets neither: a
+                // fork's `ship.ks` must not be able to read the job's secrets.
+                secret_resolvers: if provenance.is_untrusted() {
+                    BTreeSet::new()
+                } else {
+                    BTreeSet::from(["env".to_string(), "github-actions".to_string()])
+                },
             },
             workspace: Workspace { scratch: scratch_dir(env, &root), root },
             endpoint,
@@ -338,9 +374,15 @@ impl RunContext for GithubActionsRunContext {
         &'a self,
         audience: &'a str,
     ) -> BoxFuture<'a, Result<SecretValue, RunContextError>> {
-        // `capabilities().oidc` is true for every context this adapter builds,
-        // so there is no `OidcUnavailable` answer to give: a failure here is
-        // always the endpoint's.
+        // An untrusted run has no `oidc` capability, and the port promises
+        // `OidcUnavailable` exactly when it does — the endpoint is right there,
+        // but handing it out would be this adapter minting for code the
+        // organisation did not write. Otherwise a failure is the endpoint's.
+        if !self.capabilities.oidc {
+            return Box::pin(std::future::ready(Err(RunContextError::OidcUnavailable {
+                audience: audience.to_string(),
+            })));
+        }
         Box::pin(self.endpoint.mint(self.http.as_ref(), audience))
     }
 }
@@ -383,6 +425,85 @@ fn trigger_of(event_name: &str, git_ref: &str) -> Trigger {
             _ => Trigger::Push,
         },
     }
+}
+
+/// Where the code this job is about came from, from the event name and the two
+/// repository variables. An absent or empty repository reads as [`None`].
+///
+/// The order *is* the property, so it is spelled out rather than folded into a
+/// boolean:
+///
+/// 1. `pull_request_target` is [`Provenance::Target`] **always**, whoever opened
+///    it and wherever the head lives. The base branch's workflow file is what
+///    runs, but that is precisely the shape that hands a privileged token to
+///    whatever the pull request checks out — GitHub's own hardening guidance
+///    says not to use it on untrusted code. A same-repository pull request here
+///    is untrusted by construction; fail closed. `workflow_run` is the same
+///    shape under another name — a run this repository owns, following up on
+///    another run's code, which is exactly how a fork's workflow reaches a
+///    trusted workflow file — and `merge_group` is a merge queue deciding what
+///    lands from code this repository has not merged yet. Both are [`Target`](Provenance::Target)
+///    for the same reason: the workflow is trusted, the code it is about is not
+///    this organisation's.
+/// 2. A `pull_request` (or any other event) whose `head_repo` is present and
+///    differs from `base_repo` is [`Provenance::Fork`]: the code came from
+///    somewhere nobody here granted anything to.
+/// 3. A `pull_request` where either repository is **missing or empty** is
+///    [`Provenance::Fork`] too. This is the branch that matters most: a payload
+///    the adapter cannot read must not be read as consent, so a runner that
+///    withholds `GITHUB_HEAD_REPOSITORY` produces an untrusted run, not a
+///    trusted one. Trust is an affirmative claim, never a default that silence
+///    falls into. Only a pull request reaches this arm — `push`,
+///    `workflow_dispatch` and `schedule` never set the head repository at all,
+///    so treating their silence as a fork would condemn the ordinary case to
+///    distrust for the wrong reason.
+/// 4. Everything else — `push`, `workflow_dispatch`, `schedule`, a tag, and a
+///    `pull_request` with both repositories present and equal — is
+///    [`Provenance::Repository`].
+///
+/// The event name is normalised — trimmed and case-folded — before any of this
+/// reads it: the names below are what GitHub documents, so an event name that
+/// arrives as `"PULL_REQUEST"` or `"pull_request "` is still that event, and
+/// letting a near-miss fall through to rule 4 would read a fork's pull request
+/// as the repository's own code. The repository comparison stays exact on the
+/// trimmed string: GitHub preserves case in repository names but exports both
+/// variables consistently, so a name that differs only in case is not one this
+/// adapter will quietly call its own.
+fn provenance_of(event_name: &str, head_repo: Option<&str>, base_repo: Option<&str>) -> Provenance {
+    let event_name = event_name.trim().to_ascii_lowercase();
+    if matches!(event_name.as_str(), "pull_request_target" | "workflow_run" | "merge_group") {
+        return Provenance::Target;
+    }
+    let head = head_repo.map(str::trim).filter(|repo| !repo.is_empty());
+    let base = base_repo.map(str::trim).filter(|repo| !repo.is_empty());
+    match (head, base) {
+        // Rule 2: the code came from somewhere nobody here granted anything to.
+        (Some(head), Some(base)) if head != base => Provenance::Fork,
+        (Some(_), Some(_)) => Provenance::Repository,
+        (None, _) | (_, None) if event_name == "pull_request" => Provenance::Fork,
+        // Rule 4: the repository's own event, which has no fork to speak of.
+        _ => Provenance::Repository,
+    }
+}
+
+/// The provenance of the run this process is in, read from the environment alone.
+///
+/// Unlike [`GithubActionsRunContext::from_env`] this mints no token and speaks
+/// no HTTP: it is the trust decision, and the trust decision does not need to
+/// know who the run is — who is running is the adapter's question, where the code
+/// came from is the run's own. It is therefore the answer a caller that only
+/// wants to *gate* can afford to ask, and the answer is
+/// [`provenance_of`]'s either way.
+///
+/// Non-GitHub environments answer [`Provenance::Repository`] — a laptop running
+/// a local branch is the repository's own code, and no event name is there to
+/// say otherwise.
+pub(crate) fn provenance_from_env(env: &BTreeMap<String, String>) -> Provenance {
+    provenance_of(
+        env.get(GITHUB_EVENT_NAME).map(String::as_str).unwrap_or_default(),
+        env.get(GITHUB_HEAD_REPOSITORY).map(String::as_str),
+        env.get(GITHUB_REPOSITORY).map(String::as_str),
+    )
 }
 
 /// The `<n>` of `refs/pull/<n>/merge` (or `/head`), or [`None`].
@@ -541,8 +662,13 @@ mod tests {
         format!(r#"{{"value":"{jwt}","count":1}}"#)
     }
 
+    /// The repository every fixture below agrees on, head and base alike: a
+    /// run whose code is the organisation's own.
+    const REPO: &str = "Keep-Shipping/harness";
+
     /// The environment GitHub sets for a job with `id-token: write`, pointed
-    /// at `base` for its token endpoint.
+    /// at `base` for its token endpoint. The checkout comes from this
+    /// repository, so a `push` — the default event — is trusted provenance.
     fn job_env(base: &str) -> BTreeMap<String, String> {
         [
             (GITHUB_ACTIONS, "true"),
@@ -550,6 +676,8 @@ mod tests {
             (GITHUB_REF, "refs/heads/main"),
             (GITHUB_WORKSPACE, "/home/runner/work/harness/harness"),
             (GITHUB_EVENT_NAME, "push"),
+            (GITHUB_REPOSITORY, REPO),
+            (GITHUB_HEAD_REPOSITORY, REPO),
             (GITHUB_ACTOR, "octocat"),
             (RUNNER_TEMP, "/home/runner/work/_temp"),
             (TOKEN_URL, base),
@@ -765,6 +893,145 @@ mod tests {
             let env = BTreeMap::from([(RUNNER_TEMP.to_string(), unusable.to_string())]);
             assert_eq!(scratch_dir(&env, &root), PathBuf::from("/work/repo/.ks/scratch"));
         }
+    }
+
+    #[test]
+    fn github_names_decide_whose_code_the_run_is_about() {
+        const FORK: &str = "someone-else/harness";
+        let cases: Vec<(&str, Option<&str>, Option<&str>, Provenance)> = vec![
+            ("push", Some(REPO), Some(REPO), Provenance::Repository),
+            ("workflow_dispatch", Some(REPO), Some(REPO), Provenance::Repository),
+            // A branch in this repository is still this repository's code.
+            ("pull_request", Some(REPO), Some(REPO), Provenance::Repository),
+            ("pull_request", Some(FORK), Some(REPO), Provenance::Fork),
+            // Silence is not consent: a pull request we cannot place is a fork.
+            ("pull_request", None, Some(REPO), Provenance::Fork),
+            ("pull_request", Some(REPO), None, Provenance::Fork),
+            ("pull_request", Some(""), Some(""), Provenance::Fork),
+            // The key case: `pull_request_target` is untrusted even when the
+            // head and base are the same repository — the workflow file comes
+            // from the base branch while the code it runs comes from the pull
+            // request, which is the whole shape GitHub warns about.
+            ("pull_request_target", Some(REPO), Some(REPO), Provenance::Target),
+            ("pull_request_target", Some(FORK), Some(REPO), Provenance::Target),
+            ("pull_request_target", None, None, Provenance::Target),
+            // The privileged follow-up pattern: a trusted workflow triggered by
+            // another run that checked out somebody else's code, which is
+            // `pull_request_target` by another name.
+            ("workflow_run", Some(REPO), Some(REPO), Provenance::Target),
+            ("workflow_run", Some(FORK), Some(REPO), Provenance::Target),
+            // A merge queue is deciding about code this repository has not
+            // merged yet, so it gets the same reading as the other two.
+            ("merge_group", Some(REPO), Some(REPO), Provenance::Target),
+            ("merge_group", None, None, Provenance::Target),
+            // The event name is normalised before it is read, so neither a
+            // stray space nor a shouty payload falls through to `Repository`.
+            ("pull_request ", Some(FORK), Some(REPO), Provenance::Fork),
+            ("pull_request ", Some(REPO), Some(REPO), Provenance::Repository),
+            ("PULL_REQUEST", Some(FORK), Some(REPO), Provenance::Fork),
+            ("Pull_Request_Target", Some(REPO), Some(REPO), Provenance::Target),
+            // The trimming guards the guard: a trailing space must not step
+            // past rule 1 either.
+            ("workflow_run ", Some(REPO), Some(REPO), Provenance::Target),
+        ];
+        for (event_name, head, base, expected) in cases {
+            assert_eq!(
+                provenance_of(event_name, head, base),
+                expected,
+                "{event_name} head={head:?} base={base:?}"
+            );
+        }
+        assert!(Provenance::Fork.is_untrusted());
+        assert!(Provenance::Target.is_untrusted());
+        assert!(!Provenance::Repository.is_untrusted());
+    }
+
+    #[test]
+    fn the_environment_alone_answers_where_the_code_came_from() {
+        // A laptop: nothing GitHub sets, so nothing to distrust. The local
+        // branch is this repository's own code.
+        assert_eq!(provenance_from_env(&BTreeMap::new()), Provenance::Repository);
+
+        // A runner, reading the same three variables the adapter reads, and
+        // nothing else: no token endpoint, no HTTP, no claim to have verified.
+        let script = |event: &str, head: Option<&str>, base: Option<&str>| {
+            let mut env = BTreeMap::new();
+            env.insert(GITHUB_EVENT_NAME.to_string(), event.to_string());
+            env.insert(GITHUB_HEAD_REPOSITORY.to_string(), head.unwrap_or_default().to_string());
+            env.insert(GITHUB_REPOSITORY.to_string(), base.unwrap_or_default().to_string());
+            provenance_from_env(&env)
+        };
+        assert_eq!(script("push", Some(REPO), Some(REPO)), Provenance::Repository);
+        assert_eq!(script("pull_request", Some(REPO), Some(REPO)), Provenance::Repository);
+        // The untrusted cases, decided with no network in sight.
+        assert_eq!(script("pull_request", Some("someone/fork"), Some(REPO)), Provenance::Fork);
+        assert_eq!(script("pull_request_target", Some(REPO), Some(REPO)), Provenance::Target);
+
+        // And the same answer for a whole job environment, so the offline reader
+        // and the adapter cannot drift apart on one GitHub sets.
+        let mut env = job_env(TOKEN_BASE);
+        env.insert(GITHUB_EVENT_NAME.to_string(), "pull_request".to_string());
+        env.insert(GITHUB_HEAD_REPOSITORY.to_string(), "someone/fork".to_string());
+        assert_eq!(provenance_from_env(&env), Provenance::Fork);
+    }
+
+    #[test]
+    fn a_fork_pull_request_mints_nothing_and_says_why() {
+        let base = "http://token.example/id?x=1";
+        let http = http_with_identity(
+            base,
+            HttpResponse { status: 200, headers: vec![], body: Vec::new() },
+        );
+        let mut env = job_env(base);
+        env.insert(GITHUB_EVENT_NAME.to_string(), "pull_request".to_string());
+        env.insert(GITHUB_REF.to_string(), "refs/pull/412/merge".to_string());
+        env.insert(GITHUB_HEAD_REPOSITORY.to_string(), "someone-else/harness".to_string());
+        let context = block_on(GithubActionsRunContext::from_env(&env, http))
+            .expect("a job with an id token endpoint builds");
+
+        // The code under test is somebody else's, whatever the token says.
+        assert_eq!(context.event().provenance, Provenance::Fork);
+        assert!(context.event().is_untrusted());
+        assert!(!context.capabilities().oidc, "a fork is not a token factory");
+        assert!(context.capabilities().secret_resolvers.is_empty());
+
+        // No audience is mints: the refusal names what was asked for, and the
+        // endpoint was right there — so this can only be the adapter declining.
+        let error = block_on(context.oidc_token("sts.amazonaws.com")).expect_err("refused");
+        assert_eq!(
+            error,
+            RunContextError::OidcUnavailable { audience: "sts.amazonaws.com".to_string() },
+            "{error}"
+        );
+        assert!(error.to_string().contains("sts.amazonaws.com"), "{error}");
+    }
+
+    #[test]
+    fn a_same_repository_pull_request_is_trusted_and_still_mints() {
+        let base = "http://token.example/id?x=1";
+        let jwt = id_token(ISSUER, SUBJECT);
+        let answer =
+            || HttpResponse { status: 200, headers: vec![], body: token_body(&jwt).into_bytes() };
+        // Scripted for the cloud audience too, so a mint here would succeed —
+        // the assertion below is about trust, not about a missing script.
+        let http: Arc<dyn HttpClient> = Arc::new(
+            FakeHttpClient::new()
+                .with_allowed_host("token.example")
+                .with_response(HttpMethod::Get, token_url(base, IDENTITY_AUDIENCE), answer())
+                .with_response(HttpMethod::Get, token_url(base, "sts.amazonaws.com"), answer()),
+        );
+        let mut env = job_env(base);
+        env.insert(GITHUB_EVENT_NAME.to_string(), "pull_request".to_string());
+        env.insert(GITHUB_REF.to_string(), "refs/pull/412/merge".to_string());
+        let context = block_on(GithubActionsRunContext::from_env(&env, http))
+            .expect("a job with an id token endpoint builds");
+
+        assert_eq!(context.event().provenance, Provenance::Repository);
+        assert!(!context.event().is_untrusted());
+        assert!(context.capabilities().oidc, "the organisation's own code still deploys");
+        // The token is the JWT itself, wrapped as a secret, exactly as before.
+        let token = block_on(context.oidc_token("sts.amazonaws.com")).expect("a token");
+        assert_eq!(token.with_bytes(<[u8]>::to_vec), jwt.as_bytes());
     }
 
     #[test]

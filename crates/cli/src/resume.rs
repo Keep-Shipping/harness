@@ -37,7 +37,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ks_core::ports::policy::effective_baseline;
-use ks_core::ports::run_context::ActorKind;
+use ks_core::ports::run_context::{ActorKind, Provenance};
 use ks_core::step::{ActionClass, ActionKind};
 use ks_core::{ContextName, Step, ci_only_refusal, ids::RunId};
 use ks_engine::policy_gate::{PolicyGate, PreflightStep};
@@ -237,6 +237,13 @@ pub fn resume(args: &[String]) -> ExitCode {
     };
 
     let context = crate::args::detect_context();
+    // Whose code the run is about, read from the environment the same way
+    // `detect_context` reads it — no token, no HTTP. A laptop answers
+    // `Repository`, so this changes nothing off a runner; on one it is what
+    // keeps a fork's `ship.ks` from being applied under our policy
+    // ([#126](https://github.com/Keep-Shipping/harness/issues/126)).
+    let provenance =
+        crate::github_actions_run_context::provenance_from_env(&std::env::vars().collect());
     let interactive = std::io::stdin().is_terminal() && std::env::var_os("CI").is_none();
     // Who is resuming, under the same baseline this environment declares in
     // `KEEPSHIPPING_AGENTS` / `KEEPSHIPPING_REQUIRE_HUMAN`. Detection only ever
@@ -268,7 +275,7 @@ pub fn resume(args: &[String]) -> ExitCode {
     if let Err(code) = refuses_ci_only(&site, &outstanding, context, recorded_env) {
         return code;
     }
-    if let Err(code) = refuses_by_policy(&site, &outstanding, acting) {
+    if let Err(code) = refuses_by_policy(&site, &outstanding, acting, provenance) {
         return code;
     }
     let env = state.context.get(ENVIRONMENT).cloned().unwrap_or_default();
@@ -482,24 +489,58 @@ fn refuses_ci_only(
 /// No `PolicyStore` adapter exists yet, so the baseline is the conservative
 /// built-in ([`effective_baseline`] of nothing), the same one the engine's gate
 /// falls back to.
-fn refuses_by_policy(site: &check::Site, steps: &[Step], actor: ActorKind) -> Result<(), ExitCode> {
+///
+/// `provenance` is the run's own answer to *whose code this is*, read from the
+/// environment by
+/// [`provenance_from_env`](crate::github_actions_run_context::provenance_from_env):
+/// a run about a fork's or a `pull_request_target`'s `ship.ks` may not apply,
+/// deploy, destroy or read a secret, whatever the baseline grants and whatever
+/// that file's own `policy:` says ([#126](https://github.com/Keep-Shipping/harness/issues/126)).
+fn refuses_by_policy(
+    site: &check::Site,
+    steps: &[Step],
+    actor: ActorKind,
+    provenance: Provenance,
+) -> Result<(), ExitCode> {
     let baseline = effective_baseline(None);
-    let gate = PolicyGate::new(actor, &baseline, site.checked.workflow.policy());
+    let gate = PolicyGate::new(actor, &baseline, site.checked.workflow.policy())
+        .with_provenance(provenance);
     let preflight: Vec<PreflightStep> = steps
         .iter()
         .flat_map(|step| {
             let needs_secrets = site.checked.secret_uses.iter().any(|u| u.step == step.name);
-            // A step the catalog cannot classify still answers to the rule
-            // about secrets when it reads one.
-            let actions = match (step.actions.is_empty(), needs_secrets) {
-                (true, true) => vec![ActionClass::new(ActionKind::Other)],
-                _ => step.actions.clone(),
-            };
-            actions.into_iter().map(move |action| PreflightStep {
+            let classed = |action| PreflightStep {
                 step: step.name.clone(),
                 action,
                 needs_secrets,
-            })
+                declared: false,
+            };
+            // A step the catalog cannot classify still answers to the rule
+            // about secrets when it reads one.
+            match (step.actions.is_empty(), needs_secrets) {
+                (true, true) => vec![classed(ActionClass::new(ActionKind::Other))],
+                // A script step's kind (`./ship/pwn.ts`) is no catalog name, so
+                // `actions` is empty for it and the only thing the file said
+                // about what it does is the `action:` it declared. Without
+                // this it contributes nothing to the preflight, and a step
+                // nothing decides is a step that runs: the gate has to hear
+                // what the file claimed.
+                //
+                // Declaring nothing does not get the step out of the gate
+                // either. An undeclared script step is classed
+                // [`ActionKind::Other`] — the same kind
+                // [`ActionKind::of_kind`] falls back to for a name no
+                // catalog knows — and is declared rather than classed, so a
+                // fork that omits the line walks into the very refusal a fork
+                // that writes `action: build` is stopped by, and the
+                // repository's own undeclared script step is asked about
+                // instead of vanishing from the record of what ran.
+                (true, false) => vec![PreflightStep::declared(
+                    step.name.clone(),
+                    ActionClass::new(step.action.unwrap_or(ActionKind::Other)),
+                )],
+                (false, _) => step.actions.iter().map(|action| classed(action.clone())).collect(),
+            }
         })
         .collect();
     match gate.preflight(&preflight) {

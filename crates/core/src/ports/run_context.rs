@@ -195,6 +195,47 @@ pub struct GitInfo {
     pub git_ref: String,
 }
 
+/// Where the code this run is about came from.
+///
+/// Identity ([`Establishment`]) says *who is running*; this says *whose code
+/// they are running*. A push to the default branch and a pull request from a
+/// fork are both a [`ActorKind::Ci`] run with a verified identity, and they are
+/// not the same amount of trust: the second runs a `ship.ks` somebody outside
+/// the organisation wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Provenance {
+    /// The repository's own code: a push, a tag, or a pull request whose head
+    /// branch lives in the same repository as the base.
+    #[default]
+    Repository,
+    /// A pull request whose head lives in another repository — a fork. Whoever
+    /// wrote the `ship.ks`, the TypeScript script or the Dockerfile is not
+    /// anybody this organisation granted anything to.
+    Fork,
+    /// `pull_request_target`: the workflow file comes from the base branch, but
+    /// the code it checks out and runs is the pull request's. Untrusted by
+    /// construction, whoever opened it and wherever the head lives — this is
+    /// the event GitHub's own hardening guidance tells you not to use for
+    /// untrusted code.
+    Target,
+}
+
+impl Provenance {
+    /// Whether a run about this code may act outside its own checkout: read a
+    /// secret, mint a cloud credential, or push.
+    ///
+    /// Fails closed in the sense that matters — [`Provenance::Repository`] is
+    /// the only answer that grants those, and it is a claim the adapter has to
+    /// make affirmatively, never a default a missing value falls into.
+    #[must_use]
+    pub fn is_untrusted(&self) -> bool {
+        match self {
+            Provenance::Repository => false,
+            Provenance::Fork | Provenance::Target => true,
+        }
+    }
+}
+
 /// Why the run is happening.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Trigger {
@@ -221,6 +262,8 @@ pub struct Event {
     pub git: GitInfo,
     /// What triggered the run.
     pub trigger: Trigger,
+    /// Where the code this run is about came from. See [`Provenance`].
+    pub provenance: Provenance,
 }
 
 impl Event {
@@ -230,6 +273,12 @@ impl Event {
             Trigger::PullRequest { number } => Some(number),
             Trigger::Push | Trigger::Tag { .. } | Trigger::Manual => None,
         }
+    }
+
+    /// Whether this run is about code the organisation did not write.
+    #[must_use]
+    pub fn is_untrusted(&self) -> bool {
+        self.provenance.is_untrusted()
     }
 }
 

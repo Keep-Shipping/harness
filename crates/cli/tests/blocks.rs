@@ -8,8 +8,9 @@ use std::io::{BufRead, BufReader, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -83,12 +84,19 @@ fn run_with(
 
 /// A one-connection HTTP server: answers with `head` + body verbatim and
 /// records the request it received.
-fn serve_one(response: String) -> (SocketAddr, Arc<Mutex<String>>) {
+///
+/// The listener lives inside the serving thread, so the port stays open for as
+/// long as that thread runs and closes only when its closure returns. The
+/// `JoinHandle` is therefore part of the result: a caller that needs to know
+/// the port is dead must `join()` it, which proves the closure returned and the
+/// listener was dropped. Dropping it detaches, which is fine for callers that
+/// never look at reachability.
+fn serve_one(response: String) -> (SocketAddr, Arc<Mutex<String>>, JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let address = listener.local_addr().expect("addr");
     let captured = Arc::new(Mutex::new(String::new()));
     let record = Arc::clone(&captured);
-    std::thread::spawn(move || {
+    let server = std::thread::spawn(move || {
         let Ok((stream, _)) = listener.accept() else { return };
         let mut reader = BufReader::new(stream.try_clone().expect("clone the socket"));
         let mut text = String::new();
@@ -111,7 +119,7 @@ fn serve_one(response: String) -> (SocketAddr, Arc<Mutex<String>>) {
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.flush();
     });
-    (address, captured)
+    (address, captured, server)
 }
 
 fn http_response(status_line: &str, body: &str) -> String {
@@ -119,6 +127,89 @@ fn http_response(status_line: &str, body: &str) -> String {
         "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
+}
+
+/// An index that stays up until the test ends and records every request it
+/// serves, so a test can show that a command opened no connection.
+///
+/// Reachability of the port cannot stand in for that fact. Other tests in this
+/// binary run child processes, and a child forked while this listener is open
+/// inherits the socket: the copy stays listening until the child `execve`s, so
+/// the port can answer even after the serving thread is long gone and joined.
+/// The server itself is the reliable witness — it is still listening, and a
+/// connection to it is recorded rather than refused.
+struct Index {
+    address: SocketAddr,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    server: Option<JoinHandle<()>>,
+}
+
+impl Index {
+    fn new(response: &str) -> Index {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        // Non-blocking, so dropping the index does not have to wait on an accept
+        // that may never come.
+        listener.set_nonblocking(true).expect("non-blocking");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let record = Arc::clone(&requests);
+        let done = Arc::clone(&stop);
+        let response = response.to_string();
+        let server = std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let _ =
+                            stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                        let mut text = String::new();
+                        let mut reader =
+                            BufReader::new(stream.try_clone().expect("clone the socket"));
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            match reader.read_line(&mut line) {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {
+                                    let head_done = line == "\r\n";
+                                    text.push_str(&line);
+                                    if head_done {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // Recorded before the answer, so a client that has read
+                        // its answer has already left its request in the log.
+                        record.lock().expect("request record").push(text);
+                        let mut stream = stream;
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Index { address, requests, stop, server: Some(server) }
+    }
+
+    /// Every request served so far, oldest first.
+    fn seen(&self) -> Vec<String> {
+        self.requests.lock().expect("request record").clone()
+    }
+}
+
+impl Drop for Index {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(server) = self.server.take() {
+            server.join().expect("the index server");
+        }
+    }
 }
 
 #[test]
@@ -132,7 +223,7 @@ fn without_a_configured_index_the_search_is_refused_not_emptied() {
 
 #[test]
 fn the_environment_configures_the_index_when_the_flag_is_absent() {
-    let (address, captured) = serve_one(http_response("HTTP/1.1 200 OK", INDEX_ANSWER));
+    let (address, captured, _) = serve_one(http_response("HTTP/1.1 200 OK", INDEX_ANSWER));
     let (code, stdout, stderr) = run_with(
         None,
         &["blocks", "search", "rollout", "--limit", "5"],
@@ -147,7 +238,7 @@ fn the_environment_configures_the_index_when_the_flag_is_absent() {
 
 #[test]
 fn a_search_against_a_local_index_prints_the_metadata() {
-    let (address, captured) = serve_one(http_response("HTTP/1.1 200 OK", INDEX_ANSWER));
+    let (address, captured, _) = serve_one(http_response("HTTP/1.1 200 OK", INDEX_ANSWER));
     let (code, stdout, stderr) = keepshipping(&[
         "blocks",
         "search",
@@ -175,7 +266,7 @@ fn a_search_against_a_local_index_prints_the_metadata() {
 
 #[test]
 fn json_output_is_one_machine_readable_line_per_block() {
-    let (address, _) = serve_one(http_response("HTTP/1.1 200 OK", INDEX_ANSWER));
+    let (address, _, _) = serve_one(http_response("HTTP/1.1 200 OK", INDEX_ANSWER));
     let (code, stdout, stderr) = keepshipping(&[
         "blocks",
         "search",
@@ -194,7 +285,7 @@ fn json_output_is_one_machine_readable_line_per_block() {
 
 #[test]
 fn an_empty_result_set_is_exit_zero_and_says_so() {
-    let (address, _) = serve_one(http_response("HTTP/1.1 200 OK", r#"{"results":[]}"#));
+    let (address, _, _) = serve_one(http_response("HTTP/1.1 200 OK", r#"{"results":[]}"#));
     let (code, stdout, stderr) =
         keepshipping(&["blocks", "search", "rollout", "--index", &format!("http://{address}")]);
     assert_eq!(code, 0, "{stdout}{stderr}");
@@ -203,7 +294,7 @@ fn an_empty_result_set_is_exit_zero_and_says_so() {
 
 #[test]
 fn an_index_that_cannot_be_queried_is_exit_one() {
-    let (address, _) = serve_one(http_response("HTTP/1.1 404 Not Found", "{}"));
+    let (address, _, _) = serve_one(http_response("HTTP/1.1 404 Not Found", "{}"));
     let (code, _stdout, stderr) =
         keepshipping(&["blocks", "search", "rollout", "--index", &format!("http://{address}")]);
     assert_eq!(code, 1);
@@ -213,7 +304,7 @@ fn an_index_that_cannot_be_queried_is_exit_one() {
 
 #[test]
 fn a_broken_index_answer_is_exit_one_never_an_empty_result() {
-    let (address, _) = serve_one(http_response("HTTP/1.1 200 OK", r#"{"results":42}"#));
+    let (address, _, _) = serve_one(http_response("HTTP/1.1 200 OK", r#"{"results":42}"#));
     let (code, stdout, stderr) =
         keepshipping(&["blocks", "search", "rollout", "--index", &format!("http://{address}")]);
     assert_eq!(code, 1, "{stdout}{stderr}");
@@ -240,7 +331,7 @@ fn cached(dir: &TempDir, args: &[&str]) -> (i32, String, String) {
 #[test]
 fn an_online_search_is_cached_and_then_answered_offline() {
     let cache = TempDir::new("blocks-cache");
-    let (address, _captured) = serve_one(http_response("HTTP/1.1 200 OK", INDEX_ANSWER));
+    let (address, _captured, _) = serve_one(http_response("HTTP/1.1 200 OK", INDEX_ANSWER));
     let index = format!("http://{address}");
     let (code, online, stderr) =
         cached(&cache, &["blocks", "search", "rollout", "--index", &index]);
@@ -259,26 +350,29 @@ fn an_online_search_is_cached_and_then_answered_offline() {
 #[test]
 fn offline_never_opens_a_connection() {
     let cache = TempDir::new("blocks-offline-silent");
-    let (address, captured) = serve_one(http_response("HTTP/1.1 200 OK", INDEX_ANSWER));
-    let index = format!("http://{address}");
-    let (code, _online, stderr) =
+    let index_server = Index::new(&http_response("HTTP/1.1 200 OK", INDEX_ANSWER));
+    let index = format!("http://{}", index_server.address);
+    let (code, online, stderr) =
         cached(&cache, &["blocks", "search", "rollout", "--index", &index]);
-    assert_eq!(code, 0, "{stderr}");
-    let sent = captured.lock().expect("request record").clone();
+    assert_eq!(code, 0, "{online}{stderr}");
+    let seen = index_server.seen();
+    assert_eq!(seen.len(), 1, "the online search made one request: {seen:?}");
     assert!(
-        sent.starts_with("GET /v1/blocks/search?q=rollout"),
-        "the online search hit the index: {sent}"
+        seen[0].starts_with("GET /v1/blocks/search?q=rollout"),
+        "the online search hit the index: {}",
+        seen[0]
     );
-    // The one-connection server has returned, so the port is closed for good:
-    // an offline search that touched it would be exit 1, not exit 0.
-    assert!(
-        std::net::TcpStream::connect(address).is_err(),
-        "the index must be unreachable by the time the offline search runs"
-    );
-    let (code, stdout, stderr) =
+
+    // The index is still up, still listening, and still willing to answer — so
+    // an offline search that opened a connection would be served from it and
+    // recorded below. What it must not do is touch it at all.
+    let (code, offline, stderr) =
         cached(&cache, &["blocks", "search", "rollout", "--index", &index, "--offline"]);
-    assert_eq!(code, 0, "{stdout}{stderr}");
-    assert!(stdout.contains("acme/rollout"), "{stdout}");
+    assert_eq!(code, 0, "{offline}{stderr}");
+    assert!(offline.contains("acme/rollout"), "{offline}");
+    assert!(stderr.contains("local blocks cache"), "{stderr}");
+    let seen = index_server.seen();
+    assert_eq!(seen.len(), 1, "the offline search opened a connection to the index: {seen:?}");
 }
 
 #[test]
@@ -305,7 +399,7 @@ fn offline_with_an_empty_cache_is_exit_two() {
 #[test]
 fn offline_for_a_query_never_searched_online_is_exit_two() {
     let cache = TempDir::new("blocks-cache-uncached");
-    let (address, _) = serve_one(http_response("HTTP/1.1 200 OK", INDEX_ANSWER));
+    let (address, _, _) = serve_one(http_response("HTTP/1.1 200 OK", INDEX_ANSWER));
     let index = format!("http://{address}");
     let (code, _online, stderr) =
         cached(&cache, &["blocks", "search", "rollout", "--index", &index]);
@@ -320,7 +414,7 @@ fn offline_for_a_query_never_searched_online_is_exit_two() {
 #[test]
 fn a_second_index_does_not_read_the_first_ones_cache() {
     let cache = TempDir::new("blocks-cache-two-indexes");
-    let (address, _) = serve_one(http_response("HTTP/1.1 200 OK", INDEX_ANSWER));
+    let (address, _, _) = serve_one(http_response("HTTP/1.1 200 OK", INDEX_ANSWER));
     let (code, _online, stderr) =
         cached(&cache, &["blocks", "search", "rollout", "--index", &format!("http://{address}")]);
     assert_eq!(code, 0, "{stderr}");
@@ -343,7 +437,7 @@ fn a_second_index_does_not_read_the_first_ones_cache() {
 #[test]
 fn an_empty_result_set_is_cached_too() {
     let cache = TempDir::new("blocks-cache-empty-results");
-    let (address, _) = serve_one(http_response("HTTP/1.1 200 OK", r#"{"results":[]}"#));
+    let (address, _, _) = serve_one(http_response("HTTP/1.1 200 OK", r#"{"results":[]}"#));
     let index = format!("http://{address}");
     let (code, online, stderr) =
         cached(&cache, &["blocks", "search", "rollout", "--index", &index]);

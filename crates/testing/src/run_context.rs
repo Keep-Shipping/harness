@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use ks_core::ports::BoxFuture;
 use ks_core::ports::run_context::{
     Actor, ActorKind, Capabilities, Establishment, Event, GitInfo, IdentityStrength, NetworkScope,
-    RunContext, RunContextError, Trigger, Workspace,
+    Provenance, RunContext, RunContextError, Trigger, Workspace,
 };
 use ks_core::ports::secrets::SecretValue;
 
@@ -59,6 +59,7 @@ impl FakeRunContext {
             event: Event {
                 git: GitInfo { sha: FAKE_SHA.to_string(), git_ref: "refs/heads/main".to_string() },
                 trigger: Trigger::Push,
+                provenance: Provenance::Repository,
             },
             capabilities: Capabilities {
                 oidc: false,
