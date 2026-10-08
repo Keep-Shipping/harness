@@ -1,0 +1,33 @@
+[package]
+name = "ks-module-approvals"
+description = "Cratefield module: hosted approval requests, an HTML review page, and signed decisions dispatched back to GitHub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+cratefield-core = "0.8"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
+# HMAC-SHA256 over the canonical decision bytes. `hmac` 0.13 and `sha2` 0.11
+# both build on `digest` 0.11, so they pair; the workspace's `sha2` is 0.10 and
+# is left to the adapter that hashes OCI blobs.
+hmac = "0.13"
+sha2 = "0.11"
+tracing = "0.1"
+
+[dev-dependencies]
+bytes = "1"
+cratefield-testing = "0.5"
+http = "1"
+ks-core.workspace = true
+pollster = { version = "0.4", features = ["macro"] }
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true
