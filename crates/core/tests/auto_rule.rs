@@ -187,6 +187,106 @@ fn a_decision_from_no_model_or_a_failed_call_is_never_approved() {
     }
 }
 
+/// **An escalation the engine wrote itself is not a confident answer.** A
+/// `decide` step that refused to ask — a state its guard would not send, a
+/// question it could not build — answers `escalate` at confidence 1.0, because
+/// an escalation is certain. Nothing about those outputs says so: they are the
+/// same four the step returns when a model said `escalate`, and a rule reading
+/// `risk.confidence` alone reads 1.0 as a certainty worth approving on. So the
+/// source is a variant of its own here, and it can only ever ask.
+#[test]
+fn an_escalation_the_engine_wrote_itself_is_never_approved() {
+    let why = "the plan's text carries a line break that is not a newline (U+2028), \
+               so it was not sent to typesafe/jev";
+    // The shape the step writes: the answer and its confidence, then the why.
+    let reason = format!("escalate 1.00 {why}");
+    let shapes = [
+        "risk.confidence >= 0.95 and plan.destroys == 0",
+        "risk is low \u{2265} 0.95",
+        "risk.confidence >= 0.95",
+        "risk.answer == escalate",
+        "risk.confidence >= 0.95 or risk.confidence < 0",
+    ];
+    for rule in shapes {
+        let parse = ks_lang::parse(&site_with(rule));
+        let (auto, otherwise) = review_rule(&parse);
+        let plan = clean_plan();
+        let f =
+            facts("staging", answered("escalate", 1.0, &reason, DecisionSource::Escalated), &plan);
+
+        let (teams, show, refused) = asked(resolve(&auto, Some(&otherwise), &f));
+
+        assert_eq!(teams, ["@platform".to_string()]);
+        // The reason keeps what the engine said and loses only the answer and
+        // confidence `Why::Escalated`'s own sentence has already given.
+        assert_eq!(refused, Why::Escalated { step: "risk".into(), why: why.into() }, "`{rule}`");
+        // The review is told what stopped the question, which is the only thing
+        // the engine knows that no file and no rule can work out.
+        assert!(show.iter().any(|(_, said)| said.contains("U+2028")), "`{rule}`: {show:?}");
+    }
+}
+
+/// **Only the engine's own `escalate <confidence> …` prefix comes off.** The
+/// engine writes its reasons that way, and [`Why::Escalated`]'s sentence has
+/// already said the step was escalated and never asked — so the prefix would be
+/// said twice in one line. Every other reason is the human's only record of what
+/// stopped the question, and two words taken off the front of it delete that
+/// record: the engine's *other* escalation, `no model is configured (model:
+/// none)`, has no prefix to take, and a reason that merely opens with a word and
+/// a number — `risk 3 destroys happened` — is not a prefix at all.
+#[test]
+fn only_the_engines_own_answer_and_confidence_are_stripped_from_the_reason() {
+    let decided = |reason: &str| {
+        let parse = ks_lang::parse(&site_with("risk.confidence >= 0.95"));
+        let (auto, otherwise) = review_rule(&parse);
+        let plan = clean_plan();
+        let f =
+            facts("staging", answered("escalate", 1.0, reason, DecisionSource::Escalated), &plan);
+        asked(resolve(&auto, Some(&otherwise), &f))
+    };
+
+    // The engine's other escalation, `model: none`: kept whole and unchanged.
+    let none = "no model is configured (model: none)";
+    let (_, show, refused) = decided(none);
+    assert_eq!(refused, Why::Escalated { step: "risk".into(), why: none.into() });
+    assert_eq!(show, [("risk.reason".to_string(), none.to_string())]);
+
+    // A word and a number that are not the answer and the confidence: the reason
+    // says what happened, and the count is the part a reviewer cannot do without.
+    let count = "risk 3 destroys happened";
+    let (_, show, refused) = decided(count);
+    assert_eq!(refused, Why::Escalated { step: "risk".into(), why: count.into() });
+    assert_eq!(show, [("risk.reason".to_string(), count.to_string())]);
+
+    // The shape the step really writes: the prefix, and only the prefix, goes.
+    let why = "the plan's text carries a line break that is not a newline (U+2028)";
+    let (_, _, refused) = decided(&format!("escalate 1.00 {why}"));
+    assert_eq!(refused, Why::Escalated { step: "risk".into(), why: why.into() });
+}
+
+/// What the human waiting on the approval is told. It has to name the step, it
+/// has to carry the engine's own reason, and it must not borrow another
+/// variant's wording: `model: none` is a file's sentence about a missing model,
+/// and this run had a model and would not use it.
+#[test]
+fn an_escalation_says_the_engine_escalated_and_why() {
+    // The reason as [`resolve`] hands it over: the engine's own sentence, without
+    // the answer and confidence the reason line opened with.
+    let why = "the plan's text carries a tag character (U+E0061), \
+               so it was not sent to typesafe/jev";
+
+    let said = Why::Escalated { step: "risk".into(), why: why.into() }.to_string();
+
+    assert!(said.contains("risk"), "the step it is about: {said}");
+    // On the sentence's own verb, not on the prefix the reason line opens with:
+    // `resolve` strips that prefix, so the sentence is what says it.
+    assert!(said.contains("the engine escalated `risk`"), "who answered, in our words: {said}");
+    assert!(!said.contains("escalate 1.00"), "the reason's own prefix is not said twice: {said}");
+    assert!(said.contains("U+E0061"), "the engine's own reason is kept: {said}");
+    assert!(!said.contains("model: none"), "no model was missing; one was not asked: {said}");
+    assert!(!said.contains('\u{E0061}'), "and no glyph comes back: {said}");
+}
+
 /// The org baseline is the one authority a workflow file cannot write, so a
 /// rule that holds on a plan that changes nothing still asks in the
 /// environment the baseline refuses.

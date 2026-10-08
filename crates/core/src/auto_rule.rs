@@ -17,6 +17,7 @@ use std::fmt;
 
 use ks_lang::{Atom, CmpOp, Expr, Scalar, Word, WordPart};
 
+use crate::ports::decision_model::ESCALATE;
 use crate::ports::policy::{Baseline, Disposition};
 use crate::ports::run_context::ActorKind;
 use crate::ports::script_host::Value;
@@ -137,6 +138,24 @@ pub enum DecisionSource {
     Model,
     NoModel,
     Errored,
+    /// The engine refused to ask the question at all — a state its guard would
+    /// not send, a question it could not build — and answered `escalate` itself.
+    /// It has to be named rather than borrowed from the three above: the step
+    /// returned `Ok`, so `Errored` is a lie; nobody was asked, so `Model` is a
+    /// lie; and `NoModel` would tell the review `model: none`, which is false.
+    /// An escalation is also *confident* — 1.0, which is what an approval waits
+    /// for — and its outputs are the four a model would have returned.
+    ///
+    /// [`resolve`] is what refuses it: the source is the one thing no file can
+    /// express, and the arm that reads it is the only thing between "the engine
+    /// would not ask about this state" and an approval. That holds on the path
+    /// through [`resolve`] alone. [`auto_approves`] and [`decide`] take a rule
+    /// result and a destroy count and are handed no `DecisionSource` at all, so
+    /// a caller that works them out itself — the way
+    /// `risk.confidence >= 0.95` evaluated from a `decide` step's outputs —
+    /// approves an escalation at 1.0 whatever this variant says. Bypassing
+    /// [`resolve`] bypasses this too.
+    Escalated,
 }
 
 /// One `decide` step's three declared outputs, plus the provenance none of them
@@ -219,12 +238,32 @@ pub enum Resolution {
 /// stopped it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Why {
-    RuleDidNotHold { saw: Vec<(String, String)> },
-    Destroys { count: usize },
-    NoModel { step: String },
-    Errored { step: String },
-    BaselineDenied { env: String },
-    Unreadable { message: String },
+    RuleDidNotHold {
+        saw: Vec<(String, String)>,
+    },
+    Destroys {
+        count: usize,
+    },
+    NoModel {
+        step: String,
+    },
+    Errored {
+        step: String,
+    },
+    /// The step never asked anything, so there is no decision behind its
+    /// outputs and the rule was reading the engine's own certainty. `why` is
+    /// the reason the engine wrote, so the human is told what stopped the
+    /// question rather than that a step said no to nothing.
+    Escalated {
+        step: String,
+        why: String,
+    },
+    BaselineDenied {
+        env: String,
+    },
+    Unreadable {
+        message: String,
+    },
 }
 
 impl fmt::Display for Why {
@@ -247,6 +286,9 @@ impl fmt::Display for Why {
             }
             Why::Errored { step } => {
                 write!(f, "the model call behind `{step}` errored: no decision to trust")
+            }
+            Why::Escalated { step, why } => {
+                write!(f, "the engine escalated `{step}` rather than ask a model: {why}")
             }
             Why::BaselineDenied { env } => write!(f, "the org baseline disables `auto:` in {env}"),
             Why::Unreadable { message } => {
@@ -287,6 +329,12 @@ pub fn resolve(auto: &Expr<'_>, otherwise: Option<&Expr<'_>>, facts: &Facts<'_>)
             DecisionSource::Model => continue,
             DecisionSource::NoModel => Why::NoModel { step: step.into() },
             DecisionSource::Errored => Why::Errored { step: step.into() },
+            // An escalation is `escalate` at confidence 1.0 whatever stopped
+            // it, so this arm is the only thing between "the engine would not
+            // ask about this state" and a rule approving on that confidence.
+            DecisionSource::Escalated => {
+                Why::Escalated { step: step.into(), why: without_answer_prefix(&answer.reason) }
+            }
         };
         return ask(otherwise, facts, why);
     }
@@ -303,6 +351,20 @@ pub fn resolve(auto: &Expr<'_>, otherwise: Option<&Expr<'_>>, facts: &Facts<'_>)
         Ok(0) => Resolution::Approved { by: POLICY_AUTO, rule: text_of(auto), saw },
         Ok(count) => ask(otherwise, facts, Why::Destroys { count }),
         Err(message) => ask(otherwise, facts, Why::Unreadable { message }),
+    }
+}
+
+/// The engine's own reason with the answer and confidence its `reason` line
+/// opens with — `escalate 1.00 …` — taken off. [`Why::Escalated`]'s sentence
+/// already says the step was escalated and never asked, so carrying the prefix
+/// says it twice in one line. A reason written any other way is kept whole,
+/// prefix or not.
+fn without_answer_prefix(reason: &str) -> String {
+    let Some((answer, rest)) = reason.split_once(' ') else { return reason.to_string() };
+    let Some((confidence, why)) = rest.split_once(' ') else { return reason.to_string() };
+    match (answer, confidence.parse::<f64>()) {
+        (ESCALATE, Ok(_)) => why.to_string(),
+        _ => reason.to_string(),
     }
 }
 

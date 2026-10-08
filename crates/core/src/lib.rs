@@ -35,6 +35,7 @@ pub mod block_trust;
 mod catalog;
 mod check;
 pub mod context;
+pub mod decision_guard;
 mod env;
 pub mod format;
 pub mod harness;
