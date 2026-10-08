@@ -77,5 +77,10 @@ pub fn builtin_types() -> Vec<TypeDef> {
             base: ValueType::String,
             doc: "the digest of an artifact attached to an image — an SBOM, a signature",
         },
+        TypeDef {
+            name: "k8s.Cluster",
+            base: ValueType::String,
+            doc: "a resolved cluster target naming how the run authenticates, never a credential",
+        },
     ]
 }
