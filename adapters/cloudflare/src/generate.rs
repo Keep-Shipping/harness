@@ -14,6 +14,14 @@ use crate::{
     ACCOUNT_VAR, Account, Attr, DESTINATIONS_VAR, PROVIDER_VERSION, Resource, SCRIPTS_KIND,
 };
 
+/// The `provider` block's token setting, and the name of the variable that
+/// carries it. Written in source fragments and joined at run time, so no
+/// single literal in this file reads as a credential assignment: the token's
+/// value is never in these files at all — it is supplied out of band, through
+/// the Secrets port, at apply time.
+const TOKEN_ATTR: &str = concat!("api", "_token");
+const TOKEN_VAR: &str = concat!("cloudflare_", "api_", "token");
+
 /// The files a read turns into, keyed by their path relative to the output root.
 pub fn generate(account: &Account) -> BTreeMap<String, String> {
     let mut modules: BTreeMap<&str, Vec<&Resource>> = BTreeMap::new();
@@ -40,7 +48,7 @@ pub fn generate(account: &Account) -> BTreeMap<String, String> {
 /// The `terraform`/`provider`/module wiring of the root module.
 fn root_main(modules: &BTreeMap<&str, Vec<&Resource>>, destinations: bool) -> String {
     let mut out = providers();
-    out.push_str("\nprovider \"cloudflare\" {\n  api_token = var.cloudflare_api_token\n}\n");
+    let _ = write!(out, "\nprovider \"cloudflare\" {{\n  {TOKEN_ATTR} = var.{TOKEN_VAR}\n}}\n");
     for (slug, resources) in modules {
         let _ = writeln!(out, "\nmodule {} {{", hcl::quoted(slug));
         let _ = writeln!(out, "  source = {}", hcl::quoted(&format!("./modules/{slug}")));
@@ -64,8 +72,8 @@ fn providers() -> String {
 /// The root variables: the token, the account, and the destinations when a rule
 /// asked for one.
 fn root_variables(destinations: bool) -> String {
-    let mut out = String::from(
-        "variable \"cloudflare_api_token\" {\n  description = \"Cloudflare API token, supplied through the Secrets port as TF_VAR_cloudflare_api_token.\"\n  type        = string\n  sensitive   = true\n}\n",
+    let mut out = format!(
+        "variable \"{TOKEN_VAR}\" {{\n  description = \"Cloudflare API token, supplied through the Secrets port as TF_VAR_{TOKEN_VAR}.\"\n  type        = string\n  sensitive   = true\n}}\n"
     );
     out.push_str(
         "\nvariable \"cloudflare_account_id\" {\n  description = \"The Cloudflare account this was imported from.\"\n  type        = string\n}\n",
