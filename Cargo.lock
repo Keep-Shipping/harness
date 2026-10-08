@@ -993,6 +993,7 @@ dependencies = [
  "ks-engine",
  "ks-lang",
  "ks-lsp",
+ "ks-oci-distribution",
  "ks-testing",
  "serde_json",
  "sha2 0.10.9",

@@ -1,14 +1,19 @@
-//! The `blocks search` command: asks the configured blocks index for
-//! metadata about blocks matching a query, and prints it as human text or
+//! The `blocks` subcommands: `blocks search` asks the configured blocks index
+//! for metadata about blocks matching a query, and prints it as human text or
 //! JSON lines. It never touches block contents — the index is metadata only
-//! by contract.
+//! by contract. `blocks publish` is the other direction: it pushes a `.ks`
+//! block file to an OCI registry and refuses a breaking interface change
+//! inside a release line. The compatibility rule itself lives in
+//! [`crate::blocks_publish`]; this module is the wiring.
 //!
-//! Exit codes follow the house rules: 0 when the search ran (even with no
-//! results), 1 when the index could not be queried, 2 for usage and
-//! configuration problems — including "no index configured", which must not
-//! masquerade as an empty result set. `--offline` inherits the last rule: a
-//! query with nothing cached is a 2, because "no cached answer" is a
-//! configuration problem about the machine, not an empty result set.
+//! Exit codes follow the house rules: 0 when the command ran (for a search,
+//! even with no results; for a publish, when the block was published), 1 when
+//! the index could not be queried or a publish was refused or failed, 2 for
+//! usage and configuration problems — including "no index configured", which
+//! must not masquerade as an empty result set.
+//! `blocks search --offline` inherits the last rule: a query with nothing
+//! cached is a 2, because "no cached answer" is a configuration problem about
+//! the machine, not an empty result set.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -17,52 +22,169 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ks_core::ports::blocks::{BlockEntry, BlockQuery, BlocksIndexError};
 use ks_core::ports::http::HttpPolicy;
-use ks_core::ports::supply_chain::SignerIdentity;
+use ks_core::ports::supply_chain::{Registry, SignerIdentity};
+use ks_oci_distribution::{CredentialStore, OciDistribution};
 
 use crate::args::{Command, INDEX_ENV, USAGE, parse_args};
 use crate::blocks_cache::BlocksCache;
 use crate::blocks_index::{HostedBlocksIndex, parse_response};
+use crate::blocks_publish::{self, Version};
 use crate::http_client::TcpHttpClient;
 use crate::render::Format;
 
-/// The entry point for `keepshipping blocks <subcommand>`; today only
-/// `search` exists.
+/// The entry point for `keepshipping blocks <subcommand>`.
 pub fn blocks(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("search") => search(&args[1..]),
-        _ => {
-            eprintln!("{USAGE}");
-            ExitCode::from(2)
+        Some("publish") => publish(&args[1..]),
+        _ => usage(""),
+    }
+}
+
+/// `keepshipping blocks publish <FILE> --version X.Y.Z --to HOST/NAMESPACE`.
+///
+/// Exit codes follow the house rules: 0 when the block was published, 2 for
+/// usage and configuration problems — a missing flag, a version that is not
+/// `MAJOR.MINOR.PATCH`, a target that is not `host/namespace` — and 1 for a
+/// refusal (a version already published, one that breaks its release line) or
+/// a registry that would not take the push.
+fn publish(args: &[String]) -> ExitCode {
+    let Some(o) = parse_args(args, Command::BlocksPublish) else {
+        return usage("");
+    };
+    let Some(file) = o.path.as_deref() else {
+        return usage("blocks publish needs the block file to publish");
+    };
+    // A version this build cannot compare is a usage error, refused here
+    // rather than pushed and discovered at the consumer's end.
+    let Some(version) = o.version.as_deref().map(str::to_string) else {
+        return usage("blocks publish needs --version MAJOR.MINOR.PATCH");
+    };
+    let version = match Version::parse(&version) {
+        Ok(version) => version,
+        Err(reason) => return usage(format!("--version {reason}")),
+    };
+    let Some((host, namespace)) = o.target.as_deref().and_then(target_of) else {
+        return usage(
+            "blocks publish needs --to <host>/<namespace>, e.g. --to localhost:5001/acme/blocks",
+        );
+    };
+    // The authority is a host the http client has to be able to parse —
+    // `[::1]:5001` is a host, `:5001` and `host:x` are not. Read through the
+    // client's own rules (brackets stripped, port dropped, case folded), so
+    // this is how the client will treat the host too.
+    let Some((host_name, _)) = crate::http_client::url_host_port(&format!("http://{host}")) else {
+        return usage(format!("--to {host} is not a registry host and port"));
+    };
+    let host_name = host_name.to_ascii_lowercase();
+    // A loopback registry is the one this command speaks plain http to, because
+    // that is what a registry on this machine actually serves. Anything else is
+    // `https`, and the plain-http client says so.
+    let insecure = matches!(host_name.as_str(), "localhost" | "127.0.0.1" | "::1")
+        .then(|| host.to_ascii_lowercase());
+    let Ok(source) = std::fs::read_to_string(file) else {
+        return usage(format!("{file} could not be read"));
+    };
+    // A README is published only when the publisher named it: a `README.md`
+    // that happens to sit beside the block file may be about something else,
+    // and a named one that cannot be read is an error rather than a block
+    // quietly shipped without it.
+    let readme = match o.readme.as_deref() {
+        None => None,
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(error) => return usage(format!("--readme {path} could not be read: {error}")),
+        },
+    };
+    let block = match blocks_publish::read_definition(&source) {
+        Ok(block) => block,
+        Err(reason) => return usage(format!("{file}: {reason}")),
+    };
+    // The policy allowlists the target host alone: this command talks to the
+    // registry it was pointed at and to nothing else.
+    let policy =
+        HttpPolicy { allowed_hosts: [host_name].into_iter().collect(), ..HttpPolicy::default() };
+    let adapter = OciDistribution::new(Arc::new(TcpHttpClient::new(policy)))
+        .with_credentials(CredentialStore::load())
+        .with_insecure_hosts(insecure);
+    // `publish` builds `{root}/{block name}` itself, and a repository string
+    // starts at the registry host — so what it is given is `--to` whole.
+    let root = format!("{host}/{namespace}");
+    let repository = format!("{root}/{}", block.name);
+    // The tags already in the repository: what the version offered is compared
+    // against, and what makes a re-publish a refusal.
+    let tags = match wait(adapter.tags(&repository)) {
+        Ok(tags) => tags,
+        Err(error) => {
+            eprintln!("error: {repository}: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let registry: Arc<dyn Registry> = Arc::new(adapter);
+    let request = blocks_publish::PublishRequest {
+        block: &block,
+        source: &source,
+        readme: readme.as_deref(),
+        version,
+    };
+    match wait(blocks_publish::publish(&registry, &tags, &root, &request)) {
+        Ok(published) => {
+            println!(
+                "published {} {} to {}@{}",
+                block.name, published.version, published.repository, published.digest
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(1)
         }
     }
 }
 
+/// A usage problem, spelled the way the rest of the CLI spells one: what is
+/// wrong, then the usage. An empty message is an unrecognizable command line,
+/// which needs no explanation of its own.
+fn usage(message: impl std::fmt::Display) -> ExitCode {
+    let message = message.to_string();
+    if !message.is_empty() {
+        eprintln!("error: {message}");
+    }
+    eprintln!("{USAGE}");
+    ExitCode::from(2)
+}
+
+/// `--to` split into the registry authority (host, port included) and the
+/// namespace inside it. Both are required: `--to host` would publish into no
+/// namespace, and `--to /ns` names no host to push to. A `--to` carrying a
+/// scheme is refused too — this names where to push, not a url to fetch.
+fn target_of(to: &str) -> Option<(&str, &str)> {
+    let (host, namespace) = to.split_once('/')?;
+    let namespace = namespace.trim_end_matches('/');
+    (!host.is_empty() && !namespace.is_empty() && !host.contains("://"))
+        .then_some((host, namespace))
+}
+
 fn search(args: &[String]) -> ExitCode {
     let Some(o) = parse_args(args, Command::BlocksSearch) else {
-        eprintln!("{USAGE}");
-        return ExitCode::from(2);
+        return usage("");
     };
     let Some(text) = query_text(o.query.as_deref()) else {
-        eprintln!("error: blocks search needs what to look for");
-        eprintln!("{USAGE}");
-        return ExitCode::from(2);
+        return usage("blocks search needs what to look for");
     };
     let Some(base) = resolve_index(o.index.as_deref(), std::env::var(INDEX_ENV).ok().as_deref())
     else {
-        eprintln!(
-            "error: no blocks index configured; pass --index <url> or set {INDEX_ENV} to the index base url"
-        );
-        return ExitCode::from(2);
+        return usage(format!(
+            "no blocks index configured; pass --index <url> or set {INDEX_ENV} to the index base url"
+        ));
     };
     if base.starts_with("https://") {
-        eprintln!(
-            "error: {base} uses https, which the command-line client cannot speak yet; point --index at the plain-http address of the index"
-        );
-        return ExitCode::from(2);
+        return usage(format!(
+            "{base} uses https, which the command-line client cannot speak yet; point --index at the plain-http address of the index"
+        ));
     }
     if !base.starts_with("http://") {
-        eprintln!("error: {base} is not an absolute http url");
-        return ExitCode::from(2);
+        return usage(format!("{base} is not an absolute http url"));
     }
     let policy = HttpPolicy {
         allowed_hosts: [host_of(&base)].into_iter().collect(),
@@ -70,10 +192,7 @@ fn search(args: &[String]) -> ExitCode {
     };
     let index = match HostedBlocksIndex::new(base.clone(), Arc::new(TcpHttpClient::new(policy))) {
         Ok(index) => index,
-        Err(message) => {
-            eprintln!("error: {message}");
-            return ExitCode::from(2);
-        }
+        Err(message) => return usage(message),
     };
     let query = BlockQuery { text: text.to_string(), limit: o.limit };
     // Resolved once, before the branch: the online path writes through it and

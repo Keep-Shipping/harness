@@ -29,6 +29,7 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
        keepshipping fmt -
        keepshipping fmt --upgrade [PATH...]
        keepshipping blocks search <QUERY> [--index URL] [--limit N] [--offline] [--format human|json]
+       keepshipping blocks publish <FILE> --version X.Y.Z --to HOST/NAMESPACE [--readme PATH]
        keepshipping log [RUN-ID] [--format human|json]
        keepshipping log verify [RUN-ID]
        keepshipping policy explain [FILE] [--as agent|human|ci] [--env NAME]
@@ -43,7 +44,10 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
 /// `text|dot|json`, not the diagnostic formats, so `check --format dot` stays
 /// the usage error it has always been. `fmt` takes `--check`, the `-` stdin
 /// positional, and `--upgrade`; it rejects `--env`, `--event`, `--actor` and
-/// `--non-interactive`.
+/// `--non-interactive`. `blocks publish` takes `--version`, `--to` and
+/// `--readme`, and rejects every other command's flags: publishing a block
+/// under a flag that means something else is how a block lands somewhere its
+/// publisher did not choose.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Check,
@@ -52,6 +56,7 @@ pub enum Command {
     Graph,
     BlocksSearch,
     PolicyExplain,
+    BlocksPublish,
 }
 
 /// The parsed command line. `path` is the `FILE` argument: the site file —
@@ -105,6 +110,17 @@ pub struct Options {
     /// `--offline` on `blocks search`: answer from the local metadata cache
     /// and never touch the network.
     pub offline: bool,
+    /// `blocks publish --version`: the version to publish at, as written. The
+    /// command parses it — a version this build cannot compare is a usage
+    /// error, not something to push and discover later.
+    pub version: Option<String>,
+    /// `blocks publish --to`: `<host>/<namespace>`, where the block's own
+    /// name is the last path element.
+    pub target: Option<String>,
+    /// `blocks publish --readme`: the README to carry with the block. Only when
+    /// named — a `README.md` beside the block file may be about something
+    /// else, and publishing it would not be the publisher's choice.
+    pub readme: Option<String>,
     /// `--upgrade` on `fmt`: rewrite each file to the format this build
     /// writes, rather than laying it out.
     pub upgrade: bool,
@@ -145,6 +161,9 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
         index: None,
         limit: DEFAULT_SEARCH_LIMIT,
         offline: false,
+        version: None,
+        target: None,
+        readme: None,
         upgrade: false,
         check: false,
         stdin: false,
@@ -200,6 +219,13 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
                 o.limit = value.parse().ok().filter(|limit| *limit > 0)?;
             }
             "--offline" if command == Command::BlocksSearch => o.offline = true,
+            "--version" if command == Command::BlocksPublish => {
+                o.version = Some(flag_value(&mut rest)?)
+            }
+            "--to" if command == Command::BlocksPublish => o.target = Some(flag_value(&mut rest)?),
+            "--readme" if command == Command::BlocksPublish => {
+                o.readme = Some(flag_value(&mut rest)?)
+            }
             // Everything after `--` is a path, even when it starts with a dash: the
             // one way to name a file called `-weird.ks`.
             "--" if command == Command::Fmt => {
@@ -210,11 +236,14 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
             // `fmt` is the one command that takes a list: a file, a tree, or
             // several of each.
             file if command == Command::Fmt => o.paths.push(file.to_string()),
-            // One positional: the site file, the tree with `--all`, or the
-            // search text. A second is almost always a typo, not a list to
-            // check.
+            // One positional: the site file, the tree with `--all`, the
+            // search text, or the block file to publish. A second is almost
+            // always a typo, not a list to check.
             file if o.path.is_none()
-                && matches!(command, Command::Check | Command::Run | Command::PolicyExplain) =>
+                && matches!(
+                    command,
+                    Command::Check | Command::Run | Command::PolicyExplain | Command::BlocksPublish
+                ) =>
             {
                 o.path = Some(file.to_string())
             }
