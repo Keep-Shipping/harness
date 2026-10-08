@@ -661,7 +661,7 @@ Every value has a type, and types never convert implicitly
 A file declares the format it is written in with an optional header, which
 must be its first entry (comments and blank lines above it are fine):
 
-```
+```ks
 keepshipping: 0.1
 ```
 
