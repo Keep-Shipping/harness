@@ -341,21 +341,46 @@ picks. This is `ks_core::select_env`.
 `policy:` children are subjects: `agents`, `humans` (did-you-mean otherwise).
 Each subject takes:
 
-- `can:` / `before:` / `never:` — tuples of actions `<verb> [<env>]`; verbs
-  are the action classes: `check`, `build`, `test`, `plan`, `apply`,
-  `deploy`, `destroy`, `publish`, `read`. `read` takes the object `secrets`;
-  every other verb takes an optional environment, which must be declared.
-- `ask:` — handle(s) to ask.
+- `can:` / `before:` / `never:` — tuples of actions `<verb> [<object>]`. `can:`
+  allows the action outright, `before:` asks the subject's `ask:` handles first,
+  `never:` refuses it. Verbs are the action classes: `check`, `build`, `test`,
+  `plan`, `apply`, `deploy`, `destroy`, `publish`, `read`, `run`. `read` takes
+  exactly `secrets`, `run` exactly `scripts`, `publish` `blocks` or an
+  environment; every other verb takes an optional environment, and a verb naming
+  no object binds every environment.
+- `ask:` — handle(s) to ask. Part of what a `before:` rule means, so "ask" with
+  nobody named is still an ask.
 
 An environment named in a policy action must be declared under `envs:`
 (`error: undeclared environment \`prod\``, with a hint to declare it).
 
-When the actor is known (`keepshipping check --actor human|agent|ci`, default
-`human`), the policy binds that actor: an `agents: never: read secrets` rule
-refuses an agent run that needs any `secrets.<name>` — an error at the
-reference (`policy forbids agents from reading secrets, but this run needs
-secrets.db_url`) plus a diagnostic on the rule's own line, so the run stops
-before it starts. Human, CI and unknown-actor checks are unaffected.
+**An action class is what a step kind does.** `oci.image`/`oci.artifact` build, `tofu.plan` plans,
+`tofu.apply` applies, `k8s.rollout` deploys; everything else — `approval`, `decide`, any
+unclassified kind — is outside the vocabulary and so not governed. **`destroy` is read from the
+plan, not the header**: an apply whose plan destroys anything, a replacement included, *is* a
+destroy.
+
+**Humans follow the same file, minus the leash.** An agent reads `agents:`, and anything it does not
+name is an **ask** — an allowlist that defaults to allow is not one. A human (or a CI run) reads
+`humans:`, and an action that section does not name is allowed.
+
+**A `never:` rule refuses at check time**, for whichever actor is being checked
+(`keepshipping check --actor human|agent|ci`, default `human`): every step it covers is refused where
+the step is declared, plus a diagnostic on the rule's own line. An `ask` is not an error — an
+approval is a thing the run does. A rule naming an environment decides only that environment, so
+`never: deploy prod` never refuses every deploy; `keepshipping policy explain` shows it per env.
+
+**A rule for an action nothing does is a warning** (`KS0404`): a `can:` or `before:` rule no step can
+produce binds nothing. Only verbs a step kind *can* produce are warned about (`destroy` once any
+apply step exists, `read secrets` once the file references a secret); a verb no step kind produces
+yet is vocabulary ahead of the step kinds. `never:` is never warned about.
+
+**The effective policy is the baseline ∩ this file** ([ADR 0012](adr/0012-policy-authority.md)): a
+file may only narrow. The org baseline lives outside the repository (`ports::policy::PolicyStore`, no
+adapter yet), so where they disagree the stricter answer wins and the answer records which document
+it came from. **No baseline configured means the effective policy is this file's own** — a
+first-class state, not an error. One hard rule sits outside the intersection: **destroy never
+reaches an agent as an allow**.
 
 ## Types and secrets
 

@@ -31,6 +31,7 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
        keepshipping blocks search <QUERY> [--index URL] [--limit N] [--format human|json]
        keepshipping log [RUN-ID] [--format human|json]
        keepshipping log verify [RUN-ID]
+       keepshipping policy explain [FILE] [--as agent|human|ci] [--env NAME]
        keepshipping lsp";
 
 /// Which subcommand's flags `parse_args` accepts. `--format`, `--all`,
@@ -50,6 +51,7 @@ pub enum Command {
     Fmt,
     Graph,
     BlocksSearch,
+    PolicyExplain,
 }
 
 /// The parsed command line. `path` is the `FILE` argument: the site file —
@@ -124,7 +126,10 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
         repro: false,
         env: None,
         event: None,
-        actor: ActorKind::Human,
+        // `explain` defaults to the actor it exists for: the leash. A file
+        // that says nothing about an agent reads as "ask", and that answer
+        // is the one worth seeing by default.
+        actor: if command == Command::PolicyExplain { ActorKind::Agent } else { ActorKind::Human },
         secrets: false,
         non_interactive: false,
         context: None,
@@ -156,9 +161,21 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
             "--fix" if command == Command::Check => o.fix = true,
             "--repro" if command == Command::Check => o.repro = true,
             "--env" if command != Command::Fmt => o.env = Some(flag_value(&mut rest)?),
-            "--event" if command != Command::Fmt => o.event = Some(flag_value(&mut rest)?),
-            "--actor" if command != Command::Fmt => o.actor = actor_kind(&flag_value(&mut rest)?)?,
-            "--non-interactive" if command != Command::Fmt => o.non_interactive = true,
+            "--event" if command != Command::Fmt && command != Command::PolicyExplain => {
+                o.event = Some(flag_value(&mut rest)?)
+            }
+            // `policy explain` reads the file for one principal and prints
+            // what that principal may do, so `--as` names it rather than
+            // `--actor`: there is nothing to run here.
+            "--as" if command == Command::PolicyExplain => {
+                o.actor = actor_kind(&flag_value(&mut rest)?)?
+            }
+            "--actor" if command != Command::Fmt && command != Command::PolicyExplain => {
+                o.actor = actor_kind(&flag_value(&mut rest)?)?
+            }
+            "--non-interactive" if command != Command::Fmt && command != Command::PolicyExplain => {
+                o.non_interactive = true
+            }
             "--context" if matches!(command, Command::Check | Command::Run) => {
                 o.context = Some(ContextName::parse(&flag_value(&mut rest)?)?)
             }
@@ -191,7 +208,9 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
             // One positional: the site file, the tree with `--all`, or the
             // search text. A second is almost always a typo, not a list to
             // check.
-            file if o.path.is_none() && matches!(command, Command::Check | Command::Run) => {
+            file if o.path.is_none()
+                && matches!(command, Command::Check | Command::Run | Command::PolicyExplain) =>
+            {
                 o.path = Some(file.to_string())
             }
             text if o.query.is_none() && command == Command::BlocksSearch => {

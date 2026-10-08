@@ -1,0 +1,14 @@
+no baseline configured: the effective policy is this file's own policy
+ship.ks — actor: agent, env: prod
+
+step    action         decision       source
+build   build          can            file ship.ks:34
+plan    plan           can            file ship.ks:34
+review  —              not governed   —
+apply   apply          ask @platform  file ship.ks:36
+        destroy prod*  ask @platform  file ship.ks:36
+deploy  deploy prod    ask @platform  file ship.ks:36
+
+* an apply whose plan destroys or replaces anything is a destroy
+
+0 steps ran. Nothing was touched.

@@ -10,12 +10,15 @@ use crate::auto_rule::{self, MISSING_GUARD_HINT, MISSING_GUARD_MESSAGE};
 use crate::catalog::{AFTER, Catalog, StepTypes, WHEN};
 use crate::context::{CheckContext, unmet_steps};
 use crate::format::{self, Formats, Header};
+use crate::policy::{self, BLOCKS, SCRIPTS, SECRETS};
+use crate::ports::policy::{ANY_OBJECT, Disposition};
 use crate::ports::run_context::ActorKind;
 use crate::ports::secrets::SecretRef;
+use crate::step::{ActionClass, ActionKind};
 use crate::types::{self, LiteralFit, Type};
 use crate::workflow::{
-    Condition, ContextTest, Env, NeverRule, Policy, Step, Trigger, TriggerKind, Workflow,
-    implicit_default,
+    AskHandle, Condition, ContextTest, Env, Policy, PolicyRule, Step, Trigger, TriggerKind,
+    Workflow, implicit_default,
 };
 
 /// A checked file: the workflow it declares plus every diagnostic, parser
@@ -245,8 +248,25 @@ pub fn check_with(parse: &ks_lang::Parse, options: &CheckOptions<'_>) -> Checked
 /// the `is` subject of `when: env is prod`.
 const NAMESPACES: [&str; 6] = ["git", "pr", "run", "env", "ci", "secrets"];
 
-const POLICY_VERBS: [&str; 9] =
-    ["check", "build", "test", "plan", "apply", "deploy", "destroy", "publish", "read"];
+const POLICY_VERBS: [&str; 10] =
+    ["check", "build", "test", "plan", "apply", "deploy", "destroy", "publish", "read", "run"];
+
+/// The verbs some step kind can actually produce, and so the only ones the
+/// unused-verb warning is about: the rest of [`POLICY_VERBS`] is vocabulary
+/// ahead of the step kinds, and a file naming one of those binds nothing for a
+/// reason that is not this file's business.
+const PRODUCIBLE_VERBS: [&str; 6] = ["build", "plan", "apply", "deploy", "destroy", "read"];
+
+/// The verbs whose object is fixed rather than an environment: `read secrets`,
+/// `run scripts`, `publish blocks`. Writing `read` with anything else is a
+/// mistake, not an environment the rule names.
+fn fixed_object(verb: &str) -> Option<&'static str> {
+    match verb {
+        "read" => Some(SECRETS),
+        "run" => Some(SCRIPTS),
+        _ => None,
+    }
+}
 
 const TRIGGER_KINDS: [&str; 5] = ["push", "pr", "tag", "manual", "schedule"];
 
@@ -1812,8 +1832,8 @@ impl<'a> Ctx<'a> {
     fn check_policy(&mut self, policy: Entry<'_>) {
         for actor in policy.children() {
             let kind = match actor.key_name() {
-                Some("agents") => Some(ActorKind::Agent),
-                Some("humans") => Some(ActorKind::Human),
+                Some("agents") => ActorKind::Agent,
+                Some("humans") => ActorKind::Human,
                 Some(other) => {
                     let msg = format!("unknown policy subject `{other}`");
                     match suggest(other, &["agents", "humans"]) {
@@ -1833,10 +1853,17 @@ impl<'a> Ctx<'a> {
                 let Some(prop) = p.key_name() else { continue };
                 self.subject = Some(format!("{}.{prop}", actor.key_name().unwrap_or_default()));
                 match prop {
-                    // `never:` rules are retained on the workflow; `can:`
-                    // and `before:` grant and gate, they never forbid.
-                    "never" => self.actions(p, kind),
-                    "can" | "before" => self.actions(p, None),
+                    // Every declaration is retained: `can:` allows, `before:`
+                    // asks, `never:` refuses, and a decision weighs all three
+                    // ([#101](https://github.com/Keep-Shipping/harness/issues/101)).
+                    "can" | "before" | "never" => {
+                        let disposition = match prop {
+                            "can" => Disposition::Allow,
+                            "before" => Disposition::Ask,
+                            _ => Disposition::Never,
+                        };
+                        self.actions(p, kind, disposition);
+                    }
                     "ask" => {
                         if let Some(v) = p.expr() {
                             for item in tuple_items(v) {
@@ -1850,6 +1877,18 @@ impl<'a> Ctx<'a> {
                                             format!("expected `Handle`, got `{}`", w.text()),
                                             "`ask` takes handles, like `@platform`",
                                         );
+                                    }
+                                    Expr::Atom { atom: Atom::Word(w), .. } => {
+                                        // The handles a subject asks are part
+                                        // of what its `before:` rules mean, so
+                                        // they are kept: "ask" with nobody
+                                        // named is still an ask.
+                                        let handle = w.text().trim_start_matches('@').to_string();
+                                        self.policy.ask(AskHandle {
+                                            subject: kind,
+                                            handle,
+                                            span: item.span(),
+                                        });
                                     }
                                     Expr::Atom { .. } => {}
                                     _ => self.err_hint(
@@ -1880,10 +1919,11 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// `can`/`before`/`never`: tuples of `<verb> [<env>]` (`read secrets`).
-    /// `subject` is the actor the rule binds — `Some` only for `never:`,
-    /// whose rules are retained on the workflow for enforcement.
-    fn actions(&mut self, entry: Entry<'_>, subject: Option<ActorKind>) {
+    /// `can`/`before`/`never`: tuples of `<verb> [<object>]`
+    /// (`read secrets`, `deploy prod`, bare `apply`). Every rule is retained
+    /// on the workflow with its disposition, because a decision weighs them
+    /// together ([#101](https://github.com/Keep-Shipping/harness/issues/101)).
+    fn actions(&mut self, entry: Entry<'_>, subject: ActorKind, disposition: Disposition) {
         let Some(e) = entry.expr() else { return };
         for item in tuple_items(e.clone()) {
             let atoms = item.atoms();
@@ -1912,24 +1952,42 @@ impl<'a> Ctx<'a> {
                 });
                 continue;
             }
-            if text == "read" {
+            if text == "publish"
+                && matches!(atoms.get(1), Some(Atom::Word(o)) if o.text() == BLOCKS)
+            {
+                // `publish blocks` names what is published, not where. A
+                // `publish <env>` also parses: publishing somewhere is a real
+                // action, and the two objects are distinguishable by name.
+                self.rule(subject, disposition, text, BLOCKS, item.span());
+                continue;
+            }
+            if let Some(object) = fixed_object(text) {
                 match atoms.get(1) {
-                    Some(Atom::Word(obj)) if obj.text() == "secrets" => {
-                        self.forbid(subject, text, "secrets", item.span());
+                    Some(Atom::Word(obj)) if obj.text() == object => {
+                        self.rule(subject, disposition, text, object, item.span());
                     }
-                    Some(a) => self.err(Code::PolicyAction, a.span(), "`read` takes `secrets`"),
+                    Some(a) => {
+                        self.err(Code::PolicyAction, a.span(), format!("`{text}` takes `{object}`"))
+                    }
                     None => self.err_hint(
                         Code::PolicyAction,
                         verb.node.span(),
-                        "`read` takes `secrets`",
-                        "`read secrets`",
+                        format!("`{text}` takes `{object}`"),
+                        format!("`{text} {object}`"),
                     ),
                 }
                 continue;
             }
-            let Some(Atom::Word(env)) = atoms.get(1) else { continue };
+            // A verb with no object names one action whatever the
+            // environment, so the rule is kept against `*` — a `can: apply`
+            // is a real grant, and dropping it would make the file's policy
+            // answer a question nobody asked.
+            let Some(Atom::Word(env)) = atoms.get(1) else {
+                self.rule(subject, disposition, text, ANY_OBJECT, item.span());
+                continue;
+            };
             let name = env.text();
-            self.forbid(subject, text, name, item.span());
+            self.rule(subject, disposition, text, name, item.span());
             if self.env_names.iter().any(|e| e == name) {
                 continue;
             }
@@ -1953,16 +2011,22 @@ impl<'a> Ctx<'a> {
 
     // --- graph ------------------------------------------------------------
 
-    /// Retains a `never:` rule when the entry declares one for a subject.
-    fn forbid(&mut self, subject: Option<ActorKind>, verb: &str, object: &str, span: Span) {
-        if let Some(subject) = subject {
-            self.policy.forbid(NeverRule {
-                subject,
-                verb: verb.to_string(),
-                object: object.to_string(),
-                span,
-            });
-        }
+    /// Retains one `policy:` rule on the workflow.
+    fn rule(
+        &mut self,
+        subject: ActorKind,
+        disposition: Disposition,
+        verb: &str,
+        object: &str,
+        span: Span,
+    ) {
+        self.policy.forbid(PolicyRule {
+            subject,
+            verb: verb.to_string(),
+            object: object.to_string(),
+            disposition,
+            span,
+        });
     }
 
     /// A policy check that binds the run's actor: when an agent runs a file
@@ -2008,8 +2072,116 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// A `never:` rule refuses the run at the step that would break it. Keyed
+    /// off the actor being checked, not off `Agent`: `humans: never: apply`
+    /// refuses a human run just as `agents: never: apply` refuses an agent's.
+    ///
+    /// The refusal is the step's, not the run's, so the author sees which line
+    /// to change. An `Ask` is deliberately *not* an error — an approval is a
+    /// thing the run does.
+    fn enforce_step_policy(&mut self) {
+        let Some(actor) = self.actor else { return };
+        let section = policy::section_name(actor);
+        for index in 0..self.steps.len() {
+            let Some(spec) = self.steps[index].spec else { continue };
+            let class = spec.action();
+            let Some(decision) = policy::decide(&self.policy, None, actor, &class) else {
+                continue;
+            };
+            if decision.disposition != Disposition::Never {
+                continue;
+            }
+            let (name, span) = {
+                let step = &self.steps[index];
+                (step.name.clone(), step.span)
+            };
+            let (verb, object) = policy::action_of(&class).expect("a class that decided");
+            let written =
+                if object == ANY_OBJECT { verb.to_string() } else { format!("{verb} {object}") };
+            self.push(
+                Diagnostic::error(
+                    Code::PolicyForbidden,
+                    span,
+                    format!(
+                        "policy forbids {section} from {class}, but this run has a `{}` step",
+                        spec.name
+                    ),
+                )
+                .with_subject(name)
+                .with_hint(format!("the rule is `policy: {section}: never: {written}`")),
+            );
+            // The rule's own location, so the report shows the line to change.
+            if let Some(rule_span) = decision.rule_span {
+                self.err(
+                    Code::PolicyForbidden,
+                    rule_span,
+                    format!("the rule forbidding `{class}` applies to this run"),
+                );
+            }
+        }
+    }
+
+    /// A verb under `can:` or `before:` that no step in this file can produce
+    /// binds nothing: the rule is a claim about a workflow this file does not
+    /// describe. A warning, not an error — the step that makes it real may
+    /// arrive from a plugin or a later change.
+    ///
+    /// `never:` is never warned about (forbidding what the file does not do is
+    /// defensive policy), nor is a verb no step kind can produce *yet* (`test`,
+    /// `run scripts`, `publish blocks`) — that is vocabulary ahead of the step
+    /// kinds, not a claim about this file.
+    fn warn_unused_policy_verbs(&mut self) {
+        // Verbs are tracked apart from objects because an environment is not a
+        // property of a step: any deploy produces `deploy staging`.
+        let mut verbs: HashSet<&str> = HashSet::new();
+        let mut has_apply = false;
+        for step in &self.steps {
+            let Some(spec) = step.spec else { continue };
+            let kind = spec.action().kind;
+            if kind == ActionKind::Apply {
+                has_apply = true;
+            }
+            if let Some((verb, _)) = policy::action_of(&ActionClass::new(kind)) {
+                verbs.insert(verb);
+            }
+        }
+        // An apply whose plan destroys anything *is* a destroy
+        // ([`ActionClass::with_plan_destroys`]), so any apply produces it.
+        if has_apply {
+            verbs.insert("destroy");
+        }
+        // A secret reference produces `read secrets`, which no step kind does.
+        let mut objects: HashSet<String> = HashSet::new();
+        if !self.secret_uses.is_empty() {
+            objects.insert(format!("read {SECRETS}"));
+        }
+        let unused: Vec<PolicyRule> = self
+            .policy
+            .rules()
+            .iter()
+            .filter(|rule| {
+                rule.disposition != Disposition::Never
+                    && PRODUCIBLE_VERBS.contains(&rule.verb.as_str())
+                    && !produced_by(rule, &verbs, &objects)
+            })
+            .cloned()
+            .collect();
+        for rule in unused {
+            self.warn_hint(
+                Code::PolicyUnused,
+                rule.span,
+                format!("no step in this file can `{}`", written_action(&rule)),
+                "a `can:` or `before:` rule binds the action it names; \
+                 drop it, or add the step it is about"
+                    .to_string(),
+            );
+        }
+    }
+
     fn finish_all(mut self) -> Checked {
         self.enforce_actor_policy();
+        self.enforce_step_policy();
+        self.warn_unused_policy_verbs();
         // Approval gating: an approval that shows S runs before every other
         // consumer of S, except steps the approval (transitively) depends on.
         let base: Vec<Edge> = std::mem::take(&mut self.edges);
@@ -2116,6 +2288,25 @@ impl<'a> Ctx<'a> {
 }
 
 // --- helpers ---------------------------------------------------------------
+
+/// Whether this file can perform `rule`'s action at all. A rule naming an
+/// environment or `*` is answered by the verb — the run picks the environment,
+/// not the file. A rule naming a fixed object must match whole, since only one
+/// thing produces it.
+fn produced_by(rule: &PolicyRule, verbs: &HashSet<&str>, objects: &HashSet<String>) -> bool {
+    let fixed = matches!(rule.object.as_str(), SECRETS | SCRIPTS | BLOCKS);
+    if fixed { objects.contains(&written_action(rule)) } else { verbs.contains(rule.verb.as_str()) }
+}
+
+/// A rule as the file spells it: `deploy prod`, or a bare `apply` when the
+/// rule names no object.
+fn written_action(rule: &PolicyRule) -> String {
+    if rule.object == ANY_OBJECT {
+        rule.verb.clone()
+    } else {
+        format!("{} {}", rule.verb, rule.object)
+    }
+}
 
 fn member_error(c: &mut Ctx<'_>, ns: &str, name: &str, members: &[&str], span: Span) {
     match suggest(name, members) {

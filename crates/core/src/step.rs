@@ -184,6 +184,25 @@ impl ActionClass {
         self.env = Some(env.into());
         self
     }
+
+    /// The class this action really is, given what the plan it acts on would
+    /// do ([#101](https://github.com/Keep-Shipping/harness/issues/101)).
+    ///
+    /// An [`ActionKind::Apply`] whose plan destroys anything — a replacement
+    /// counts, since a replace is a delete followed by a create — is a
+    /// [`ActionKind::Destroy`], and the environment is kept so `apply` in
+    /// `prod` still reads as what it acts on.
+    ///
+    /// Everything else is returned unchanged, including a destroy that stays a
+    /// destroy: the count cannot make an apply more destructive than a destroy
+    /// already is, and the file's `before: destroy` rule must keep matching it.
+    #[must_use]
+    pub fn with_plan_destroys(self, destroys: usize) -> ActionClass {
+        match self.kind {
+            ActionKind::Apply if destroys > 0 => ActionClass { kind: ActionKind::Destroy, ..self },
+            _ => self,
+        }
+    }
 }
 
 impl fmt::Display for ActionClass {

@@ -21,6 +21,7 @@ mod fmt;
 mod github_actions_run_context;
 mod graph;
 mod log;
+mod policy;
 mod progress;
 mod render;
 mod run_log;
@@ -64,6 +65,7 @@ fn dispatch() -> ExitCode {
         Some("fmt") => fmt::fmt(&args[1..]),
         Some("graph") => graph::graph(&args[1..]),
         Some("blocks") => blocks::blocks(&args[1..]),
+        Some("policy") => policy::policy(&args[1..]),
         Some("lsp") => ks_lsp::serve(),
         Some("log") => log::log(&args[1..]),
         _ => {

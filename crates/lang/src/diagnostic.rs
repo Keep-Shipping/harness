@@ -120,6 +120,8 @@ pub enum Code {
     PolicyAction,
     /// A `never:` rule refuses this run before it starts.
     PolicyForbidden,
+    /// A `can:` or `before:` rule names an action no step in the file can do.
+    PolicyUnused,
     /// A secret interpolated into a string, where it could leak.
     SecretInString,
     /// A secret passed to `show:`, which displays it.
@@ -164,6 +166,7 @@ impl Code {
             Code::PolicyDecl => "KS0401",
             Code::PolicyAction => "KS0402",
             Code::PolicyForbidden => "KS0403",
+            Code::PolicyUnused => "KS0404",
             Code::SecretInString => "KS0501",
             Code::SecretShown => "KS0502",
             Code::OptionalAbsent => "KS0601",
@@ -199,6 +202,7 @@ impl Code {
         Code::PolicyDecl,
         Code::PolicyAction,
         Code::PolicyForbidden,
+        Code::PolicyUnused,
         Code::SecretInString,
         Code::SecretShown,
         Code::OptionalAbsent,

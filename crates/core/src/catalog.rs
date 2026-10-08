@@ -7,7 +7,7 @@ use std::fmt;
 
 use crate::harness::Harness;
 use crate::ports::script_host::{Value, ValueType};
-use crate::step::{StepCapabilities, StepSchema, TypeRef};
+use crate::step::{ActionClass, ActionKind, StepCapabilities, StepSchema, TypeRef};
 use crate::types::{self, Type};
 
 /// One step kind's contract as the checker reads it: the input types values
@@ -50,6 +50,15 @@ impl StepTypes {
     /// The declared type of output `name`.
     pub(crate) fn output(&self, name: &str) -> Option<&Type> {
         self.outputs.iter().find(|(n, _)| n == name).map(|(_, ty)| ty)
+    }
+
+    /// What a run of this step kind is, for policy
+    /// ([#101](https://github.com/Keep-Shipping/harness/issues/101)): the
+    /// kind's name through [`action_kind`], with no environment — the
+    /// catalog does not know which environment a run selected.
+    #[must_use]
+    pub fn action(&self) -> ActionClass {
+        ActionClass::new(action_kind(&self.name))
     }
 
     /// The input names a value could be meant for, the reserved ones
@@ -324,6 +333,29 @@ impl Catalog {
     pub(crate) fn rationale(&self, want: &Type) -> Option<&'static str> {
         let Type::Named(name) = want else { return None };
         self.types.iter().find(|(n, _)| *n == name.as_str()).and_then(|(_, r)| *r)
+    }
+}
+
+/// The action class a catalog step kind name stands for
+/// ([#101](https://github.com/Keep-Shipping/harness/issues/101)).
+///
+/// One table, in one place, so the checker, the docs renderer and any caller
+/// asking "what does this step *do* under policy?" cannot disagree: a step kind
+/// whose classification exists in two places is a policy that answers two
+/// different questions.
+///
+/// Everything not named is [`ActionKind::Other`], which is the safe answer:
+/// `Other` is not policy-governed, so a step kind nobody has classified is
+/// never refused on a guess. `approval` and `decide` are deliberately in it —
+/// an approval step *is* the ask, and gating it on itself would be circular.
+#[must_use]
+pub fn action_kind(kind: &str) -> ActionKind {
+    match kind {
+        "oci.image" | "oci.artifact" => ActionKind::Build,
+        "tofu.plan" => ActionKind::Plan,
+        "tofu.apply" => ActionKind::Apply,
+        "k8s.rollout" => ActionKind::Deploy,
+        _ => ActionKind::Other,
     }
 }
 
