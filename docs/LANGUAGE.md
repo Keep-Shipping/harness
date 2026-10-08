@@ -281,6 +281,68 @@ and suggests `--skip <step>` or `--until <earlier step>`; checked with
 such a step unless `--allow-partial` is passed. This warning covers the step
 property; an environment's `ci-only:` is not part of it.
 
+**`rollback:` under a step** says what a deploy does when it does not come up
+healthy. Like `ci-only:` it is a reserved step property, read with the
+declaration rather than as an input a step kind has to declare. It takes one
+of three values: `auto` (the default — revert to the last known-good version
+without asking), `manual` (stop the run and wait for a human; nothing has
+changed yet), and `none` (never revert — the step leaves the failed state as
+it is, for a human or for a later step).
+
+It only matters for a step whose action is `deploy`, and only when that step
+failed or timed out. A build that fails has nothing to revert, and a deploy
+that came up healthy has nothing to undo.
+
+A rollback is its own run-log event, `step.rolled-back`, not a field on
+`step.finished`. It carries the policy, the status — `reverted`, `failed`,
+`pending` or `unsupported` — and the version traffic actually went back to.
+That version is the target's own answer, not what the caller meant to revert
+to: a rollback that could not finish records its reason and no version, because
+no version was reached. `pending` and `unsupported` are different claims.
+`pending` means a person is being asked, under a `manual` policy: nothing has
+changed yet and a rollback is outstanding. `unsupported` means the runner has no
+rollback facility for that step at all, so it did not try — no version, no
+reason, and nobody waiting. The vocabulary is `ks_core::step::RollbackPolicy`
+and `ks_core::step::Rollback`.
+
+`rollback:` is specified here and reserved for the executor. `check` carries
+the key in its reserved step-property list, so a file that spells it under a
+step is no longer refused as an unknown input, and it checks the value against
+the three policies above — anything else is a type error (`KS0101`), quoted or
+in a list just as much as a word the policies do not name. What it parses it
+puts on the step, and the plan carries it from there to the executor: a file
+that says `rollback: manual` is run as `manual`.
+
+**A rollback never covers infrastructure.** A failed deploy after a successful
+`tofu.apply` does **not** roll the infrastructure back. `tofu.apply` is its
+own step: it has its own plan, it carries its own approval, and whatever it
+created — a cluster, a bucket, a database — exists once it has returned. A
+deploy step that failed cannot know how to reverse any of that, and does not
+try: what a deploy reverted is the version it deployed, and infrastructure is
+not part of that. Tearing it down on the way out would destroy whatever the
+next deploy expects to find, which is a worse failure than the one being
+handled.
+
+So say `rollback: none` on the deploy and put the teardown in a separate step
+of its own, behind its own `when:` and its own approval — a step whose kind is
+whatever your target calls a destroy. The operator then decides when
+infrastructure comes down, from a step that says what it does, instead of a
+deploy step pretending to undo something it never created.
+
+**Data is not rolled back either.** A database restore rewinds every write
+since the snapshot, customers' included, so it is not a thing an automated
+path may do. A step that touches data declares `rollback: manual`, which stops
+the run and asks rather than reverting; `none` is right when the write itself
+cannot be rewound. Either way the run log says what the step declared and what
+the harness did about it, and nothing was changed. `manual` records a
+`pending` rollback with no version, so a reader can see a human is being
+consulted and no code is being reverted; `none` records no rollback at all,
+because none was ever begun, and the step's own failure is the whole of the
+record. What the log does not yet carry is the restore point itself:
+recording where a human can rewind the data to is not implemented, so
+the log tells a reader that a restore is outstanding and leaves them to take it
+from the target's own tooling.
+
 **Ordering without data.** `after:` is a reserved input on every step, like
 `when:`. It takes one step name or a list of them, bare or quoted (`after:
 review`, `after: "review"`, `after: build, apply`), and adds the edges

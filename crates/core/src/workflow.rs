@@ -7,7 +7,7 @@ use ks_lang::Span;
 
 use crate::ports::policy::{ANY_OBJECT, Disposition};
 use crate::ports::run_context::ActorKind;
-use crate::step::ActionClass;
+use crate::step::{ActionClass, RollbackPolicy};
 
 /// One `on:` trigger.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +56,11 @@ pub struct Step {
     /// the run will get, whether the file spelled it or the block declared
     /// it. Empty for any other step.
     pub block_inputs: BTreeMap<String, String>,
+    /// The `rollback:` policy the step declared, or [`RollbackPolicy::Auto`]
+    /// when it declared none ([#78](https://github.com/Keep-Shipping/harness/issues/78)).
+    /// The executor reads this: it is the only place the file's answer lives
+    /// once the workflow exists.
+    pub rollback: RollbackPolicy,
     /// The `when:` condition, when the step declares one. The planner reads
     /// it: a condition that names no step is settled before the run starts,
     /// one that reads step outputs cannot be.

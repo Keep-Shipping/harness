@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime};
 
 use ks_core::ports::BoxFuture;
 use ks_core::ports::clock::Clock;
-use ks_core::step::{ActionKind, CancellationToken};
+use ks_core::step::{ActionKind, CancellationToken, Rollback, RollbackPolicy};
 
 /// A step failed or ran out of time: exit 1, the code `check` has always used.
 pub const EXIT_FAILED: u8 = 1;
@@ -97,15 +97,19 @@ impl Retry {
 }
 
 /// One step of a plan, as the planner handed it over: identity, kind, what has to be done
-/// first, and how long it may take.
+/// first, what a lost deploy does about it, and how long it may take.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedStep {
     /// Unique within the run; what `needs` refers to.
     pub id: String,
     /// The step kind, e.g. `"tofu.apply"`. Only the name is read, for the retry rule.
     pub kind: String,
-    /// What kind of thing it does: picks the default timeout and the rollback rule.
+    /// What kind of thing it does: picks the default timeout.
     pub action: ActionKind,
+    /// What a deploy that did not land does about it — see [`rollback`](PlannedStep::rollback).
+    /// Defaults to [`RollbackPolicy::Auto`], so a plan that says nothing still goes back to the
+    /// last known-good version.
+    pub rollback: RollbackPolicy,
     /// Ids of steps that must have succeeded first. Each names an *earlier* step.
     pub needs: Vec<String>,
     /// This step's own cap, overriding the per-action default; the run's remaining time caps it
@@ -125,11 +129,20 @@ impl PlannedStep {
             id: id.into(),
             kind: kind.into(),
             action,
+            rollback: RollbackPolicy::default(),
             needs: Vec::new(),
             timeout: None,
             retry: None,
             idempotent: false,
         }
+    }
+
+    /// Sets what this step does when a deploy of it does not land: revert on its own, ask a
+    /// human, or leave the failed state alone. Only read for a [`Deploy`](ActionKind::Deploy)
+    /// that failed or timed out.
+    pub fn rollback(mut self, policy: RollbackPolicy) -> PlannedStep {
+        self.rollback = policy;
+        self
     }
 
     pub fn needs<I, S>(mut self, needs: I) -> PlannedStep
@@ -296,8 +309,18 @@ pub struct StepRecord {
     pub finished: Option<SystemTime>,
     /// Why it ended that way: the failure text, or what skipped it.
     pub reason: Option<String>,
-    /// Set only for a `Deploy` that failed or timed out: what rollback said.
-    pub rollback: Option<Result<(), String>>,
+    /// What a `Deploy` that failed or timed out left behind: the [`Rollback`] its
+    /// [`RollbackPolicy`] asked for, with the version traffic went back to when the target named
+    /// one. A runner whose rollback returned `Err` is recorded as [`Rollback::failed`] with that
+    /// reason — the rollback was attempted and did not finish, and the target is still serving the
+    /// version that failed. A runner with no rollback at all records [`Rollback::unsupported`],
+    /// which is not the same as [`Rollback::pending`]: nothing was attempted, and nobody is
+    /// waiting.
+    ///
+    /// `None` for every step that did not lose, and for a lost deploy whose policy is
+    /// [`RollbackPolicy::None`]: nothing was attempted there and nothing is waiting, which is not
+    /// what a [`RollbackPolicy::Manual`] deploy leaves behind.
+    pub rollback: Option<Rollback>,
 }
 
 /// A plan the executor will not run.
@@ -342,11 +365,28 @@ pub trait StepRunner: Send + Sync {
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Attempt>;
 
-    /// Undoes a `Deploy` that failed or timed out. The default does nothing: rollback needs an
+    /// Undoes a `Deploy` that failed or timed out, and reports **where traffic went** — not
+    /// merely that a rollback was tried. The two deploy targets answer the same question
+    /// differently: [`Cluster::rollback`](ks_core::ports::cluster::Cluster::rollback) names a
+    /// revision it went back to,
+    /// [`FunctionHost::rollback`](ks_core::ports::function_host::FunctionHost::rollback) names a
+    /// version, and the run log records which one the target actually reached.
+    ///
+    /// `Err` is a rollback that was attempted and could not finish, which the executor keeps on
+    /// the step as [`Rollback::failed`]; the caller keeps the message.
+    ///
+    /// The default reports [`Rollback::unsupported`] and does nothing: rollback needs an
     /// environment to talk to, which lands with the adapters
-    /// ([#78](https://github.com/Keep-Shipping/harness/issues/78)).
-    fn rollback<'a>(&'a self, _step: &'a PlannedStep) -> BoxFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
+    /// ([#78](https://github.com/Keep-Shipping/harness/issues/78)). A runner with no rollback
+    /// facility says so rather than pretending a revert happened or that a human is waiting — it
+    /// reached no version, it did not try, so there is no failure to report, no version to invent
+    /// and nobody to page. That is what `unsupported` names, and it is deliberately not
+    /// [`Rollback::pending`], which means a rollback is outstanding and awaiting a person: this
+    /// runner has no rollback outstanding at all. A runner that *did* try and could not finish
+    /// overrides this with [`Rollback::failed`] and its own reason, rather than letting a no-op
+    /// speak for it.
+    fn rollback<'a>(&'a self, _step: &'a PlannedStep) -> BoxFuture<'a, Result<Rollback, String>> {
+        Box::pin(async { Ok(Rollback::unsupported()) })
     }
 }
 
@@ -560,10 +600,30 @@ async fn run_one(
         }
     };
 
-    // A deploy that did not land gets rolled back, whatever else the run does next.
+    // A deploy that did not land is rolled back — or deliberately not — as its own policy says,
+    // whatever else the run does next.
     let lost = matches!(status, StepStatus::Failed | StepStatus::TimedOut);
     let rollback = match step.action == ActionKind::Deploy && lost {
-        true => Some(runner.rollback(step).await),
+        true => match step.rollback {
+            RollbackPolicy::Auto => Some(match runner.rollback(step).await {
+                Ok(reported) => reported,
+                // The rollback was attempted and did not finish. The target is still on the
+                // version that failed, and the record has to say so rather than swallow it.
+                Err(reason) => Rollback::failed(reason),
+            }),
+            // `manual`: the runner is not called at all — nothing is changed, because a rollback
+            // that rewrites data rewinds every write since, customers' included. The step keeps
+            // the status it has, so the run still stops and dependants still skip; only the
+            // rollback is left to a person. The record says `pending` so the run reads as waiting
+            // on a decision rather than as one that simply stopped.
+            RollbackPolicy::Manual => Some(Rollback::pending()),
+            // `none`: nothing was attempted and nothing is waiting, so there is nothing to
+            // record. The failure that put the target in its bad state is on the step already;
+            // what a rollback would have touched is somebody else's step to say so.
+            RollbackPolicy::None => None,
+        },
+        // Only a deploy that lost has anything to undo: a build that failed changed nothing a
+        // rollback could reach, and a deploy that landed is what the run wanted.
         false => None,
     };
 

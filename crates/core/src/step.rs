@@ -269,6 +269,201 @@ impl ActionKind {
     }
 }
 
+/// What a deploy does when it does not come up healthy
+/// ([#78](https://github.com/Keep-Shipping/harness/issues/78)): one answer that means the same on
+/// every target, so a workflow states its appetite for risk once instead of once per adapter.
+///
+/// [`Auto`](RollbackPolicy::Auto) is the default because a deploy that failed its health gate and
+/// is still serving the bad version is an outage the harness can end on its own, and ending it
+/// sooner than a human can be paged is the whole point of a gate. The other two exist because
+/// auto is the wrong answer for some steps, and the step is the only thing that knows which:
+///
+/// * [`Manual`](RollbackPolicy::Manual) is for a rollback that *rewrites data*. Restoring a
+///   database rewinds every write since the snapshot, customers' included, so no automated path
+///   may take it — the run stops and asks, and the run log says it is waiting.
+/// * [`None`](RollbackPolicy::None) is for a step that creates infrastructure. A deploy that fails
+///   after a successful `tofu.apply` must *not* roll the infrastructure back: the apply already
+///   moved the world, and tearing it down again destroys whatever the next deploy expects to find.
+///   Infrastructure that must not be undone, or must be undone by a different step, says so here
+///   rather than relying on what a rollback would happen to touch.
+///
+/// Deliberately no `Ord`: the three are not a severity ladder — `Manual` is more dangerous than
+/// `Auto` and `None` is a different question — so nothing may sort them and treat the order as
+/// meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackPolicy {
+    /// Revert to the last known-good version without asking.
+    Auto,
+    /// Stop the run and wait for a human; nothing changed yet.
+    Manual,
+    /// Never revert. The step leaves the failed state as it is, for a human or a later step.
+    None,
+}
+
+impl RollbackPolicy {
+    /// The policy's name, as it appears in logs and docs, e.g. `"auto"`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RollbackPolicy::Auto => "auto",
+            RollbackPolicy::Manual => "manual",
+            RollbackPolicy::None => "none",
+        }
+    }
+
+    /// The policy a file's `rollback:` names, or `None` when it names none of the three.
+    ///
+    /// Total in the sense that matters: an unknown spelling is [`None`], never
+    /// [`Auto`](RollbackPolicy::Auto). A guess here would silently re-arm the
+    /// automatic rollback the file was written to turn off, which is the one
+    /// answer nobody could notice being wrong. `check` reports the spelling
+    /// before this is ever asked, so `None` here means the checker was not run.
+    pub fn parse(name: &str) -> Option<RollbackPolicy> {
+        match name {
+            "auto" => Some(RollbackPolicy::Auto),
+            "manual" => Some(RollbackPolicy::Manual),
+            "none" => Some(RollbackPolicy::None),
+            _ => None,
+        }
+    }
+}
+
+impl Default for RollbackPolicy {
+    /// [`Auto`](RollbackPolicy::Auto): the safe reading of a deploy that failed its gate.
+    fn default() -> RollbackPolicy {
+        RollbackPolicy::Auto
+    }
+}
+
+impl fmt::Display for RollbackPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Whether a rollback actually happened, could not, or is waiting on someone. A run log needs a
+/// stable name for each so a dashboard can tell "went back" from "asked a human" from "nothing
+/// happened".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackStatus {
+    /// The target went back to a previous version.
+    Reverted,
+    /// The rollback was attempted and did not succeed; the target is still on the bad version.
+    Failed,
+    /// A [`Manual`](RollbackPolicy::Manual) rollback is awaiting a human. Nothing changed.
+    Pending,
+    /// The runner has no way back for this step and did not try: the default `StepRunner::rollback`
+    /// no-op, or a target that has no rollback facility at all.
+    ///
+    /// Distinct from [`Pending`](RollbackStatus::Pending), and the difference is the whole point of
+    /// this variant: `pending` says a human is being consulted and a rollback is outstanding, which
+    /// is what a `manual` policy genuinely means. Nothing here was consulted and nothing is
+    /// outstanding — nobody was paged and no approval channel opened. A run log that records
+    /// `pending` for a runner that has no rollback claims an operator is waiting on one, and the
+    /// combination `policy: "auto", status: "pending"` says a rollback is queued automatically and
+    /// awaiting a human, which nothing can produce.
+    Unsupported,
+}
+
+impl RollbackStatus {
+    /// The status's name, as it appears in the run log, e.g. `"reverted"`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RollbackStatus::Reverted => "reverted",
+            RollbackStatus::Failed => "failed",
+            RollbackStatus::Pending => "pending",
+            RollbackStatus::Unsupported => "unsupported",
+        }
+    }
+}
+
+impl fmt::Display for RollbackStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What a rollback did, and where it left traffic.
+///
+/// One type for both halves because the two deploy targets report different things for the same
+/// event — [`Cluster::rollback`](crate::ports::cluster::Cluster::rollback) hands back a
+/// [`Rollout`](crate::ports::cluster::Rollout) naming a revision,
+/// [`FunctionHost::rollback`](crate::ports::function_host::FunctionHost::rollback) hands back a
+/// version — and the run log has to record where traffic *actually* went, not what the caller
+/// intended to revert to. A caller that recorded its own intent would log a version that a failed
+/// rollback never reached.
+///
+/// Both halves are private so a report cannot claim a reverted-to version it did not observe, and
+/// the fields cannot be set inconsistently: a [`Failed`](RollbackStatus::Failed) rollback carries
+/// its reason and no version, because no version was reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rollback {
+    status: RollbackStatus,
+    reverted_to: Option<String>,
+    reason: Option<String>,
+}
+
+impl Rollback {
+    /// A rollback that went back to `version`.
+    #[must_use]
+    pub fn reverted_to(version: impl Into<String>) -> Rollback {
+        Rollback {
+            status: RollbackStatus::Reverted,
+            reverted_to: Some(version.into()),
+            reason: None,
+        }
+    }
+
+    /// A rollback that was attempted and did not succeed. `reason` is the target's own wording,
+    /// safe to print: the target is still serving the version that failed.
+    #[must_use]
+    pub fn failed(reason: impl Into<String>) -> Rollback {
+        Rollback { status: RollbackStatus::Failed, reverted_to: None, reason: Some(reason.into()) }
+    }
+
+    /// A [`RollbackPolicy::Manual`] rollback that stopped and asked. Nothing was reverted, so there
+    /// is no version and no reason — but the run log must still show that a rollback is waiting on
+    /// a human rather than absent, or the run reads as one that simply stopped.
+    #[must_use]
+    pub fn pending() -> Rollback {
+        Rollback { status: RollbackStatus::Pending, reverted_to: None, reason: None }
+    }
+
+    /// A runner with no way back for this step, which therefore did not try.
+    ///
+    /// Nothing was reached and nothing was learned, so there is no version and no reason — the
+    /// same invariant the other constructors keep, for the same reason. The step still records a
+    /// rollback rather than nothing at all, because "this runner cannot undo it" is a fact about
+    /// the run; what it must never record is a reason, since nothing was attempted that could fail.
+    #[must_use]
+    pub fn unsupported() -> Rollback {
+        Rollback { status: RollbackStatus::Unsupported, reverted_to: None, reason: None }
+    }
+
+    /// The version traffic went back to, when the target reported one. `None` whenever nothing
+    /// was reached — a failed, pending or unsupported rollback has no version, and asking for one
+    /// must not yield the version that failed.
+    ///
+    /// Named `reverted_to_version` because [`Rollback::reverted_to`] builds the value; a getter
+    /// and a constructor cannot share a name.
+    #[must_use]
+    pub fn reverted_to_version(&self) -> Option<&str> {
+        self.reverted_to.as_deref()
+    }
+
+    /// Whether the rollback happened, failed, is waiting on a human, or is not available at all.
+    #[must_use]
+    pub fn status(&self) -> RollbackStatus {
+        self.status
+    }
+
+    /// Why the rollback failed, if it did. Only a [`Failed`](RollbackStatus::Failed) rollback
+    /// carries one; a successful revert's own reason is the version it went to.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+}
+
 /// What a step *needs* from its environment — as the step declares it. Distinct from
 /// [`run_context::Capabilities`](crate::ports::run_context::Capabilities), which is what a run
 /// *has*: the checker refuses (or flags) needs exceeding capabilities before anything executes.
@@ -852,6 +1047,85 @@ mod tests {
             restricted.provided(),
             "cutting down twice changes nothing"
         );
+    }
+
+    #[test]
+    fn rollback_policies_report_their_wire_names_and_default_to_auto() {
+        for policy in [RollbackPolicy::Auto, RollbackPolicy::Manual, RollbackPolicy::None] {
+            assert_eq!(policy.to_string(), policy.as_str(), "{policy:?}");
+        }
+        assert_eq!(RollbackPolicy::Auto.as_str(), "auto");
+        assert_eq!(RollbackPolicy::Manual.as_str(), "manual");
+        assert_eq!(RollbackPolicy::None.as_str(), "none");
+        // A step that says nothing rolls back on its own.
+        assert_eq!(RollbackPolicy::default(), RollbackPolicy::Auto);
+    }
+
+    #[test]
+    fn rollback_policies_parse_their_own_names_and_nothing_else() {
+        for policy in [RollbackPolicy::Auto, RollbackPolicy::Manual, RollbackPolicy::None] {
+            assert_eq!(RollbackPolicy::parse(policy.as_str()), Some(policy), "{policy:?}");
+        }
+        // An unknown spelling is no policy at all, never the default: guessing
+        // `auto` would re-arm the rollback the file was written to turn off.
+        assert_eq!(RollbackPolicy::parse("Auto"), None, "the spelling is exact");
+        assert_eq!(RollbackPolicy::parse("yes"), None);
+        assert_eq!(RollbackPolicy::parse(""), None);
+    }
+
+    #[test]
+    fn a_reverted_rollback_reports_where_traffic_went() {
+        let rollback = Rollback::reverted_to("api-42");
+        assert_eq!(rollback.status(), RollbackStatus::Reverted);
+        assert_eq!(rollback.reverted_to_version(), Some("api-42"));
+        assert_eq!(rollback.reason(), None, "a revert is explained by the version it reached");
+    }
+
+    #[test]
+    fn a_failed_rollback_reports_why_and_no_version() {
+        // The version that failed must not come back out of here: a rollback that did not happen
+        // reached nothing.
+        let rollback = Rollback::failed("revision 3 does not exist");
+        assert_eq!(rollback.status(), RollbackStatus::Failed);
+        assert_eq!(rollback.reason(), Some("revision 3 does not exist"));
+        assert_eq!(rollback.reverted_to_version(), None);
+    }
+
+    #[test]
+    fn a_pending_rollback_is_neither_reverted_nor_explained() {
+        let rollback = Rollback::pending();
+        assert_eq!(rollback.status(), RollbackStatus::Pending);
+        assert_eq!(rollback.reverted_to_version(), None);
+        assert_eq!(rollback.reason(), None);
+    }
+
+    #[test]
+    fn an_unsupported_rollback_reached_nothing_and_learned_nothing() {
+        let rollback = Rollback::unsupported();
+        assert_eq!(rollback.status(), RollbackStatus::Unsupported);
+        assert_eq!(rollback.reverted_to_version(), None, "no version was ever reached");
+        assert_eq!(rollback.reason(), None, "nothing was attempted, so nothing can have failed");
+    }
+
+    #[test]
+    fn an_unsupported_rollback_is_not_a_pending_one() {
+        // The distinction is the whole point of the variant: one says a human is waiting on a
+        // rollback that will happen, the other says no rollback was ever on offer.
+        assert_ne!(Rollback::unsupported(), Rollback::pending());
+        assert_ne!(Rollback::unsupported().status(), Rollback::pending().status());
+    }
+
+    #[test]
+    fn rollback_statuses_report_their_wire_names() {
+        for (status, name) in [
+            (RollbackStatus::Reverted, "reverted"),
+            (RollbackStatus::Failed, "failed"),
+            (RollbackStatus::Pending, "pending"),
+            (RollbackStatus::Unsupported, "unsupported"),
+        ] {
+            assert_eq!(status.as_str(), name);
+            assert_eq!(status.to_string(), name);
+        }
     }
 
     #[test]

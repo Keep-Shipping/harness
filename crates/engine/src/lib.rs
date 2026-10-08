@@ -16,6 +16,7 @@ pub mod oci_image;
 pub mod oci_verify;
 pub mod plan;
 pub mod plan_guard;
+pub mod rollback;
 pub mod run;
 pub mod sched;
 pub mod secrets;
