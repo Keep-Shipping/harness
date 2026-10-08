@@ -1,0 +1,152 @@
+# Keep Shipping on GitLab CI
+#
+# ```yaml
+# include:
+#   - remote: https://raw.githubusercontent.com/Keep-Shipping/harness/main/templates/gitlab/keepshipping.yml
+#
+# variables:
+#   KEEPSHIPPING_SITE_FILE: ship.ks
+#   KEEPSHIPPING_ENVIRONMENT: prod
+# ```
+#
+# `remote:` is the right vehicle, not a CI/CD component: a component is addressed
+# within one instance's own component library, while a template in any public git
+# repository can be included by every instance, self-hosted ones included. Its
+# top-level keys merge into the including pipeline, so the job names below
+# (`keepshipping:*`, a prefix chosen not to collide) become jobs there, and its
+# `variables` can be overridden there. The file is self-contained because a
+# nested `include:local` does *not* resolve against a remote include.
+#
+# What a user edits:
+#   * `KEEPSHIPPING_SITE_FILE` — the `.ks` file to run (default `ship.ks`).
+#   * `KEEPSHIPPING_ENVIRONMENT` — the `env:` name the run picks (default `prod`).
+#   * `KEEPSHIPPING_REV` — what `cargo install --rev` resolves. `--rev` takes any
+#     git revision, so `main`, `v0.1.0` and a commit SHA are written the same way
+#     and one value covers all three; `--branch` is deliberately not used, since it
+#     pins nothing and a moving ref is what makes a verdict unreproducible.
+#
+# Every job that needs an identity declares
+# `id_tokens: KEEP_SHIPPING_ID_TOKEN: { aud: keepshipping }` — the whole of the
+# OIDC story on GitLab: there is no token endpoint, GitLab mints the JWT before
+# the job starts and passes it in as an ordinary variable, and the adapter reads
+# `iss`/`sub` from it (docs/GITLAB_CI.md). `aud` says what the token is *for* and
+# the receiver must agree with it, so a step wanting a cloud credential declares
+# a second `id_tokens:` entry carrying that provider's audience instead.
+
+variables:
+  KEEPSHIPPING_SITE_FILE: "ship.ks"
+  KEEPSHIPPING_ENVIRONMENT: "prod"
+  # REPLACE ME: the 40-character commit SHA of the harness to build. A branch or
+  # a tag is accepted here too, and pins nothing.
+  KEEPSHIPPING_REV: "REPLACE_ME_WITH_A_FULL_40_CHAR_COMMIT_SHA"
+
+stages: [verify, plan, approval, deploy]
+
+.defaults:
+  image: rust:1-bookworm
+  interruptible: true
+
+# Type-checks the site file. Runs on any pipeline with a merge request, a branch
+# or a tag behind it — that is, on every pipeline but a detached one.
+keepshipping:check:
+  stage: verify
+  id_tokens:
+    KEEP_SHIPPING_ID_TOKEN:
+      aud: keepshipping
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+  script:
+    - apt-get update && apt-get install --yes --no-install-recommends pkg-config libssl-dev
+    # `-p ks-cli`: the harness root is a virtual workspace with no `[package]` of
+    # its own, and `keepshipping` also names the crate at `ventures/keepshipping`.
+    - cargo install --locked --git "https://github.com/Keep-Shipping/harness" --rev "$KEEPSHIPPING_REV" -p ks-cli --bin keepshipping
+    - keepshipping check "$KEEPSHIPPING_SITE_FILE" --warnings-as-errors
+
+# Plans and runs the site file, parking at any step that needs a person: it exits
+# 4 (`waiting_for_approval`) once recorded, and `keepshipping:resume` carries it on
+# from the artifact left here.
+keepshipping:plan:
+  stage: plan
+  id_tokens:
+    KEEP_SHIPPING_ID_TOKEN:
+      aud: keepshipping
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+  needs:
+    - job: keepshipping:check
+      artifacts: false
+  script:
+    - apt-get update && apt-get install --yes --no-install-recommends pkg-config libssl-dev
+    - cargo install --locked --git "https://github.com/Keep-Shipping/harness" --rev "$KEEPSHIPPING_REV" -p ks-cli --bin keepshipping
+    - keepshipping run "$KEEPSHIPPING_SITE_FILE" --env "$KEEPSHIPPING_ENVIRONMENT" --non-interactive || [ "$?" = "4" ]
+  artifacts:
+    # The parked run's record is the ticket — `runs/<run>/state.json` and the
+    # run's own log — and `keepshipping:resume` downloads it.
+    when: always
+    expire_in: 1 week
+    paths:
+      - .keepshipping/
+
+# The approval gate: nothing is deployed from a branch, default-branch or tag
+# pipeline until somebody answers. A merge-request pipeline deliberately gets
+# `when: never` below — it is a preview, nothing is deployed from it, and a gate
+# there would only hold the pipeline open.
+#
+# GitLab has two ways to require a person and only one is on every tier: a
+# protected environment's deployment approvals are Premium/Ultimate, while
+# `when: manual` is everywhere, so the free-tier path is the manual job (a
+# Premium project can point this job at a protected environment instead).
+# `allow_failure: false` is the load-bearing part: it makes the manual job a
+# *blocking* one, so the pipeline stays `manual` until somebody clicks play.
+keepshipping:approval:
+  stage: approval
+  when: manual
+  allow_failure: false
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+  # The gate follows the run, so a pipeline cannot offer an approval for a run
+  # that never parked. No artifacts: this job approves, it does not carry on.
+  needs:
+    - job: keepshipping:plan
+      artifacts: false
+  script:
+    # No `git clone` in this template, so the commit is named by the pipeline's
+    # own variable rather than by a repository this job has not fetched.
+    - echo "a person approved ${CI_COMMIT_SHORT_SHA}; resume the parked run from its state"
+
+# Carries the parked run on once the gate is answered: `needs:` brings the plan
+# job's `.keepshipping/` artifact down into this job's directory, and the
+# approval entry is what makes this wait for the gate rather than race it.
+keepshipping:resume:
+  stage: deploy
+  id_tokens:
+    KEEP_SHIPPING_ID_TOKEN:
+      aud: keepshipping
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+  needs:
+    - job: keepshipping:approval
+    - job: keepshipping:plan
+  script:
+    - apt-get update && apt-get install --yes --no-install-recommends pkg-config libssl-dev
+    - cargo install --locked --git "https://github.com/Keep-Shipping/harness" --rev "$KEEPSHIPPING_REV" -p ks-cli --bin keepshipping
+    # `runs pending` lists what is parked here — one line per run, the run id (26
+    # characters) first — and says `nothing is waiting for approval` when the run
+    # finished without parking, which is a queue that needs no resume.
+    - RUN="$(keepshipping runs pending | awk 'length($1) == 26 { print $1; exit }')"
+    - test -n "$RUN" || { echo "nothing is parked, so there is nothing to resume"; exit 0; }
+    # `resume RUN-ID [FILE]` re-checks the binding, the context gate and policy,
+    # then drives what is left. Exit 4 is not a failure: the run is still waiting
+    # — a further approval parked it again, or an agent's run parks until a human
+    # runs `keepshipping approve RUN-ID` — and nothing after the resume ran.
+    - keepshipping resume "$RUN" "$KEEPSHIPPING_SITE_FILE" || [ "$?" = "4" ]
