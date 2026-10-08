@@ -107,6 +107,9 @@ fn keepshipping(dir: &Path, args: &[&str], vars: &[(&str, &str)]) -> (i32, Strin
     for (name, _) in AGENT_TYPICAL_ENV {
         cmd.env_remove(*name);
     }
+    // The organisation baseline too, so an exported `KEEPSHIPPING_*` cannot
+    // change what these tests are about.
+    cmd.env_remove("KEEPSHIPPING_REQUIRE_HUMAN").env_remove("KEEPSHIPPING_AGENTS");
     for (name, value) in vars {
         cmd.env(name, value);
     }

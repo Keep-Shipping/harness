@@ -116,7 +116,13 @@ fn run_in(dir: Option<&std::path::Path>, args: &[&str]) -> (i32, String, String)
     }
     // Check now has a context, detected from the environment: these results
     // must not depend on whether the test itself runs on a CI runner.
-    let out = cmd.env_remove("CI").env_remove("GITHUB_ACTIONS").output().expect("run keepshipping");
+    let out = cmd
+        .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("KEEPSHIPPING_REQUIRE_HUMAN")
+        .env_remove("KEEPSHIPPING_AGENTS")
+        .output()
+        .expect("run keepshipping");
     (
         out.status.code().expect("exit code"),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -213,6 +219,8 @@ fn no_colour_reaches_the_output_without_a_terminal() {
         .env("NO_COLOR", "1")
         .env_remove("CI")
         .env_remove("GITHUB_ACTIONS")
+        .env_remove("KEEPSHIPPING_REQUIRE_HUMAN")
+        .env_remove("KEEPSHIPPING_AGENTS")
         .output()
         .expect("run keepshipping");
     let _ = std::fs::remove_file(&path);

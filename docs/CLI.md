@@ -14,7 +14,8 @@ implemented end to end today; `run` is not.
   by `--dry-run`; no step is handed one yet. With `--only STEP` it names the inputs for one script
   step — see [DIAGNOSTICS.md](DIAGNOSTICS.md) for the grammar.
   Execution is not wired to the CLI yet: the planner and executor exist in `ks-engine` and
-  `run` will hand them the plan.
+  `run` will hand them the plan. What `--as` means when it is left out is in
+  [Who the run thinks it is](#who-the-run-thinks-it-is).
 - `keepshipping blocks search <QUERY>` — search the metadata-only blocks index (`--index URL` or
   `KEEPSSHIPPING_BLOCKS_INDEX`, `--limit N`, `--offline`, `--format human|json`). It asks the
   index; it never downloads a block.
@@ -45,6 +46,41 @@ There is **no `--as` flag** on `approve` or `deny`. The approver named in the st
 the environment's own (`$USER`, then `$USERNAME`, then `local`): a label for the run log, not a
 credential. An approver that could be named on the command line is one an agent could name too,
 which is what the approval port exists to prevent.
+
+## Who the run thinks it is
+
+`--as` is a declaration, and detection is what backs it up. A local run with no `--as` is read
+from its environment: any known agent marker (`CLAUDECODE`, `CURSOR_AGENT`, `GEMINI_CLI`,
+`CODEX_SANDBOX`, …) says an agent, and a run with no terminal that also flattens the interactive
+tools (`TERM=dumb`, `PAGER=cat`, `GIT_EDITOR=true`, …) is an agent too. Otherwise it is a human.
+Detection only ever escalates — it never pulls a declared `human` or `ci` back down to an agent — so
+guessing wrong costs a prompt rather than a run.
+
+A local run is never CI, however much its environment insists: `CI` and `GITHUB_ACTIONS` only
+choose the run *context* (which environments a run may reach) and mean there is no terminal to ask
+at. `--as ci` is a declaration, and only an adapter that verified an OIDC token may establish a CI
+identity on evidence.
+
+An organisation can say more about who runs on its machines, with two variables:
+
+| Variable | Meaning |
+|---|---|
+| `KEEPSHIPPING_AGENTS` | comma-separated GitHub logins that are agents, beyond the `[bot]` accounts GitHub marks itself — `ada-bot,claude-ci`. Each is trimmed and compared case-insensitively; an empty entry is ignored. **Not yet in the run path.** It is read only by the GitHub Actions run-context adapter, which is built and tested but not yet wired into `run` (#150), so today it parses, is tested, and changes nothing about a run. |
+| `KEEPSHIPPING_REQUIRE_HUMAN` | `1`, `true`, `yes` or `y` (any case) turns it on: a local run is a human only if it passes `--as human` **and** confirms it at a terminal. `0`, `false`, `no`, and anything else — including a value it cannot parse — leaves it off; the variable never fails a run. |
+
+**What detection is not.** On a laptop, a process running with the developer's credentials can do
+what the developer can. Detection is best-effort: a marker can be unset, a flag can be omitted, and
+either variable above can be `unset` by the very process it was set for. This policy protects the
+pipeline and the repository; it does not protect the machine it was typed on, and it was never a
+substitute for that.
+
+Where an *unattended* or CI run is concerned, separate approval is the control that survives, and
+it survives because the approver is a different process on a different machine: an agent's run parks
+([below](#parking-and-resuming)) and waits for `keepshipping approve` instead of answering its own
+prompt. On a laptop that same process can run `keepshipping approve` too — `approve` consults no
+actor, no baseline and no terminal, and an approval made in a shell is an approval by whoever holds
+that shell. So parking raises the cost of an unattended run rather than establishing a floor under
+an agent that is sitting at the keyboard.
 
 Each successful online search is cached under `$XDG_CACHE_HOME/keepshipping/blocks` (or
 `$HOME/.cache/keepshipping/blocks`), keyed by index URL, query and limit; a search that fails
@@ -220,7 +256,17 @@ timeout, so carrying on is a *new* job. Two kinds of run park, and the record sa
 - **an agent's run** (`--as agent`, or detected) parks at its first approval, because an agent may
   not answer its own. `resume` will not answer it: a human runs `keepshipping approve <run>`, and
   `resume` then carries on past the recorded answer. Nor does a resume an agent is running answer
-  anything — it exits 4 and says who can.
+  anything — it exits 4 and says who can. This is the control that holds where `--as` cannot, but
+  only where the run is unattended or in CI: the approver is then a different process on a
+  different machine. On a laptop the same process can run `keepshipping approve` as easily
+  ([above](#who-the-run-thinks-it-is)).
+
+**`KEEPSHIPPING_REQUIRE_HUMAN` and resuming.** `resume` decides who is resuming under the same
+baseline, and it declares nothing: with the switch on, *every* resumer counts as an agent, a person
+at a terminal included. A human resuming under `KEEPSHIPPING_REQUIRE_HUMAN=1` therefore also gets
+exit 4 and the "an agent is resuming it" refusal. That is deliberate — the switch cannot tell a
+person from an agent impersonating one, so it fails closed — but it does mean the switch is not
+something to leave exported for a whole shell. Unset it to resume by hand.
 
 At a terminal a person's run still asks, and a typed `n` declines; a person watching is not a park.
 Once step kinds are built in, a run nobody is watching ends like this:

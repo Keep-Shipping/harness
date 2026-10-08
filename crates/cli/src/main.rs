@@ -130,16 +130,15 @@ fn run(args: &[String]) -> ExitCode {
     let path = o.path.as_deref().unwrap_or("ship.ks");
     let context = context_of(&o);
     // Who is running this, decided once from the declaration, the environment
-    // and the organisation's baseline — the latter an empty one until the
-    // PolicyStore port has an adapter to load it from.
-    let actor = actor::for_run(
-        o.declared,
-        o.actor_name.as_deref(),
-        interactive(&o),
-        &actor::ActorBaseline::default(),
-    );
-    // Detection only ever escalates to an agent; it never pulls a declared
-    // `human` or `ci` back down to one.
+    // and the organisation's baseline — the latter whatever this environment
+    // declares in `KEEPSHIPPING_AGENTS` / `KEEPSHIPPING_REQUIRE_HUMAN`. A
+    // stored `PolicyStore` baseline is still to come; until then the
+    // environment is the only place an organisation can speak.
+    let baseline = actor::ActorBaseline::from_env(&std::env::vars().collect());
+    let actor = actor::for_run(o.declared, o.actor_name.as_deref(), interactive(&o), &baseline);
+    // Detection alone only ever escalates to an agent; it never pulls a
+    // declared `human` or `ci` back down to one. A baseline that requires a
+    // human is the other half and may escalate either.
     let actor_kind = if actor.kind == ActorKind::Agent { ActorKind::Agent } else { o.actor };
     let is_agent = actor_kind == ActorKind::Agent;
     let site = match check::load(Path::new(path), path, actor_kind, o.path.is_none(), context) {

@@ -54,7 +54,13 @@ fn run(name: &str, src: &str, args: &[&str]) -> (i32, String, String) {
     cmd.args(args).arg(&path);
     // The environment under test is the one these tests describe, not the one
     // they happen to run in.
-    let out = cmd.env_remove("CI").env_remove("GITHUB_ACTIONS").output().expect("run keepshipping");
+    let out = cmd
+        .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("KEEPSHIPPING_REQUIRE_HUMAN")
+        .env_remove("KEEPSHIPPING_AGENTS")
+        .output()
+        .expect("run keepshipping");
     let _ = std::fs::remove_file(&path);
     (
         out.status.code().expect("exit code"),
@@ -75,6 +81,8 @@ fn the_hero_file_with_a_script_step_checks_clean() {
         .arg("check")
         .current_dir(HERO)
         .env_remove("CI")
+        .env_remove("KEEPSHIPPING_REQUIRE_HUMAN")
+        .env_remove("KEEPSHIPPING_AGENTS")
         .output()
         .expect("run keepshipping");
     assert_eq!(out.status.code().expect("exit code"), 0);

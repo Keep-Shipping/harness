@@ -3,9 +3,10 @@
 //!
 //! The decision lives in the port
 //! ([`detect_local_actor`]);
-//! this module supplies it with the organisation's [`ActorBaseline`] and the
-//! one thing the port cannot supply — a person confirming, at a terminal, that
-//! they are one. Guessing "agent" costs a prompt, never a run.
+//! this module supplies it with the organisation's [`ActorBaseline`] — read
+//! from [`ActorBaseline::from_env`], the `KEEPSHIPPING_`-prefixed environment
+//! — and the one thing the port cannot supply — a person confirming, at a
+//! terminal, that they are one. Guessing "agent" costs a prompt, never a run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Write};
@@ -17,6 +18,12 @@ use ks_core::ports::run_context::{
 /// The prompt the baseline puts to a terminal before it calls somebody a
 /// human, in the same lowercase register as the rest of the CLI's questions.
 const CONFIRM_PROMPT: &str = "this baseline needs a person: are you a human? [y/N] ";
+
+/// The GitHub logins the organisation declares are agents, comma-separated.
+const AGENTS_ENV: &str = "KEEPSHIPPING_AGENTS";
+/// The switch that says a local run is a human only if it says so and proves
+/// it at a terminal.
+const REQUIRE_HUMAN_ENV: &str = "KEEPSHIPPING_REQUIRE_HUMAN";
 
 /// The value of `--as`: a kind, plus the agent's name when the invocation gave
 /// one (`agent:<name>`). Only `agent` takes a name, and only a non-empty one;
@@ -35,6 +42,19 @@ pub fn parse_as(text: &str) -> Option<(ActorKind, Option<String>)> {
 
 /// The actor half of an organisation baseline: what the organisation declares
 /// about agents, and how hard it wants to be about people.
+///
+/// Two variables carry it, both `KEEPSHIPPING_`-prefixed and read by
+/// [`from_env`](ActorBaseline::from_env):
+///
+/// - `KEEPSHIPPING_AGENTS` — comma-separated GitHub logins the organisation
+///   declares are agents, beyond the `[bot]` accounts GitHub marks itself.
+///   Each is trimmed; an empty one is dropped.
+/// - `KEEPSHIPPING_REQUIRE_HUMAN` — `1`, `true`, `yes` or `y` (any case,
+///   trimmed) sets `require_human`; `0`, `false` and `no` (and anything it
+///   cannot parse) leave it off.
+///
+/// Both are hints about who is running, not security controls: neither can
+/// keep out a process that has simply unset them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActorBaseline {
     /// GitHub logins the organisation declares are agents, beyond the ones
@@ -43,6 +63,32 @@ pub struct ActorBaseline {
     /// When set, a local run is a human only if it asserts `--as human` *and*
     /// confirms it on a terminal; everything else is an agent.
     pub require_human: bool,
+}
+
+impl ActorBaseline {
+    /// The baseline this environment describes.
+    ///
+    /// Pure in its argument, so the whole of it is testable without touching
+    /// the real environment, and it never fails: a variable that is unset or
+    /// that says something it cannot parse is not worth stopping a run over —
+    /// the worst it costs is a run that is called a human when nobody set the
+    /// baseline, which is exactly what happened before it existed.
+    pub fn from_env(env: &BTreeMap<String, String>) -> ActorBaseline {
+        let agents = env
+            .get(AGENTS_ENV)
+            .map(|listed| listed.split(',').map(str::trim).filter(|login| !login.is_empty()))
+            .into_iter()
+            .flatten()
+            .map(str::to_string)
+            .collect();
+        // `y` is accepted because it is what [`confirm_human`]'s prompt teaches
+        // a person to type; a user exporting the answer they were just asked
+        // for should not silently get no protection.
+        let require_human = env.get(REQUIRE_HUMAN_ENV).is_some_and(|value| {
+            matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "y")
+        });
+        ActorBaseline { agents, require_human }
+    }
 }
 
 /// Decides who a local run is.
@@ -252,5 +298,79 @@ mod tests {
         // The list is the baseline's alone: the same login under an empty one
         // is a person.
         assert!(!is_agent_account("ada-bot", Some("User"), &ActorBaseline::default()));
+    }
+
+    /// An environment carrying nothing the baseline reads.
+    fn env_with(vars: &[(&str, &str)]) -> BTreeMap<String, String> {
+        vars.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect()
+    }
+
+    #[test]
+    fn an_unset_baseline_is_the_empty_one() {
+        // Both variables absent, and both present-but-empty, say the same
+        // thing: the organisation has declared nothing.
+        for env in [BTreeMap::new(), env_with(&[(AGENTS_ENV, ""), (REQUIRE_HUMAN_ENV, "")])] {
+            assert_eq!(ActorBaseline::from_env(&env), ActorBaseline::default(), "{env:?}");
+        }
+        // A variable it does not read is not a baseline either.
+        let unrelated = env_with(&[("SOME_OTHER_AGENTS", "ada-bot"), ("CI", "true")]);
+        assert_eq!(ActorBaseline::from_env(&unrelated), ActorBaseline::default(), "{unrelated:?}");
+    }
+
+    #[test]
+    fn the_declared_agents_are_a_trimmed_list_with_the_empty_ones_dropped() {
+        let baseline = ActorBaseline::from_env(&env_with(&[(
+            AGENTS_ENV,
+            " ada-bot , ,Claude-Bot,,another ,",
+        )]));
+        assert_eq!(
+            baseline.agents,
+            BTreeSet::from([
+                "ada-bot".to_string(),
+                "Claude-Bot".to_string(),
+                "another".to_string()
+            ])
+        );
+        assert!(!baseline.require_human);
+        // Stored as written: `is_agent_account` is what compares, case-insensitively.
+        assert!(is_agent_account("ada-BOT", None, &baseline));
+        // Nothing but commas is no agents at all.
+        let blank = ActorBaseline::from_env(&env_with(&[(AGENTS_ENV, " , , ")]));
+        assert_eq!(blank, ActorBaseline::default());
+    }
+
+    #[test]
+    fn only_a_plain_yes_switches_the_requirement_on() {
+        // (value, does it set the requirement?)
+        let cases = [
+            ("1", true),
+            ("true", true),
+            ("TRUE", true),
+            ("yes", true),
+            ("Yes", true),
+            ("  yEs  ", true),
+            // The prompt says `[y/N]`, so `y` is the answer it teaches.
+            ("y", true),
+            ("Y", true),
+            ("0", false),
+            ("false", false),
+            ("no", false),
+            // Nothing it can parse is nothing it can refuse a run over.
+            ("maybe", false),
+            ("", false),
+            ("2", false),
+            ("true false", false),
+        ];
+        for (value, expected) in cases {
+            let env = env_with(&[(REQUIRE_HUMAN_ENV, value)]);
+            assert_eq!(ActorBaseline::from_env(&env).require_human, expected, "{value:?}");
+        }
+        // Unset is unset, and neither spelling reads the other's variable.
+        assert!(!ActorBaseline::from_env(&BTreeMap::new()).require_human);
+        let agents_only = ActorBaseline::from_env(&env_with(&[(AGENTS_ENV, "ada-bot")]));
+        assert_eq!(
+            agents_only,
+            ActorBaseline { agents: BTreeSet::from(["ada-bot".to_string()]), require_human: false }
+        );
     }
 }
