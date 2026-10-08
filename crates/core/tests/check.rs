@@ -182,6 +182,34 @@ steps:
 }
 
 #[test]
+fn a_tofu_plan_file_cannot_be_applied_by_terraform() {
+    let src = "\
+steps:
+  plan: tofu.plan
+    dir: ./infra
+  apply: terraform.apply
+    plan: plan.file
+";
+    let all = messages(src);
+    assert!(
+        all.iter().any(|m| m.contains("expected terraform.PlanFile, got tofu.PlanFile")),
+        "{all:?}"
+    );
+}
+
+#[test]
+fn a_terraform_plan_applies_through_terraform() {
+    let src = "\
+steps:
+  plan: terraform.plan
+    dir: ./infra
+  apply: terraform.apply
+    plan: plan.file
+";
+    assert!(errors(src).is_empty(), "{:?}", errors(src));
+}
+
+#[test]
 fn a_pasted_digest_literal_warns_and_names_the_reference() {
     let digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     let src = format!(

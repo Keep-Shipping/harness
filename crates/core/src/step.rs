@@ -261,8 +261,8 @@ impl ActionKind {
     pub fn of_kind(kind: &str) -> ActionKind {
         match kind {
             "oci.image" | "oci.artifact" => ActionKind::Build,
-            "tofu.plan" => ActionKind::Plan,
-            "tofu.apply" => ActionKind::Apply,
+            "tofu.plan" | "terraform.plan" => ActionKind::Plan,
+            "tofu.apply" | "terraform.apply" => ActionKind::Apply,
             "k8s.rollout" => ActionKind::Deploy,
             _ => ActionKind::Other,
         }

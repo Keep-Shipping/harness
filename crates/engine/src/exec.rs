@@ -48,6 +48,10 @@ const FAR_FUTURE: Duration = Duration::from_secs(253_402_300_799);
 /// than none.
 const TOFU_APPLY_KIND: &str = "tofu.apply";
 
+/// The same for `terraform.apply` — the Terraform tool behind the other name, with the same
+/// non-idempotence.
+const TERRAFORM_APPLY_KIND: &str = "terraform.apply";
+
 /// How long a step of this action may run when the plan does not say otherwise. Generous enough
 /// for a slow `tofu apply`, tight enough for reading a secret.
 pub fn default_timeout(action: ActionKind) -> Duration {
@@ -475,12 +479,13 @@ fn skipped(id: &str, status: StepStatus, why: &str) -> StepRecord {
 }
 
 /// Whether this step may be retried at all: it has to ask, and it has to be safe to run twice.
-/// `tofu.apply`, `Apply` and `Destroy` are never retried, whatever the plan declares —
-/// re-running them can leave infrastructure half-changed.
+/// `tofu.apply`, `terraform.apply`, `Apply` and `Destroy` are never retried, whatever the plan
+/// declares — re-running them can leave infrastructure half-changed.
 fn retriable(step: &PlannedStep) -> bool {
     step.retry.is_some()
         && step.idempotent
         && step.kind != TOFU_APPLY_KIND
+        && step.kind != TERRAFORM_APPLY_KIND
         && !matches!(step.action, ActionKind::Apply | ActionKind::Destroy)
 }
 

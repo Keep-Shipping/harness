@@ -54,6 +54,15 @@ a paid Pro tier. The options for this repository:
   [#15](https://github.com/Keep-Shipping/harness/issues/15), which covers
   the same model from the venture side.
 
+### Infrastructure-as-code tools
+The `tofu.*` and `terraform.*` steps drive the user's **own** binary: the
+`tofu-cli` adapter is handed a path to it and shells out, and the harness
+never downloads, bundles or redistributes either tool. That matters most for
+Terraform, which is BUSL-1.1 and not ours to ship; OpenTofu is MPL-2.0, and a
+future downloader may fetch it on the user's behalf. Everything this
+repository adds around them — the port, the adapter, the conformance kit — is
+Apache-2.0.
+
 ## Consequences
 - [LICENSE](../../LICENSE) is the canonical Apache-2.0 text and
   `[workspace.package]` in [Cargo.toml](../../Cargo.toml) carries
