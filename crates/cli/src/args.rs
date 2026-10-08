@@ -35,6 +35,7 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
        keepshipping log seal [RUN-ID]
        keepshipping log verify [RUN-ID | REPO@DIGEST] [--key FILE]
        keepshipping policy explain [FILE] [--as agent|human|ci] [--env NAME] [--base REF]
+       keepshipping import shell <SCRIPT> [--out FILE]
        keepshipping runs pending
        keepshipping approve RUN-ID [--comment TEXT]
        keepshipping deny RUN-ID --reason TEXT
