@@ -354,6 +354,13 @@ pub enum ApprovalError {
         /// The ticket that was asked about, exactly as it was passed in.
         ticket: String,
     },
+    /// Nothing is open against this run: it is not parked, it never asked,
+    /// or it has already been answered. A second answer is filed against a
+    /// run that has moved on, so it is refused rather than recorded.
+    NoOpenRequest {
+        /// The run that has nothing waiting.
+        run: String,
+    },
     /// The approval backend itself failed (forge unreachable, no permission…).
     Unavailable {
         /// What went wrong, safe to print.
@@ -400,6 +407,11 @@ impl fmt::Display for ApprovalError {
                 f,
                 "no approval ticket {ticket} was ever issued; keep the ticket `request` returned and \
                  pass that one to poll or wait"
+            ),
+            ApprovalError::NoOpenRequest { run } => write!(
+                f,
+                "there is nothing waiting for approval on run {run}; list what is pending, and only \
+                 answer a run that is still open"
             ),
             ApprovalError::Unavailable { message } => {
                 write!(f, "the approval backend is unavailable: {message}")
@@ -653,6 +665,12 @@ mod tests {
         assert!(
             unknown.contains("t-9999") && unknown.contains("`request` returned"),
             "an unknown ticket must name the ticket and the one to keep: {unknown}"
+        );
+
+        let nothing_open = ApprovalError::NoOpenRequest { run: "run-42".to_string() }.to_string();
+        assert!(
+            nothing_open.contains("run-42") && nothing_open.contains("nothing waiting"),
+            "a run with nothing open must name the run: {nothing_open}"
         );
     }
 }

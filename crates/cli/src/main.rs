@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod actor;
+mod approve;
 mod args;
 mod blocks;
 mod blocks_cache;
@@ -81,6 +82,10 @@ fn dispatch() -> ExitCode {
         // out of the language server.
         Some("lsp") => ks_lsp::serve_with(ks_cli::scripts::script_outputs),
         Some("log") => log::log(&args[1..]),
+        // The approver's side of the same story: what is parked, and the answer. The whole
+        // argument list, command word and all — `approve` reads the word itself, since which word
+        // it is is what picks the form.
+        Some("runs" | "approve" | "deny") => approve::approve(&args),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)

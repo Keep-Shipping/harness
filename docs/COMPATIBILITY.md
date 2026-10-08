@@ -19,7 +19,7 @@ each is at. Each is bumped only for a breaking change.
 host — so a step author bumping it is making a promise this
 repository has not yet made the tooling keep.
 
-## Port contract digest: `d1c3dac51c6bf127`
+## Port contract digest: `43c412a2ee3a824f`
 
 A digest of the port traits in `crates/core/src/ports/` — the method
 signatures only, with comments and formatting normalised away. It is

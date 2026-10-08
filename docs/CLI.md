@@ -18,8 +18,22 @@ implemented end to end today; `run` is not.
 - `keepshipping blocks publish <FILE>` — push a `.ks` block file to an OCI registry (`--version
   X.Y.Z`, `--to <host>/<namespace>`, `--readme PATH`), refusing a breaking interface change inside a
   release line. [Publishing blocks](#publishing-blocks) below.
+- `keepshipping runs pending` — the runs parked waiting for a person, one line each: run id, the
+  step it waits on, and the environment it is headed for. Prints `nothing is waiting for approval`
+  (and exits 0) when the queue is empty, or when nothing has ever run here.
+- `keepshipping approve RUN-ID [--comment TEXT]` — release the parked step, recording the approval
+  in the state and as `approval.granted` in the run's hash-chained log. The comment is printed back
+  to you; the log event has no field for it.
+- `keepshipping deny RUN-ID --reason TEXT` — refuse it. `--reason` is required. The run stays parked
+  — what a refusal means for the run is the engine's decision, not this command's — and the
+  refusal is recorded as `approval.denied` in the run log.
 - `keepshipping policy explain [FILE]` — the effective policy for one actor (`--as agent|human|ci`,
   default `agent`; `--env NAME`), each row attributed to the document that decided it. Below.
+
+There is **no `--as` flag** on `approve` or `deny`. The approver named in the state and the log is
+the environment's own (`$USER`, then `$USERNAME`, then `local`): a label for the run log, not a
+credential. An approver that could be named on the command line is one an agent could name too,
+which is what the approval port exists to prevent.
 
 Each successful online search is cached under `$XDG_CACHE_HOME/keepshipping/blocks` (or
 `$HOME/.cache/keepshipping/blocks`), keyed by index URL, query and limit; a search that fails

@@ -1,10 +1,11 @@
 //! Fakes for the approval ports: a scripted [`FakeApprovalChannel`] that mints
-//! tickets and serves verdicts, a [`FakeDirectory`] with a static roster, and
-//! the conformance kit both share. Never touches the filesystem or network.
+//! tickets and serves verdicts, a [`FakeApprovalInbox`] over the same store, a
+//! [`FakeDirectory`] with a static roster, and the conformance kits they share.
+//! Never touches the filesystem or network.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use ks_core::ids::RunId;
@@ -13,6 +14,7 @@ use ks_core::ports::approval::{
     ApprovalChannel, ApprovalError, ApprovalRequest, Artifact, ArtifactKind, Directory,
     DirectoryError, Identity, Outcome, Team, Ticket, Verdict,
 };
+use ks_core::ports::approval_inbox::{ApprovalInbox, Decision, Pending};
 use ks_core::ports::supply_chain::Digest;
 
 /// One call a test can observe on the [`FakeApprovalChannel`], oldest first via
@@ -57,6 +59,45 @@ struct Roster {
     error: Option<DirectoryError>,
 }
 
+/// One call a test can observe on the [`FakeApprovalInbox`], oldest first via
+/// [`FakeApprovalInbox::calls`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboxCall {
+    /// [`ApprovalInbox::pending`] listed what an approver could still decide.
+    Pending,
+    /// [`ApprovalInbox::decide`] recorded an answer, which the channel then
+    /// serves for that run's ticket.
+    Decided {
+        /// The run that was answered.
+        run: RunId,
+        /// The decision as the caller made it — before the inbox bound it to
+        /// the request's artifacts, which is the binding the verdict carries.
+        decision: Decision,
+    },
+}
+
+/// The two approval fakes' shared mutable state, behind one `Arc`: the requests
+/// that are open, the runs that have been answered, and every inbox call.
+///
+/// It is *shared* so that the two ends of one approval really are one
+/// conversation — a request [`FakeApprovalChannel::request`] takes is one
+/// [`FakeApprovalInbox::pending`] lists, and a decision the inbox records is
+/// the verdict the channel hands back for the same ticket.
+#[derive(Default)]
+struct Inbox {
+    /// Requests nobody has answered yet, oldest first — the queue `pending`
+    /// reads. A run leaves it when it is decided.
+    open: Vec<Pending>,
+    /// The runs that have already been answered, so `pending` never offers a
+    /// run twice and `decide` refuses a second answer.
+    answered: BTreeSet<RunId>,
+    /// The verdicts, keyed by the ticket they were answered through, so the
+    /// channel can serve the same answer `decide` recorded.
+    verdicts: BTreeMap<String, Verdict>,
+    /// Every call, oldest first.
+    calls: Vec<InboxCall>,
+}
+
 /// An [`ApprovalChannel`] you script per test — the stand-in for the real
 /// GitHub and static-directory adapters.
 ///
@@ -99,14 +140,19 @@ struct Roster {
 /// ```
 ///
 /// All mutable state sits behind one mutex, so the fake is `Send + Sync` and
-/// `approving` works on `&self`.
+/// `approving` works on `&self`. [`FakeApprovalInbox::sharing`] hands out the
+/// approver's end of the same conversation.
 pub struct FakeApprovalChannel {
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
+    inbox: Arc<Mutex<Inbox>>,
 }
 
 impl Default for FakeApprovalChannel {
     fn default() -> FakeApprovalChannel {
-        FakeApprovalChannel { state: Mutex::new(State::default()) }
+        FakeApprovalChannel {
+            state: Arc::new(Mutex::new(State::default())),
+            inbox: Arc::new(Mutex::new(Inbox::default())),
+        }
     }
 }
 
@@ -181,6 +227,12 @@ impl FakeApprovalChannel {
             _ => state.queue.pop_front(),
         }
     }
+
+    /// The verdict the shared inbox recorded against `ticket`, if an approver
+    /// has answered it there.
+    fn recorded_verdict(&self, ticket: &Ticket) -> Option<Verdict> {
+        self.inbox.lock().expect("fake approval inbox").verdicts.get(ticket.as_str()).cloned()
+    }
 }
 
 impl fmt::Debug for FakeApprovalChannel {
@@ -190,6 +242,7 @@ impl fmt::Debug for FakeApprovalChannel {
             .field("tickets", &state.tickets)
             .field("scripted", &state.queue.len())
             .field("calls", &state.calls.len())
+            .field("open", &self.inbox.lock().expect("fake approval inbox").open.len())
             .finish()
     }
 }
@@ -209,7 +262,15 @@ impl ApprovalChannel for FakeApprovalChannel {
                 artifacts: request.artifacts.clone(),
                 from: request.from.clone(),
             });
-            Ok(Ticket::new(ticket))
+            let ticket = Ticket::new(ticket);
+            // Asking is what parks the question: the inbox this channel shares
+            // lists it as open until somebody answers it.
+            self.inbox
+                .lock()
+                .expect("fake approval inbox")
+                .open
+                .push(Pending { ticket: ticket.clone(), request: request.clone() });
+            Ok(ticket)
         };
         Box::pin(std::future::ready(result))
     }
@@ -220,12 +281,19 @@ impl ApprovalChannel for FakeApprovalChannel {
     ) -> BoxFuture<'a, Result<Option<Verdict>, ApprovalError>> {
         // Nobody having answered yet is the normal state, not a failure; a
         // ticket the fake never minted is neither — nothing can answer it.
-        let result = {
+        let scripted = {
             let mut state = self.state.lock().expect("fake approval state");
             match Self::known_ticket(&state, ticket) {
                 Ok(()) => Ok(Self::next_verdict(&mut state)),
                 Err(error) => Err(error),
             }
+        };
+        // An answer the shared inbox recorded for this run is this ticket's
+        // answer: the two ends are one conversation, so what a person clicked
+        // in the inbox is what the parked step is released by.
+        let result = match scripted {
+            Ok(None) => Ok(self.recorded_verdict(ticket)),
+            other => other,
         };
         Box::pin(std::future::ready(result))
     }
@@ -239,13 +307,15 @@ impl ApprovalChannel for FakeApprovalChannel {
             let mut state = self.state.lock().expect("fake approval state");
             match Self::known_ticket(&state, ticket) {
                 Err(error) => Err(error),
-                Ok(()) => match Self::next_verdict(&mut state) {
-                    Some(verdict) => Ok(verdict),
-                    None => Err(ApprovalError::Undecided {
-                        ticket: ticket.as_str().to_string(),
-                        after: timeout,
-                    }),
-                },
+                Ok(()) => {
+                    match Self::next_verdict(&mut state).or_else(|| self.recorded_verdict(ticket)) {
+                        Some(verdict) => Ok(verdict),
+                        None => Err(ApprovalError::Undecided {
+                            ticket: ticket.as_str().to_string(),
+                            after: timeout,
+                        }),
+                    }
+                }
             }
         };
         Box::pin(std::future::ready(result))
@@ -366,6 +436,162 @@ impl Directory for FakeDirectory {
     }
 }
 
+/// The approver's side of [`FakeApprovalChannel`], over the same
+/// in-memory store — so a request the channel takes is one the inbox can list, and a
+/// decision the inbox records is one the channel hands back.
+///
+/// ```
+/// use ks_core::ids::RunId;
+/// use ks_core::ports::approval::{ApprovalChannel, ApprovalError, ApprovalRequest, Identity, Outcome, Team};
+/// use ks_core::ports::approval_inbox::{ApprovalInbox, Decision};
+/// use ks_testing::approval::{FakeApprovalChannel, FakeApprovalInbox};
+/// use ks_testing::block_on;
+///
+/// let request = ApprovalRequest {
+///     run: RunId::from_parts(0, 1),
+///     step: "apply-infra".to_string(),
+///     summary: "1 to create".to_string(),
+///     artifacts: vec![],
+///     from: Team::parse("@platform").expect("valid"),
+///     reason: "production deploy".to_string(),
+///     proposed_by: Identity::human("ada"),
+/// };
+/// let channel = FakeApprovalChannel::new();
+/// let ticket = block_on(channel.request(&request)).expect("the request is accepted");
+/// let inbox = FakeApprovalInbox::sharing(&channel);
+///
+/// // Ada's own run is nowhere in her inbox...
+/// assert!(block_on(inbox.pending(&Identity::human("ada"))).expect("listed").is_empty());
+/// // ...and answering it is refused rather than silently recorded.
+/// assert!(matches!(
+///     block_on(inbox.decide(&request.run, Decision::new(Identity::human("ada"), Outcome::Approved))),
+///     Err(ApprovalError::ApproverIsProposer { .. })
+/// ));
+///
+/// // Somebody else can answer it, and the channel then hands back that very
+/// // verdict for the ticket the request was asked under.
+/// let listed = block_on(inbox.pending(&Identity::human("grace"))).expect("listed");
+/// assert_eq!(listed.len(), 1);
+/// let answered = block_on(inbox.decide(
+///     &listed[0].request.run,
+///     Decision::new(Identity::human("grace"), Outcome::Approved).with_comment("ship it"),
+/// ))
+/// .expect("a person may answer");
+/// assert_eq!(answered.comment.as_deref(), Some("ship it"));
+/// assert_eq!(block_on(channel.poll(&ticket)), Ok(Some(answered)));
+/// ```
+///
+/// All mutable state sits behind one mutex behind an `Arc`, so the fake is
+/// `Send + Sync` and several handles can share one conversation.
+pub struct FakeApprovalInbox {
+    shared: Arc<Mutex<Inbox>>,
+}
+
+impl Default for FakeApprovalInbox {
+    fn default() -> FakeApprovalInbox {
+        FakeApprovalInbox { shared: Arc::new(Mutex::new(Inbox::default())) }
+    }
+}
+
+impl FakeApprovalInbox {
+    /// An inbox with nothing open against it, until a channel sharing this
+    /// store asks something.
+    pub fn new() -> FakeApprovalInbox {
+        FakeApprovalInbox::default()
+    }
+
+    /// The approver's end of `channel`, over the very same store.
+    pub fn sharing(channel: &FakeApprovalChannel) -> FakeApprovalInbox {
+        FakeApprovalInbox { shared: Arc::clone(&channel.inbox) }
+    }
+
+    /// Every call made against the inbox, oldest first.
+    pub fn calls(&self) -> Vec<InboxCall> {
+        self.shared.lock().expect("fake approval inbox").calls.clone()
+    }
+}
+
+impl fmt::Debug for FakeApprovalInbox {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let inbox = self.shared.lock().expect("fake approval inbox");
+        f.debug_struct("FakeApprovalInbox")
+            .field("open", &inbox.open.len())
+            .field("answered", &inbox.answered.len())
+            .field("calls", &inbox.calls.len())
+            .finish()
+    }
+}
+
+impl ApprovalInbox for FakeApprovalInbox {
+    fn pending<'a>(
+        &'a self,
+        approver: &'a Identity,
+    ) -> BoxFuture<'a, Result<Vec<Pending>, ApprovalError>> {
+        let result = {
+            let mut inbox = self.shared.lock().expect("fake approval inbox");
+            inbox.calls.push(InboxCall::Pending);
+            // A run never appears in its own author's inbox, and one that has
+            // been answered has already left the queue: the refusals are made
+            // here rather than left for an adapter to remember.
+            Ok(inbox
+                .open
+                .iter()
+                .filter(|pending| pending.request.proposed_by != *approver)
+                .filter(|pending| !inbox.answered.contains(&pending.request.run))
+                .cloned()
+                .collect())
+        };
+        Box::pin(std::future::ready(result))
+    }
+
+    fn decide<'a>(
+        &'a self,
+        run: &'a RunId,
+        decision: Decision,
+    ) -> BoxFuture<'a, Result<Verdict, ApprovalError>> {
+        let result =
+            {
+                let mut inbox = self.shared.lock().expect("fake approval inbox");
+                let Some(index) = inbox.open.iter().position(|pending| {
+                    pending.request.run == *run && !inbox.answered.contains(run)
+                }) else {
+                    // Never asked, already answered, or parked elsewhere: there is
+                    // nothing to file this against, and an "answer" recorded
+                    // against a run that has moved on is worse than a refusal.
+                    return Box::pin(std::future::ready(Err(ApprovalError::NoOpenRequest {
+                        run: run.as_str().to_string(),
+                    })));
+                };
+                let pending = inbox.open[index].clone();
+
+                // The approver never supplies artifacts: the inbox binds the
+                // verdict to what the request asked about, and checks it with the
+                // same rule the engine checks at resume — so a proposer clicking
+                // approve on their own run fails at the click, and the request
+                // stays open for somebody who may answer it.
+                let mut verdict = Verdict::new(
+                    decision.approver.clone(),
+                    SystemTime::now(),
+                    decision.outcome,
+                    pending.request.artifacts.clone(),
+                );
+                if let Some(comment) = decision.comment.clone() {
+                    verdict = verdict.with_comment(comment);
+                }
+                if let Err(error) = pending.request.accepts(&verdict) {
+                    return Box::pin(std::future::ready(Err(error)));
+                }
+
+                inbox.calls.push(InboxCall::Decided { run: run.clone(), decision });
+                inbox.verdicts.insert(pending.ticket.as_str().to_string(), verdict.clone());
+                inbox.open.remove(index);
+                inbox.answered.insert(run.clone());
+                Ok(verdict)
+            };
+        Box::pin(std::future::ready(result))
+    }
+}
+
 /// The approval conformance kit: every adapter — the fakes here, real GitHub
 /// teams, and the static `.keepshipping/teams` directory — must pass this.
 ///
@@ -454,6 +680,126 @@ pub async fn conformance(
         }),
         "conformance: the verdict's own approver {} must be a member of {team}",
         verdict.approver
+    );
+}
+
+/// The fake's own approver-side round trip, exercised so the shared store
+/// [`FakeApprovalInbox`] and [`FakeApprovalChannel`] keep between them stays
+/// honest. **This is not an adapter conformance kit:** the arguments are these
+/// two concrete fakes, so a real inbox — the GitHub-backed one, or any other —
+/// cannot call this at all. The adapter-wide kit is [`conformance`] above, over
+/// `&dyn` ports; an inbox-wide equivalent, over `&dyn ApprovalInbox`, is still
+/// to be written.
+///
+/// What it walks is one approval round trip from the approver's seat, asserting
+/// every refusal on the way. The proposer does not see their own run in `pending`,
+/// and answering it is [`ApproverIsProposer`](ApprovalError::ApproverIsProposer)
+/// at the click; a bot is [`ApproverNotHuman`](ApprovalError::ApproverNotHuman);
+/// a human who is not the proposer gets a verdict bound to exactly the
+/// artifacts that were asked about — built by the inbox, never supplied by the
+/// caller — and the channel hands that very verdict back for the ticket the
+/// request was asked under. A second answer is
+/// [`NoOpenRequest`](ApprovalError::NoOpenRequest), and the run has left the
+/// queue by then.
+pub async fn inbox_conformance(channel: &FakeApprovalChannel, inbox: &FakeApprovalInbox) {
+    let team = Team::parse("@platform").expect("a well-formed handle");
+    let approver = Identity::human("inbox-conformance-approver");
+    let proposer = Identity::human("inbox-conformance-proposer");
+    let request = ApprovalRequest {
+        run: RunId::from_parts(1_700_000_000_000, 7),
+        step: "inbox-conformance-apply".to_string(),
+        summary: "1 to create".to_string(),
+        artifacts: vec![Artifact::new(
+            ArtifactKind::PlanFile,
+            Digest::sha256_from_hex(&"b".repeat(64))
+                .expect("64 hex digits is a well-formed sha256"),
+        )],
+        from: team.clone(),
+        reason: "conformance".to_string(),
+        proposed_by: proposer.clone(),
+    };
+
+    let ticket = channel
+        .request(&request)
+        .await
+        .unwrap_or_else(|error| panic!("inbox conformance: the request must be accepted: {error}"));
+
+    assert!(
+        inbox.pending(&proposer).await.expect("conformance: the queue must be readable").is_empty(),
+        "inbox conformance: a run must never appear in its own author's inbox"
+    );
+    assert!(
+        matches!(
+            inbox.decide(&request.run, Decision::new(proposer, Outcome::Approved)).await,
+            Err(ApprovalError::ApproverIsProposer { .. })
+        ),
+        "inbox conformance: the proposer must be refused at the click"
+    );
+    assert!(
+        matches!(
+            inbox
+                .decide(&request.run, Decision::new(Identity::service("ci"), Outcome::Approved))
+                .await,
+            Err(ApprovalError::ApproverNotHuman { .. })
+        ),
+        "inbox conformance: a bot must be refused at the click"
+    );
+
+    let listed = inbox
+        .pending(&approver)
+        .await
+        .unwrap_or_else(|error| panic!("inbox conformance: the queue must be readable: {error}"));
+    assert_eq!(
+        listed.len(),
+        1,
+        "inbox conformance: the requested run must be waiting for {approver}"
+    );
+    assert_eq!(
+        listed[0].request.artifacts, request.artifacts,
+        "inbox conformance: the approver must see exactly what the run asked about"
+    );
+
+    let verdict = inbox
+        .decide(
+            &request.run,
+            Decision::new(approver.clone(), Outcome::Approved).with_comment("ship it"),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("inbox conformance: a person must be able to answer: {error}")
+        });
+    request.accepts(&verdict).unwrap_or_else(|error| {
+        panic!("inbox conformance: the verdict must be bound to the artifacts asked about: {error}")
+    });
+    assert_eq!(
+        verdict.approver, approver,
+        "inbox conformance: the verdict must carry the identity the adapter established"
+    );
+    assert_eq!(
+        verdict.comment.as_deref(),
+        Some("ship it"),
+        "inbox conformance: the approver's own comment must survive"
+    );
+    assert_eq!(
+        channel.poll(&ticket).await.expect("conformance: the ticket is known"),
+        Some(verdict.clone()),
+        "inbox conformance: the channel must hand back the verdict the inbox recorded"
+    );
+    assert!(
+        inbox.pending(&approver).await.expect("conformance: the queue must be readable").is_empty(),
+        "inbox conformance: an answered run must leave the queue"
+    );
+    assert!(
+        matches!(
+            inbox
+                .decide(
+                    &request.run,
+                    Decision::new(approver, Outcome::Refused).with_comment("changed my mind"),
+                )
+                .await,
+            Err(ApprovalError::NoOpenRequest { .. })
+        ),
+        "inbox conformance: a second answer must be refused, not recorded"
     );
 }
 
@@ -567,5 +913,98 @@ mod tests {
         channel.approving(approver.clone(), &request());
         let directory = FakeDirectory::new().with_member(&team, approver.clone());
         block_on(conformance(&channel, &directory, &team, &approver));
+    }
+
+    #[test]
+    fn a_run_never_appears_in_its_authors_inbox_and_cannot_be_answered_there() {
+        let channel = FakeApprovalChannel::new();
+        let inbox = FakeApprovalInbox::sharing(&channel);
+        let request = request();
+        block_on(channel.request(&request)).expect("the request is accepted");
+
+        let proposer = request.proposed_by.clone();
+        assert!(block_on(inbox.pending(&proposer)).expect("listed").is_empty());
+        assert!(
+            matches!(
+                block_on(inbox.decide(&request.run, Decision::new(proposer, Outcome::Approved))),
+                Err(ApprovalError::ApproverIsProposer { .. })
+            ),
+            "a proposer must be refused at the click, and nothing recorded"
+        );
+        // Refused means *not* answered: the request is still somebody else's.
+        assert_eq!(block_on(inbox.pending(&Identity::human("grace"))).expect("listed").len(), 1);
+        assert!(!inbox.calls().iter().any(|call| matches!(call, InboxCall::Decided { .. })));
+    }
+
+    #[test]
+    fn a_bot_cannot_answer_and_a_second_answer_is_refused() {
+        let channel = FakeApprovalChannel::new();
+        let inbox = FakeApprovalInbox::sharing(&channel);
+        let request = request();
+        block_on(channel.request(&request)).expect("the request is accepted");
+
+        assert!(matches!(
+            block_on(
+                inbox.decide(
+                    &request.run,
+                    Decision::new(Identity::service("ci"), Outcome::Approved)
+                )
+            ),
+            Err(ApprovalError::ApproverNotHuman { .. })
+        ));
+
+        let approver = Identity::human("grace");
+        let verdict = block_on(inbox.decide(
+            &request.run,
+            Decision::new(approver.clone(), Outcome::Approved).with_comment("ship it"),
+        ))
+        .expect("a person may answer");
+        assert_eq!(verdict.comment.as_deref(), Some("ship it"));
+        assert_eq!(verdict.bound_artifacts, request.artifacts);
+        assert_eq!(block_on(inbox.pending(&approver)).expect("listed").len(), 0);
+
+        // And the run that moved on takes no second answer.
+        assert_eq!(
+            block_on(inbox.decide(
+                &request.run,
+                Decision::new(approver, Outcome::Refused).with_comment("actually no"),
+            )),
+            Err(ApprovalError::NoOpenRequest { run: request.run.as_str().to_string() })
+        );
+
+        let calls = inbox.calls();
+        assert_eq!(
+            calls,
+            vec![
+                InboxCall::Decided {
+                    run: request.run.clone(),
+                    decision: Decision::new(Identity::human("grace"), Outcome::Approved)
+                        .with_comment("ship it"),
+                },
+                InboxCall::Pending,
+            ],
+            "only successful calls are recorded"
+        );
+    }
+
+    #[test]
+    fn a_run_that_never_asked_has_nothing_to_answer() {
+        let channel = FakeApprovalChannel::new();
+        let inbox = FakeApprovalInbox::sharing(&channel);
+        let run = RunId::from_parts(1_700_000_000_000, 99);
+        assert_eq!(
+            block_on(
+                inbox.decide(&run, Decision::new(Identity::human("grace"), Outcome::Approved))
+            ),
+            Err(ApprovalError::NoOpenRequest { run: run.as_str().to_string() })
+        );
+        assert!(inbox.calls().is_empty(), "a refusal records no call");
+    }
+
+    #[test]
+    fn the_inbox_fake_passes_inbox_conformance() {
+        let channel = FakeApprovalChannel::new();
+        let inbox = FakeApprovalInbox::sharing(&channel);
+        block_on(inbox_conformance(&channel, &inbox));
     }
 }
