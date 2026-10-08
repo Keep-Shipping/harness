@@ -8,7 +8,8 @@ implemented end to end today; `run` is not.
   fails on warnings, `--secrets` lists the file's environments and their secret names. How
   findings are printed, and how a run fails, is in [DIAGNOSTICS.md](DIAGNOSTICS.md).
 - `keepshipping run [FILE]` — check the file, choose an environment (`--env NAME`,
-  `--event "push main"`, `--actor human|agent|ci`, `--non-interactive`), print it, and stop.
+  `--event "push main"`, `--actor human|agent|ci`, `--as human|agent[:name]|ci`,
+  `--non-interactive`), print it, and stop.
   Execution is not wired to the CLI yet: the planner and executor exist in `ks-engine` and
   `run` will hand them the plan.
 - `keepshipping blocks search <QUERY>` — search the metadata-only blocks index (`--index URL` or
@@ -108,7 +109,7 @@ Codes 0–3 are the CLI's own and are stable. 4, 5 and 130 come from `ks_engine:
 | 1 | `failed` | `check` found errors (or warnings with `--warnings-as-errors`); a run failed: a step failed, a step timed out, or the run hit its own timeout |
 | 2 | — | usage: an unknown flag or format, a missing value, a file that cannot be read, or no environment could be chosen |
 | 3 | — | internal: an unexpected I/O error or a panic — a bug in keepshipping, never in your file |
-| 4 | `waiting_for_approval` | a step needs an approval nobody gave; its dependants were skipped, the rest of the run carried on |
+| 4 | `waiting_for_approval` | a step needs an approval nobody gave; its dependants were skipped, the rest of the run carried on — except in an agent's run (`--as agent`), which waits on a human and stops there: nothing after the approval ran |
 | 5 | `policy_refused` | policy refused the run: the refused step and everything that needs it are skipped, and anything else in the run still runs |
 | 130 | `cancelled` | the run was cancelled (Ctrl-C, a cancelled CI job) — 128 + `SIGINT`, as a shell reports it |
 

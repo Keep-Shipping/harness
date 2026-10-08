@@ -16,6 +16,9 @@ use std::time::{Duration, Instant};
 /// One thing that happened in a run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunEvent {
+    /// The file checked clean, ahead of the steps: what an agent's run
+    /// stands on before it goes near anything.
+    Checked { path: String },
     /// A step began; its line is still empty until it reports something.
     Started { step: String },
     /// A line of the step's own output, shown under `-v`.
@@ -35,6 +38,11 @@ pub enum RunEvent {
     Shipped { what: String, took: Duration },
     /// The approval at `step` was declined; nothing after it ran.
     Declined { step: String },
+    /// The approval at `step` was not answered at all: the run waits on
+    /// `on`, and `notified` says who has already been told, if anyone.
+    /// Nothing after it ran, so the event closes the run with what that
+    /// means — the reader, an agent included, is free to stop here.
+    Waiting { step: String, on: String, notified: Option<String> },
 }
 
 /// Something that draws a run as it happens.
@@ -51,6 +59,10 @@ pub trait Renderer {
 const NAME_WIDTH: usize = 8;
 const SUMMARY_WIDTH: usize = 25;
 
+/// How far in a line that continues another one sits: under the name column,
+/// which starts after the glyph and its space.
+const CONTINUATION: usize = 1 + 1 + NAME_WIDTH;
+
 /// The spinner, one braille dot hopping around the eighth of a circle.
 const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -65,14 +77,38 @@ pub fn duration(d: Duration) -> String {
 
 /// The line a finished step goes on the run as:
 /// `▸ build   sha256:9f2c…e1  signed    38s`. A summary longer than its
-/// column is cut with an `…` rather than pushing the time out of line.
+/// column is cut with an `…` rather than pushing the time out of line, and
+/// a step that took no time has no time column at all.
 pub fn step_line(step: &str, summary: &str, took: Duration) -> String {
     let chars: Vec<char> = summary.chars().collect();
     let short: String = match chars.len() {
         n if n <= SUMMARY_WIDTH => summary.to_string(),
         _ => chars[..SUMMARY_WIDTH - 1].iter().chain([&'…']).collect(),
     };
+    // A step that took no time says no time: an agent's run reports what it
+    // did before it waited, and a time column of `0s` there is noise.
+    if took.is_zero() {
+        return format!("▸ {step:<NAME_WIDTH$}{short}");
+    }
     format!("▸ {step:<NAME_WIDTH$}{short:<SUMMARY_WIDTH$} {}", duration(took))
+}
+
+/// The line a checked file goes on a run as: `✓ check   ship.ks is valid`,
+/// in the same name column the steps use.
+pub fn check_line(path: &str) -> String {
+    format!("✓ {:<NAME_WIDTH$}{path} is valid", "check")
+}
+
+/// The line a run nobody can answer leaves:
+/// `⏸ review  waiting on a human`.
+pub fn waiting_line(step: &str, on: &str) -> String {
+    format!("⏸ {step:<NAME_WIDTH$}waiting on {on}")
+}
+
+/// Who has been told, under the line that says who the run waits on:
+/// `          @platform notified, plan attached`.
+pub fn notified_line(who: &str) -> String {
+    format!("{:<CONTINUATION$}{who} notified, plan attached", "")
 }
 
 /// The line a failed step leaves: the step, and what stopped it.
@@ -145,6 +181,10 @@ impl<W: Write> Run<W> {
 impl<W: Write> Renderer for Run<W> {
     fn event(&mut self, e: &RunEvent) {
         match e {
+            RunEvent::Checked { path } => {
+                self.retire();
+                let _ = writeln!(self.out, "{}", check_line(path));
+            }
             RunEvent::Started { step } => {
                 self.retire();
                 if self.tty {
@@ -185,6 +225,17 @@ impl<W: Write> Renderer for Run<W> {
             }
             RunEvent::Declined { step } => {
                 let _ = writeln!(self.out, "✗ declined at {step}");
+            }
+            // Nobody is answering, so there is no prompt to leave open and
+            // no answer to close it: the wait is the line, and the run ends
+            // saying what it did not do — the reader stops here.
+            RunEvent::Waiting { step, on, notified } => {
+                self.retire();
+                let _ = writeln!(self.out, "{}", waiting_line(step, on));
+                if let Some(who) = notified {
+                    let _ = writeln!(self.out, "{}", notified_line(who));
+                }
+                let _ = writeln!(self.out, "nothing applied. agent is free to wait.");
             }
             _ => {}
         }
@@ -260,6 +311,13 @@ mod tests {
             step_line("deploy", "4/4 pods healthy and warm for a while", Duration::from_secs(27)),
             "▸ deploy  4/4 pods healthy and war… 27s"
         );
+        // A step that merely rounded down to `0s` still has a time: only a
+        // duration of exactly zero loses the column.
+        assert_eq!(
+            step_line("apply", "1 resource", Duration::from_millis(900)),
+            "▸ apply   1 resource                0s"
+        );
+        assert_eq!(step_line("apply", "1 resource", Duration::ZERO), "▸ apply   1 resource");
     }
 
     #[test]

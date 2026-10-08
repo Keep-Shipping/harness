@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod actor;
 mod args;
 mod blocks;
 mod blocks_cache;
@@ -50,7 +51,7 @@ use ks_cli::test_server;
 use crate::args::{Command, Options, USAGE, context_of, parse_args};
 use crate::blocks::wait;
 use crate::drive::{Done, Outcome, StepRunner};
-use crate::progress::Renderer;
+use crate::progress::{Renderer, RunEvent};
 
 fn main() -> ExitCode {
     // A panic is a bug in keepshipping, not a problem with the user's file:
@@ -94,7 +95,20 @@ fn run(args: &[String]) -> ExitCode {
     };
     let path = o.path.as_deref().unwrap_or("ship.ks");
     let context = context_of(&o);
-    let site = match check::load(Path::new(path), path, o.actor, o.path.is_none(), context) {
+    // Who is running this, decided once from the declaration, the environment
+    // and the organisation's baseline — the latter an empty one until the
+    // PolicyStore port has an adapter to load it from.
+    let actor = actor::for_run(
+        o.declared,
+        o.actor_name.as_deref(),
+        interactive(&o),
+        &actor::ActorBaseline::default(),
+    );
+    // Detection only ever escalates to an agent; it never pulls a declared
+    // `human` or `ci` back down to one.
+    let actor_kind = if actor.kind == ActorKind::Agent { ActorKind::Agent } else { o.actor };
+    let is_agent = actor_kind == ActorKind::Agent;
+    let site = match check::load(Path::new(path), path, actor_kind, o.path.is_none(), context) {
         Ok(site) => site,
         Err(code) => return code,
     };
@@ -120,12 +134,12 @@ fn run(args: &[String]) -> ExitCode {
         None => None,
     };
     match ks_core::select_env(&site.checked.workflow, o.env.as_deref(), event.as_ref()) {
-        Ok(ks_core::EnvChoice::Selected(name)) => selected(&o, &site, &name),
+        Ok(ks_core::EnvChoice::Selected(name)) => selected(&o, &site, &name, is_agent),
         Ok(ks_core::EnvChoice::Ambiguous(names)) => {
             let offered = names.join(", ");
             if interactive(&o) {
                 match prompt(&offered, &names) {
-                    Some(name) => selected(&o, &site, &name),
+                    Some(name) => selected(&o, &site, &name, is_agent),
                     None => {
                         eprintln!("error: no environment chosen (expected one of {offered})");
                         ExitCode::from(2)
@@ -149,7 +163,10 @@ fn run(args: &[String]) -> ExitCode {
 }
 
 /// The environment is chosen: print the run the file describes, and run it.
-fn selected(o: &Options, site: &check::Site, env: &str) -> ExitCode {
+/// `is_agent` is what the run decided about itself; an agent's run never
+/// reaches a terminal for approval, because an agent cannot approve its own
+/// run — it would be approving itself.
+fn selected(o: &Options, site: &check::Site, env: &str, is_agent: bool) -> ExitCode {
     let workflow = &site.checked.workflow;
     let only: Vec<&str> = o.only.iter().map(String::as_str).collect();
     let skip: Vec<&str> = o.skip.iter().map(String::as_str).collect();
@@ -164,7 +181,10 @@ fn selected(o: &Options, site: &check::Site, env: &str) -> ExitCode {
     // production as an agent, stops here — over the steps this run actually
     // covers, and before a word is printed, the way the policy gate above
     // stops.
-    if refuses_scripts(workflow, o.actor, env, &steps) {
+    // The actor the run decided on, so a detected agent is gated like a
+    // declared one.
+    let actor = if is_agent { ActorKind::Agent } else { o.actor };
+    if refuses_scripts(workflow, actor, env, &steps) {
         return ExitCode::from(1);
     }
     println!("environment: {env}");
@@ -186,11 +206,22 @@ fn selected(o: &Options, site: &check::Site, env: &str) -> ExitCode {
     let what = workflow.name().map(str::to_string).unwrap_or_else(|| stem(&site.file));
     let tty = std::io::stdout().is_terminal() && std::env::var("TERM").is_ok_and(|t| t != "dumb");
     let shared = Mutex::new(renderer(tty, o.verbose));
-    let mut approver: Box<dyn drive::Approver> = if interactive(o) {
+    let mut approver: Box<dyn drive::Approver> = if is_agent {
+        // Who to tell comes from the approval's own `ask:`; until that is
+        // read here, the run waits without naming anyone.
+        Box::new(drive::AgentRun { notified: None })
+    } else if interactive(o) {
         Box::new(drive::TtyApprover::new(std::io::stdin().lock()))
     } else {
         Box::new(drive::Declines)
     };
+    if is_agent {
+        // An agent reads the run and acts on it, so its run opens with the
+        // check the steps below are standing on.
+        if let Ok(mut r) = shared.lock() {
+            r.event(&RunEvent::Checked { path: site.path.clone() });
+        }
+    }
     let started = Instant::now();
     let outcome = drive::with_spinner(tty, &shared, |renderer| {
         drive::drive(
@@ -202,7 +233,13 @@ fn selected(o: &Options, site: &check::Site, env: &str) -> ExitCode {
             &what,
         )
     });
-    if outcome == Outcome::Shipped { ExitCode::SUCCESS } else { ExitCode::from(1) }
+    match outcome {
+        Outcome::Shipped => ExitCode::SUCCESS,
+        // Waiting is not failing: the run stopped for an approval nobody
+        // gave, which is the engine's own exit 4.
+        Outcome::Waiting => ExitCode::from(ks_engine::exec::EXIT_WAITING_FOR_APPROVAL),
+        Outcome::Declined | Outcome::Failed => ExitCode::from(1),
+    }
 }
 
 /// The renderer the run's lines go through: animated at a terminal, plain

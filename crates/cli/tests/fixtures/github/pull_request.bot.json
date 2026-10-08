@@ -1,0 +1,18 @@
+{
+  "action": "opened",
+  "number": 412,
+  "pull_request": {
+    "number": 412,
+    "user": {
+      "login": "keepshipping-agent[bot]",
+      "type": "Bot"
+    },
+    "head": { "ref": "agent/oci-artifact", "sha": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b" },
+    "base": { "ref": "main", "sha": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c" }
+  },
+  "sender": {
+    "login": "keepshipping-agent[bot]",
+    "type": "Bot"
+  },
+  "repository": { "full_name": "Keep-Shipping/harness" }
+}
