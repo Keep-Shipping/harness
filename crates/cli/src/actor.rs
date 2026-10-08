@@ -143,7 +143,10 @@ pub fn for_run(
     interactive: bool,
     baseline: &ActorBaseline,
 ) -> Actor {
-    let facts = std::env::vars().collect();
+    // The same read the CI context is built from: `vars` panics on a single
+    // variable that is not UTF-8, and one such variable anywhere in a CI job
+    // would take down a `--ci` run here, before it read a thing it needed.
+    let facts = crate::env_snapshot();
     let ask = || confirm_human(std::io::stdin().lock(), std::io::stderr());
     local(declared, name, facts, interactive, git_user_name(), baseline, ask)
 }

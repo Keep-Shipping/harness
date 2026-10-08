@@ -9,13 +9,16 @@ implemented end to end today; `run` is not.
   findings are printed, and how a run fails, is in [DIAGNOSTICS.md](DIAGNOSTICS.md).
 - `keepshipping run [FILE]` — check the file, choose an environment (`--env NAME`,
   `--event "push main"`, `--actor human|agent|ci`, `--as human|agent[:name]|ci`,
-  `--non-interactive`, `--base REF`), print it, and stop. `--input KEY=VALUE` (repeatable; a value beginning
-  `@secret:` names a secret rather than carrying one) is checked before the run starts and echoed
-  by `--dry-run`; no step is handed one yet. With `--only STEP` it names the inputs for one script
-  step — see [DIAGNOSTICS.md](DIAGNOSTICS.md) for the grammar. `--base REF` reads the default
-  branch's `policy:` block out of git, so a branch may only narrow it
-  ([#118](https://github.com/Keep-Shipping/harness/issues/118)); a resume reads it from the
+  `--non-interactive`, `--base REF`, `--ci`), print it, and stop. `--input KEY=VALUE`
+  (repeatable; a value beginning `@secret:` names a secret rather than carrying one) is checked
+  before the run starts and echoed by `--dry-run`; no step is handed one yet. With `--only STEP` it
+  names the inputs for one script step — see [DIAGNOSTICS.md](DIAGNOSTICS.md) for the grammar.
+  `--base REF` reads the default branch's `policy:` block out of git, so a branch may only narrow
+  it ([#118](https://github.com/Keep-Shipping/harness/issues/118)); a resume reads it from the
   environment or finds it, so a run approved on a laptop resumes on a CI job without being told.
+  `--ci` answers for the CI it is in — see [CI.md](CI.md) for what it detects, and what it does
+  not. `--sha SHA` states the commit for such a run, and needs `--ci` with it: on its own the flag
+  would say nothing, so it is a usage error rather than a silently dropped option.
   Execution is not wired to the CLI yet: the planner and executor exist in `ks-engine` and
   `run` will hand them the plan. What `--as` means when it is left out is in
   [Who the run thinks it is](#who-the-run-thinks-it-is).

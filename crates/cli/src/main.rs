@@ -20,6 +20,10 @@ mod decide;
 mod decisions;
 mod drive;
 mod fmt;
+// Generic CI mode: any CI that can run a binary (#130). Built from the
+// job's environment, so it answers the port without an OIDC token to verify
+// and says so on one line before the run starts.
+mod generic_ci;
 // The GitHub Actions run context (#150) is built and tested here, but the
 // command dispatch still has no run context to hand it: wiring CI-versus-local
 // selection into `run` waits for the local adapter. Until then nothing in the
@@ -44,7 +48,7 @@ mod seal;
 mod upgrade;
 
 use std::io::{IsTerminal, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -128,20 +132,59 @@ fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Parsed before anything is decided about the run: `--event` is a usage
+    // error or it is nothing, and generic CI mode wants the answer to build
+    // the actor's event.
+    let event = match o.event.as_deref().map(parse_event) {
+        Some(Ok(t)) => Some(t),
+        Some(Err(msg)) => {
+            eprintln!("error: {msg}");
+            return ExitCode::from(2);
+        }
+        None => None,
+    };
+    // `--sha` is how a generic CI run states the commit its system names no
+    // variable for. Without `--ci` there is no run context to state it to, so
+    // the flag would parse and then be dropped without a word — which is how a
+    // caller ends up believing a run was about a commit it never named.
+    if o.sha.is_some() && !o.ci {
+        eprintln!("error: --sha is the commit a --ci run states; pass --ci as well");
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    }
     let path = o.path.as_deref().unwrap_or("ship.ks");
-    let context = context_of(&o);
+    // `--ci` is the caller saying a CI is in charge, which settles it even
+    // where the environment is empty: the flag is the assertion, and it
+    // overrides a detected laptop so a job that exports nothing still gets
+    // the CI context and every `ci-only:` step it covers.
+    let context = if o.ci { ContextName::Ci } else { context_of(&o) };
     // Who is running this, decided once from the declaration, the environment
     // and the organisation's baseline — the latter whatever this environment
     // declares in `KEEPSHIPPING_AGENTS` / `KEEPSHIPPING_REQUIRE_HUMAN`. A
     // stored `PolicyStore` baseline is still to come; until then the
     // environment is the only place an organisation can speak.
-    let baseline = actor::ActorBaseline::from_env(&std::env::vars().collect());
+    let baseline = actor::ActorBaseline::from_env(&env_snapshot());
     let actor = actor::for_run(o.declared, o.actor_name.as_deref(), interactive(&o), &baseline);
     // Detection alone only ever escalates to an agent; it never pulls a
     // declared `human` or `ci` back down to one. A baseline that requires a
     // human is the other half and may escalate either.
     let actor_kind = if actor.kind == ActorKind::Agent { ActorKind::Agent } else { o.actor };
     let is_agent = actor_kind == ActorKind::Agent;
+    // Generic CI mode: what the job's environment says about itself, for the
+    // log, the parked record and the one stderr line. It is not handed to any
+    // step — dispatch has no run context to give one yet (#130).
+    let ci = o.ci.then(|| {
+        crate::generic_ci::GenericCiRunContext::from_env(
+            &env_snapshot(),
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            crate::generic_ci::Overrides {
+                actor: o.declared,
+                actor_name: o.actor_name.clone(),
+                sha: o.sha.clone(),
+                trigger: event.as_ref().map(crate::generic_ci::trigger_from_cli),
+            },
+        )
+    });
     let site = match check::load(Path::new(path), path, actor_kind, o.path.is_none(), context) {
         Ok(site) => site,
         Err(code) => return code,
@@ -159,21 +202,15 @@ fn run(args: &[String]) -> ExitCode {
     if let Err(code) = refuses_to_run(&site, &o, context) {
         return code;
     }
-    let event = match o.event.as_deref().map(parse_event) {
-        Some(Ok(t)) => Some(t),
-        Some(Err(msg)) => {
-            eprintln!("error: {msg}");
-            return ExitCode::from(2);
-        }
-        None => None,
-    };
     match ks_core::select_env(&site.checked.workflow, o.env.as_deref(), event.as_ref()) {
-        Ok(ks_core::EnvChoice::Selected(name)) => selected(&o, &site, &name, is_agent, &inputs),
+        Ok(ks_core::EnvChoice::Selected(name)) => {
+            selected(&o, &site, &name, is_agent, &inputs, ci.as_ref())
+        }
         Ok(ks_core::EnvChoice::Ambiguous(names)) => {
             let offered = names.join(", ");
             if interactive(&o) {
                 match prompt(&offered, &names) {
-                    Some(name) => selected(&o, &site, &name, is_agent, &inputs),
+                    Some(name) => selected(&o, &site, &name, is_agent, &inputs, ci.as_ref()),
                     None => {
                         eprintln!("error: no environment chosen (expected one of {offered})");
                         ExitCode::from(2)
@@ -206,6 +243,7 @@ fn selected(
     env: &str,
     is_agent: bool,
     inputs: &[Input],
+    ci: Option<&crate::generic_ci::GenericCiRunContext>,
 ) -> ExitCode {
     let workflow = &site.checked.workflow;
     let only: Vec<&str> = o.only.iter().map(String::as_str).collect();
@@ -233,6 +271,12 @@ fn selected(
     // printed anything or resolved a credential.
     if refuses_ci_only(workflow, o, env, &steps) {
         return ExitCode::from(1);
+    }
+    // What `--ci` detected, said once, before anything runs: which CI this is,
+    // and that its identity is self-declared because generic mode verifies no
+    // OIDC token (#130). One line, on stderr with the rest of the refusals.
+    if let Some(ci) = ci {
+        eprintln!("note: {}", ci.note());
     }
     if o.dry_run {
         // The graph and the check, and nothing else: the promise `check`
@@ -306,6 +350,18 @@ fn selected(
     if let Some(base) = &base {
         parking = parking.with_context(resume::BASE_REF, &base.git_ref);
     }
+    // Which CI parked the run, so a later `runs pending` or `resume` can say
+    // where it came from without re-deriving it from the machine it lands on.
+    // The key lives here rather than beside `resume::ACTOR` so this change
+    // stays off a file another change is already editing. The value is the
+    // same name the `--ci` note calls the actor by, so a record and the line
+    // that wrote it cannot call one CI two different things (`unknown` where
+    // the environment named no system).
+    const CI_KEY: &str = "ci";
+    let mut parking = match ci {
+        Some(ci) => parking.with_context(CI_KEY, &ci.system().to_string()),
+        None => parking,
+    };
     // A step the effective policy asks about is a wait, and a wait is what an
     // `approval` step is: the run writes itself down with nothing done and the
     // job ends. An agent's run waits on a human decision, because an agent may
@@ -375,6 +431,47 @@ fn stem(file: &Path) -> String {
     file.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| file.to_string_lossy().into_owned())
+}
+
+/// The process environment, as the map both the CI context and the actor's
+/// facts are built from.
+///
+/// Read through `vars_os`, never `vars`: `vars` panics on a single variable
+/// that is not valid UTF-8, and one such variable anywhere in a CI job — which
+/// is exactly where they leak in — would take the whole run down over a name
+/// this run may not even read. A value that is not UTF-8 is lossily
+/// converted: what it said may be mangled, and what it said is not worth a
+/// crash.
+pub(crate) fn env_snapshot() -> std::collections::BTreeMap<String, String> {
+    lossy(std::env::vars_os())
+}
+
+/// The environment as `from_env` takes it, whatever it holds. Split out from
+/// the read so a test can hand it a variable `vars` would have panicked on.
+fn lossy(
+    env: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> std::collections::BTreeMap<String, String> {
+    env.map(|(name, value)| {
+        (name.to_string_lossy().into_owned(), value.to_string_lossy().into_owned())
+    })
+    .collect()
+}
+
+/// A variable that is not valid UTF-8 is lossily read, not fatal: `vars`
+/// panics where `vars_os` does not, and CI environments are exactly where they
+/// leak in. This pins the read; the binary it feeds is turned on by the
+/// non-UTF-8 environment test beside it.
+#[test]
+#[cfg(unix)]
+fn lossy_keeps_a_variable_that_is_not_utf8() {
+    use std::os::unix::ffi::OsStringExt;
+    let bad = std::ffi::OsString::from_vec(b"WEIRD\xffNAME".to_vec());
+    let snapshot = lossy([(bad.clone(), bad.clone())].into_iter());
+    // Lossy, not fatal: the name survives as replacement characters, which is
+    // all a CI variable this run never reads has to be worth.
+    assert_eq!(snapshot.len(), 1, "the variable was read, not dropped");
+    let (name, value) = snapshot.iter().next().expect("the one variable");
+    assert!(name.contains('\u{fffd}') && value.contains('\u{fffd}'), "{name}={value}");
 }
 
 /// The runner the binary runs steps through. A script step goes to the
@@ -570,8 +667,15 @@ fn refuses_to_run_at(
 }
 
 /// A terminal to ask, the user having allowed it, and no CI in charge.
+///
+/// `--ci` is a CI in charge however the environment looks, and a non-interactive
+/// run parks at its first approval and ends the job instead of holding a runner
+/// open until it times out (#97).
 fn interactive(o: &Options) -> bool {
-    std::io::stdin().is_terminal() && !o.non_interactive && std::env::var_os("CI").is_none()
+    std::io::stdin().is_terminal()
+        && !o.non_interactive
+        && !o.ci
+        && std::env::var_os("CI").is_none()
 }
 
 fn prompt(offered: &str, names: &[String]) -> Option<String> {
