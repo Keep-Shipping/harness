@@ -140,6 +140,8 @@ pub enum Code {
     NeedsContext,
     /// An `auto:` approval rule that could approve a destructive plan.
     AutoDestroys,
+    /// A step an approval gates uses an artifact the approval does not show.
+    UncoveredArtifact,
     /// The file declares a format this keepshipping does not read.
     FormatUnsupported,
     /// The file declares the format before the current one.
@@ -183,6 +185,7 @@ impl Code {
             Code::OptionalAbsent => "KS0601",
             Code::NeedsContext => "KS0602",
             Code::AutoDestroys => "KS0701",
+            Code::UncoveredArtifact => "KS0702",
             Code::FormatUnsupported => "KS0005",
             Code::FormatDeprecated => "KS0610",
             Code::FormatUndeclared => "KS0611",
@@ -224,6 +227,7 @@ impl Code {
         Code::FormatDeprecated,
         Code::FormatUndeclared,
         Code::AutoDestroys,
+        Code::UncoveredArtifact,
         Code::NonReproducible,
     ];
 }

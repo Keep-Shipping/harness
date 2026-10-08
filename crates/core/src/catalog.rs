@@ -212,15 +212,23 @@ impl Catalog {
             false,
             false,
         );
+        // `quorum` and `expires` carry defaults in the step schema, so the
+        // catalog types them as optional, as it does for `oci.artifact`.
         add(
             "approval",
             &[
                 ("show", Type::Any),
                 ("from", Type::Handle),
+                ("quorum", Type::Optional(Box::new(Type::Int))),
+                ("expires", Type::Optional(Box::new(Type::Duration))),
                 ("auto", Type::Bool),
                 ("else", Type::Any),
             ],
-            &[("approved", Type::Bool), ("by", Type::String)],
+            &[
+                ("approved_by", Type::List(Box::new(named("Identity")))),
+                ("at", Type::String),
+                ("comment", Type::String),
+            ],
             false,
             false,
         );
@@ -446,6 +454,7 @@ const FAMILIES: &[(&str, Option<&str>)] = &[
     ("fn.Version", None),
     ("Secret", None),
     ("Team", None),
+    ("Identity", None),
     ("Env", None),
 ];
 

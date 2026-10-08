@@ -647,6 +647,42 @@ steps:
          and plan.destroys == 0
 ",
         },
+        Code::UncoveredArtifact => Explanation {
+            code,
+            title: "artifact used after an approval that does not show it",
+            severity: Severity::Error,
+            summary: "An `approval` is a promise about particular hashes: the approver is shown \
+                the plan file and the image digests, and says yes to those. A step the file \
+                orders after the approval consumes an artifact the approval never showed, so \
+                the thing being deployed is not the thing that was approved. Add the artifact \
+                to `show:`, or order the step before the approval.",
+            bad: "\
+steps:
+  plan: tofu.plan
+    dir: ./infra
+  build: oci.image
+    from: ./Dockerfile
+  review: approval
+    show: plan.changes
+    from: @platform
+  deploy: k8s.rollout
+    image: build.digest
+    after: review
+",
+            good: "\
+steps:
+  plan: tofu.plan
+    dir: ./infra
+  build: oci.image
+    from: ./Dockerfile
+  review: approval
+    show: plan.changes, build.digest
+    from: @platform
+  deploy: k8s.rollout
+    image: build.digest
+    after: review
+",
+        },
         Code::NonReproducible => Explanation {
             code,
             title: "image build is not reproducible",
