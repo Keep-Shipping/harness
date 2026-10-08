@@ -268,8 +268,12 @@ impl GithubActionsRunContext {
                 // A hosted runner reaches the whole internet; narrowing this
                 // belongs to policy, not to the adapter.
                 network: NetworkScope::Any,
-                // GitHub's own secrets belong to the workflow, not a resolver.
-                secret_resolvers: BTreeSet::new(),
+                // Both environment-backed resolvers serve a job; the
+                // `github-actions` one is the store behind `ci-only`
+                // environments. Spelled out rather than imported from
+                // `env_secrets`, which this file's two crate roots (lib and
+                // bin) cannot both name.
+                secret_resolvers: BTreeSet::from(["env".to_string(), "github-actions".to_string()]),
             },
             workspace: Workspace { scratch: scratch_dir(env, &root), root },
             endpoint,

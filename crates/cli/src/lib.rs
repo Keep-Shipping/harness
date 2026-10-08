@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod env_secrets;
 pub mod http_client;
 pub mod scripts;
 // Test-only scaffolding, but it has to be reachable from the binary's test

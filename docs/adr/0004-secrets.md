@@ -65,7 +65,7 @@ appears in diagnostics and logs.
   [#123](https://github.com/Keep-Shipping/harness/issues/123).
 - The first two resolvers are `env` (the process environment; works on a
   laptop and in any CI) and GitHub Actions. Actions secrets already arrive as
-  environment variables, but a `github` resolver answers only inside a
+  environment variables, but a `github-actions` resolver answers only inside a
   verified GitHub Actions `RunContext` — that gate is what makes `ci-only`
   enforceable. Both are targeted at M1/M2.
 - Later resolvers — macOS Keychain, 1Password CLI, Vault, cloud secret
@@ -113,10 +113,17 @@ appears in diagnostics and logs.
   to satisfy, not one it already satisfies.
 - Redaction is best-effort on exact values. `Redactor` matches the literal
   UTF-8 value and merges overlapping spans, so no registered bytes survive in
-  the clear — but a secret that appears transformed (base64-encoded, hashed,
-  split across a line) is not caught, and non-UTF-8 values are skipped
-  entirely. Redaction is a safety net, not a guarantee; the reason `Secret` is
-  a type is what actually keeps values out of strings.
+  the clear. Registering a value also registers the encodings a step is likely
+  to produce on its own — base64 (padded, unpadded and URL-safe), percent
+  encoding of every byte outside the RFC 3986 unreserved set, and the JSON
+  string escaping `serde_json` writes — so a value that reaches a log base64'd,
+  URL-encoded or JSON-escaped is still scrubbed. What remains best-effort:
+  a base64 encoding of a secret embedded at an offset that is not a multiple of
+  three inside a longer blob, a hashed, truncated or encrypted value, a value
+  split across lines or re-ordered before it is printed, and non-UTF-8 values
+  in the clear (skipped, though their base64 and percent forms are still
+  registered). Redaction is a safety net, not a guarantee; the reason `Secret`
+  is a type is what actually keeps values out of strings.
 - Zeroisation is best-effort too, without `unsafe`: `Drop` overwrites the
   value's own allocation and pins the loop with `black_box`. Copies the
   allocator made while the `Vec` grew are not reached.
