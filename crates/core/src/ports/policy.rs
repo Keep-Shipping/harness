@@ -34,6 +34,7 @@ use std::fmt;
 
 use super::BoxFuture;
 use crate::ports::run_context::ActorKind;
+use crate::ports::supply_chain::SignerIdentity;
 
 /// What a rule says about one action.
 ///
@@ -187,6 +188,21 @@ pub struct Baseline {
     /// The document these rules were read from, or `None` for the built-in
     /// default.
     pub source: Option<BaselineSource>,
+    /// The identities whose blocks this organization trusts to run.
+    ///
+    /// A block is someone else's pipeline code running with your credentials:
+    /// it names the steps, it reads the inputs, and it gets to run. Only a
+    /// signature that verifies *and* names one of these identities is
+    /// acceptable — see [`block_trust`](crate::block_trust).
+    ///
+    /// **Empty trusts nothing.** The unconfigured case must not be a hole, so
+    /// [`Baseline::conservative`] lists no publishers and every block is
+    /// refused until an organization says otherwise.
+    ///
+    /// It lives here, in the org's baseline, and nowhere else: a workflow file
+    /// must never author what constrains it ([ADR
+    /// 0012](https://github.com/Keep-Shipping/harness/blob/main/docs/adr/0012-policy-authority.md)).
+    pub publishers: Vec<SignerIdentity>,
 }
 
 impl Baseline {
@@ -271,7 +287,7 @@ impl Baseline {
                 provenance: never,
             },
         ]);
-        Baseline { rules, source: None }
+        Baseline { rules, source: None, publishers: Vec::new() }
     }
 
     /// What `subject` is permitted to do `verb` on `object`.
@@ -510,6 +526,7 @@ mod tests {
                 path: ".keepshipping/policy.ks".to_string(),
                 git_ref: "main".to_string(),
             }),
+            publishers: Vec::new(),
         };
         assert_eq!(effective_baseline(Some(configured.clone())), configured);
     }
@@ -544,6 +561,7 @@ mod tests {
                 },
             ],
             source: Some(source.clone()),
+            publishers: Vec::new(),
         };
         assert_eq!(never_first.decide(ActorKind::Agent, "destroy", "prod"), Disposition::Never);
 
@@ -569,6 +587,7 @@ mod tests {
             source: Some(BaselineSource::Hosted {
                 location: "https://policy.example.com".to_string(),
             }),
+            publishers: Vec::new(),
         };
         assert_eq!(allow_first.decide(ActorKind::Agent, "destroy", "prod"), Disposition::Allow);
     }

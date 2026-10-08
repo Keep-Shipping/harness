@@ -263,7 +263,7 @@ fn site_policy() -> ks_core::Policy {
 /// An org baseline with one rule, declared the way a real one is.
 fn baseline(rules: Vec<Rule>) -> Baseline {
     let source = BaselineSource::Hosted { location: "https://policy.example.com".to_string() };
-    Baseline { rules, source: Some(source) }
+    Baseline { rules, source: Some(source), publishers: Vec::new() }
 }
 
 fn rule(subject: Subject, verb: &str, object: &str, disposition: Disposition) -> Rule {

@@ -50,6 +50,9 @@ pub const RESERVED_REPO_B: &str = "conformance-b";
 ///             provenance: Provenance::Baseline { source: source.clone() },
 ///         }],
 ///         source: Some(source),
+///         // No publishers: the default trusts no block, and this fake is
+///         // about the rules.
+///         publishers: Vec::new(),
 ///     },
 /// );
 ///
@@ -194,6 +197,7 @@ mod tests {
                 provenance: Provenance::Baseline { source: source() },
             }],
             source: Some(source()),
+            publishers: Vec::new(),
         }
     }
 
@@ -301,6 +305,7 @@ mod tests {
                 provenance: Provenance::Default,
             }],
             source: Some(source()),
+            publishers: Vec::new(),
         };
         // A baseline that claims a document has been read, yet attributes a
         // rule to nothing anyone wrote. Nothing in the type stops it, which is
