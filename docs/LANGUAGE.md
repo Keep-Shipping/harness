@@ -493,13 +493,57 @@ business, checked later.)
 - `ci-only:` — `true` or `false`;
 - `approvers:` — handle(s);
 - `on:` — the triggers that select this environment;
-- `vars:` — child entries, available everywhere as `env.<name>`.
+- `vars:` — child entries, available everywhere as `env.<name>`;
+- `require-verified:` — `true` or `false`.
 
 Unknown properties get a did-you-mean. A file without `envs:` has one
 implicit environment `default`.
 
 `when: env is prod` is the one non-decision `is` test: `prod` must be a
 declared environment.
+
+**`require-verified:` makes verification an environment's condition, not a
+step's habit.** A deploy step (`k8s.rollout`, `vm.deploy`) says what it ships
+must be signed by with a `verify:` input — `verify: "signed-by key:release-key"`,
+or `verify: "signed-by <subject> from <issuer>"`. The property means that every
+deploy which can reach this environment has to say so:
+
+```
+envs:
+  dev:
+  prod:
+    require-verified: true
+steps:
+  build: oci.image
+    from: ./Dockerfile
+  deploy: k8s.rollout
+    image: build.digest
+    verify: "signed-by key:release-key"
+```
+
+A `k8s.rollout` with no `verify:` under such an environment is an error
+(`KS0304`), naming both the environment and the step. So is one with
+`verify: ""`: the empty string is what a deploy that verifies nothing spells,
+and reading it as a request would let a step claim verification by writing
+nothing.
+
+**Which deploys it covers.** A step's `when: env is <name>` is what puts it in
+an environment; a deploy with no such gate is in scope for *every* environment,
+including the ones that demand verification. That is deliberate — the gate is a
+declaration of scope, its absence is not an exemption, and treating silence as
+one would make the strongest statement in the file also the cheapest to evade
+by deleting a line. A deploy that really belongs elsewhere says so:
+`when: env is dev` puts it out of scope for `prod`, visibly.
+
+A block use is judged as the use: it carries the actions of the steps inside it,
+so a use that reaches a deploy inherits the deploy's obligation, and `verify:`
+passed to it (or defaulted by its signature) is what satisfies it. Report it
+against the use's name.
+
+`require-verified:` is a pre-flight check on the client, not a control on the
+cluster: it refuses the workflow, not a deployment made by somebody else. See
+[DEPLOY_VERIFICATION.md](DEPLOY_VERIFICATION.md) for what it does not cover and
+how to mirror the same rule cluster-side with Kyverno or Sigstore.
 
 **When a `when:` is settled.** A condition that reads only context — a
 boolean literal, `env is <name>`, `not` over either — is settled before the

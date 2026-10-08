@@ -207,6 +207,11 @@ impl Catalog {
                 ("max_failures", Type::Optional(Box::new(Type::Int))),
                 ("rollback", Type::Optional(Box::new(Type::List(Box::new(Type::Any))))),
                 ("ssh_user", Type::Optional(Box::new(Type::String))),
+                // What the deploy ships, and the identity it must be signed by. Both optional:
+                // a deploy that names no artifact has nothing to verify, and a deploy that names
+                // no identity verifies nothing.
+                ("image", Type::Optional(Box::new(Type::String))),
+                ("verify", Type::Optional(Box::new(Type::String))),
             ],
             &[("healthy", Type::Int), ("total", Type::Int), ("summary", Type::String)],
             false,
@@ -280,7 +285,9 @@ impl Catalog {
                 ("image", named("oci.Digest")),
                 ("to", named("k8s.Cluster")),
                 ("wait", Type::Any),
-                ("verify", Type::String),
+                // Optional because the step schema gives `verify` an empty default: a rollout
+                // that names no identity verifies nothing, exactly as it does today.
+                ("verify", Type::Optional(Box::new(Type::String))),
                 // What is deployed, and where it goes. Optional, because a
                 // rollout may pin each image by container name instead, and
                 // because a workflow may declare its own defaults.

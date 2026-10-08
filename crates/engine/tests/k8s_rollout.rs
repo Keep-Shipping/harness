@@ -17,7 +17,7 @@ use ks_core::ports::health::{Health, HealthReport};
 use ks_core::ports::script_host::Value;
 use ks_core::ports::secrets::Redactor;
 use ks_core::step::{
-    CancellationToken, Inputs, LogRecord, LogSink, Outputs, Port, Ports, StepError,
+    CancellationToken, Inputs, LogRecord, LogSink, Outputs, Port, Ports, StepError, StepKind,
 };
 use ks_engine::k8s_rollout::K8sRollout;
 use ks_engine::run::run_step;
@@ -321,5 +321,26 @@ fn an_apply_that_fails_rolls_back_what_it_had_already_changed() {
             r#"apply ["Deployment/api"]"#,
             "rollback Deployment/api to 7"
         ]
+    );
+}
+
+/// `verify:` is an input, so it is defaulted like the rest: a rollout that
+/// names no identity verifies nothing, and needs neither a registry nor a
+/// signer — which is what lets a composition without either still build
+/// ([#113](https://github.com/Keep-Shipping/harness/issues/113)). The refusals
+/// themselves live in `deploy_verify.rs`, against a real digest.
+#[test]
+fn an_empty_verify_is_the_default_and_verifies_nothing() {
+    let schema = K8sRollout.schema();
+    let verify = schema.inputs.iter().find(|field| field.name == "verify");
+    assert_eq!(
+        verify.and_then(|field| field.default.clone()),
+        Some(Value::from("")),
+        "empty means no verification"
+    );
+    assert_eq!(K8sRollout.optional(), [Port::Registry, Port::Signer], "the ports are optional");
+    assert!(
+        !K8sRollout.requires().contains(&Port::Signer),
+        "a deploy is not blocked by having no signer"
     );
 }

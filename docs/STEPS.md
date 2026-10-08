@@ -9,12 +9,13 @@ Every step kind the harness ships, with its declared schema. Inputs are
 checked against the schema before the step runs; outputs, after.
 
 
-## `k8s.rollout` (v1.0.0)
+## `k8s.rollout` (v1.1.0)
 
 Applies manifests to a cluster with every image pinned by digest, and waits for the workloads to become healthy.
 
 - Action: deploy
 - Requires: Cluster
+- Optional: Registry, Signer
 
 Inputs:
 
@@ -27,6 +28,7 @@ Inputs:
 | `namespace` | string | `` | the namespace to deploy into |
 | `wait` | list | [`healthy`, `5m`] | the state to wait for and how long, as `healthy, 5m` |
 | `rollback` | string | `auto` | `auto` to roll back a rollout that does not settle, `none` to leave it |
+| `verify` | string | `` | the identity every image above must be signed by, as `signed-by <identity>`: `signed-by key:release-key`, or `signed-by https://token.actions.githubusercontent.com from https://github.com/acme/api/.github/workflows/release.yml@refs/heads/main`. An empty value verifies nothing |
 
 Outputs:
 
@@ -161,12 +163,13 @@ Outputs:
 | `empty` | bool | whether it changes nothing |
 | `summary` | string | the plan in plain terms |
 
-## `vm.deploy` (v1.0.0)
+## `vm.deploy` (v1.1.0)
 
 Deploys to a fleet of hosts over SSH, one batch at a time, and reports how many came up.
 
 - Action: deploy
 - Requires: RemoteShell
+- Optional: Registry, Signer
 
 Inputs:
 
@@ -180,6 +183,8 @@ Inputs:
 | `max_failures` | int | 0 | how many hosts may fail health before the deploy stops and rolls back |
 | `rollback` | list | - | commands that restore a host's previous artifact, in the same `{ program, args, timeout }` shape as `run`, run on every host of a failed batch |
 | `ssh_user` | string | `deploy` | the user to deploy as, for the hosts that do not name one |
+| `image` | string | - | the digest-pinned artifact the deploy ships, as `repository@sha256:…`; verification checks the signature on this digest |
+| `verify` | string | `` | the identity `image` must be signed by, as `signed-by <identity>`: `signed-by key:release-key`, or `signed-by https://token.actions.githubusercontent.com from https://github.com/acme/api/.github/workflows/release.yml@refs/heads/main`. An empty value verifies nothing |
 
 Outputs:
 
