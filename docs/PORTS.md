@@ -29,6 +29,28 @@ comment edits do not need any of that — the fingerprint normalises them away.
 
 Newest first, one heading per contract version, dated.
 
+## STEP_API 6
+
+- **2026-10-07** — [`ScriptHost::run`](https://github.com/Keep-Shipping/harness/blob/main/crates/core/src/ports/script_host.rs)
+  takes a fourth argument, `log: &StepLog`
+  ([#91](https://github.com/Keep-Shipping/harness/issues/91)): a script's log
+  frames now go to the step's own redacting logger, so they pass through the
+  run's [`Redactor`](https://github.com/Keep-Shipping/harness/blob/main/crates/core/src/ports/secrets.rs)
+  exactly as a built-in step's lines do, and a script that logs a secret it
+  revealed prints `***`. This closes the log side of the existing contract —
+  secrets already reached scripts over a dedicated file descriptor, never
+  argv, the environment or stdio — so an adapter no longer has to get
+  redaction right on its own or not at all. The change is breaking for every
+  `ScriptHost` implementor, which is why `STEP_API` moves.
+
+  The other half is in the engine rather than the port: every step's outputs
+  go through `reject_secret_outputs`, which fails the step
+  (`InvalidOutput`) if a value the run resolved appears anywhere in them,
+  including inside a longer string. Returning a secret is refused rather than
+  redacted, because an output feeds wiring, cache keys and the run log, where
+  a masked value helps nobody. Nothing about which ports exist changed, so
+  `Port` and `define_ports!` are untouched.
+
 ## STEP_API 5
 
 - **2026-10-07** — Additive: the `RemoteShell` port gained

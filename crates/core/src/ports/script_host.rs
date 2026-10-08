@@ -16,6 +16,17 @@
 //! adapter share one [`StepSchema::validate_inputs`] /
 //! [`StepSchema::validate_outputs`].
 //!
+//! A script's own logging is the same story from the other end
+//! ([#91](https://github.com/Keep-Shipping/harness/issues/91)): its log frames
+//! go to the [`StepLog`] [`ScriptHost::run`] is handed, so they pass through
+//! the run's [`Redactor`] exactly as a built-in step's do — a script that
+//! logs a revealed secret prints `***`. And a secret coming back *out* is not
+//! merely redacted, it is refused:
+//! [`reject_secret_outputs`](crate::step::reject_secret_outputs) fails the
+//! step, because an output feeds wiring and the run log, where masking a
+//! value would help nobody.
+//!
+//! [`Redactor`]: crate::ports::secrets::Redactor
 //! [`SecretBundle`]: crate::ports::secrets::SecretBundle
 
 use std::collections::BTreeMap;
@@ -24,6 +35,7 @@ use std::path::{Path, PathBuf};
 
 use super::BoxFuture;
 use crate::ports::secrets::SecretBundle;
+use crate::step::StepLog;
 
 /// Which script to run: a path, relative to the run's workspace root.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,8 +320,10 @@ pub enum ScriptHostError {
     ScriptFailed {
         /// The exit code, if it exited at all.
         exit_code: Option<i32>,
-        /// The script's own stderr tail, safe to print; the adapter lets the
-        /// run's redactor scrub it first.
+        /// The script's own stderr tail. Scrubbed by the adapter with
+        /// [`StepLog::redact`](crate::step::StepLog::redact) before it goes
+        /// in: those bytes come from the process, and whatever a failed
+        /// script printed is exactly what a revealed secret looks like.
         message: String,
     },
 }
@@ -368,16 +382,34 @@ pub trait ScriptHost: Send + Sync {
 
     /// Runs `script` with `inputs`, handing the values of `secrets` to the
     /// script over a dedicated file descriptor — never argv, the environment
-    /// or stdio, and never logging them. Adapters validate `inputs` against
-    /// the script's schema before starting the process, and the returned
-    /// values against it after; a nonzero exit is
-    /// [`ScriptFailed`](ScriptHostError::ScriptFailed), a wire violation is
-    /// [`Protocol`](ScriptHostError::Protocol).
+    /// or stdio. Adapters validate `inputs` against the script's schema before
+    /// starting the process, and the returned values against it after; a
+    /// nonzero exit is [`ScriptFailed`](ScriptHostError::ScriptFailed), a wire
+    /// violation is [`Protocol`](ScriptHostError::Protocol) — and a failed
+    /// script's stderr tail goes through [`log.redact(..)`](StepLog::redact)
+    /// on the way into the error, since a revealed secret is exactly what a
+    /// crashing script tends to print.
+    ///
+    /// The script's log frames go to `log` — the step's own
+    /// [`StepLog`], which redacts every message and
+    /// field through the run's [`Redactor`](crate::ports::secrets::Redactor)
+    /// before the sink sees them. That
+    /// is the same channel a built-in step logs on, so `log(db.reveal())`
+    /// prints `***` and never the value, and the adapter has no redaction
+    /// of its own to get wrong. It must not write log frames anywhere else
+    /// either: stdout and stderr belong to the protocol and to errors.
+    ///
+    /// What the script *returns* is a separate matter: the engine runs every
+    /// step's outputs through
+    /// [`reject_secret_outputs`](crate::step::reject_secret_outputs) against
+    /// the same redactor, so a returned secret — or a string with one
+    /// embedded — fails the step rather than propagating.
     fn run<'a>(
         &'a self,
         script: &'a ScriptRef,
         inputs: &'a Values,
         secrets: &'a SecretBundle,
+        log: &'a StepLog,
     ) -> BoxFuture<'a, Result<Values, ScriptHostError>>;
 }
 

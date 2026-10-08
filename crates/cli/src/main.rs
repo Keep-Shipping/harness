@@ -37,9 +37,9 @@ use std::time::Instant;
 
 use ks_core::ports::run_context::ActorKind;
 use ks_core::ports::script_host::{ScriptHost, ScriptRef, Values};
-use ks_core::ports::secrets::SecretBundle;
+use ks_core::ports::secrets::{Redactor, SecretBundle};
 use ks_core::script_step::{is_script_kind, needing_approval, script_path};
-use ks_core::step::ActionKind;
+use ks_core::step::{ActionKind, LogRecord, LogSink, StepLog};
 use ks_core::{ContextName, Step, Trigger, TriggerKind};
 // The binary shares the adapter with the OCI distribution crate's tests, which
 // link this package as a library; the module is declared once, in `lib.rs`.
@@ -238,7 +238,7 @@ impl Steps {
 }
 
 impl StepRunner for Steps {
-    fn run(&mut self, step: &Step, _log: &mut dyn FnMut(&str)) -> Result<Done, String> {
+    fn run(&mut self, step: &Step, log: &mut dyn FnMut(&str)) -> Result<Done, String> {
         let kind = step.kind.as_deref().unwrap_or("steps");
         if !is_script_kind(kind) {
             return Err(format!("`{kind}` steps are not built in yet"));
@@ -257,11 +257,38 @@ impl StepRunner for Steps {
         };
         // Inputs are passed empty: the step's schema is not read at run time
         // yet (#88), so there is nothing to hand over and nothing to check.
-        let outputs = wait(host.run(&ScriptRef::new(path), &Values::new(), &SecretBundle::new()))
-            .map_err(|e| e.to_string())?;
+        // The script's log lines come back through the step's own logger. No
+        // secrets are resolved here yet, so its redactor holds nothing.
+        let sink = Arc::new(CollectingSink::default());
+        let step_log =
+            StepLog::new(step.name.clone(), Arc::new(Redactor::new()), Arc::clone(&sink) as _);
+        let outputs =
+            wait(host.run(&ScriptRef::new(path), &Values::new(), &SecretBundle::new(), &step_log))
+                .map_err(|e| e.to_string());
+        for record in sink.take() {
+            log(&record.message);
+        }
+        let outputs = outputs?;
         Ok(Done::Summary(
             outputs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "),
         ))
+    }
+}
+
+/// Keeps a script step's log records until the step returns, so they can be
+/// handed to the progress renderer's per-line callback in order.
+#[derive(Default)]
+struct CollectingSink(Mutex<Vec<LogRecord>>);
+
+impl CollectingSink {
+    fn take(&self) -> Vec<LogRecord> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+}
+
+impl LogSink for CollectingSink {
+    fn record(&self, record: LogRecord) {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(record);
     }
 }
 

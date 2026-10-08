@@ -355,6 +355,18 @@ impl Redactor {
         redacted
     }
 
+    /// Whether `text` contains any registered value at all.
+    ///
+    /// The question [`reject_secret_outputs`](crate::step::reject_secret_outputs) asks about a
+    /// step's return value before it is read: the run's secrets are already registered here, so a
+    /// yes means the step handed one back. It reuses `match_spans` — the same scan
+    /// [`Redactor::redact`] makes — so it agrees exactly with what redaction would have hidden,
+    /// including the skip for non-UTF-8 values, and a second implementation cannot drift from
+    /// the first. Matching here is *detection*, not redaction: the caller must not print `text`.
+    pub fn contains(&self, text: &str) -> bool {
+        !self.match_spans(text).is_empty()
+    }
+
     /// Every byte range of `text` a registered value matches, merged so
     /// overlapping or adjacent matches form one span, in order. Ranges from
     /// matching a UTF-8 value inside a `&str` always land on char
@@ -580,6 +592,22 @@ mod tests {
         redactor.register(&SecretValue::new(vec![0xFF, 0xFE, 0x00]));
         redactor.register(&SecretValue::new(Vec::new()));
         assert_eq!(redactor.redact("nothing to see"), "nothing to see");
+    }
+
+    #[test]
+    fn contains_agrees_with_what_redact_would_have_hidden() {
+        let mut redactor = Redactor::new();
+        redactor.register(&SecretValue::new(b"hunter2".to_vec()));
+        for text in ["hunter2", "login=hunter2", "hunter2hunter2", "hunter2-infra", "clean"] {
+            assert_eq!(
+                redactor.contains(text),
+                redactor.redact(text).contains("***"),
+                "{text:?} was detected and redacted inconsistently"
+            );
+        }
+        // A redactor that never saw a value detects nothing — the check is only as
+        // good as the registration the engine did before the step ran.
+        assert!(!Redactor::new().contains("hunter2"));
     }
 
     #[test]

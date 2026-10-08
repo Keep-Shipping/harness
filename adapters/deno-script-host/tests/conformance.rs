@@ -14,17 +14,25 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use ks_core::ports::script_host::{
     ScriptHost, ScriptHostError, ScriptRef, Value, ValueType, Values,
 };
-use ks_core::ports::secrets::{SecretBundle, SecretValue};
+use ks_core::ports::secrets::{Redactor, SecretBundle, SecretValue};
+use ks_core::step::{LogLevel, LogSink, StepLog};
 use ks_deno_script_host::{DENO_VERSION, DenoScriptHost};
 use ks_testing::block_on;
 use ks_testing::script_host::conformance;
+use ks_testing::step::RecordingSink;
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+
+/// A step logger that redacts nothing and keeps nothing, for runs whose log
+/// lines are not under test.
+fn quiet() -> StepLog {
+    StepLog::new("conformance.script", Arc::new(Redactor::new()), Arc::new(RecordingSink::new()))
+}
 
 /// Whether these tests should run at all, and why not when they should not.
 fn skip(reason: &str) {
@@ -63,24 +71,30 @@ fn secrets_arrive_on_their_channel_and_never_reach_a_log() {
 };
 "#,
     );
-    let logged: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&logged);
-    let host = host(&workspace).with_log_sink(move |level, message| {
-        sink.lock().expect("the log sink").push((level.to_string(), message.to_string()));
-    });
-
+    let host = host(&workspace);
     let mut secrets = SecretBundle::new();
     secrets.insert("conformance-token", SecretValue::new(b"hunter2".to_vec()));
-    let outputs = block_on(host.run(&ScriptRef::new("step.ts"), &Values::new(), &secrets))
+    // The step's own logger, redacting with the run's redactor: the adapter has
+    // no redaction of its own, so this is the only thing between a line and
+    // the sink.
+    let mut redactor = Redactor::new();
+    redactor.register(&SecretValue::new(b"hunter2".to_vec()));
+    let sink = Arc::new(RecordingSink::new());
+    let log = StepLog::new("app.step", Arc::new(redactor), Arc::clone(&sink) as Arc<dyn LogSink>);
+    let outputs = block_on(host.run(&ScriptRef::new("step.ts"), &Values::new(), &secrets, &log))
         .expect("the step runs with its secret");
 
     assert_eq!(outputs["token"], Value::from("hunter2"), "the value reached the step intact");
     assert_eq!(outputs["length"], Value::Number(7.0));
-    let logged = logged.lock().expect("the log sink").clone();
+    let logged = sink.records();
     assert_eq!(logged.len(), 1, "the step logged once: {logged:?}");
-    assert_eq!(logged[0].0, "info");
-    assert!(!logged[0].1.contains("hunter2"), "the log sink must not see a secret");
-    assert!(logged[0].1.contains("***"), "the secret is redacted in the log: {}", logged[0].1);
+    assert_eq!(logged[0].level, LogLevel::Info);
+    assert!(!logged[0].message.contains("hunter2"), "the log sink must not see a secret");
+    assert!(
+        logged[0].message.contains("***"),
+        "the secret is redacted in the log: {}",
+        logged[0].message
+    );
 }
 
 #[test]
@@ -117,7 +131,7 @@ fn a_step_cannot_read_outside_the_workspace_or_the_environment() {
             [("what".to_string(), Value::from(what)), ("path".to_string(), Value::from(path))]
                 .into_iter()
                 .collect();
-        let error = block_on(host.run(&script, &inputs, &SecretBundle::new()))
+        let error = block_on(host.run(&script, &inputs, &SecretBundle::new(), &quiet()))
             .expect_err("the sandbox refuses both");
         let message = error.to_string();
         assert!(matches!(error, ScriptHostError::ScriptFailed { .. }), "{what}: {message}");
@@ -167,6 +181,7 @@ fn a_symlink_out_of_the_workspace_is_denied_though_deno_would_allow_it() {
         &ScriptRef::new("through-the-link.ts"),
         &Values::new(),
         &SecretBundle::new(),
+        &quiet(),
     ))
     .expect_err("a link out of the workspace is denied");
 
@@ -219,6 +234,7 @@ fn a_symlink_that_stays_inside_the_workspace_still_runs() {
         &ScriptRef::new("through-the-link.ts"),
         &Values::new(),
         &SecretBundle::new(),
+        &quiet(),
     ))
     .expect("a link within the workspace is not an escape");
     assert_eq!(
@@ -278,12 +294,14 @@ fn net_is_refused_unless_the_step_declared_the_host() {
         .into_iter()
         .collect();
 
-    let declared = block_on(host.run(&ScriptRef::new("declared.ts"), &url, &SecretBundle::new()))
-        .expect("a declared host is reachable");
+    let declared =
+        block_on(host.run(&ScriptRef::new("declared.ts"), &url, &SecretBundle::new(), &quiet()))
+            .expect("a declared host is reachable");
     assert_eq!(declared["body"], Value::from("pong"));
 
-    let error = block_on(host.run(&ScriptRef::new("undeclared.ts"), &url, &SecretBundle::new()))
-        .expect_err("an undeclared host is not");
+    let error =
+        block_on(host.run(&ScriptRef::new("undeclared.ts"), &url, &SecretBundle::new(), &quiet()))
+            .expect_err("an undeclared host is not");
     assert!(error.to_string().contains("NotCapable"), "{error}");
 
     let _ = answer.join();
@@ -321,10 +339,10 @@ fn the_same_script_and_the_same_lockfile_give_the_same_bytes_twice() {
     );
     let host = host(&workspace);
     let script = ScriptRef::new("clock.ts");
-    let first =
-        block_on(host.run(&script, &Values::new(), &SecretBundle::new())).expect("the first run");
-    let second =
-        block_on(host.run(&script, &Values::new(), &SecretBundle::new())).expect("the second run");
+    let first = block_on(host.run(&script, &Values::new(), &SecretBundle::new(), &quiet()))
+        .expect("the first run");
+    let second = block_on(host.run(&script, &Values::new(), &SecretBundle::new(), &quiet()))
+        .expect("the second run");
     assert_eq!(first, second, "two runs of one step must agree");
 
     // Fixed constants, not just agreement: the seed, TZ=UTC and the empty

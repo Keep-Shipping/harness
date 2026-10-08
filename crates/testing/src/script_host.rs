@@ -5,21 +5,36 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use ks_core::ports::BoxFuture;
 use ks_core::ports::script_host::{
     ScriptHost, ScriptHostError, ScriptRef, StepSchema, Value, ValueType, Values,
 };
-use ks_core::ports::secrets::{SecretBundle, SecretValue};
+use ks_core::ports::secrets::{Redactor, SecretBundle, SecretValue};
+use ks_core::step::{LogSink, StepLog};
+
+use crate::step::RecordingSink;
+
+/// The name the conformance kit's secrets arrive under, and their value. Both live here so the
+/// kit's hosts, its fixtures and its redaction assertions cannot drift apart.
+const CONFORMANCE_SECRET: &str = "conformance-token";
+const CONFORMANCE_TOKEN: &[u8] = b"hunter2";
+/// The fixture that logs the token rather than returning it.
+const LOG_SECRET_FIXTURE: &str = "log-secret";
+
+/// What a scripted fake script computes: outputs from the validated inputs, with the step's
+/// `StepLog` to log on — the two things a script process is handed and nothing else.
+type ScriptFn = dyn Fn(&Values, &StepLog) -> Values + Send + Sync;
 
 /// What a registered fake script does when [`ScriptHost::run`] reaches it,
 /// after the input contract has been validated.
 enum Behavior {
     /// Returns these fixed outputs (still validated against the schema).
     Outputs(Values),
-    /// Computes outputs from the (already validated) inputs.
-    Fn(Box<dyn Fn(&Values) -> Values + Send + Sync>),
+    /// Computes outputs from the (already validated) inputs, logging on the
+    /// step's `StepLog` like a real script's log frames do.
+    Fn(Box<ScriptFn>),
     /// Simulates the process failing: exits nonzero (or never exits).
     Fail(ScriptHostError),
 }
@@ -41,11 +56,17 @@ struct Registered {
 /// and records which secret *names* it received — never values, in the
 /// record or in `Debug`.
 ///
+/// The log frames a scripted function emits go to the [`StepLog`] the run
+/// hands it, so they are redacted on the way out exactly as a real script's
+/// would be.
+///
 /// ```
 /// use std::collections::BTreeMap;
+/// use std::sync::Arc;
 /// use ks_core::ports::script_host::{ScriptHost, ScriptRef, StepSchema, ValueType, Value};
-/// use ks_core::ports::secrets::SecretBundle;
-/// use ks_testing::{block_on, script_host::FakeScriptHost};
+/// use ks_core::ports::secrets::{Redactor, SecretBundle};
+/// use ks_core::step::{LogSink, StepLog};
+/// use ks_testing::{block_on, script_host::FakeScriptHost, step::RecordingSink};
 ///
 /// let mut schema = StepSchema::default();
 /// schema.inputs.insert("name".to_string(), ValueType::String);
@@ -57,10 +78,13 @@ struct Registered {
 ///     schema,
 ///     outputs,
 /// );
+/// let sink = Arc::new(RecordingSink::new());
+/// let log = StepLog::new("app.greet", Arc::new(Redactor::new()), Arc::clone(&sink) as Arc<dyn LogSink>);
 /// let greeting = block_on(host.run(
 ///     &ScriptRef::new("scripts/greet.ts"),
 ///     &BTreeMap::from([("name".to_string(), Value::from("app"))]),
 ///     &SecretBundle::new(),
+///     &log,
 /// )).expect("the scripted script runs");
 /// assert_eq!(greeting["greeting"], Value::from("hello, app"));
 /// ```
@@ -94,12 +118,15 @@ impl FakeScriptHost {
     }
 
     /// Registers `script` with `schema` and outputs computed from the
-    /// (already validated) inputs.
+    /// (already validated) inputs. The closure also gets the step's
+    /// [`StepLog`], so a test can script the log frames a real script emits
+    /// — including ones built from a secret — and watch them come out
+    /// redacted, which is the contract the fourth `run` argument carries.
     pub fn with_script_fn(
         mut self,
         script: &ScriptRef,
         schema: StepSchema,
-        outputs: impl Fn(&Values) -> Values + Send + Sync + 'static,
+        outputs: impl Fn(&Values, &StepLog) -> Values + Send + Sync + 'static,
     ) -> FakeScriptHost {
         self.register(script, schema, Behavior::Fn(Box::new(outputs)));
         self
@@ -129,7 +156,20 @@ impl FakeScriptHost {
         let mut fake = self;
         for fixture in fixtures() {
             let script = ScriptRef::new(fixture_path(fixture.name));
-            fake = fake.with_script(&script, fixture.schema, fixture.returns);
+            // `log-secret` is the one fixture whose *behaviour* is on the log rather than on
+            // stdout: it logs the token the run handed it and returns nothing. Every other
+            // fixture is a fixed stdout object.
+            fake = if fixture.name == LOG_SECRET_FIXTURE {
+                fake.with_script_fn(&script, fixture.schema, |_inputs, log| {
+                    log.info(
+                        &format!("connecting with {}", String::from_utf8_lossy(CONFORMANCE_TOKEN)),
+                        &[("token", &String::from_utf8_lossy(CONFORMANCE_TOKEN))],
+                    );
+                    Values::new()
+                })
+            } else {
+                fake.with_script(&script, fixture.schema, fixture.returns)
+            };
         }
         fake
     }
@@ -167,8 +207,14 @@ impl fmt::Debug for FakeScriptHost {
 }
 
 /// The shared `run` body: validate, execute, validate — in that order, with
-/// the same [`StepSchema`] checks a real adapter must run.
-fn execute(registered: &Registered, inputs: &Values) -> Result<Values, ScriptHostError> {
+/// the same [`StepSchema`] checks a real adapter must run. `log` is the
+/// step's redacting logger, handed to scripted functions and ignored by the
+/// fixed-output and failure behaviors, neither of which logs.
+fn execute(
+    registered: &Registered,
+    inputs: &Values,
+    log: &StepLog,
+) -> Result<Values, ScriptHostError> {
     registered.schema.validate_inputs(inputs)?;
     match &registered.behavior {
         Behavior::Outputs(outputs) => {
@@ -176,7 +222,7 @@ fn execute(registered: &Registered, inputs: &Values) -> Result<Values, ScriptHos
             Ok(outputs.clone())
         }
         Behavior::Fn(compute) => {
-            let outputs = compute(inputs);
+            let outputs = compute(inputs, log);
             registered.schema.validate_outputs(&outputs)?;
             Ok(outputs)
         }
@@ -204,6 +250,7 @@ impl ScriptHost for FakeScriptHost {
         script: &'a ScriptRef,
         inputs: &'a Values,
         secrets: &'a SecretBundle,
+        log: &'a StepLog,
     ) -> BoxFuture<'a, Result<Values, ScriptHostError>> {
         let result = {
             let registry = self.scripts.lock().expect("fake script host registry");
@@ -212,7 +259,7 @@ impl ScriptHost for FakeScriptHost {
                 self.secret_names.lock().expect("fake script host secrets").push(name.to_string());
             }
             match registry.get(script.path()) {
-                Some(registered) => execute(registered, inputs),
+                Some(registered) => execute(registered, inputs, log),
                 None => Err(unknown_script(script)),
             }
         };
@@ -246,7 +293,9 @@ pub struct ScriptFixture {
 /// The `ScriptHost` conformance fixtures: a right-typed echo, a fixture
 /// exercising every container and scalar type, and one scripted bug per
 /// typed error — a wrong-typed output, a missing output, an undeclared
-/// output, and a wrong-typed input. Real adapters (protocol settled in
+/// output, and a wrong-typed input — plus one fixture whose whole point is
+/// the log: it logs the secret it was handed, as a message and as a field
+/// value, and returns nothing. Real adapters (protocol settled in
 /// [ADR 0009](../../../docs/adr/0009-typescript-escape-hatch-runtime.md)) map
 /// each fixture to an actual script file and must reproduce
 /// both its `returns` behaviour and its `expected` result; the fake maps
@@ -304,6 +353,16 @@ pub fn fixtures() -> Vec<ScriptFixture> {
             expected: Err(ScriptHostError::UnexpectedOutput { name: "surprise".to_string() }),
         },
         ScriptFixture {
+            // Logs the secret it was handed — as the message and as a field value —
+            // and returns nothing. Nothing about this is observable in the return
+            // value: the kit asserts it on the log, where it must read `***`.
+            name: LOG_SECRET_FIXTURE,
+            schema: StepSchema::default(),
+            inputs: Values::new(),
+            returns: Values::new(),
+            expected: Ok(Values::new()),
+        },
+        ScriptFixture {
             // The caller supplies a String where the script declared Number.
             name: "bad-input",
             schema: schema_of(&[("count", ValueType::Number)], &[("x", ValueType::String)]),
@@ -327,16 +386,31 @@ pub fn fixtures() -> Vec<ScriptFixture> {
 /// produce the fixture's expected result. Runs carry a secret named
 /// `conformance-token`; hosts must pass it to the script by file descriptor
 /// and must never log it.
+///
+/// Every run gets a fresh [`Redactor`] holding that token, and a
+/// [`StepLog`] over it the host writes its log frames
+/// to — the same channel the engine hands a step. The kit then asserts the
+/// whole log across the whole fixture set: the raw token appears in none of
+/// it, and `***` appears, because the `log-secret` fixture's script logs the
+/// secret it was handed.
 pub async fn conformance(host: &dyn ScriptHost, script_for: impl Fn(&ScriptFixture) -> ScriptRef) {
     let mut secrets = SecretBundle::new();
-    secrets.insert("conformance-token", SecretValue::new(b"hunter2".to_vec()));
+    secrets.insert(CONFORMANCE_SECRET, SecretValue::new(CONFORMANCE_TOKEN.to_vec()));
+    let mut redactor = Redactor::new();
+    redactor.register(&SecretValue::new(CONFORMANCE_TOKEN.to_vec()));
+    let sink = Arc::new(RecordingSink::new());
+    let log = StepLog::new(
+        "conformance.script",
+        Arc::new(redactor),
+        Arc::clone(&sink) as Arc<dyn LogSink>,
+    );
     for fixture in fixtures() {
         let script = script_for(&fixture);
         let schema = host.schema(&script).await.unwrap_or_else(|error| {
             panic!("conformance: schema of {:?} failed: {error}", fixture.name)
         });
         assert_eq!(&schema, &fixture.schema, "conformance: schema mismatch for {:?}", fixture.name);
-        let actual = host.run(&script, &fixture.inputs, &secrets).await;
+        let actual = host.run(&script, &fixture.inputs, &secrets, &log).await;
         match (&fixture.expected, actual) {
             (Ok(want), Ok(got)) => {
                 assert_eq!(got, *want, "conformance: outputs of {:?}", fixture.name)
@@ -349,6 +423,15 @@ pub async fn conformance(host: &dyn ScriptHost, script_for: impl Fn(&ScriptFixtu
             }
         }
     }
+    // The assertion is over the records themselves, not the count or a sample: a
+    // single surviving byte of the token is the whole failure this kit exists for.
+    let records = sink.records();
+    let shown = format!("{records:?}");
+    assert!(
+        !shown.contains(std::str::from_utf8(CONFORMANCE_TOKEN).expect("the token is UTF-8")),
+        "conformance: a secret reached the log: {shown}"
+    );
+    assert!(shown.contains("***"), "conformance: nothing was redacted at all: {shown}");
 }
 
 /// The path [`FakeScriptHost::with_fixtures`] registers each fixture under;
@@ -375,6 +458,18 @@ mod tests {
     use super::*;
     use crate::block_on;
 
+    /// A logger over a redactor holding the kit's token — what a step would be handed.
+    fn log_for(secret: Option<&[u8]>) -> (StepLog, Arc<RecordingSink>) {
+        let mut redactor = Redactor::new();
+        if let Some(bytes) = secret {
+            redactor.register(&SecretValue::new(bytes.to_vec()));
+        }
+        let sink = Arc::new(RecordingSink::new());
+        let log =
+            StepLog::new("test.script", Arc::new(redactor), Arc::clone(&sink) as Arc<dyn LogSink>);
+        (log, sink)
+    }
+
     fn echo_script() -> ScriptRef {
         ScriptRef::new("scripts/greet.ts")
     }
@@ -383,7 +478,7 @@ mod tests {
         let mut schema = StepSchema::default();
         schema.inputs.insert("name".to_string(), ValueType::String);
         schema.outputs.insert("greeting".to_string(), ValueType::String);
-        FakeScriptHost::new().with_script_fn(&echo_script(), schema, |inputs| {
+        FakeScriptHost::new().with_script_fn(&echo_script(), schema, |inputs, _log| {
             let name = match inputs.get("name") {
                 Some(Value::String(name)) => name.as_str(),
                 _ => "stranger",
@@ -396,15 +491,39 @@ mod tests {
     fn computed_outputs_see_the_validated_inputs() {
         let host = echo_host();
         let inputs = values_of(&[("name", "app".into())]);
-        let outputs = block_on(host.run(&echo_script(), &inputs, &SecretBundle::new()))
+        let (log, _) = log_for(None);
+        let outputs = block_on(host.run(&echo_script(), &inputs, &SecretBundle::new(), &log))
             .expect("the fn script runs");
         assert_eq!(outputs["greeting"], Value::from("hi, app"));
     }
 
     #[test]
+    fn a_script_logging_a_secret_is_redacted_on_the_way_out() {
+        let schema = StepSchema::default();
+        let host = FakeScriptHost::new().with_script_fn(&echo_script(), schema, |_inputs, log| {
+            // What a script does with the value it was handed on the secret fd.
+            let token = String::from_utf8_lossy(CONFORMANCE_TOKEN).to_string();
+            log.info(&format!("connecting with {token}"), &[("token", &token)]);
+            Values::new()
+        });
+        let (log, sink) = log_for(Some(CONFORMANCE_TOKEN));
+        block_on(host.run(&echo_script(), &Values::new(), &SecretBundle::new(), &log))
+            .expect("the fn script runs");
+
+        let records = sink.records();
+        let shown = format!("{records:?}");
+        assert!(!shown.contains("hunter2"), "the raw token reached the sink: {shown}");
+        // Redacted, not dropped: the frame is still there, with stars in it.
+        let record = records.first().expect("the frame was recorded");
+        assert_eq!(record.message, "connecting with ***");
+        assert_eq!(record.fields, vec![("token".to_string(), "***".to_string())]);
+    }
+
+    #[test]
     fn unregistered_scripts_are_protocol_errors() {
         let host = FakeScriptHost::new();
-        let error = block_on(host.run(&echo_script(), &Values::new(), &SecretBundle::new()))
+        let (log, _) = log_for(None);
+        let error = block_on(host.run(&echo_script(), &Values::new(), &SecretBundle::new(), &log))
             .expect_err("nothing is registered");
         assert!(matches!(error, ScriptHostError::Protocol { .. }), "{error}");
         assert!(block_on(host.schema(&echo_script())).is_err());

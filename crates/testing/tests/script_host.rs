@@ -2,16 +2,24 @@
 //! output errors, secrets passed by name only, and dyn compatibility.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use ks_core::ports::script_host::{ScriptHost, ScriptHostError, ScriptRef, Value, ValueType};
-use ks_core::ports::secrets::{SecretBundle, SecretValue};
+use ks_core::ports::secrets::{Redactor, SecretBundle, SecretValue};
+use ks_core::step::StepLog;
 use ks_testing::block_on;
 use ks_testing::script_host::{
     FakeScriptHost, conformance as script_host_conformance, fixture_path, fixtures,
 };
+use ks_testing::step::RecordingSink;
 
 fn fixture_script(name: &str) -> ScriptRef {
     ScriptRef::new(format!("/fixtures/{name}.ts"))
+}
+
+/// The logger a run hands a step: redacting, recording, and throwaway for anything but logs.
+fn log() -> StepLog {
+    StepLog::new("app.script", Arc::new(Redactor::new()), Arc::new(RecordingSink::new()))
 }
 
 #[test]
@@ -28,8 +36,12 @@ fn a_wrong_typed_output_is_a_typed_error() {
         fixtures().into_iter().find(|f| f.name == "wrong-type").expect("the fixture").schema,
         BTreeMap::from([("x".to_string(), Value::Number(7.0))]),
     );
-    match block_on(host.run(&fixture_script("wrong-type"), &BTreeMap::new(), &SecretBundle::new()))
-    {
+    match block_on(host.run(
+        &fixture_script("wrong-type"),
+        &BTreeMap::new(),
+        &SecretBundle::new(),
+        &log(),
+    )) {
         Err(ScriptHostError::OutputTypeMismatch { name, expected, found }) => {
             assert_eq!(name, "x");
             assert_eq!((expected, found), (ValueType::String, ValueType::Number));
@@ -50,14 +62,15 @@ fn a_wrong_typed_output_is_a_typed_error() {
 fn secrets_reach_the_script_by_name_only() {
     let schema =
         fixtures().into_iter().find(|f| f.name == "echo").expect("the echo fixture").schema;
-    let host = FakeScriptHost::new().with_script_fn(&fixture_script("echo"), schema, |inputs| {
-        BTreeMap::from([("greeting".to_string(), inputs["name"].clone())])
-    });
+    let host =
+        FakeScriptHost::new().with_script_fn(&fixture_script("echo"), schema, |inputs, _log| {
+            BTreeMap::from([("greeting".to_string(), inputs["name"].clone())])
+        });
     let inputs = BTreeMap::from([("name".to_string(), Value::from("app"))]);
     let mut secrets = SecretBundle::new();
     secrets.insert("deploy-token", SecretValue::new(b"hunter2".to_vec()));
 
-    let outputs = block_on(host.run(&fixture_script("echo"), &inputs, &secrets))
+    let outputs = block_on(host.run(&fixture_script("echo"), &inputs, &secrets, &log()))
         .expect("the echo script runs");
     assert_eq!(outputs["greeting"], Value::from("app"));
 
@@ -75,9 +88,13 @@ fn a_scripted_failure_comes_back_typed() {
         Some(3),
         "cannot find module",
     );
-    let error =
-        block_on(host.run(&fixture_script("broken"), &BTreeMap::new(), &SecretBundle::new()))
-            .expect_err("the broken script fails");
+    let error = block_on(host.run(
+        &fixture_script("broken"),
+        &BTreeMap::new(),
+        &SecretBundle::new(),
+        &log(),
+    ))
+    .expect_err("the broken script fails");
     assert_eq!(
         error,
         ScriptHostError::ScriptFailed {
