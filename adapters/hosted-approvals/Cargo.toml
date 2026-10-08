@@ -1,0 +1,25 @@
+[package]
+name = "ks-hosted-approvals"
+description = "Web and Slack approval channels for the hosted venture: an HTML review page and Block Kit buttons over one in-memory ticket store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+ks-core.workspace = true
+serde_json.workspace = true
+# The Slack signing scheme is HMAC-SHA256 (`hmac` 0.13 and `sha2` 0.11 both
+# build on `digest` 0.11, so they pair); the workspace's `sha2` is 0.10 and is
+# left to the adapter that hashes OCI blobs.
+hmac = "0.13"
+sha2 = "0.11"
+
+[dev-dependencies]
+ks-engine.workspace = true
+ks-testing.workspace = true
+
+[lints]
+workspace = true

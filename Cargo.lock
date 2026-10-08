@@ -1050,6 +1050,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ks-hosted-approvals"
+version = "0.0.0"
+dependencies = [
+ "hmac",
+ "ks-core",
+ "ks-engine",
+ "ks-testing",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "ks-lang"
 version = "0.0.0"
 
