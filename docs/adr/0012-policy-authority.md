@@ -99,6 +99,13 @@ what the baseline allows.
   hosted store. The port is a read of one baseline document — it has no
   write path, because a workflow file must never be able to author the
   thing that constrains it.
+- **A baseline rule with the verb `auto` switches off `auto:` for one
+  environment.** The nine verbs above are the file's own vocabulary; a
+  baseline document is written by the org and is not held to that list, so
+  `never: auto production` says what it says without a language change
+  (`ks_core::baseline_allows_auto`). The verb matches first-match-wins like
+  every other rule, so a `never` must precede any broader `allow`; and with no
+  baseline configured at all `auto:` stays available — it is opt-out.
 - **`PolicyStore` ships unimplemented.** Nothing in this repository
   implements it, and the name exists only in the two diagrams that already
   carry it. This ADR introduces the port and says plainly that it is empty:
