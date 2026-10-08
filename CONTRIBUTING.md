@@ -80,7 +80,7 @@ The ADR guard test enforces this: `cargo test -p ks-testing --test adr_guard`.
 
 - [ ] The merge gates pass.
 - [ ] New behaviour has tests; bug fixes come with a failing-first test.
-- [ ] New steps and adapters pass the conformance kit (`ks-testing`).
+- [ ] New steps and adapters pass the conformance kit (`ks-testing`); the guide is [docs/STEP-AUTHORING.md](docs/STEP-AUTHORING.md).
 - [ ] Port contract changes have a changelog entry.
 
 ## Licence

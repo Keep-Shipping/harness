@@ -25,6 +25,61 @@ regenerate `COMPATIBILITY.md` with
 `KS_BLESS=1 cargo test -p ks-testing --test compatibility`. Reformatting and
 comment edits do not need any of that — the fingerprint normalises them away.
 
+## Port reference
+
+One row per port trait, verified against `crates/core/src/ports/`. **In `Port`**
+is the question that matters to a step author, and it is checked here against
+the `Port` enum and the `define_ports!` list in
+`crates/core/src/step.rs`, which must agree in order: a step can only declare a
+port that has a variant. The kit is the port's conformance function in
+`ks-testing` — most are named `conformance`, but the two supply-chain ones are
+`registry_conformance` and `signer_conformance`, and a few take extra arguments
+beyond the trait (`cluster::conformance` a name and a manifest, `iac::conformance`
+a directory). `—` means the module ships fakes but no kit. The implementor is
+the in-tree `impl` of the trait.
+
+### Ports a step can declare
+
+| Trait | For | In `Port` | Kit | Implementor |
+|---|---|---|---|---|
+| `RunContext` | who and where a run is | yes | `run_context::conformance` | `ks-cli`'s `GithubActionsRunContext` |
+| `Secrets` | resolving named secrets, redacting values | yes | `secrets::conformance` | core's `ActorGatedSecrets`, the engine's `PolicySecrets` |
+| `ImageBuilder` | building a container image | yes | — | — |
+| `Registry` | pushing and pulling by digest | yes | `supply_chain::registry_conformance` | `ks-oci-distribution` |
+| `Signer` | signing, attestations, digests | yes | `supply_chain::signer_conformance` | — |
+| `IacTool` | planning and applying infrastructure | yes | `iac::conformance` | `ks-tofu-cli` |
+| `HttpClient` | bounded, policy-checked HTTP | yes | `http::conformance` | `ks-cli`'s `TcpHttpClient` |
+| `Clock` | time and sleeping | yes | `clock::conformance` | `ks-cli`'s `SystemClock` |
+| `IdGen` | minting fresh run ids | yes | `id_gen::conformance` | — |
+| `ScriptHost` | running TypeScript escape-hatch steps | yes | `script_host::conformance` | `ks-deno-script-host` |
+| `ApprovalChannel` | asking a team for approval | yes | `approval::conformance`, which takes the channel, a `Directory`, a team and an approver, and so covers `Directory` too | `ks-hosted-approvals`, `ks-github` |
+| `Cluster` | applying manifests and watching rollouts | yes | `cluster::conformance`, which takes a name and a manifest | `ks-helm-cli` |
+| `RemoteShell` | commands on a host the harness does not own | yes | `remote_shell::conformance` | — |
+| `FunctionHost` | publishing a version, shifting traffic | yes | `function_host::conformance` | — |
+| `DecisionModel` | asking a model a judgement it cannot be handed | yes | `decision_model::conformance` | `ks-jev` |
+
+### Engine- and CLI-only ports
+
+No `Port` variant, so no step can hold one and `STEP_API` does not move when
+one changes. The **Implementor** column says which crate ships the one that
+runs in production.
+
+| Trait | For | Implementor | Kit |
+|---|---|---|---|
+| `BlocksIndex` | the metadata-only blocks index | CLI's `HostedBlocksIndex` | — |
+| `BlockSource` | block content, resolved and fetched by digest | — | `block_source::conformance` |
+| `PolicyStore` | the org baseline policy, read from outside the repository | — | `policy::conformance` |
+| `RunLog` | the append-only record of what a run did | CLI's `JsonlRunLog` | — |
+| `StateStore` | a parked run's state and its saved plans | engine's `LocalStateStore` | `state_store::conformance` |
+| `ApprovalInbox` | the approver's side: what is waiting for me, and here is my answer | — | `approval::inbox_conformance`, which takes a channel and an inbox |
+
+`health` is not a port: `crates/core/src/ports/health.rs` holds only the
+`Health` / `HealthReport` vocabulary the deploy-target ports report in.
+
+Writing an adapter? [STEP-AUTHORING.md](STEP-AUTHORING.md) has the crate shape
+and the test-file pattern; changing one of the traits above? The changelog
+below is where it goes.
+
 ## Changelog
 
 Newest first, one heading per contract version, dated.
