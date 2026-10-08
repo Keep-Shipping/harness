@@ -35,6 +35,7 @@ mod github_actions_run_context;
 #[allow(dead_code)]
 mod gitlab_ci_run_context;
 mod graph;
+mod import;
 // The local ed25519 `Signer` for the signed run log (#112).
 mod local_key;
 mod log;
@@ -98,6 +99,9 @@ fn dispatch() -> ExitCode {
         Some("graph") => graph::graph(&args[1..]),
         Some("blocks") => blocks::blocks(&args[1..]),
         Some("policy") => policy::policy(&args[1..]),
+        // `import shell` turns an existing deploy script into a starting
+        // `.ks` file: best effort, and it says what it did not recognise.
+        Some("import") => import::import(&args[1..]),
         // The checker is pure, so the only thing that can know what a
         // `script` step's TypeScript module declares is this one. It is
         // handed over rather than reached for, keeping node and the cache

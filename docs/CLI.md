@@ -47,6 +47,9 @@ implemented end to end today; `run` is not.
   overrode. `export` writes one JSON line per decision for labelling and calibration. A log whose
   hash chain is broken is named on stderr, left out of the numbers and makes the command exit 1.
   [CALIBRATION.md](CALIBRATION.md) is the workflow.
+- `keepshipping import shell <SCRIPT>` — read an existing deployment shell script and write a
+  starting `.ks` file from the commands it recognises (`--out FILE`; default `<script stem>.ks`).
+  [Importing a shell script](#importing-a-shell-script) below.
 
 There is **no `--as` flag** on `approve` or `deny`. The approver named in the state and the log is
 the environment's own (`$USER`, then `$USERNAME`, then `local`): a label for the run log, not a
@@ -248,6 +251,94 @@ the line and this command has nothing to print but the "sent nothing" message.
 | 0 | — | the chain held; every `decide.sent` event was printed, or the run sent nothing |
 | 1 | — | the chain is broken, or the output could not be written — nothing is printed |
 | 2 | — | usage: no `--explain`, a repeated `--explain`, more than one run id, an id that is not a ULID, or a run that is not there or cannot be read |
+
+## Importing a shell script
+
+`keepshipping import shell deploy2.sh` is a **best effort**: it reads a POSIX-ish deployment
+script line by line, turns the commands keepshipping has a step kind for into real typed steps,
+and prints a report saying what it recognised, what it did not, and what you have to do next. It
+is not a shell parser — it is a line-oriented scan over a fixed vocabulary — and it is written so
+that being unsure is visible rather than silent.
+
+- `--out FILE` — where to write. Default `<script stem>.ks`, so `deploy2.sh` gives `deploy2.ks`.
+- The output is **never overwritten**: an existing file is exit 2 with the flag to name another.
+- Exit 0 when the file was written, 2 for a usage problem or a script that cannot be read, 1 when
+  the output cannot be written.
+- A command continued with `\` is one command: `docker build \` / `-f Dockerfile.prod \` / `.` is
+  read as `docker build -f Dockerfile.prod .`, and every line in the report points at the line the
+  command **started** on.
+
+### What it recognises
+
+| In the script | In the file |
+| --- | --- |
+| `docker build [-f FILE] [-t TAG] [CONTEXT]` | `oci.image`: `from:` (the `-f` file, else the context), `context:`, `push:` |
+| `docker push TAG` | folded into the `oci.image` step before it, as its `push:` — the **first** push wins, and a `-t` on the build beats both. Later pushes are still reported, not dropped. With no build before it: unrecognised |
+| `tofu plan [-out=FILE] [DIR]`, `terraform plan …` | `tofu.plan` / `terraform.plan` with `dir:` |
+| `tofu apply FILE`, `terraform apply FILE` | `tofu.apply` / `terraform.apply` with `plan: <planstep>.file`, when `FILE` is the file some plan step wrote |
+| `kubectl apply -f`, `kubectl set image`, `kubectl rollout`, `helm upgrade` | one `k8s.rollout` with `image: <build>.digest` |
+| `ssh HOST COMMAND`, including inside a `for` loop | one `vm.deploy` with `hosts:` and `run:` |
+
+Every kind above is in the built-in catalog — an **unknown** kind type-checks clean, so a
+converter that invented `helm.upgrade` would pass `keepshipping check` and produce a file that
+cannot run. What it does **not** recognise it reports by line with a one-line suggestion, rather
+than dropping it.
+
+What becomes no step at all, and is only reported:
+
+- `VAR=value` and `export VAR=value` — listed as variables you may want under `envs:`. **No
+  `envs:` block is invented**: which variables a pipeline declares is yours to decide.
+- `set -euo pipefail` and friends — noted as shell options. A `.ks` file has none.
+- `if`, `for`, `while`, `case`, functions and heredocs — **control flow has no representation in
+  `.ks` at all**. A `for h in web-1 web-2` loop over `ssh` is flattened into one `vm.deploy`
+  naming every distinct host, and the report says the loop was flattened.
+
+### The script step
+
+If **any** command was unrecognised, or any control flow was seen, one script step is appended at
+the end: kind `./<script stem>.ts`, `action:` set to the most severe class among the wrapped
+commands (`build` < `plan` < `apply` < `deploy` < `destroy`, `other` when there is nothing to go
+on), and `after:` every step before it. It is where all of it lives, and **you write the module** —
+nothing checks that the file is there.
+
+No `approval` step is emitted. Putting the gate in is your call, and an approval that does not
+cover everything downstream of it trips the `UncoveredArtifact` coverage rule. The report does say
+when an apply or a deploy will need one before it will run in prod.
+
+The file it writes carries `keepshipping: 0.1` first and a `name:` from the script's stem, and is
+already in `keepshipping fmt`'s canonical form. It has **no `on:` trigger** — the report says so,
+because a file without one checks clean and never starts.
+
+### What the report says
+
+```
+$ keepshipping import shell deploy2.sh
+wrote deploy2.ks from deploy2.sh
+
+recognised
+  line  step    kind         command
+  12    build   oci.image    docker build -f Dockerfile -t $IMAGE:$VERSION ./api
+  13    build   oci.image    docker push "$IMAGE:$VERSION"
+  18    plan    tofu.plan    tofu plan -out=prod.tfplan -var=region=$REGION ./infra/prod
+  19    apply   tofu.apply   tofu apply prod.tfplan
+  21    deploy  k8s.rollout  kubectl apply -f k8s/namespace.yaml
+  31    vm      vm.deploy    ssh $host sudo systemctl restart api && sudo systemctl reload nginx
+
+unrecognised
+  16  docker run --rm "$IMAGE:$VERSION" /api/healthz
+      `docker run` has no step kind: oci.image is the only docker-shaped thing in KS, and it covers build and push
+  27  aws cloudfront create-invalidation --distribution-id "$CDN_ID" --paths "/*"
+      no step kind talks to a cloud CLI: this is the script step's job
+
+control flow
+  26  if [ "$REGION" = "eu-west-1" ]; then
+  30  for host in web-1 web-2 web-3; do
+  .ks has no if, for, while, case or heredoc: every line above stays in the script step
+```
+
+...then the variables it saw, the `set` flags, the folds and flattens it did, and a short **next**
+section: run `keepshipping check` and `keepshipping fmt`, write the `.ts` if one is referenced,
+give the `k8s.rollout` a `to:`, and put an `approval` before the apply or the deploy.
 
 ## Exit codes
 
