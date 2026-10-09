@@ -22,6 +22,21 @@ ENV = "production"
 # AUTH_ISSUER = "https://auth.factory0.ventures"
 # AUTH_CLIENT_ID = "keepshipping-console"
 
+# Edit as code (issue #170, docs/EDIT_AS_CODE.md): where the console's
+# Terraform pull requests go. EDITS_REPO is `owner/name`; files land under
+# EDITS_INFRA_DIR (empty = repository root) in the zone's module directory.
+# The two secrets are NOT here — set them with:
+#   wrangler secret put EDITS_GITHUB_TOKEN   # opens the pull requests
+#   wrangler secret put EDITS_RUNNER_TOKEN   # the CI plan callback's Bearer
+# Until EDITS_GITHUB_TOKEN exists the pages render but nothing delivers;
+# the cron picks the queue up when the secret lands.
+EDITS_REPO = "keepshipping/infra"
+EDITS_BASE_BRANCH = "main"
+EDITS_INFRA_DIR = ""
+# The sign-in page the console's 401 links to (with ?return=… set).
+# Empty/absent means the 401 page uses words instead of a link.
+EDITS_SIGN_IN_URL = ""
+
 [[ratelimits]]
 name = "RATE_LIMITER"
 namespace_id = "2001"
