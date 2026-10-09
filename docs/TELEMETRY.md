@@ -119,7 +119,7 @@ The closed vocabularies are named here rather than left to the receiver, so
 that a new kind cannot become a free-form field:
 
 - `enum(cli)` is the top-level word `dispatch()` matches in
-  `crates/cli/src/main.rs`, fifteen of them: `approve`, `blocks`,
+  `crates/cli/src/main.rs`, seventeen of them: `--version`, `about`, `approve`, `blocks`,
   `check`, `decide`, `decisions`, `deny`, `fmt`, `graph`, `import`,
   `log`, `lsp`, `policy`, `resume`, `run`, `runs`.
 - `enum(action)` is `ActionKind::NAMES` in `crates/core/src/step.rs`:
