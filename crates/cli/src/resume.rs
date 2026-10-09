@@ -514,7 +514,7 @@ fn refuses_ci_only(
 /// the one shape where it does not even need a fork. So the answer is
 /// [`Provenance::Fork`]: an environment that cannot name one system has not
 /// named the system whose rules this run should be under. Only the *named*
-/// markers count toward that ([`named_ci_systems`]), never the bare `CI` every
+/// markers count toward that ([`named_ci_systems`](crate::generic_ci::named_ci_systems)), never the bare `CI` every
 /// system sets beside its own — counting that would make every run ambiguous.
 fn provenance_from_env(env: &BTreeMap<String, String>) -> Provenance {
     if crate::generic_ci::named_ci_systems(env) > 1 {
