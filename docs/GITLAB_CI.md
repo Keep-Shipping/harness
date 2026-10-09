@@ -35,10 +35,17 @@ adapter.
 | the checkout | `CI_PROJECT_DIR` | `Workspace::root` |
 | the ref name | `CI_COMMIT_REF_NAME` | `GitInfo::git_ref`, under `refs/heads/` |
 | the tag | `CI_COMMIT_TAG` | `Trigger::Tag` and `refs/tags/<tag>` |
-| what started the pipeline | `CI_PIPELINE_SOURCE` | `Trigger` |
+| what started the pipeline | `CI_PIPELINE_SOURCE` | `Trigger`, and the first half of the provenance answer |
 | the merge request | `CI_MERGE_REQUEST_IID`, `CI_MERGE_REQUEST_REF_PATH` | `Trigger::PullRequest`, `refs/merge-requests/<iid>/head` |
+| where the head branch lives | `CI_MERGE_REQUEST_SOURCE_PROJECT_ID` | one half of the fork test, against the row below |
+| where the merge request lands | `CI_MERGE_REQUEST_PROJECT_ID` | the other half of the fork test |
 | who triggered it | `GITLAB_USER_LOGIN`, else the token's `user_login`, else its `sub` | `Actor::display_name` |
 | the identity | `KEEP_SHIPPING_ID_TOKEN` | `Establishment::CiOidc`, and `oidc_token`'s answer |
+
+Those three are GitLab's own predefined variables, set by the platform rather than
+written by the pipeline author. The two project ids are set on a merge-request
+pipeline and nowhere else, which is why a push pipeline never has a pair of ids that
+can disagree with each other.
 
 Every name above is in GitLab's
 [predefined variables reference](https://docs.gitlab.com/ci/variables/predefined_variables/);
@@ -65,6 +72,12 @@ for. A token whose `aud` is absent, malformed, or a list that does not include
 the caller gets `RunContextError::OidcUnavailable { audience }` — never the
 token. An `aud` that is an array of strings is accepted when it contains the
 caller.
+
+A run whose provenance is untrusted gets none of it. Such a context carries
+`oidc: false`, so `oidc_token` answers `OidcUnavailable` for every audience —
+including the one the job's pre-minted token's `aud` names exactly. Otherwise the
+failure would be the token's, and the pipeline that asked for that token is the one
+whose code is under test. See [Fork merge requests](#fork-merge-requests).
 
 ## The trigger
 
@@ -115,6 +128,31 @@ no protected variables either: `id_tokens:` works (GitLab mints the token for
 the fork project, so the identity is the fork's), while anything the parent marked
 protected or masked is simply absent.
 
+That is the platform's model. The adapter does not rest on it: a classification that
+depends on a property of the platform is a property of somebody else's deployment,
+and the answer the harness gives has to hold wherever the job runs. So the code the
+job is *about* is classified separately, from the variables, and it fails closed:
+
+| On GitLab | Provenance |
+|---|---|
+| `CI_PIPELINE_SOURCE=external_pull_request_event` | a fork, always, whatever the project ids say — a mirror of a pull request from another Git repository is by construction another project's code |
+| `merge_request_event`, with `CI_MERGE_REQUEST_SOURCE_PROJECT_ID` differing from `CI_MERGE_REQUEST_PROJECT_ID` | a fork: the head branch lives in another project |
+| `merge_request_event`, with either id missing or empty | a fork: a payload the adapter cannot read is not consent |
+| `push`, `schedule`, a tag, `web`, and a merge request whose two ids are equal | the repository's own code |
+
+The third row is the one that matters most, and it is deliberate. Only a
+merge-request pipeline sets those two ids at all, so nothing ordinary is condemned by
+it — but a runner that withholds `CI_MERGE_REQUEST_SOURCE_PROJECT_ID` gets an untrusted
+run rather than a trusted one. Trust is an affirmative claim, never a default that
+silence falls into.
+
+An untrusted run keeps its identity: it still establishes *who* is running, which is
+a different question from whose code it is about. What it loses is everything that
+hands its code a credential — the context is built with `oidc: false` (see [The id
+token](#the-id-token)), so a `role:` cannot be federated, and the policy gate offers
+it no secret resolver: no `apply`, no `deploy`, no `destroy`, no secret reads. `build`
+and `plan` still run.
+
 ## Known limits
 
 - **The token's signature is not verified.** GitLab signs ID tokens with RS256
@@ -131,7 +169,10 @@ protected or masked is simply absent.
   that parks for approval and resumes in another job gets a different token.
 - **The adapter is not wired into dispatch yet.** Like the GitHub Actions one,
   it is built and tested but unreachable from `run` until CI-versus-local
-  selection lands.
+  selection lands. What has reached production is its provenance reader:
+  `keepshipping resume` classifies a GitLab run with it (see
+  [CREDENTIALS.md](CREDENTIALS.md#what-the-harness-itself-does)), which is where
+  a fork's `ship.ks` is actually refused.
 
 ## See also
 

@@ -495,9 +495,13 @@ fn provenance_of(event_name: &str, head_repo: Option<&str>, base_repo: Option<&s
 /// wants to *gate* can afford to ask, and the answer is
 /// [`provenance_of`]'s either way.
 ///
-/// Non-GitHub environments answer [`Provenance::Repository`] — a laptop running
-/// a local branch is the repository's own code, and no event name is there to
-/// say otherwise.
+/// [`Provenance::Repository`] is the answer only where no `GITHUB_*` variable is
+/// set at all: a laptop on a local branch, or a CI this adapter knows nothing
+/// about. A caller whose CI might not be GitHub should ask that CI's own
+/// adapter instead, the way `keepshipping resume` now dispatches on `GITLAB_CI`
+/// to [`crate::gitlab_ci_run_context::provenance_from_env`] — asked about a
+/// GitLab run, this function is wrong by construction, because the variables
+/// that would identify the fork are not the ones it reads.
 pub(crate) fn provenance_from_env(env: &BTreeMap<String, String>) -> Provenance {
     provenance_of(
         env.get(GITHUB_EVENT_NAME).map(String::as_str).unwrap_or_default(),

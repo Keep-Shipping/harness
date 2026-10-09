@@ -26,12 +26,67 @@ It does **not** give:
 | Status reporting | None. There is no Checks API to write to; the job fails because the binary's exit code is non-zero. |
 | Approvals from inside the job | None. An approval **parks** the run and the job ends (exit 4). See [Approvals and parking](#approvals-and-parking). |
 | A verified CI identity | None. See [Identity](#identity). |
+| A fork marker it can trust | None. Generic mode reads none, so a run is untrusted unless its branch is declared. See [Provenance](#provenance-generic-mode-fails-closed). |
 
 This is deliberate, and
 [ADR 0008](adr/0008-github-actions-first.md) commits to it: GitHub Actions is the *native*
 integration, where an action, trigger mapping, OIDC, the Checks API and the approval hand-off are
 all wired up. Generic mode is the floor that runs everywhere, and every native integration has to
 keep passing it. A run on Buildkite and the same run on a laptop are the same run.
+
+## Provenance: generic mode fails closed
+
+Generic mode also classifies the code a run is *about*, and it classifies it as **untrusted**
+unless you say otherwise.
+
+It has to. GitHub exports the two repository names a fork test needs, and GitLab exports the two
+project ids. On Jenkins, Buildkite, CircleCI or a self-hosted runner those variables do not exist,
+and where something like them does exist, whoever wrote the pipeline wrote it — read back by a job
+that same file controls. A word in a build script is not evidence about whose code is being built.
+Silence is not consent, so generic mode trusts nothing it was not told.
+
+**A `--ci` run is untrusted by default, including a run on `main`.** There is no special case for
+the default branch: the branch name is read out of an environment the pipeline controls, so trusting
+it by default would be trusting a string the pipeline wrote. Naming the branch is the whole of the
+opt-in, and it is available on every system generic mode speaks for.
+
+Declare the branches you trust in `KEEP_SHIPPING_TRUSTED_BRANCHES`: a comma-separated list of
+branch names as git knows them — `main`, not `refs/heads/main`. Whitespace around an entry is
+trimmed and an empty entry is ignored.
+
+```yaml
+# buildkite
+steps:
+  - label: "keepshipping"
+    command: keepshipping\ run\ ship.ks\ --ci
+    env:
+      - KEEP_SHIPPING_TRUSTED_BRANCHES=main,release
+```
+
+| The run is on | `KEEP_SHIPPING_TRUSTED_BRANCHES` | Provenance |
+|---|---|---|
+| `refs/heads/main` | `main` | the repository's own code |
+| `refs/heads/feature/x` | `main` | untrusted |
+| `refs/heads/main` | unset, or empty, or a list of nothing | untrusted |
+| `refs/heads/main-old` | `main` | untrusted — the match is exact, so a shared prefix is not a match, and `MAIN` is not `main` |
+| `refs/tags/v1.2.3` | `v1.2.3`, or anything else | untrusted — a tag ref is never eligible |
+
+A tag pipeline can be pointed at any ref the runner can fetch, and the shape of the ref is the only
+thing generic mode can check for itself — the GitHub adapter has an event payload to say whose tag it
+is, and generic mode has no equivalent. A release build that has to be trusted belongs on the native
+integration; see [GITHUB_ACTIONS.md](GITHUB_ACTIONS.md).
+
+An untrusted run is what the [policy gate](CREDENTIALS.md#what-the-harness-itself-does) refuses
+secrets to. `keepshipping run` still builds no gate — see [What this does not do
+yet](#what-this-does-not-do-yet) — so today the classification rides on the run's own context
+rather than on anything refusing.
+
+`keepshipping resume` asks a different reader, and applies the same rule. It classifies the run
+from the CI that is actually running it: GitLab's own reader under `GITLAB_CI=true`, GitHub's
+under `GITHUB_ACTIONS=true`, and — on Buildkite, CircleCI, Jenkins or a runner exporting `CI`
+alone — generic mode's rule above, so a resume on a CI with no native adapter is untrusted unless
+`KEEP_SHIPPING_TRUSTED_BRANCHES` declares its branch. Only an environment with no CI marker at
+all is a laptop, and is trusted as the local branch it is.
 
 ## Detection
 
@@ -79,6 +134,8 @@ generic run, and a step kind that needs one is refused rather than half-served.
 
 **A policy that requires a strong CI identity must not trust generic mode.** Use the native GitHub
 Actions integration where the identity has to carry weight; see [GITHUB_ACTIONS.md](GITHUB_ACTIONS.md).
+A policy that trusts a *branch* is the same kind of claim: generic mode asks you to name the branch
+rather than infer one, for the reasons under [Provenance](#provenance-generic-mode-fails-closed).
 
 ## Per-system snippets
 
@@ -213,6 +270,7 @@ from the machine it lands on.
 ## What this does not do yet
 
 The CLI never hands a run context to a step, so none of the above reaches step execution: the note,
-the `ci` context and the parked record are what `--ci` changes today. Plumbing the port into steps
-is separate work. The GitHub Actions adapter that does answer the port with a real OIDC identity is
-in `crates/cli/src/github_actions_run_context.rs` and is not yet wired into dispatch either.
+the `ci` context, the run's provenance and the parked record are what `--ci` changes today. Plumbing
+the port into steps is separate work. The GitHub Actions adapter that does answer the port with a
+real OIDC identity is in `crates/cli/src/github_actions_run_context.rs` and is not yet wired into
+dispatch either.

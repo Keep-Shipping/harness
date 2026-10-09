@@ -66,6 +66,17 @@ use ks_core::ports::secrets::SecretValue;
 
 use crate::resume::actor_word;
 
+/// The branch names the operator has declared trusted, comma-separated, in a
+/// run context generic mode builds.
+///
+/// This is the only signal generic mode has about whose code it is running, so
+/// it is also the only thing that can make a generic run
+/// [`Provenance::Repository`]. An absent variable, an empty one, one naming
+/// nothing this run is on — all of them leave the run untrusted. Entries are
+/// branch names as git knows them, `main` rather than `refs/heads/main`;
+/// whitespace around an entry is trimmed and an empty entry is ignored.
+const TRUSTED_BRANCHES: &str = "KEEP_SHIPPING_TRUSTED_BRANCHES";
+
 /// Which CI system the environment says is in charge.
 ///
 /// [`CiSystem::Generic`] is both "some CI that exports only `CI`" and "nothing
@@ -137,6 +148,59 @@ pub struct Overrides {
     /// is not on the branch the environment happens to have exported, and
     /// reporting both would say it is in two places at once.
     pub trigger: Option<Trigger>,
+}
+
+/// Every variable a CI system sets to say it is the one running, including the
+/// bare `CI` all of them set. This is the list [`detect`] reads its named
+/// systems off, and [`detects_a_ci`] reads to answer the question behind it.
+const CI_MARKERS: &[&str] =
+    &["GITHUB_ACTIONS", "GITLAB_CI", "BUILDKITE", "CIRCLECI", "JENKINS_URL", "CI"];
+
+/// Whether the environment says a CI is in charge at all — one of the systems
+/// [`detect`] can name, or a runner that exports only `CI`.
+///
+/// This is the question a caller with an adapter for GitHub and one for GitLab
+/// still has to answer: with neither marker set, the environment they would
+/// read is not a CI's, and neither reader's `Repository` is evidence of
+/// anything but the absence of the variables that would have said otherwise.
+///
+/// It reads [`set`] rather than [`detect`], so it is deliberately a superset of
+/// what [`detect`] names. `GITHUB_ACTIONS` is read exactly by [`detect`] — a
+/// job that set it to `1` did not name itself — but is read here the way
+/// [`args::detect_context`](crate::args::detect_context) reads it, as a system
+/// saying it is there. The two only disagree about a misspelled marker, and the
+/// disagreement runs towards calling the run a CI, which is the answer that
+/// makes the caller ask [`provenance_of_env`] rather than assume trust.
+pub(crate) fn detects_a_ci(env: &BTreeMap<String, String>) -> bool {
+    CI_MARKERS.iter().any(|marker| set(env, marker))
+}
+
+/// How many *named* systems the environment says are in charge at once — the
+/// question behind "which CI is running this?", when the answer cannot be one
+/// system.
+///
+/// `CI` is read out of [`CI_MARKERS`] but is not counted: every real CI sets it
+/// next to its own marker, so counting it would make every run on a runner say
+/// two systems are in charge, and the question would never have an answer. What
+/// is left is the list of systems a job can name, so the count is a question
+/// about who is running rather than about whether anything is.
+pub(crate) fn named_ci_systems(env: &BTreeMap<String, String>) -> usize {
+    CI_MARKERS.iter().filter(|marker| **marker != "CI" && set(env, marker)).count()
+}
+
+/// The provenance generic mode's own rules give to an environment, for a caller
+/// that has no run context to build — `resume`, which is handed a run id and a
+/// command line rather than a CI's.
+///
+/// The ref is the one [`GenericCiRunContext::from_env`] would have read from
+/// the same environment, with no override on top: a caller without a command
+/// line has no override to apply. Both rules of [`provenance_of`] are this
+/// adapter's and are applied here unchanged rather than restated — a
+/// `KEEP_SHIPPING_TRUSTED_BRANCHES` that trusted a `--ci` run but not a resume
+/// of it would be two answers to one question.
+pub(crate) fn provenance_of_env(env: &BTreeMap<String, String>) -> Provenance {
+    let git_ref = facts(detect(env), env).git_ref.unwrap_or_default();
+    provenance_of(&git_ref, env.get(TRUSTED_BRANCHES).map(String::as_str))
 }
 
 /// The CI system the environment is in, from its marker variables.
@@ -227,18 +291,20 @@ impl GenericCiRunContext {
             _ => git_ref,
         };
         let actor = actor_of(system, facts.actor, overrides.actor, overrides.actor_name.as_deref());
+        // Read after the ref above is final: a `--event "tag v1.2.3"` run is on
+        // a tag whatever the environment exported, and a tag is never trusted
+        // by this adapter. Generic mode fails closed — untrusted unless the
+        // operator declared the branch in `KEEP_SHIPPING_TRUSTED_BRANCHES`.
+        let provenance = provenance_of(&git_ref, env.get(TRUSTED_BRANCHES).map(String::as_str));
         let root = facts.root.unwrap_or(root);
         let scratch = scratch_dir(facts.temp.as_deref(), &root);
         GenericCiRunContext {
             system,
             actor,
-            // Generic mode reads no fork marker it could trust, so it states the
-            // repository's own code; fork detection is the native adapters' (#126).
-            event: Event {
-                git: GitInfo { sha, git_ref },
-                trigger,
-                provenance: Provenance::Repository,
-            },
+            // The run's own statement about whose code it is; see
+            // `provenance_of` for why the answer is almost always "not the
+            // repository's" here.
+            event: Event { git: GitInfo { sha, git_ref }, trigger, provenance },
             capabilities: Capabilities {
                 // Honest: there is no token endpoint this adapter can reach and
                 // verify, so it does not claim one. `oidc_token` answers
@@ -325,6 +391,81 @@ fn actor_of(
         },
     };
     Actor { kind, established, display_name }
+}
+
+/// Where the code this run is about came from, from the ref and the branch
+/// names the operator declared in [`TRUSTED_BRANCHES`].
+///
+/// Two rules, and the *default* is the point of the whole function:
+///
+/// 1. A run on a branch whose name appears in the declared list is
+///    [`Provenance::Repository`]. The branch name is the git ref with
+///    `refs/heads/` stripped, compared exactly after trimming: no prefix
+///    matching, and case-sensitive, because a branch named `MAIN` is a
+///    different branch from `main` and a near-miss (`main-old`) that quietly
+///    matched would trust a branch nobody declared.
+/// 2. Everything else — no declared list, an empty one, a list that names
+///    nothing this run is on, a tag ref, a ref with no `refs/heads/` prefix at
+///    all — is [`Provenance::Fork`].
+///
+/// **Even a run on `main` is untrusted until the operator names `main`.** That
+/// is deliberate, and it is the whole of the change from the earlier state of
+/// this adapter: there is no special case for the default branch, and the
+/// escape hatch is the declared list, not a name this function happens to
+/// recognise. An adapter that trusted `main` by default would be trusting a
+/// *string* it read out of the environment, and that string is written by the
+/// pipeline that is asking the question.
+///
+/// # Why untrusted is the default rather than merely cautious
+///
+/// Because generic mode is the mode an operator reaches for when they are on
+/// Jenkins, Buildkite, CircleCI, a self-hosted runner, or a CI this adapter has
+/// never heard of — and on those systems the variables that would identify a
+/// fork do not exist. GitHub exports the two repository names
+/// (`GITHUB_HEAD_REPOSITORY`, `GITHUB_BASE_REPOSITORY`) and GitLab exports the
+/// two project ids; a pipeline author can supply them by hand, but then they
+/// are words in a `.jenkinsfile` or a `pipeline { }` block, written by whoever
+/// wrote that file, and read back by a job that file also controls. A word on a
+/// command line or a variable in a build script is not evidence about *whose
+/// code* is being built. Silence there is not consent.
+///
+/// So the trust signal here is deliberately an *assertion* rather than an
+/// inference: the operator says which of their branches this adapter may treat
+/// as the repository's own, and anything they did not say is untrusted. That
+/// is a stronger claim than "this looks like the default branch", and it is the
+/// one the [`Provenance::is_untrusted`](ks_core::ports::run_context::Provenance)
+/// side of the port is built on: `PolicyGate` refuses every secret to an
+/// untrusted provenance, so the cost of being wrong here is a denied secret,
+/// not a leaked one. See
+/// [`Provenance::is_untrusted`](ks_core::ports::run_context::Provenance::is_untrusted).
+///
+/// # Why a tag ref is never trusted, even by name
+///
+/// `refs/tags/…` is not eligible at all, whatever the declared list says. A
+/// tag pipeline in generic mode can be pointed at any ref the runner can
+/// fetch, and the ref's shape is the only thing this adapter can check for
+/// itself — unlike GitHub's adapter, which has the event payload to say whose
+/// tag it is. An operator who wants a release build trusted has to name the
+/// code somewhere this adapter cannot reach around; the native adapter is that
+/// place.
+fn provenance_of(git_ref: &str, trusted: Option<&str>) -> Provenance {
+    // Rule 1: only a branch ref is eligible, and a ref that names no branch
+    // (`refs/tags/v1.2.3`, a pull-request ref, an empty ref, Jenkins' detached
+    // SHA) has no name to match, so it falls to rule 2.
+    let Some(branch) =
+        git_ref.strip_prefix("refs/heads/").map(str::trim).filter(|name| !name.is_empty())
+    else {
+        return Provenance::Fork;
+    };
+    // Rule 1 again, read entry by entry: whitespace around a name is noise, an
+    // empty entry names nothing, and `None` — no declaration at all — names
+    // nothing either.
+    let mut declared = trusted.unwrap_or_default().split(',').map(str::trim);
+    if declared.any(|name| !name.is_empty() && name == branch) {
+        return Provenance::Repository;
+    }
+    // Rule 2: everything else.
+    Provenance::Fork
 }
 
 impl RunContext for GenericCiRunContext {
@@ -1220,5 +1361,157 @@ mod tests {
         assert_eq!(trigger("tag v1.2.3"), Trigger::Tag { name: "v1.2.3".to_string() });
         assert_eq!(trigger("tag"), Trigger::Push, "no name, no tag");
         assert_eq!(trigger("manual"), Trigger::Manual);
+    }
+
+    /// Every way the declared list and a ref can disagree, and what each one
+    /// must answer. One table so the policy reads as a whole: a run is trusted
+    /// only where a row says so.
+    #[test]
+    fn generic_mode_trusts_only_a_declared_branch() {
+        type Case = (&'static str, Option<&'static str>, Provenance, &'static str);
+        let cases: Vec<Case> = vec![
+            // The declared branch is trusted.
+            ("refs/heads/main", Some("main"), Provenance::Repository, "declared"),
+            // ...including among others, and with whitespace around each entry.
+            (
+                "refs/heads/main",
+                Some("nightly , main ,release"),
+                Provenance::Repository,
+                "declared among others",
+            ),
+            (
+                "refs/heads/release",
+                Some(" main , release "),
+                Provenance::Repository,
+                "whitespace is trimmed",
+            ),
+            // The branch is not in the list: nothing says it is the
+            // repository's own code.
+            ("refs/heads/feature/x", Some("main"), Provenance::Fork, "not declared"),
+            // Nothing was declared at all — not even an empty list, which is
+            // a declaration of nothing.
+            ("refs/heads/main", None, Provenance::Fork, "no list"),
+            ("refs/heads/main", Some(""), Provenance::Fork, "empty list"),
+            ("refs/heads/main", Some(" , ,, "), Provenance::Fork, "list of empty entries"),
+            // A near miss is not a match: `main-old` shares a prefix with
+            // `main` and is a different branch, and comparison is exact.
+            ("refs/heads/main-old", Some("main"), Provenance::Fork, "prefix is not equality"),
+            (
+                "refs/heads/main-old",
+                Some("main-old"),
+                Provenance::Repository,
+                "the near-miss is declared in its own right",
+            ),
+            // Case-sensitive: `MAIN` is not `main`.
+            ("refs/heads/MAIN", Some("main"), Provenance::Fork, "case matters"),
+            // A tag is never trusted here, by its own name or anything else:
+            // the ref shape is the only thing this adapter can check.
+            ("refs/tags/v1.2.3", Some("v1.2.3"), Provenance::Fork, "a tag is not a branch"),
+            (
+                "refs/tags/v1.2.3",
+                Some("v1.2.3, main"),
+                Provenance::Fork,
+                "a tag is not a branch even when the list names it",
+            ),
+            // Nor is a ref that names no branch at all.
+            ("", Some("main"), Provenance::Fork, "no ref, no branch"),
+            ("refs/pull/42/merge", Some("main"), Provenance::Fork, "a pull-request ref"),
+            ("refs/heads/", Some(""), Provenance::Fork, "a branch ref naming no branch"),
+            ("main", Some("main"), Provenance::Fork, "a bare name is not a ref"),
+        ];
+        for (git_ref, trusted, expected, why) in cases {
+            assert_eq!(provenance_of(git_ref, trusted), expected, "{git_ref:?} {trusted:?}: {why}");
+        }
+        // The whole of the point, stated once more where a reader cannot miss
+        // it: the untrusted answers are the ones `is_untrusted` acts on.
+        assert!(provenance_of("refs/heads/main", None).is_untrusted());
+        assert!(!provenance_of("refs/heads/main", Some("main")).is_untrusted());
+    }
+
+    #[test]
+    fn every_system_fails_closed_until_an_operator_declares_a_branch() {
+        // A run that looks exactly like a GitHub Actions push to `main`, built
+        // by the adapter that cannot see a fork marker, is untrusted anyway.
+        let github = &[
+            ("GITHUB_ACTIONS", "true"),
+            ("GITHUB_REF", "refs/heads/main"),
+            ("GITHUB_EVENT_NAME", "push"),
+        ][..];
+        assert_eq!(context(github).event().provenance, Provenance::Fork);
+        assert_eq!(
+            context_with(
+                &[
+                    ("GITHUB_ACTIONS", "true"),
+                    ("GITHUB_REF", "refs/heads/main"),
+                    (TRUSTED_BRANCHES, "main")
+                ],
+                Overrides::default()
+            )
+            .event()
+            .provenance,
+            Provenance::Repository,
+            "the operator naming the branch is the whole signal"
+        );
+        // The same policy on every system generic mode speaks for, each on the
+        // branch its own variables name. This is a per-adapter policy, not a
+        // GitHub-only one: on Jenkins, Buildkite, CircleCI and GitLab the fork
+        // markers are equally absent, and a self-hosted runner in `CI` alone
+        // names nothing whatsoever.
+        /// A system, the variables that put it on a branch, and whether that
+        /// branch has a name this adapter can match a declaration against.
+        type System = (CiSystem, Vec<(&'static str, &'static str)>, bool);
+        let systems: Vec<System> = vec![
+            (
+                CiSystem::GitHubActions,
+                vec![("GITHUB_ACTIONS", "true"), ("GITHUB_REF", "refs/heads/main")],
+                true,
+            ),
+            (CiSystem::GitLab, vec![("GITLAB_CI", "true"), ("CI_COMMIT_REF_NAME", "main")], true),
+            (CiSystem::Buildkite, vec![("BUILDKITE", "true"), ("BUILDKITE_BRANCH", "main")], true),
+            (CiSystem::CircleCi, vec![("CIRCLECI", "true"), ("CIRCLE_BRANCH", "main")], true),
+            (
+                CiSystem::Jenkins,
+                vec![("JENKINS_URL", "https://jenkins.example/"), ("GIT_BRANCH", "origin/main")],
+                true,
+            ),
+            // A bare `CI` names no ref at all, so there is no branch for the
+            // declaration to match: this row stays untrusted whatever the
+            // operator declares, which is rule 2 as much as rule 1 is.
+            (CiSystem::Generic, vec![("CI", "true")], false),
+        ];
+        for (system, vars, names_a_branch) in systems {
+            let run = context(&vars);
+            assert_eq!(run.system(), system, "{vars:?}");
+            assert_eq!(
+                run.event().provenance,
+                Provenance::Fork,
+                "{vars:?}: generic mode reads no fork marker, so nothing is trusted"
+            );
+            // Declaring the branch is all it takes, on every system that names
+            // one.
+            let mut declared = vars.clone();
+            declared.push((TRUSTED_BRANCHES, "main"));
+            assert_eq!(
+                context(&declared).event().provenance,
+                if names_a_branch { Provenance::Repository } else { Provenance::Fork },
+                "{declared:?}"
+            );
+        }
+        // A tag declared through `--event` is still a tag, and a tag ref is
+        // never trusted by this adapter — which is why the provenance is read
+        // after the final ref, not before it.
+        let tag = context_with(
+            &[
+                ("BUILDKITE", "true"),
+                ("BUILDKITE_BRANCH", "main"),
+                (TRUSTED_BRANCHES, "main, v1.2.3"),
+            ],
+            Overrides {
+                trigger: Some(Trigger::Tag { name: "v1.2.3".to_string() }),
+                ..Overrides::default()
+            },
+        );
+        assert_eq!(tag.event().git.git_ref, "refs/tags/v1.2.3");
+        assert_eq!(tag.event().provenance, Provenance::Fork, "a tag ref is not a branch");
     }
 }

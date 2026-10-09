@@ -140,6 +140,39 @@ const TARGET_PR: &[(&str, &str)] = &[
     ("GITHUB_REPOSITORY", "Keep-Shipping/harness"),
 ];
 
+/// The same question asked of GitLab: a merge request whose head branch lives
+/// in project 77, opened against project 42. GitLab runs it in the *target*
+/// project's pipeline, which is exactly why asking only GitHub would have read
+/// it as the repository's own code.
+const GITLAB_FORK_MR: &[(&str, &str)] = &[
+    ("GITLAB_CI", "true"),
+    ("CI_PIPELINE_SOURCE", "merge_request_event"),
+    ("CI_MERGE_REQUEST_SOURCE_PROJECT_ID", "77"),
+    ("CI_MERGE_REQUEST_PROJECT_ID", "42"),
+];
+
+/// The same GitLab merge request with its head branch inside the target
+/// project: the repository's own code, and so not a refusal.
+const GITLAB_OWN_MR: &[(&str, &str)] = &[
+    ("GITLAB_CI", "true"),
+    ("CI_PIPELINE_SOURCE", "merge_request_event"),
+    ("CI_MERGE_REQUEST_SOURCE_PROJECT_ID", "42"),
+    ("CI_MERGE_REQUEST_PROJECT_ID", "42"),
+];
+
+/// A Buildkite job on `main`: no adapter of ours has a fork marker for it, so
+/// this is a push onto a branch the operator has to name before it is the
+/// repository's own code (#305).
+const BUILDKITE_MAIN: &[(&str, &str)] = &[("BUILDKITE", "true"), ("BUILDKITE_BRANCH", "main")];
+
+/// The same job, with the operator having named `main`. The one signal generic
+/// mode has, so it is the whole of the opt-in.
+const BUILDKITE_MAIN_DECLARED: &[(&str, &str)] = &[
+    ("BUILDKITE", "true"),
+    ("BUILDKITE_BRANCH", "main"),
+    ("KEEP_SHIPPING_TRUSTED_BRANCHES", "main"),
+];
+
 fn run_id() -> RunId {
     RunId::from_parts(1_700_000_000_000, 42)
 }
@@ -190,8 +223,31 @@ fn keepshipping(dir: &Path, args: &[&str], vars: &[(&str, &str)]) -> (i32, Strin
     cmd.args(args).current_dir(dir).env_remove("GITHUB_ACTIONS").env_remove("CI");
     // The variables that say whose code a run is about, so a test says what
     // provenance it means — and so a test suite run on a GitHub runner does not
-    // answer for the tests that mean nothing by it.
-    for name in ["GITHUB_EVENT_NAME", "GITHUB_HEAD_REPOSITORY", "GITHUB_REPOSITORY"] {
+    // answer for the tests that mean nothing by it. GitLab's are cleared for
+    // the same reason, and because `GITLAB_CI` is the marker the resume's
+    // dispatch keys on. The rest are the markers the resume's dispatch reads
+    // next: a suite run on Buildkite or Jenkins must not answer for a test
+    // that means to be a laptop either (#305). `KEEP_SHIPPING_TRUSTED_BRANCHES`
+    // is cleared for the same reason — an operator's export must not decide
+    // what a test is about.
+    for name in [
+        "GITHUB_EVENT_NAME",
+        "GITHUB_HEAD_REPOSITORY",
+        "GITHUB_REPOSITORY",
+        "GITLAB_CI",
+        "CI_PIPELINE_SOURCE",
+        "CI_MERGE_REQUEST_SOURCE_PROJECT_ID",
+        "CI_MERGE_REQUEST_PROJECT_ID",
+        "BUILDKITE",
+        "BUILDKITE_BRANCH",
+        "BUILDKITE_TAG",
+        "CIRCLECI",
+        "CIRCLE_BRANCH",
+        "CIRCLE_TAG",
+        "JENKINS_URL",
+        "GIT_BRANCH",
+        "KEEP_SHIPPING_TRUSTED_BRANCHES",
+    ] {
         cmd.env_remove(name);
     }
     for marker in KNOWN_AGENT_MARKERS {
@@ -485,6 +541,65 @@ fn a_resume_about_someone_elses_code_may_not_apply() {
         assert!(err.contains(said), "{label}: it names which case this is: {err}");
         still_waiting(&dir);
     }
+}
+
+/// The same question asked of GitLab, and the reason the resume asks the CI
+/// that is actually running rather than assuming GitHub (#305). GitLab runs a
+/// fork merge request's pipeline in the **target** project, so a resume that
+/// read only GitHub's variables would find none, answer
+/// `Provenance::Repository`, and apply a fork's `ship.ks` with the runner's
+/// credentials in hand — the identical hole the fork pull request above is
+/// refused for, on the CI where it was still open.
+#[test]
+fn a_resume_in_a_gitlab_fork_merge_request_may_not_apply_either() {
+    let dir = work_dir("park-gitlab-fork-mr", APPLIES);
+    park_run(&dir, &parked_at_review(APPLIES, "approval"));
+    let (code, _, err) = keepshipping(&dir, &["resume", run_id().as_str()], GITLAB_FORK_MR);
+    assert_eq!(code, 5, "refused by policy, nothing approved: {err}");
+    assert!(err.contains("refusing to resume"), "{err}");
+    assert!(err.contains("apply"), "it names the step: {err}");
+    assert!(err.contains("provenance"), "it names the question: {err}");
+    assert!(err.contains("a fork pull request"), "it names which case this is: {err}");
+    still_waiting(&dir);
+
+    // The control, and the reason the refusal above is about the head branch's
+    // project rather than about GitLab: the same GitLab merge request with its
+    // head branch inside the target project is the repository's own code.
+    let ours = work_dir("park-gitlab-own-mr", APPLIES);
+    park_run(&ours, &parked_at_review(APPLIES, "approval"));
+    let (code, out, err) = keepshipping(&ours, &["resume", run_id().as_str()], GITLAB_OWN_MR);
+    // The allowed outcome is not merely "not refused": the run is carried on
+    // past the approval and on to the step kind that is not built in yet, which
+    // is what a resume that was let through prints and returns.
+    assert!(!err.contains("refusing to resume"), "our own merge request: {out}{err}");
+    assert!(out.contains("steps are not built in yet"), "past the approval: {out}{err}");
+    assert_eq!(code, 1, "{out}{err}");
+}
+
+/// The same question on a CI with no adapter of ours (#305). Buildkite exports
+/// no fork marker this crate can read, so a resume there used to fall through
+/// to the GitHub reader — which finds no `GITHUB_*` variable, answers
+/// `Repository`, and applies. It must be refused, and the opt-in must be the
+/// operator's declared branch rather than anything the job's own file can say.
+#[test]
+fn a_resume_on_a_ci_with_no_adapter_of_ours_may_not_apply_until_a_branch_is_declared() {
+    let dir = work_dir("park-buildkite-undeclared", APPLIES);
+    park_run(&dir, &parked_at_review(APPLIES, "approval"));
+    let (code, _, err) = keepshipping(&dir, &["resume", run_id().as_str()], BUILDKITE_MAIN);
+    assert_eq!(code, 5, "refused by policy, nothing approved: {err}");
+    assert!(err.contains("refusing to resume"), "{err}");
+    assert!(err.contains("apply"), "it names the step: {err}");
+    assert!(err.contains("provenance"), "it names the question: {err}");
+    still_waiting(&dir);
+
+    // A branch the operator named is trusted: the same job, declared.
+    let ours = work_dir("park-buildkite-declared", APPLIES);
+    park_run(&ours, &parked_at_review(APPLIES, "approval"));
+    let (code, out, err) =
+        keepshipping(&ours, &["resume", run_id().as_str()], BUILDKITE_MAIN_DECLARED);
+    assert!(!err.contains("refusing to resume"), "a declared branch: {out}{err}");
+    assert!(out.contains("steps are not built in yet"), "past the approval: {out}{err}");
+    assert_eq!(code, 1, "{out}{err}");
 }
 
 /// A script step is the same question asked in a file the catalog cannot read:

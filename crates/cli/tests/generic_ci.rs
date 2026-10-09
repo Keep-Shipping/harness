@@ -26,9 +26,19 @@ steps:
 ";
 
 /// Every variable a CI system could be detected from, so a test says what it
-/// means regardless of where it runs.
-const MARKERS: &[&str] =
-    &["GITHUB_ACTIONS", "GITLAB_CI", "BUILDKITE", "CIRCLECI", "JENKINS_URL", "CI"];
+/// means regardless of where it runs. `KEEP_SHIPPING_TRUSTED_BRANCHES` is here
+/// for the same reason rather than because a system is detected from it: it is
+/// what can make a generic run's branch the repository's own code, so an
+/// operator's export must not decide what a test is about (#305).
+const MARKERS: &[&str] = &[
+    "GITHUB_ACTIONS",
+    "GITLAB_CI",
+    "BUILDKITE",
+    "CIRCLECI",
+    "JENKINS_URL",
+    "CI",
+    "KEEP_SHIPPING_TRUSTED_BRANCHES",
+];
 
 /// Runs the binary in `dir` with the detection variables cleared, then with
 /// whatever `vars` add.

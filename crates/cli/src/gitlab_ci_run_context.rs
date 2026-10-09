@@ -72,6 +72,14 @@ const CI_PIPELINE_SOURCE: &str = "CI_PIPELINE_SOURCE";
 const CI_MERGE_REQUEST_IID: &str = "CI_MERGE_REQUEST_IID";
 /// The full ref an MR pipeline checks out, e.g. `refs/merge-requests/1/head`.
 const CI_MERGE_REQUEST_REF_PATH: &str = "CI_MERGE_REQUEST_REF_PATH";
+/// The numeric project id the merge request's head branch lives in, on a
+/// merge-request pipeline and nowhere else — the fork test in
+/// [`provenance_of`]. Absent from ordinary pipelines, which is why it is not
+/// one of the [`JOB_VARS`]: requiring it would refuse every branch pipeline.
+const CI_MERGE_REQUEST_SOURCE_PROJECT_ID: &str = "CI_MERGE_REQUEST_SOURCE_PROJECT_ID";
+/// The numeric project id the merge request targets, on a merge-request
+/// pipeline and nowhere else.
+const CI_MERGE_REQUEST_PROJECT_ID: &str = "CI_MERGE_REQUEST_PROJECT_ID";
 /// Who triggered the pipeline — or, on a manual job, who started that job. This
 /// is *not* the merge request author; GitLab has no variable for that.
 const GITLAB_USER_LOGIN: &str = "GITLAB_USER_LOGIN";
@@ -166,6 +174,14 @@ impl GitlabCiRunContext {
 
         let trigger = trigger_of(env);
         let git_ref = git_ref_of(env, &trigger);
+        // Where the branch under test came from, which is not the same question
+        // as where the token came from: an untrusted run still establishes who is
+        // running, and the capability guards below are what it may do next.
+        let provenance = provenance_of(
+            env.get(CI_PIPELINE_SOURCE).map(String::as_str),
+            env.get(CI_MERGE_REQUEST_SOURCE_PROJECT_ID).map(String::as_str),
+            env.get(CI_MERGE_REQUEST_PROJECT_ID).map(String::as_str),
+        );
         let root = PathBuf::from(&env[CI_PROJECT_DIR]);
         // The runner is the runner either way: what the pipeline's variables
         // add is who asked for it, and a baseline naming that account an
@@ -179,17 +195,27 @@ impl GitlabCiRunContext {
         };
         Ok(GitlabCiRunContext {
             actor,
-            // Fork merge-request detection for GitLab is not built yet (#126 covers
-            // GitHub), so this adapter states the repository's own code.
+            // Where the code this job is about came from. Whatever the pipeline
+            // configuration turns out to be, a fork merge request's is not this
+            // organisation's to vouch for, so the adapter must not mint for it —
+            // and it is reported as `Provenance::Fork` rather than
+            // `Provenance::Target`: both are untrusted, and `Fork` is the honest
+            // description of a merge request whose head branch lives in another
+            // project. That is the reason the fork arms below exist at all.
             event: Event {
                 git: GitInfo { sha: env[CI_COMMIT_SHA].clone(), git_ref },
                 trigger,
-                provenance: Provenance::Repository,
+                provenance,
             },
             capabilities: Capabilities {
-                // The constructor requires the token, so `oidc` and the token
-                // variable agree by construction.
-                oidc: true,
+                // A fork merge request's pipeline config is the fork's to write —
+                // `ship.ks`, the TypeScript script and the Dockerfile all arrive
+                // from the fork — so this adapter must not claim to be a token
+                // factory for it, however the template declared the token that
+                // established the job's own identity. Withholding the capability
+                // here is the adapter honouring the port, not only the workflow
+                // refusing.
+                oidc: !provenance.is_untrusted(),
                 // A runner has no person attached mid-flight.
                 interactive: false,
                 // GitLab's `cache:` keyword is a cache every job may use; how
@@ -255,6 +281,17 @@ impl RunContext for GitlabCiRunContext {
         &'a self,
         audience: &'a str,
     ) -> BoxFuture<'a, Result<SecretValue, RunContextError>> {
+        // An untrusted run has no `oidc` capability, and the port promises
+        // `OidcUnavailable` exactly when it does — the same refusal the GitHub
+        // adapter makes, and for the same reason: a job whose pipeline is a
+        // fork's must not be able to mint for whatever audience it happens to
+        // carry, even when GitLab did hand that job a token in hand and its
+        // `aud` names the caller exactly. Otherwise a failure is the token's.
+        if !self.capabilities.oidc {
+            return Box::pin(std::future::ready(Err(RunContextError::OidcUnavailable {
+                audience: audience.to_string(),
+            })));
+        }
         let result = self.token.with_bytes(|bytes| -> Result<SecretValue, RunContextError> {
             if !aud_names(&claims_json(bytes)?, audience) {
                 return Err(RunContextError::OidcUnavailable { audience: audience.to_string() });
@@ -328,6 +365,104 @@ fn git_ref_of(env: &BTreeMap<String, String>, trigger: &Trigger) -> String {
         Trigger::Tag { name } => format!("refs/tags/{name}"),
         _ => format!("refs/heads/{}", env[CI_COMMIT_REF_NAME]),
     }
+}
+
+/// Where the code this job is about came from, from the pipeline source and the
+/// two merge-request project ids. An absent or empty id reads as [`None`].
+///
+/// The order *is* the property, so it is spelled out rather than folded into a
+/// boolean:
+///
+/// 1. `external_pull_request_event` is [`Provenance::Fork`] **always**. That
+///    source is GitLab's mirror of a pull request from another Git repository:
+///    the pipeline runs here, but everything it checks out was written by
+///    whoever wrote the code in the other repository. The ids are not consulted
+///    at all, because a project can name itself as its own source project and
+///    still be running somebody else's branch — no amount of matching ids makes
+///    this source trusted.
+/// 2. On a `merge_request_event`, a non-empty `source_project_id` that differs
+///    from a non-empty `target_project_id` is [`Provenance::Fork`]: the head
+///    branch lives in a project nobody here granted anything to.
+/// 3. On a `merge_request_event` where either id is **missing or empty** is
+///    [`Provenance::Fork`] too. This is the branch that matters most: a payload
+///    the adapter cannot read must not be read as consent, so a runner that
+///    withholds [`CI_MERGE_REQUEST_SOURCE_PROJECT_ID`] produces an untrusted
+///    run, not a trusted one. Trust is an affirmative claim, never a default
+///    that silence falls into. What keeps this from condemning the ordinary case
+///    is that only a merge-request pipeline reaches the arm at all — `push`,
+///    `schedule`, `web` and tag pipelines never set these variables, and GitLab
+///    checks those out from the project the pipeline belongs to, so their
+///    silence carries no doubt worth failing on.
+/// 4. A merge request whose two ids are present and equal, and every
+///    non-merge-request source, is [`Provenance::Repository`]: the branch
+///    under test lives in the project that owns the pipeline.
+///
+/// Rules 2 and 3 are read only once the source has named a merge-request
+/// pipeline. Any other source never looks at the ids at all: GitLab does not
+/// set them there, and a `push` or `schedule` pipeline that somehow carried
+/// them is not thereby about another project.
+///
+/// A fork merge request is reported as [`Provenance::Fork`] and not
+/// [`Provenance::Target`], even though GitLab runs the *target* project's
+/// pipeline config, so that the two arms cannot be confused with GitHub's
+/// `pull_request` and `pull_request_target` shapes: both are untrusted, and
+/// `Fork` is the honest description of a merge request whose head branch lives
+/// in another project.
+///
+/// The source is normalised — trimmed and case-folded — before any of this
+/// reads it, so a payload that arrives as `" Merge_Request_Event "` is still
+/// the merge-request event and cannot fall through to rule 4. The project-id
+/// comparison stays exact on the trimmed string: these are opaque numeric
+/// identifiers GitLab writes, not names whose case it might fold, and an id
+/// this adapter does not recognise byte for byte is not one it will quietly
+/// call its own.
+fn provenance_of(
+    pipeline_source: Option<&str>,
+    source_project_id: Option<&str>,
+    target_project_id: Option<&str>,
+) -> Provenance {
+    let source = pipeline_source.unwrap_or_default().trim().to_ascii_lowercase();
+    // Rule 1: a mirror of somebody else's pull request, whatever the ids say.
+    if source == "external_pull_request_event" {
+        return Provenance::Fork;
+    }
+    // Rules 2 and 3 are about a merge request and nothing else: these two
+    // variables exist only on a merge-request pipeline, so a `push` that
+    // somehow carries them is not thereby about another project — rule 4 reads
+    // the source, not the leftovers.
+    if source != "merge_request_event" {
+        return Provenance::Repository;
+    }
+    let head = source_project_id.map(str::trim).filter(|id| !id.is_empty());
+    let base = target_project_id.map(str::trim).filter(|id| !id.is_empty());
+    match (head, base) {
+        // Rule 2: the head branch lives in a project nobody here granted to.
+        (Some(head), Some(base)) if head != base => Provenance::Fork,
+        // Rule 4: the branch under test is this project's own.
+        (Some(_), Some(_)) => Provenance::Repository,
+        // Rule 3: silence is not consent.
+        (None, _) | (_, None) => Provenance::Fork,
+    }
+}
+
+/// The provenance of the run this process is in, read from the environment alone.
+///
+/// Unlike [`GitlabCiRunContext::from_env`] this mints no token and speaks no
+/// HTTP: it is the trust decision, and the trust decision does not need to know
+/// who the run is — who is running is the adapter's question, where the code
+/// came from is the run's own. It is therefore the answer a caller that only
+/// wants to *gate* can afford to ask, and the answer is [`provenance_of`]'s
+/// either way.
+///
+/// A non-GitLab environment answers [`Provenance::Repository`] — a laptop
+/// running a local branch is the repository's own code, and there is no
+/// `CI_PIPELINE_SOURCE` there to say otherwise.
+pub(crate) fn provenance_from_env(env: &BTreeMap<String, String>) -> Provenance {
+    provenance_of(
+        env.get(CI_PIPELINE_SOURCE).map(String::as_str),
+        env.get(CI_MERGE_REQUEST_SOURCE_PROJECT_ID).map(String::as_str),
+        env.get(CI_MERGE_REQUEST_PROJECT_ID).map(String::as_str),
+    )
 }
 
 /// Whether the token's `aud` claim names `audience`. The claim is a string or
@@ -630,6 +765,134 @@ mod tests {
             r#"{{"iss":"{ISSUER}","sub":"{SUBJECT}","aud":["other","{CONFORMANCE_AUDIENCE}"]}}"#
         )));
         assert!(block_on(context.oidc_token(CONFORMANCE_AUDIENCE)).is_ok());
+    }
+
+    /// The project every fixture's merge request lives in, and the one it targets:
+    /// a run whose code is this organisation's own.
+    const PROJECT: &str = "42";
+    /// The project a fork's merge request comes from: the same number of a
+    /// different owner.
+    const FORK_PROJECT: &str = "77";
+
+    #[test]
+    fn provenance_reads_the_merge_request_ids_and_nothing_else() {
+        let cases: Vec<(&str, Option<&str>, Option<&str>, Provenance)> = vec![
+            // A push carries no merge-request variables at all, and its
+            // silence is not a doubt: GitLab checked it out from this project.
+            ("push", None, None, Provenance::Repository),
+            ("schedule", None, None, Provenance::Repository),
+            ("web", Some(FORK_PROJECT), Some(PROJECT), Provenance::Repository),
+            // Same-project merge request: the branch under test is ours.
+            ("merge_request_event", Some(PROJECT), Some(PROJECT), Provenance::Repository),
+            // The fork case: the head branch lives in another project.
+            ("merge_request_event", Some(FORK_PROJECT), Some(PROJECT), Provenance::Fork),
+            // Silence is not consent: a merge request we cannot place is a fork.
+            ("merge_request_event", None, Some(PROJECT), Provenance::Fork),
+            ("merge_request_event", Some(PROJECT), None, Provenance::Fork),
+            ("merge_request_event", None, None, Provenance::Fork),
+            ("merge_request_event", Some(""), Some(""), Provenance::Fork),
+            ("merge_request_event", Some(""), Some(PROJECT), Provenance::Fork),
+            ("merge_request_event", Some(PROJECT), Some(""), Provenance::Fork),
+            // A mirror of a pull request from another Git repository is a fork by
+            // construction — the ids are never consulted, so even ids that agree
+            // do not make it trusted.
+            ("external_pull_request_event", None, None, Provenance::Fork),
+            ("external_pull_request_event", Some(PROJECT), Some(PROJECT), Provenance::Fork),
+            // The source is normalised before it is read, so neither a stray
+            // space nor a shouty payload steps past rule 3 into `Repository`.
+            (" Merge_Request_Event ", Some(PROJECT), Some(PROJECT), Provenance::Repository),
+            (" Merge_Request_Event ", None, Some(PROJECT), Provenance::Fork),
+            ("MERGE_REQUEST_EVENT", Some(FORK_PROJECT), Some(PROJECT), Provenance::Fork),
+            (" External_Pull_Request_Event ", Some(PROJECT), Some(PROJECT), Provenance::Fork),
+            // The ids are trimmed before they are compared, and the comparison
+            // is exact on what is left: an id this adapter does not recognise
+            // byte for byte is not one it calls its own.
+            ("merge_request_event", Some(" 42 "), Some("42"), Provenance::Repository),
+            ("merge_request_event", Some("42 "), Some(" 42"), Provenance::Repository),
+            ("merge_request_event", Some("042"), Some("42"), Provenance::Fork),
+            // No source at all is a plain push by every other reading here too.
+            ("", Some(FORK_PROJECT), Some(PROJECT), Provenance::Repository),
+        ];
+        for (source, head, base, expected) in cases {
+            assert_eq!(
+                provenance_of(Some(source), head, base),
+                expected,
+                "{source:?} source_project={head:?} target_project={base:?}"
+            );
+        }
+        // The adapter reads an absent variable as no variable at all.
+        assert_eq!(provenance_of(None, None, None), Provenance::Repository);
+        assert_eq!(provenance_of(None, Some(FORK_PROJECT), Some(PROJECT)), Provenance::Repository);
+        assert_eq!(provenance_of(None, None, Some(PROJECT)), Provenance::Repository);
+    }
+
+    #[test]
+    fn a_fork_merge_request_mints_nothing_and_says_why() {
+        // A merge request whose head branch lives in another project, with the
+        // job's own token still carrying the audience the caller asks for.
+        let mut env = job_env();
+        env.insert(CI_PIPELINE_SOURCE.to_string(), "merge_request_event".to_string());
+        env.insert(CI_MERGE_REQUEST_IID.to_string(), "41".to_string());
+        env.insert(
+            CI_MERGE_REQUEST_REF_PATH.to_string(),
+            "refs/merge-requests/41/head".to_string(),
+        );
+        env.insert(CI_MERGE_REQUEST_PROJECT_ID.to_string(), PROJECT.to_string());
+        env.insert(CI_MERGE_REQUEST_SOURCE_PROJECT_ID.to_string(), FORK_PROJECT.to_string());
+        let context = build(&env);
+
+        assert_eq!(context.event().provenance, Provenance::Fork);
+        // The identity is unaffected: an untrusted run still establishes who is
+        // running, which is not the question provenance answers.
+        assert_eq!(context.actor().established, established());
+        assert_eq!(context.event().trigger, Trigger::PullRequest { number: 41 });
+        assert!(!context.capabilities().oidc, "a fork's pipeline is not a token factory");
+        // The token GitLab did hand the job names the conformance audience
+        // exactly, and is still refused: the pipeline that asked for it is the
+        // fork's to write.
+        assert_eq!(
+            block_on(context.oidc_token(CONFORMANCE_AUDIENCE)).expect_err("a fork mints nothing"),
+            refused(CONFORMANCE_AUDIENCE)
+        );
+
+        // The same job, with the merge request inside this project, keeps the
+        // capability and mints as before.
+        env.insert(CI_MERGE_REQUEST_SOURCE_PROJECT_ID.to_string(), PROJECT.to_string());
+        let own = build(&env);
+        assert_eq!(own.event().provenance, Provenance::Repository);
+        assert!(own.capabilities().oidc);
+        assert!(block_on(own.oidc_token(CONFORMANCE_AUDIENCE)).is_ok());
+    }
+
+    #[test]
+    fn the_environment_alone_answers_where_the_code_came_from() {
+        // A laptop: nothing GitLab sets, so nothing to distrust — the local
+        // branch is this repository's own code.
+        assert_eq!(provenance_from_env(&BTreeMap::new()), Provenance::Repository);
+
+        // The untrusted cases, decided with no network in sight.
+        let fork = BTreeMap::from([
+            (CI_PIPELINE_SOURCE.to_string(), "merge_request_event".to_string()),
+            (CI_MERGE_REQUEST_SOURCE_PROJECT_ID.to_string(), FORK_PROJECT.to_string()),
+            (CI_MERGE_REQUEST_PROJECT_ID.to_string(), PROJECT.to_string()),
+        ]);
+        assert_eq!(provenance_from_env(&fork), Provenance::Fork);
+        assert_eq!(
+            provenance_from_env(&BTreeMap::from([(
+                CI_PIPELINE_SOURCE.to_string(),
+                "external_pull_request_event".to_string()
+            )])),
+            Provenance::Fork
+        );
+
+        // And the same answer for a whole job environment, so the offline reader
+        // and the adapter cannot drift apart on what GitLab sets.
+        let mut env = job_env();
+        env.insert(CI_PIPELINE_SOURCE.to_string(), "merge_request_event".to_string());
+        env.insert(CI_MERGE_REQUEST_SOURCE_PROJECT_ID.to_string(), FORK_PROJECT.to_string());
+        env.insert(CI_MERGE_REQUEST_PROJECT_ID.to_string(), PROJECT.to_string());
+        assert_eq!(provenance_from_env(&env), Provenance::Fork);
+        assert_eq!(provenance_from_env(&job_env()), Provenance::Repository);
     }
 
     #[test]

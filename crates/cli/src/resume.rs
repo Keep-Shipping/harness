@@ -30,6 +30,7 @@
 //! the answer with `keepshipping approve`, and `resume` then continues past it.
 //! Nor does a resume an agent is running answer anything.
 
+use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -242,8 +243,8 @@ pub fn resume(args: &[String]) -> ExitCode {
     // `Repository`, so this changes nothing off a runner; on one it is what
     // keeps a fork's `ship.ks` from being applied under our policy
     // ([#126](https://github.com/Keep-Shipping/harness/issues/126)).
-    let provenance =
-        crate::github_actions_run_context::provenance_from_env(&std::env::vars().collect());
+    let env: BTreeMap<String, String> = std::env::vars().collect();
+    let provenance = provenance_from_env(&env);
     let interactive = std::io::stdin().is_terminal() && std::env::var_os("CI").is_none();
     // Who is resuming, under the same baseline this environment declares in
     // `KEEPSHIPPING_AGENTS` / `KEEPSHIPPING_REQUIRE_HUMAN`. Detection only ever
@@ -480,6 +481,55 @@ fn refuses_ci_only(
     Err(ExitCode::from(1))
 }
 
+/// Whose code this process is running about, asked of whichever CI is actually
+/// running it.
+///
+/// The dispatch is on the CI's own marker, because asking the wrong reader is
+/// the whole hole this closes: ask the GitHub reader about a GitLab fork merge
+/// request and it finds no `GITHUB_*` variables at all, answers
+/// `Provenance::Repository`, and the policy gate below lets a fork's `ship.ks`
+/// apply — a resume is precisely where a runner is already holding the
+/// credentials. So, in order:
+///
+/// 1. GitLab's own marker answers for GitLab, which the GitHub reader cannot
+///    see at all ([#305](https://github.com/Keep-Shipping/harness/issues/305)).
+/// 2. GitHub's own marker answers for GitHub, the native integration.
+/// 3. **Any other CI** — Buildkite, CircleCI, Jenkins, a self-hosted runner
+///    exporting `CI` alone — is [untrusted](crate::generic_ci::provenance_of_env)
+///    unless the operator declared its branch in `KEEP_SHIPPING_TRUSTED_BRANCHES`,
+///    which is generic mode's own rule applied to a resume. Those systems export
+///    no fork marker this crate can read, so silence is not consent: failing
+///    open here would make every one of them a way to mint a secret, which is
+///    what the issue names.
+/// 4. **No CI marker at all** is a laptop, and the GitHub reader's
+///    `Repository` is right for it: a developer resuming their own run is not
+///    an untrusted CI run, and the gate below has to keep working for them.
+///
+/// **Two systems naming themselves at once** is not a fifth case to dispatch on
+/// but the absence of an answer: the environment cannot say which system is in
+/// charge, so whichever adapter ran would be reading the *other* one's
+/// variables and would find none of them. Both answer `Repository` in that
+/// silence, and a run carrying both markers would be trusted for having no
+/// evidence at all — which is the fail-open this dispatch exists to remove, in
+/// the one shape where it does not even need a fork. So the answer is
+/// [`Provenance::Fork`]: an environment that cannot name one system has not
+/// named the system whose rules this run should be under. Only the *named*
+/// markers count toward that ([`named_ci_systems`](crate::generic_ci::named_ci_systems)), never the bare `CI` every
+/// system sets beside its own — counting that would make every run ambiguous.
+fn provenance_from_env(env: &BTreeMap<String, String>) -> Provenance {
+    if crate::generic_ci::named_ci_systems(env) > 1 {
+        Provenance::Fork
+    } else if env.get("GITLAB_CI").map(String::as_str) == Some("true") {
+        crate::gitlab_ci_run_context::provenance_from_env(env)
+    } else if env.get("GITHUB_ACTIONS").map(String::as_str) == Some("true") {
+        crate::github_actions_run_context::provenance_from_env(env)
+    } else if crate::generic_ci::detects_a_ci(env) {
+        crate::generic_ci::provenance_of_env(env)
+    } else {
+        crate::github_actions_run_context::provenance_from_env(env)
+    }
+}
+
 /// The policy gate ([#103](https://github.com/Keep-Shipping/harness/issues/103)):
 /// the steps left to run, decided for `actor` against the organisation's
 /// baseline and the file's own `never:` rules before the run carries on. A step
@@ -491,11 +541,10 @@ fn refuses_ci_only(
 /// falls back to.
 ///
 /// `provenance` is the run's own answer to *whose code this is*, read from the
-/// environment by
-/// [`provenance_from_env`](crate::github_actions_run_context::provenance_from_env):
-/// a run about a fork's or a `pull_request_target`'s `ship.ks` may not apply,
-/// deploy, destroy or read a secret, whatever the baseline grants and whatever
-/// that file's own `policy:` says ([#126](https://github.com/Keep-Shipping/harness/issues/126)).
+/// environment by [`provenance_from_env`]: a run about a fork's or a
+/// `pull_request_target`'s `ship.ks` may not apply, deploy, destroy or read a
+/// secret, whatever the baseline grants and whatever that file's own `policy:`
+/// says ([#126](https://github.com/Keep-Shipping/harness/issues/126)).
 fn refuses_by_policy(
     site: &check::Site,
     steps: &[Step],
@@ -789,5 +838,247 @@ mod tests {
 
         state.record(CompletedStep { name: "review".into(), ..Default::default() });
         assert!(gate(&state, ActorKind::Human).is_err(), "nothing left to resume");
+    }
+
+    /// The dispatch itself: whose variables are read is decided by which CI
+    /// says it is running, because a GitLab fork merge request read as GitHub
+    /// answers `Repository` and lets a fork's `ship.ks` apply (#305).
+    #[test]
+    fn the_provenance_comes_from_whichever_ci_is_running() {
+        let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+
+        // A laptop: nothing to read, and the repository's own code is right.
+        assert_eq!(provenance_from_env(&env(&[])), Provenance::Repository);
+        assert!(!provenance_from_env(&env(&[])).is_untrusted());
+
+        // GitHub's own two untrusted shapes still come through unchanged.
+        for (event, head) in [("pull_request", "someone/fork"), ("pull_request_target", "o/r")] {
+            assert!(
+                provenance_from_env(&env(&[
+                    ("GITHUB_ACTIONS", "true"),
+                    ("GITHUB_EVENT_NAME", event),
+                    ("GITHUB_HEAD_REPOSITORY", head),
+                    ("GITHUB_REPOSITORY", "Keep-Shipping/harness"),
+                ]))
+                .is_untrusted(),
+                "{event}"
+            );
+        }
+
+        // GitLab's, which the GitHub reader cannot see at all: no `GITHUB_*`
+        // variable is set, so the same environment read as GitHub answers
+        // `Repository`.
+        let fork = env(&[
+            ("GITLAB_CI", "true"),
+            ("CI_PIPELINE_SOURCE", "merge_request_event"),
+            ("CI_MERGE_REQUEST_SOURCE_PROJECT_ID", "77"),
+            ("CI_MERGE_REQUEST_PROJECT_ID", "42"),
+        ]);
+        assert!(
+            provenance_from_env(&fork).is_untrusted(),
+            "a GitLab fork merge request is untrusted"
+        );
+        assert!(!crate::github_actions_run_context::provenance_from_env(&fork).is_untrusted());
+
+        // And the same GitLab merge request with its head branch inside the
+        // target project is trusted, so the refusal above is the head branch's
+        // project rather than GitLab itself.
+        assert!(
+            !provenance_from_env(&env(&[
+                ("GITLAB_CI", "true"),
+                ("CI_PIPELINE_SOURCE", "merge_request_event"),
+                ("CI_MERGE_REQUEST_SOURCE_PROJECT_ID", "42"),
+                ("CI_MERGE_REQUEST_PROJECT_ID", "42"),
+            ]))
+            .is_untrusted()
+        );
+
+        // `GITLAB_CI` is the marker and nothing else: a value GitLab does not
+        // write is not GitLab saying it is GitLab, so the GitLab reader does not
+        // answer — which is why the marker is compared to the exact string
+        // GitLab documents. It is not a fail-open either: the environment still
+        // says a CI is running, so generic mode's rule answers instead of the
+        // GitHub reader's `Repository`.
+        assert!(
+            provenance_from_env(&env(&[
+                ("GITLAB_CI", "1"),
+                ("CI_PIPELINE_SOURCE", "merge_request_event"),
+                ("CI_MERGE_REQUEST_SOURCE_PROJECT_ID", "77"),
+                ("CI_MERGE_REQUEST_PROJECT_ID", "42"),
+            ]))
+            .is_untrusted()
+        );
+    }
+
+    /// An environment that names two systems at once names neither: which
+    /// adapter answered would be a guess, and the guess reads the other one's
+    /// variables and finds none — so both say `Repository` and the run is
+    /// trusted for having no evidence at all. That is the fail-open, closed
+    /// (#305).
+    #[test]
+    fn two_ci_markers_at_once_cannot_say_whose_code_this_is() {
+        let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+
+        // Both readers really would have said yes to this environment: GitHub's
+        // sees no `GITHUB_*` evidence of a fork and GitLab's no `CI_*` one.
+        let both = env(&[("GITLAB_CI", "true"), ("GITHUB_ACTIONS", "true")]);
+        assert!(!crate::github_actions_run_context::provenance_from_env(&both).is_untrusted());
+        assert!(!crate::gitlab_ci_run_context::provenance_from_env(&both).is_untrusted());
+        assert_eq!(provenance_from_env(&both), Provenance::Fork);
+
+        // Which pair it is does not matter, and neither does where the variables
+        // that would have said whose code this is are missing.
+        for markers in [
+            vec![("GITHUB_ACTIONS", "true"), ("GITLAB_CI", "true")],
+            vec![("BUILDKITE", "true"), ("JENKINS_URL", "https://jenkins.example/")],
+            vec![("GITLAB_CI", "true"), ("BUILDKITE", "true"), ("CIRCLECI", "true")],
+        ] {
+            assert_eq!(provenance_from_env(&env(&markers)), Provenance::Fork, "{markers:?}");
+        }
+        // Even where the fork evidence of both systems is present: whichever
+        // reader did not run would have answered `Repository`.
+        assert_eq!(
+            provenance_from_env(&env(&[
+                ("GITLAB_CI", "true"),
+                ("GITHUB_ACTIONS", "true"),
+                ("CI_PIPELINE_SOURCE", "merge_request_event"),
+                ("CI_MERGE_REQUEST_SOURCE_PROJECT_ID", "77"),
+                ("CI_MERGE_REQUEST_PROJECT_ID", "42"),
+            ])),
+            Provenance::Fork
+        );
+
+        // The bare `CI` is not a second system: every real CI sets it beside its
+        // own marker, so a run naming one system and `CI` is that one system.
+        assert_eq!(
+            provenance_from_env(&env(&[
+                ("CI", "true"),
+                ("GITLAB_CI", "true"),
+                ("CI_COMMIT_REF_NAME", "main"),
+                ("KEEP_SHIPPING_TRUSTED_BRANCHES", "main"),
+            ])),
+            Provenance::Repository
+        );
+        // ...and on its own it is not ambiguity either: a bare `CI` names no
+        // system, so it takes the generic reader's untrusted answer.
+        assert_eq!(provenance_from_env(&env(&[("CI", "true")])), Provenance::Fork);
+
+        // One marker still dispatches to its own reader, which is the whole of
+        // what the ambiguity rule must not have broken: a GitLab fork merge
+        // request and a GitHub fork pull request are each untrusted on their
+        // own evidence.
+        assert_eq!(
+            provenance_from_env(&env(&[
+                ("CI", "true"),
+                ("GITLAB_CI", "true"),
+                ("CI_PIPELINE_SOURCE", "merge_request_event"),
+                ("CI_MERGE_REQUEST_SOURCE_PROJECT_ID", "77"),
+                ("CI_MERGE_REQUEST_PROJECT_ID", "42"),
+            ])),
+            Provenance::Fork
+        );
+        assert_eq!(
+            provenance_from_env(&env(&[
+                ("CI", "true"),
+                ("GITHUB_ACTIONS", "true"),
+                ("GITHUB_EVENT_NAME", "pull_request"),
+                ("GITHUB_HEAD_REPOSITORY", "someone/fork"),
+                ("GITHUB_REPOSITORY", "Keep-Shipping/harness"),
+            ])),
+            Provenance::Fork
+        );
+        // And a laptop is still a laptop, marker-free or with only `CI` beside
+        // nothing: `CI` alone names no system, and no marker at all is the case
+        // the GitHub reader answers for.
+        for local in [vec![], vec![("HOME", "/home/ada")], vec![("CI", "false")], vec![("CI", "")]]
+        {
+            assert_eq!(
+                provenance_from_env(&env(&local)),
+                Provenance::Repository,
+                "{local:?} is a laptop, not an ambiguous CI"
+            );
+        }
+    }
+
+    /// A CI with no adapter of ours: the branch has to be declared, or nothing
+    /// it is about is the repository's own code (#305). The GitHub reader
+    /// answers `Repository` for every one of these environments — none of them
+    /// sets a `GITHUB_*` variable — so the test that matters is the one the
+    /// GitHub reader would fail.
+    #[test]
+    fn a_resume_on_a_ci_with_no_adapter_of_ours_trusts_only_a_declared_branch() {
+        let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+
+        /// A CI system, the variables that put it on a branch, and whether a
+        /// declaration of `main` can rescue it at all.
+        type System = (Vec<(&'static str, &'static str)>, bool, &'static str);
+        let systems: Vec<System> = vec![
+            // Buildkite.
+            (vec![("BUILDKITE", "true"), ("BUILDKITE_BRANCH", "main")], true, "buildkite"),
+            // CircleCI.
+            (vec![("CIRCLECI", "true"), ("CIRCLE_BRANCH", "main")], true, "circleci"),
+            // Jenkins, whose `origin/` prefix comes off before the branch does.
+            (
+                vec![("JENKINS_URL", "https://jenkins.example/"), ("GIT_BRANCH", "origin/main")],
+                true,
+                "jenkins",
+            ),
+            // A runner that exports `CI` and names no branch at all: there is
+            // nothing for a declaration to match, so it is untrusted whatever
+            // the operator declares.
+            (vec![("CI", "true"), ("BUILD_ID", "9182")], false, "a bare CI run"),
+        ];
+
+        for (vars, names_a_branch, why) in systems {
+            let run = env(&vars);
+            assert!(
+                provenance_from_env(&run).is_untrusted(),
+                "{why}: nothing this reader can see says whose code this is"
+            );
+            // The GitHub reader really would have said yes to all of them.
+            assert!(
+                !crate::github_actions_run_context::provenance_from_env(&run).is_untrusted(),
+                "{why}: the GitHub reader is the fail-open this dispatch avoids"
+            );
+
+            // Declaring the branch is the whole of the opt-in — where the run
+            // names a branch for it to match.
+            let mut declared = vars.clone();
+            declared.push(("KEEP_SHIPPING_TRUSTED_BRANCHES", "main"));
+            assert_eq!(
+                provenance_from_env(&env(&declared)),
+                if names_a_branch { Provenance::Repository } else { Provenance::Fork },
+                "{why}"
+            );
+        }
+
+        // A branch the operator did not declare stays untrusted even where a
+        // list exists: a shared prefix is not a match.
+        assert!(
+            provenance_from_env(&env(&[
+                ("BUILDKITE", "true"),
+                ("BUILDKITE_BRANCH", "feature/x"),
+                ("KEEP_SHIPPING_TRUSTED_BRANCHES", "main"),
+            ]))
+            .is_untrusted()
+        );
+
+        // A laptop is not a CI, and must keep working: `resume` on a
+        // developer's machine is the local branch it has always been.
+        for local in
+            [vec![], vec![("HOME", "/home/ada")], vec![("USER", "ada"), ("PWD", "/work/harness")]]
+        {
+            assert_eq!(
+                provenance_from_env(&env(&local)),
+                Provenance::Repository,
+                "{local:?} is a laptop, not an untrusted run"
+            );
+        }
     }
 }
