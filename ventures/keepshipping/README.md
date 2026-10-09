@@ -19,6 +19,21 @@ composition: the venture's name and domain, the product code
 - Confirm/expiry links point back at the API and then redirect to the site
   (`status_redirect`).
 - `GET /v1/waitlist/admin/export.csv` — Bearer `ADMIN_TOKEN` CSV export.
+- `GET /v1/setup` — the standard setup console (#273): a plain-words
+  checklist per domain — Google Search Console, Gmail Postmaster Tools,
+  Bing Webmaster Tools, SPF, DKIM, DMARC, MTA-STS, TLS-RPT — with a live
+  chip per item (Done / Turning on / Needs you / Off) re-checked over
+  DNS-over-HTTPS every few seconds. Every route needs a signed-in caller;
+  the pages are served from the API host, which is therefore on the
+  write-origin allowlist too.
+  - `GET /v1/setup/{domain}` — the checklist; a first view seeds
+    Google-Workspace defaults. `POST /v1/setup/{domain}` sends ONE change
+    for everything ticked — a pull request (`setup/{domain}-…`, one
+    `dns.tf`, a plain-words summary) against the infra repo, never a
+    direct DNS API mutation; re-sending an unchanged checklist sends
+    nothing. `POST /v1/setup/{domain}/confirmed` records an "I did this"
+    for the outside services; `GET /v1/setup/{domain}/status` is the JSON
+    the page polls.
 
 Alongside the routes, the hourly cron (`[triggers] crons` in `wrangler.toml`,
 shared with the billing module's dispute poll) runs the waitlist module's
@@ -37,6 +52,7 @@ wrangler d1 migrations apply keepshipping-waitlist
 wrangler secret put OWLPOST_API_KEY   # preferred mailer; verify send.keepshipping.run in Owlpost
 wrangler secret put RESEND_API_KEY    # fallback mailer, used when no Owlpost key is set
 wrangler secret put TURNSTILE_SECRET  # Turnstile widget on keepshipping.run
+wrangler secret put SETUP_GITHUB_TOKEN # opens the setup console's pull requests
 wrangler deploy
 ```
 
@@ -50,6 +66,11 @@ Secrets degrade safely: with no `TURNSTILE_SECRET` the harness refuses
 joins in production (fail-closed); with neither mail key the join is still
 captured as `pending`, just without confirm mail. `ADMIN_TOKEN` is the
 export credential — set it before pointing the admin tooling at the API.
+The setup console needs `SETUP_GITHUB_REPO` (a var, `owner/repo`) plus
+`SETUP_GITHUB_TOKEN` (a secret over that repo; `SETUP_GITHUB_BASE` names
+the target branch, `main` by default) to file its pull requests — with
+either missing it still serves, saves and answers status, and says on the
+page that connecting to GitHub is needed before the change can be filed.
 
 ## Mail theme
 

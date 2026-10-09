@@ -36,7 +36,12 @@
 //!   `POLAR_WEBHOOK_SECRET` through the `cratefield-adapter-polar`
 //!   adapter: with the token missing the adapter reports `not configured`
 //!   and every billing route answers a `not-ready` problem — the
-//!   deployment before billing is switched on, never a mis-bill.
+//!   deployment before billing is switched on, never a mis-bill;
+//! * the standard setup console (issue #273) runs on `SETUP_GITHUB_REPO`
+//!   and `SETUP_GITHUB_TOKEN` (with the optional `SETUP_GITHUB_BASE`):
+//!   when either is missing it still serves, saves and answers status,
+//!   and says on the page that connecting to GitHub is needed before the
+//!   pull request can open — the change is never lost, only unfiled.
 //!
 //! Mail renders in the venture's own theme ([`mail_theme`], from
 //! `src/mail-theme.json`), with the optional `MAIL_THEME` var or secret
@@ -46,11 +51,13 @@
 
 mod billing;
 mod origin;
+mod setup;
 
 pub mod fleet;
 
 pub use billing::{Billing, DISPUTE_POLL_CRON, Plan, entitlements};
 pub use origin::{SITE_ORIGINS, write_origin_rejected};
+pub use setup::{GitHubPullRequests, PullRequests, Setup};
 
 use std::sync::{Arc, OnceLock};
 
@@ -105,6 +112,40 @@ pub fn module() -> Waitlist {
 #[must_use]
 pub fn billing_module() -> Billing {
     Billing
+}
+
+/// The venture's standard setup console (issue #273), mounted next to the
+/// other modules. GitHub wiring is optional by design:
+/// `SETUP_GITHUB_REPO` (a var, `owner/repo`) and `SETUP_GITHUB_TOKEN` (a
+/// secret over the infra repo) open the pull request every change is;
+/// `SETUP_GITHUB_BASE` names the branch the pull requests propose into
+/// (`main` by default). With either of the required two missing the
+/// console still serves, saves and answers status — it just says, on the
+/// page, that connecting to GitHub is needed before the change can be
+/// filed. Public so the integration tests mount the same module the
+/// worker serves.
+#[must_use]
+pub fn setup_module(env: &Env) -> Setup {
+    let read = |reader: fn(&Env, &str) -> worker::Result<String>, name: &str| {
+        reader(env, name)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    let repo = read(|env, name| env.var(name).map(|value| value.to_string()), "SETUP_GITHUB_REPO");
+    let token =
+        read(|env, name| env.secret(name).map(|value| value.to_string()), "SETUP_GITHUB_TOKEN");
+    let base = read(|env, name| env.var(name).map(|value| value.to_string()), "SETUP_GITHUB_BASE")
+        .unwrap_or_else(|| "main".to_owned());
+    match (repo, token) {
+        (Some(repo), Some(token)) => Setup::new(Some(Arc::new(GitHubPullRequests::new(
+            Arc::new(FetchClient),
+            repo,
+            token,
+            base,
+        )))),
+        _ => Setup::new(None),
+    }
 }
 
 /// The Polar adapter the secrets select (ADR 0202): `POLAR_ACCESS_TOKEN` for
@@ -255,7 +296,10 @@ fn instance(env: &Env) -> Arc<(Harness, Cloudflare)> {
                 Some(captcha) => runtime.captcha_arc(Arc::new(captcha)),
                 None => runtime,
             };
+            // The setup module reads `Env`, so it joins the static
+            // composition here rather than inside `composition()`.
             let harness = composition()
+                .module(setup_module(env))
                 .runtime(runtime.clone())
                 .build()
                 .expect("the composition is static; `tests/harness.rs` builds the same one");
