@@ -25,7 +25,9 @@ function activate(context) {
       { scheme: 'file', language: 'keepshipping' },
       { scheme: 'untitled', language: 'keepshipping' },
     ],
-    traceOutputChannel: vscode.window.createOutputChannel('Keep Shipping Language Server'),
+    // vscode-languageclient 10 needs a LogOutputChannel ({ log: true }); a plain
+    // OutputChannel has no onDidChangeLogLevel and the client fails to start.
+    traceOutputChannel: vscode.window.createOutputChannel('Keep Shipping Language Server', { log: true }),
     initializationOptions: { trace },
   };
 
