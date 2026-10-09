@@ -18,6 +18,30 @@ Named types:
 | `oci.Ref` | string | an image reference pinned to a digest, as `<repository>@<digest>` |
 | `oci.Tag` | string | a mutable image reference, as `<repository>:<tag>` |
 
+## `gsc.sitemap_submit` (v1.0.0)
+
+Submits a sitemap to Google Search Console so indexing starts as soon as the domain is verified.
+
+- Action: other
+- Requires: HttpClient
+- Capabilities: none
+
+Inputs:
+
+| Name | Type | Default | Description |
+| --- | --- | --- | --- |
+| `credentials` | string | - | the Google service-account JSON key used to authenticate; it is never logged, returned or named in an error |
+| `site` | string | - | the Search Console site identifier, e.g. `sc-domain:example.com` |
+| `sitemap` | string | - | absolute https URL of the sitemap, e.g. `https://example.com/sitemap.xml` |
+
+Outputs:
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `site` | string | the site submitted for |
+| `sitemap` | string | the sitemap that was submitted |
+| `submitted` | bool | always true when the step returns |
+
 ## `k8s.rollout` (v1.1.0)
 
 Applies manifests to a cluster with every image pinned by digest, and waits for the workloads to become healthy.

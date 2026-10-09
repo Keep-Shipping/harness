@@ -32,6 +32,11 @@ percent-encoding = "2"
 serde = { version = "1", features = ["derive"] }
 # The setup change's files go to GitHub's contents API base64-encoded.
 base64 = "0.23"
+http = "1"
+# The Search Console module signs its JWT assertion with the same flow the
+# engine's `gsc.sitemap_submit` step uses; `sha2` is rsa's own gate for
+# `SigningKey<Sha256>`'s digest OID.
+rsa = { version = "0.9", features = ["sha2"] }
 serde_json = "1"
 time = { version = "0.3", default-features = false, features = ["std", "formatting", "parsing", "macros"] }
 tracing = "0.1"
@@ -41,8 +46,16 @@ worker = { version = "0.8.5", default-features = false, features = ["d1"] }
 # wasm32 backend is opt-in per leaf crate. Never compiled on native targets.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.4", default-features = false, features = ["wasm_js"] }
+# The Search Console module's `rsa` signs through rand 0.8, which is on the
+# older getrandom — same opt-in under its old `js` name, same reason, so the
+# worker still builds.
+getrandom02 = { package = "getrandom", version = "0.2", default-features = false, features = ["js"] }
 
 [dev-dependencies]
+# `axum`/`tokio` serve the dev-only page server in `examples/gsc_dev.rs`;
+# `async-trait` is what the example's permissive dev auth port needs.
+async-trait = "0.1"
+axum = { version = "0.8", features = ["tokio", "http1"] }
 cratefield-adapter-sqlite = "0.3"
 cratefield-testing = "0.5"
 hmac = "0.13"
@@ -53,4 +66,5 @@ insta = "1"
 ks-core.workspace = true
 pollster = "1.0"
 sha2 = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
 tower = { version = "0.5", features = ["util"] }

@@ -19,6 +19,19 @@ composition: the venture's name and domain, the product code
 - Confirm/expiry links point back at the API and then redirect to the site
   (`status_redirect`).
 - `GET /v1/waitlist/admin/export.csv` — Bearer `ADMIN_TOKEN` CSV export.
+- `GET /v1/console/search-console?zone=...` — the Search Console status
+  page (#274): what the domain's verification and sitemap state is, the
+  one-time service-account setup, and the change form. All console routes
+  require a signed-in caller; an anonymous one gets the 401 shell.
+- `GET /v1/console/gsc?zone=...` — the JSON twin of the page's status
+  card: `{"zone", "verified", "sitemap_submitted", "sitemap",
+  "last_read_at"}` for the Standard setup page to embed.
+- `POST /v1/console/search-console/module` — generates the domain
+  verification Terraform change from a form (`zone`, `owners`, `sitemap`):
+  `text/x-terraform` attachment `search-console.tf` by default, or (with
+  `Accept: application/json`) an edit-as-code payload. Reads only — no
+  Google API call mutates anything; the submission itself stays the
+  engine's `gsc.sitemap_submit` step.
 - `GET /v1/setup` — the standard setup console (#273): a plain-words
   checklist per domain — Google Search Console, Gmail Postmaster Tools,
   Bing Webmaster Tools, SPF, DKIM, DMARC, MTA-STS, TLS-RPT — with a live
@@ -53,8 +66,16 @@ wrangler secret put OWLPOST_API_KEY   # preferred mailer; verify send.keepshippi
 wrangler secret put RESEND_API_KEY    # fallback mailer, used when no Owlpost key is set
 wrangler secret put TURNSTILE_SECRET  # Turnstile widget on keepshipping.run
 wrangler secret put SETUP_GITHUB_TOKEN # opens the setup console's pull requests
+wrangler secret put GOOGLE_SERVICE_ACCOUNT_JSON  # Search Console status reads (#274)
 wrangler deploy
 ```
+
+The Search Console secret is a Google service-account key file's JSON,
+pasted whole — its `private_key` signs the JWT that fetches the status.
+Share the property once in Search Console ("Settings → Users", the
+service account's `client_email` as an Owner); until then every domain
+reads as "not verified yet". With the secret unset the status reads answer
+a not-ready page and the Terraform generator still works.
 
 The mailer is chosen by which secret is present, never by retrying a
 failed send: `OWLPOST_API_KEY` selects [Owlpost](https://owlpost.to) (send
