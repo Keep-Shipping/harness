@@ -33,3 +33,4 @@ A guard test (`cargo test -p ks-testing --test adr_guard`) checks every ADR belo
 | [0015](0015-telemetry-policy.md) | Telemetry policy | Accepted |
 | [0100](0100-step-contract-and-composition-checks.md) | Step contract and composition checks | Accepted |
 | [0200](0200-hosted-venture-on-the-cratefield-harness.md) | Hosted venture on the Cratefield harness | Accepted |
+| [0201](0201-hosted-on-cloudflare.md) | Hosted on Cloudflare | Proposed |

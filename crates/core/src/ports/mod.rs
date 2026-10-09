@@ -21,6 +21,8 @@
 //! - [`policy`] — the org baseline policy, read from outside the repository ([#56](https://github.com/Keep-Shipping/harness/issues/56));
 //! - [`clock`] — time and sleeping, as a dependency rather than ambient;
 //! - [`id_gen`] — minting fresh run ids;
+//! - [`run_lock`] — mutual exclusion of runs that change one (account, module)
+//!   ([#175](https://github.com/Keep-Shipping/harness/issues/175));
 //! - [`run_log`] — the append-only record of what a run did ([#46](https://github.com/Keep-Shipping/harness/issues/46));
 //! - [`script_host`] — running the TypeScript escape-hatch steps;
 //! - [`decision_model`] — asking a model a judgement it cannot be handed ([#54](https://github.com/Keep-Shipping/harness/issues/54));
@@ -31,7 +33,9 @@
 //! — the engine and the CLI hold them, not a step — so none of the three is in
 //! the `Port` enum or in `define_ports!`, and `STEP_API` does not move when
 //! they change. [`approval_inbox`] is a fourth of that kind: the CLI holds the
-//! approver's end of an approval, so a run's author cannot reach it. `check` in
+//! approver's end of an approval, so a run's author cannot reach it.
+//! [`run_lock`] is a fifth: only the engine holds the lock that keeps two runs
+//! from changing one module at once. `check` in
 //! particular stays pure and I/O-free: it reads a
 //! block's *digest* and a baseline's rules, and never resolves a version or
 //! fetches a document. The remaining ports from the crate map (image building,
@@ -69,6 +73,7 @@ pub mod id_gen;
 pub mod policy;
 pub mod remote_shell;
 pub mod run_context;
+pub mod run_lock;
 pub mod run_log;
 pub mod script_host;
 pub mod secrets;
