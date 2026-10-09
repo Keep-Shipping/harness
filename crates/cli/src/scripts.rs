@@ -98,7 +98,7 @@ fn cache_key(source: &[u8]) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(EXTRACTOR.as_bytes());
     hasher.update(source);
-    format!("{:x}", hasher.finalize())
+    hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Write beside the cache and rename over it, so a run that dies mid-write

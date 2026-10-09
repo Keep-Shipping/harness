@@ -228,7 +228,12 @@ pub fn cache_key(
             }
         }
     }
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!("sha256:{}", hex(&hasher.finalize())))
+}
+
+/// Bytes as lowercase hex. sha2 0.11 digests no longer implement `LowerHex`.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Where the length-prefixed encoders below write: the key hasher, or the bytes of a cache
