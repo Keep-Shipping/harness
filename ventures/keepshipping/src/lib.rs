@@ -31,7 +31,12 @@
 //!   being verified;
 //! * without `TURNSTILE_SECRET` no captcha port exists at all, and the
 //!   harness refuses joins in `ENV=production` (fail-closed — see the
-//!   module's `verify_human_form`).
+//!   module's `verify_human_form`);
+//! * billing (issue #177, ADR 0202) runs on `POLAR_ACCESS_TOKEN` +
+//!   `POLAR_WEBHOOK_SECRET` through the `cratefield-adapter-polar`
+//!   adapter: with the token missing the adapter reports `not configured`
+//!   and every billing route answers a `not-ready` problem — the
+//!   deployment before billing is switched on, never a mis-bill.
 //!
 //! Mail renders in the venture's own theme ([`mail_theme`], from
 //! `src/mail-theme.json`), with the optional `MAIL_THEME` var or secret
@@ -39,13 +44,16 @@
 
 #![forbid(unsafe_code)]
 
+mod billing;
 mod origin;
 
+pub use billing::{Billing, DISPUTE_POLL_CRON, Plan, entitlements};
 pub use origin::{SITE_ORIGINS, write_origin_rejected};
 
 use std::sync::{Arc, OnceLock};
 
 use cratefield_adapter_owlpost::Owlpost;
+use cratefield_adapter_polar::{CustomerIds, Polar};
 use cratefield_adapter_resend::Resend;
 use cratefield_adapter_turnstile::Turnstile;
 use cratefield_core::{Harness, Mailer, Template, Venture};
@@ -87,6 +95,38 @@ pub fn module() -> Waitlist {
         .products(["keepshipping"])
         .referrals(false)
         .status_redirect("https://keepshipping.run/")
+}
+
+/// The venture's billing module (issue #177, ADR 0202), mounted next to the
+/// waitlist module: paid plans through Polar over the `Payments` port.
+/// Public so the integration tests mount the same module the worker serves.
+#[must_use]
+pub fn billing_module() -> Billing {
+    Billing
+}
+
+/// The Polar adapter the secrets select (ADR 0202): `POLAR_ACCESS_TOKEN` for
+/// the Management API and `POLAR_WEBHOOK_SECRET` for webhook signatures;
+/// customers are named by the venture's own account id (Polar's
+/// `external_customer_id`). A missing token still builds: the adapter reports
+/// `not configured` and the billing routes answer a `not-ready` problem —
+/// the deployment before billing is switched on, never a panic.
+fn payments(env: &Env) -> Arc<Polar> {
+    // A secret as trimmed text, blank counting as absent — the same rule
+    // the mailer reads by.
+    let read = |name: &str| {
+        env.secret(name).ok().map(|secret| secret.to_string()).map(|key| key.trim().to_owned())
+    };
+    Arc::new(
+        Polar::new(
+            Arc::new(FetchClient),
+            Arc::new(WorkersClock),
+            cratefield_adapter_polar::Environment::parse(read("POLAR_ENVIRONMENT").as_deref()),
+            read("POLAR_ACCESS_TOKEN").unwrap_or_default(),
+            read("POLAR_WEBHOOK_SECRET").unwrap_or_default(),
+        )
+        .with_customer_ids(CustomerIds::External),
+    )
 }
 
 /// The venture's mail theme: `src/mail-theme.json`, baked into the binary
@@ -192,15 +232,14 @@ fn instance(env: &Env) -> Arc<(Harness, Cloudflare)> {
     static INSTANCE: OnceLock<Arc<(Harness, Cloudflare)>> = OnceLock::new();
     INSTANCE
         .get_or_init(|| {
+            let runtime = Cloudflare::new()
+                .db("DB")
+                .rate_limiter("RATE_LIMITER")
+                .mailer_arc(mailer(env))
+                .payments_arc(payments(env));
             let runtime = match captcha(env) {
-                Some(captcha) => Cloudflare::new()
-                    .db("DB")
-                    .rate_limiter("RATE_LIMITER")
-                    .mailer_arc(mailer(env))
-                    .captcha_arc(Arc::new(captcha)),
-                None => {
-                    Cloudflare::new().db("DB").rate_limiter("RATE_LIMITER").mailer_arc(mailer(env))
-                }
+                Some(captcha) => runtime.captcha_arc(Arc::new(captcha)),
+                None => runtime,
             };
             let harness = Harness::builder()
                 .venture(venture())
@@ -240,9 +279,10 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> worker::Result<Respo
     serve(harness, runtime, req, env, ctx).await
 }
 
-/// Cron entry: the module's sweeps (pending-entry retention runs on the
-/// `retention_days_pending` clock). No schedule is wired in
-/// `wrangler.toml` yet — the first sweeps matter only once mail flows.
+/// Cron entry: the modules' sweeps. The hourly trigger wired in
+/// `wrangler.toml` (`0 * * * *`) is the billing module's dispute poll
+/// (`DISPUTE_POLL_CRON` — Polar sends no dispute webhooks); the waitlist
+/// module's pending-entry retention runs on the same dispatch.
 #[event(scheduled)]
 pub async fn scheduled(event: worker::ScheduledEvent, env: Env, ctx: worker::ScheduleContext) {
     // Handler errors inside `serve_scheduled` are logged, never a failed
