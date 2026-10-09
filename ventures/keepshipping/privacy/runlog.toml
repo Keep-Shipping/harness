@@ -1,0 +1,66 @@
+# Privacy declaration for the run log.
+#
+# Read by `cratefield-module-privacy` (the upstream Cratefield crate), under the
+# convention that a module states what it holds so that access and erasure
+# requests can be answered against a declared contract rather than a discovered
+# schema. This is a declaration of FACT about the module, not configuration:
+# nothing in this repository reads this file, and the crate it is written for is
+# not a dependency here.
+#
+# The keys under `holds` are the dotted wire names of the RunEvent variants
+# (RunEvent::kind, run_log.rs). No hosted run-log viewer is deployed and no
+# event leaves the runner; this declares what the log would hold if one were.
+#
+# A key containing a dot is QUOTED. Unquoted, TOML reads `a.b` as a dotted key
+# and builds a nested table, which is not the flat shape here. Strip the quotes
+# to recover the wire name.
+#
+# Redaction runs twice, before any adapter sees an event, and is not a section
+# below for the reason given at the end of this header. RunEvent::redacted
+# scrubs every variant, spelled per field on purpose, because an or-pattern
+# binds only the fields every arm shares -- which is how `approver` went
+# unscrubbed the first time this was written. Underneath, VALUE_ALLOWLIST in
+# crates/core/src/redact.rs names exactly nine attribute paths whose values may
+# leave: count, desired_count, instance_type, instance_class, min_size, max_size,
+# node_count, replicas, engine_version -- matched against the whole path and
+# capped at MAX_VALUE_BYTES, 64. Everything else renders (withheld).
+#
+# Every file in this directory has exactly three sections: [holds], [retention]
+# and [erasure], so one small reader parses all of them.
+
+module = "runlog"
+title = "Run log"
+status = "local only, not uploaded"
+stores = ".keepshipping/runs, hash-chained JSONL on the runner"
+inventory = "docs/PRIVACY.md"
+
+[holds]
+"run.started" = "file_hash, trigger, actor HANDLE, is_agent"
+"step.started" = "step name only"
+"step.finished" = "step name, outcome, output NAMES, duration, redacted error text"
+"step.rolled-back" = "step name, policy, status, reverted version, reason text"
+"approval.requested" = "step, channel, artifact hashes"
+"approval.granted" = "approver HANDLE, channel, artifact hashes"
+"approval.denied" = "approver HANDLE plus FREE TEXT reason, the approver's own words or the engine's one line"
+"approval.expired" = "step, channel, artifact hashes; nobody answered before the deadline"
+"approval.aborted" = "proposer HANDLE, channel, artifact hashes"
+"approval.rejected" = "FREE TEXT detail naming which rule held; there is no approver to blame"
+"decide.sent" = "redacted plan state and questions; shows exactly what left the machine"
+"decide.answered" = "model, version, answer, confidence, and question_hash and state_hash which are sha256 of what was sent so a decision can be matched to its inputs without the log holding either"
+"credentials.resolved" = "cloud, role, and how credentials were got; the token itself is never here"
+"decision.overridden" = "by HANDLE plus FREE TEXT reason; a human disagreeing with a recorded decision"
+"attestation.attached" = "image digest and pushed attestation envelope digest"
+"policy.refused" = "an optional step name, None before any step ran, and the rule that held. Carries no digest and no resource address"
+"plan.stale" = "step, cause (state or drift), the sha256 digest of the approved plan, the sha256 digest of the fresh plan or None when the re-plan failed, and whether the fresh change set differs or None when there was nothing to compare"
+"run.finished" = "status and shipped artifact names"
+
+[retention]
+state = "as long as the runner keeps the file"
+schedule = "none; nothing sweeps .keepshipping/runs"
+window_setting = "none; no window is configured anywhere in this repository"
+
+[erasure]
+disposition = "delete the run file"
+statement = "none; deletion is of the local JSONL file under .keepshipping/runs, not a query against a service"
+identifier = "run id, which is the file name stem"
+reason = "nothing has left the runner, so an erasure request is answered locally by the person who runs it; there is no copy elsewhere to reach"

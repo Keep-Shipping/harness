@@ -1,0 +1,56 @@
+# Privacy declaration for the keepshipping-waitlist module.
+#
+# Read by `cratefield-module-privacy` (the upstream Cratefield crate), under the
+# convention that a module states what it holds so that access and erasure
+# requests can be answered against a declared contract rather than a discovered
+# schema. This is a declaration of FACT about the module, not configuration:
+# nothing in this repository reads this file, and the crate it is written for is
+# not a dependency here. It is committed ahead of the wiring so the promise is
+# reviewable before the code exists.
+#
+# The `holds` keys below are the `waitlist_entries` columns and nothing else.
+# A column added to a migration must be added here too; the guard test compares
+# the two. `waitlist_position_lock` holds no personal data and is deliberately
+# absent. `waitlist_send_cooldown` is ALSO absent, but for a different and
+# weaker reason: whether its `subject` column holds a recipient address is not
+# verifiable from this repository, because the code that writes it is in
+# cratefield-module-waitlist. Confirm before launch; see the retention note.
+
+module = "waitlist"
+title = "Keep Shipping early-access waitlist"
+status = "built, not deployed: wrangler.toml binds a placeholder database_id and no deploy workflow exists"
+stores = "D1 tables waitlist_entries, waitlist_send_cooldown, waitlist_position_lock"
+endpoint = "https://api.keepshipping.run"
+inventory = "docs/PRIVACY.md"
+
+[holds]
+id = "ULID primary key; identifies the entry without naming the person"
+email = "The address given at signup, as typed; the only address we mail"
+email_normalized = "Lowercased address backing the per-product uniqueness constraint"
+product = "Product code the entry is for; a queue is per product"
+status = "pending or confirmed; separates a captured address from a proven one"
+position = "Dense per-product join order, never recomputed; the number status reports"
+referral_code = "Unique code the person shares; attribution for the referral credit"
+referred_by = "The referral_code of whoever invited them; credits the inviter"
+referrals = "Count of referrals already credited to this row"
+answers = "Opaque text. The field list is UNDECIDED and no answers form exists; every field will be named in docs/PRIVACY.md before the form goes live"
+created_at = "Text timestamp of the signup; orders the queue"
+confirmed_at = "Text timestamp of the double opt-in, if it happened"
+generation = "Integer starting at 1; confirm tokens bind to (id, generation)"
+
+[retention]
+state = "not running, and the sweep is upstream"
+schedule = "none; wrangler.toml declares no crons trigger, so the #[event(scheduled)] handler never fires"
+sweep_owner = "cratefield-module-waitlist; that crate is on crates.io and cargo fetch resolves it, but its source is not in this working tree, so the sweep itself is NOT readable from here and the only evidence here is a doc comment on the handler"
+window_setting = "retention_days_pending, a cratefield-module-waitlist setting that no [vars] entry in this repository supplies; the window's value is not visible here"
+applies_to = "pending entries only"
+confirmed = "no sweep is scheduled for confirmed rows either"
+
+[erasure]
+disposition = "anonymise"
+statement = "UPDATE waitlist_entries SET email = NULL, email_normalized = NULL, answers = NULL WHERE id = ?"
+identifier = "id"
+reason = "position is a dense per-product join order that is never recomputed and referrals is a credit already granted to somebody else, so deleting a confirmed row changes a count other people can see and orphans every referred_by that points at its code; keeping the row and taking the person out of it answers the request without rewriting anyone else's place in the queue"
+source = "migrations/0005_waitlist_anonymisable_entry.sql"
+nullable_since = "0005 dropped NOT NULL from email and email_normalized so the statement above cannot fail on the first request"
+manual_path = "wrangler d1 execute against database keepshipping-waitlist; see README.md"
