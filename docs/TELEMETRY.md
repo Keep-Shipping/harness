@@ -127,7 +127,7 @@ that a new kind cannot become a free-form field:
 - `enum(code)` is `Code::ALL` in `crates/lang/src/diagnostic.rs`, the
   33 codes `KS0001`–`KS0005`, `KS0101`–`KS0102`, `KS0201`–`KS0206`,
   `KS0301`–`KS0306`, `KS0401`–`KS0405`, `KS0501`–`KS0502`,
-  `KS0601`–`KS0602`, `KS0610`–`KS0611`, `KS0701`–`KS0702`, `KS0801`.
+  `KS0601`–`KS0603`, `KS0610`–`KS0611`, `KS0701`–`KS0702`, `KS0801`.
   No field uses it today; it exists in the type set for the one payload
   that would want it, a diagnostic-code-keyed count map of the same shape
   as `action_counts`, and adding that field is a schema bump.
