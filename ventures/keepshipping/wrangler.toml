@@ -1,9 +1,15 @@
-# The early-access waitlist Worker (issue #146). `wrangler deploy` from
-# this directory; `wrangler d1 create` + `wrangler secret put` first (see
-# the README). The D1 binding name and the rate limiter name are load-bearing
+# The Keep Shipping console Worker: fleet view (#169), standard setup
+# (#273), Search Console status (#274), plus the billing and waitlist
+# modules. `wrangler deploy` from this directory; migrations and
+# `wrangler secret put` first (see the README, "Deploy").
+#
+# Host: console.keepshipping.run. NOT api.keepshipping.run, and NOT the
+# Worker name `keepshipping-waitlist`: both belong to the separate live
+# waitlist Worker (Keep-Shipping/waitlist-backend). Reusing either would
+# replace that Worker or take its host. The D1 binding name and the rate limiter name are load-bearing
 # in `src/lib.rs` (`Cloudflare::new().db("DB").rate_limiter("RATE_LIMITER")`).
 
-name = "keepshipping-waitlist"
+name = "keepshipping-console"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-09-01"
 
@@ -39,7 +45,9 @@ EDITS_SIGN_IN_URL = ""
 
 [[ratelimits]]
 name = "RATE_LIMITER"
-namespace_id = "2001"
+# Account-wide on Factory0: 2001 is this venture's waitlist copy elsewhere
+# and 1031 the live waitlist Worker; 2201 is unused on the account.
+namespace_id = "2201"
 
 [ratelimits.simple]
 limit = 30
@@ -54,21 +62,20 @@ crons = ["0 * * * *"]
 
 [[d1_databases]]
 binding = "DB"
-database_name = "keepshipping-waitlist"
-# Placeholder: replace with the id `wrangler d1 create keepshipping-waitlist`
-# prints. Deploy must fail until a real database exists, not silently bind
-# to someone else's.
-database_id = "00000000-0000-0000-0000-000000000000"
+# The console's own database on Factory0, created with
+# `wrangler d1 create keepshipping-console`. Never the live waitlist's
+# `keepshipping-waitlist` database: the two Workers share no data.
+database_name = "keepshipping-console"
+database_id = "b8f67c1f-9958-48f2-811b-1cc5b884c8d5"
 migrations_dir = "migrations"
 
 # The console fleet view (issue #169): the nightly check writes the fleet
 # snapshot here (key `fleet.json`), which /console/fleet renders.
 [[kv_namespaces]]
 binding = "FLEET"
-# Placeholder: replace with the id `wrangler kv namespace create FLEET`
-# prints, as with the D1 database above.
-id = "00000000000000000000000000000000"
+# Namespace `keepshipping-console-fleet` on Factory0.
+id = "435eb12c7b7f41a9a7dac20b268293f2"
 
 [[routes]]
-pattern = "api.keepshipping.run"
+pattern = "console.keepshipping.run"
 custom_domain = true

@@ -1,4 +1,4 @@
-# keepshipping-waitlist
+# keepshipping-waitlist (the Keep Shipping console)
 
 Keep Shipping's early-access waitlist — a [Cratefield](https://crates.io/crates/cratefield-core)
 venture ([#146](https://github.com/Keep-Shipping/harness/issues/146)). All
@@ -46,8 +46,8 @@ composition: the venture's name and domain, the product code
   Bing Webmaster Tools, SPF, DKIM, DMARC, MTA-STS, TLS-RPT — with a live
   chip per item (Done / Turning on / Needs you / Off) re-checked over
   DNS-over-HTTPS every few seconds. Every route needs a signed-in caller;
-  the pages are served from the API host, which is therefore on the
-  write-origin allowlist too.
+  the pages are served from the console host (`console.keepshipping.run`,
+  see "Host" below).
   - `GET /v1/setup/{domain}` — the checklist; a first view seeds
     Google-Workspace defaults. `POST /v1/setup/{domain}` sends ONE change
     for everything ticked — a pull request (`setup/{domain}-…`, one
@@ -64,13 +64,47 @@ sweeps: purging `pending` entries past
 closed. Without it nothing expires — the handler is mounted, but only a
 declared trigger reaches it.
 
+## Host
+
+This Worker is the **console**: `keepshipping-console` at
+`console.keepshipping.run`, with its own D1 database
+(`keepshipping-console`), KV namespace (`keepshipping-console-fleet`) and
+rate-limiter namespace (`2201`) on the Factory0 account.
+
+It is deliberately *not* `api.keepshipping.run`. That host, and the Worker
+name `keepshipping-waitlist`, belong to the separate live waitlist Worker in
+[Keep-Shipping/waitlist-backend](https://github.com/Keep-Shipping/waitlist-backend),
+which the site's form posts to and whose D1 holds the real waitlist.
+Deploying this crate under that name or route would replace it.
+
+The waitlist module is still mounted here (the composition is shared with
+the tests), but it is inert in this deployment: its tables live in the
+console's own database, so it never reads or writes the live list; the
+site never posts to this host; and with no `TURNSTILE_SECRET` it refuses
+joins in `ENV=production`. Leave `TURNSTILE_SECRET` and the mail keys
+unset on the console.
+
+The setup console's forms post back to `console.keepshipping.run`. The
+origin guard accepts that once the same-origin rule from #332 (edit as
+code) is in; before it, those writes answer `403`. The pages also need
+`.auth_from_env()` on the runtime (also in #332) plus `AUTH_ISSUER` and
+`AUTH_CLIENT_ID`, or they answer `503`.
+
+The owner script `~/keepshipping-console-deploy.sh` (outside the repo)
+applies the migrations, deploys, sets `HARNESS_SECRET` when missing, lists
+the secrets that need a person, smokes `/__health`, and publishes the docs
+site (`tools/deploy.sh`, Pages project `keepshipping-docs`).
+
 ## Deploy
 
 ```sh
 npm install -g wrangler   # or npx wrangler
-wrangler d1 create keepshipping-waitlist
-#   → put the printed database_id into wrangler.toml
-wrangler d1 migrations apply keepshipping-waitlist
+# The database (`keepshipping-console`), the FLEET KV namespace and the
+# rate-limiter namespace (2201) already exist on Factory0 and are pinned
+# in wrangler.toml; on a fresh account create them and replace the ids.
+wrangler d1 migrations apply keepshipping-console --remote
+wrangler secret put HARNESS_SECRET    # >= 32 bytes; signs confirm links (openssl rand -hex 32)
+wrangler secret put ADMIN_TOKEN       # optional; the CSV export Bearer
 wrangler secret put OWLPOST_API_KEY   # preferred mailer; verify send.keepshipping.run in Owlpost
 wrangler secret put RESEND_API_KEY    # fallback mailer, used when no Owlpost key is set
 wrangler secret put TURNSTILE_SECRET  # Turnstile widget on keepshipping.run
