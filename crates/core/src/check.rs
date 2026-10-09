@@ -724,6 +724,27 @@ impl<'a> Ctx<'a> {
             let spec = kind_name
                 .as_deref()
                 .and_then(|n| self.catalog.step(n).or_else(|| block.map(|b| b.as_step_types())));
+            // A kind neither the catalog nor a resolved block answers is a
+            // warning, not an error — the kind may be one another build,
+            // a plugin or a harness registers, and the file still checks —
+            // but never silence: the step's inputs go unverified (here and
+            // in `check_input`), so a misspelled kind should say so, with
+            // the closest known kind as the hint. A script kind is the
+            // documented escape hatch and warns nowhere.
+            if let Some(kind) =
+                kind_name.as_deref().filter(|k| spec.is_none() && !is_script_kind(k))
+            {
+                let names: Vec<String> = self.catalog.kinds().map(|k| k.name.clone()).collect();
+                let mut warning = Diagnostic::warning(
+                    Code::UnknownKind,
+                    kind_span,
+                    format!("unknown step kind `{kind}`; its inputs are not checked"),
+                );
+                if let Some((s, _)) = suggestion(kind, &names) {
+                    warning = warning.with_hint(format!("did you mean `{s}`?"));
+                }
+                self.push(warning);
+            }
             let ci_only = self.step_ci_only(s);
             let verify = self.step_verify(s, block);
             let rollback = self.step_rollback(s);
@@ -1617,6 +1638,12 @@ impl<'a> Ctx<'a> {
         match spec.and_then(|sp| sp.output(out)) {
             Some(ty) if more.is_none() => ty.clone(),
             Some(_) => Type::Any, // a field of a declared output, unchecked
+            // An unknown kind checks nothing, its outputs included: they
+            // type `any` read bare exactly as through `.out.`, because the
+            // kind may be one another build registers. Script kinds never
+            // reach here — `script_output` answered above. A known kind
+            // with no such output is the error below.
+            None if spec.is_none() => Type::Any,
             None => {
                 let name = self.steps[i].name.clone();
                 let msg = format!("step `{name}` has no output `{out}`");
@@ -3677,7 +3704,13 @@ steps:
     #[test]
     fn secret_requirements_list_each_environments_references() {
         let checked = check_src(TWO_ENVS);
-        assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
+        // `db.migrate` and `db.report` name no catalog kind, so each warns
+        // KS0603 — and nothing else: the listing below is what this tests.
+        assert!(
+            checked.diagnostics.iter().all(|d| d.code == Code::UnknownKind),
+            "{:#?}",
+            checked.diagnostics
+        );
         let listing = secret_requirements(&checked);
         assert_eq!(listing.len(), 2, "one entry per declared environment");
         assert_eq!(listing[0].env, "staging");

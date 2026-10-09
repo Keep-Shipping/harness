@@ -778,6 +778,32 @@ steps:
     image: build.digest
 ",
         },
+        Code::UnknownKind => Explanation {
+            code,
+            title: "unknown step kind",
+            severity: Severity::Warning,
+            summary: "The step's kind is not in the catalog — usually a misspelling, sometimes \
+                a kind another build, a plugin or a harness registers. The file still checks, \
+                but the step's inputs are not verified, so a typo in an input name or a value \
+                of the wrong type passes silently on this step; its outputs type `any`, read \
+                bare or through `.out.`. Check the spelling (the hint suggests the closest \
+                known kind) or register the kind's schema; where CI should refuse unknown \
+                kinds, run `keepshipping check --warnings-as-errors`.",
+            bad: "\
+steps:
+  plan: tofu.plna
+    dir: ./infra
+  apply: tofu.apply
+    plan: plan.changes
+",
+            good: "\
+steps:
+  plan: tofu.plan
+    dir: ./infra
+  apply: tofu.apply
+    plan: plan.file
+",
+        },
         Code::FormatDeprecated => Explanation {
             code,
             title: "file format is one behind",

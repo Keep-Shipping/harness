@@ -229,8 +229,10 @@ reference.
 **Steps and outputs.** Each kind declares its inputs and outputs (see the
 built-in catalog in `ks-core`: `oci.image`, `tofu.plan`, `approval`,
 `tofu.apply`, `k8s.rollout`, `decide`, and a TypeScript module's path — see
-**Script steps** below); unknown kinds are unchecked, their
-outputs type `any`. **`out.` rule**: outputs the kind declares statically are
+**Script steps** below); a kind the catalog does not know is unchecked — the
+checker warns rather than passing silently (KS0603), the step's inputs go
+unverified, and its outputs type `any` whether read bare or through `.out.`.
+**`out.` rule**: outputs the kind declares statically are
 read as `<step>.<output>`; outputs that exist only at run time (tofu
 outputs, script and block returns) are read as `<step>.out.<name>[.<field>…]`.
 Reading `apply.digest` on a run-time-only kind is an error pointing at
@@ -241,9 +243,10 @@ a did-you-mean hint.
 (`./ship/migrate.ts`, read against the directory holding the `ship.ks`) is a
 script step: the escape hatch for the work the language has no name for. The
 path may not reach outside that directory — a `..` component or an absolute
-path is an error (KS0101). Its inputs are unchecked for now and its outputs
-type `any`, like any unknown kind; both come from the script's own schema
-(ADR 0009).
+path is an error (KS0101). Its inputs are unchecked for now and, until the
+module is read, its outputs type `any`; both come from the script's own
+schema (ADR 0009). A script step is a documented kind, so unlike an unknown
+one it warns nowhere.
 
 A script step's `action:` says what kind of run it is — one of `build`,
 `plan`, `apply`, `deploy`, `destroy`, `read-secrets`, `other`. It defaults to
@@ -466,7 +469,8 @@ signature says. Signatures are resolved by the caller and injected into
 by the use's kind as written — resolving `acme/web-service@v3` to a version
 is [#81](https://github.com/Keep-Shipping/harness/issues/81). A use of a
 kind nothing resolves is checked like any unknown kind: no inputs, no
-outputs. `keepshipping check` resolves the `blocks/*.ks` beside the file it
+outputs, and the same KS0603 warning. `keepshipping check` resolves the
+`blocks/*.ks` beside the file it
 checks — a file inside `blocks/` sees its siblings — and matches a use by the
 name its `block:` declares, so `deploy: web-service` finds
 `blocks/web-service.ks`.
