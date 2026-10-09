@@ -114,6 +114,55 @@ principal with issuer `https://token.actions.githubusercontent.com` and subject
 `ARM_TENANT_ID` and `ARM_SUBSCRIPTION_ID`; keepshipping federates the step with
 a token minted for the audience `api://AzureADTokenExchange`.
 
+## Cloudflare: a token per account
+
+The Cloudflare adapter ([`ks-cloudflare`](../adapters/cloudflare)) reads an
+account and writes OpenTofu for it, so the account needs one dedicated
+**account** API token — created inside the account, never the global API key
+and never a user token — that both reads the account for the import and
+applies the generated files. Read and write for exactly the resource types
+the import manages, and nothing else:
+
+| Managed resource | Permission groups |
+|---|---|
+| `cloudflare_zone` | Zone Read, Zone Write |
+| `cloudflare_zone_setting` | Zone Settings Read, Zone Settings Write |
+| `cloudflare_dns_record` | DNS Read, DNS Write |
+| `cloudflare_workers_route` | Workers Routes Read, Workers Routes Write |
+| `cloudflare_email_routing_rule` | Email Routing Rules Read, Email Routing Rules Write |
+| `cloudflare_ruleset` | Zone WAF Read, Zone WAF Write |
+| `cloudflare_bot_management` | Bot Management Read, Bot Management Write |
+| `cloudflare_pages_project`, `cloudflare_pages_domain` | Cloudflare Pages Read, Cloudflare Pages Write |
+| `cloudflare_workers_custom_domain` | Workers Scripts Read, Workers Scripts Write |
+| `cloudflare_d1_database` | D1 Read, D1 Write |
+| `cloudflare_r2_bucket` | Workers R2 Storage Read, Workers R2 Storage Write |
+| `cloudflare_workers_kv_namespace` | Workers KV Storage Read, Workers KV Storage Write |
+
+On connect the adapter verifies the token against the account
+(`GET /accounts/{id}/tokens/verify`), reads its *own* policies, and refuses it
+when a managed permission is missing, when anything beyond the table is
+granted, or when a policy reaches outside this account and its zones
+(wildcards included; a `deny` takes back what an allow granted). One extra is
+deliberately allowed: the read-only `Account API Tokens Read` permission —
+reading the token's own policies, the check's entire job, needs it. A user
+token verifies at no endpoint here: the account's verify endpoint refuses it,
+and the adapter answers with the one fix, an account-owned token.
+
+**State.** OpenTofu state lives in R2 — key `account_id/module/terraform.tfstate`
+in one bucket, the generated root's `backend.tf` — with the S3 native lockfile
+(`use_lockfile = true`, OpenTofu ≥ 1.10; R2 answers the conditional writes
+locking needs). R2 has **no object versioning** (`PutBucketVersioning` is
+unimplemented over its S3 API), so the bucket keeps no state history. The
+state is encrypted at rest with a passphrase-derived AES-GCM key, `enforced`
+for state and plan — losing the passphrase with no other copy of the state
+means losing the state.
+
+**Where the credentials are.** Not in the generated files. R2's S3 keys are
+run-environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, from
+an R2 token — the Cloudflare API token is not an S3 credential); the
+encryption passphrase and the API token travel as `TF_VAR_*` values through
+the Secrets port, and appear in no file, log or error.
+
 ## GCP: not built yet
 
 Per-step federation on GCP is **not** implemented: `CloudRole::parse` accepts no
