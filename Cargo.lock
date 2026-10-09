@@ -228,6 +228,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cratefield-adapter-polar"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "100322f9ad8bec5bb3b0a14361c930a6953e7ffc4ad2de0cff667893a16be03a"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cratefield-core",
+ "getrandom",
+ "http",
+ "serde_json",
+ "time",
+ "tracing",
+]
+
+[[package]]
 name = "cratefield-adapter-resend"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -293,15 +309,16 @@ dependencies = [
 
 [[package]]
 name = "cratefield-core"
-version = "0.8.0"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40d159c9c54cfd5199802573a9a23526312bcf6d7657414845a70990196ee4a4"
+checksum = "2b276719b770a079c5a3ac81f00681724ec22de20b2dc1fec68b1d61d8380caa"
 dependencies = [
  "async-trait",
  "axum",
  "base64",
  "bytes",
  "futures-core",
+ "futures-util",
  "hmac",
  "http",
  "schemars",
@@ -1024,8 +1041,11 @@ dependencies = [
 name = "keepshipping-waitlist"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "cratefield-adapter-owlpost",
+ "cratefield-adapter-polar",
  "cratefield-adapter-resend",
+ "cratefield-adapter-sqlite",
  "cratefield-adapter-turnstile",
  "cratefield-core",
  "cratefield-mail-templates",
@@ -1033,11 +1053,16 @@ dependencies = [
  "cratefield-runtime-cloudflare",
  "cratefield-testing",
  "getrandom",
+ "hmac",
  "http",
  "insta",
  "ks-core",
  "pollster",
  "serde_json",
+ "sha2 0.11.0",
+ "time",
+ "tower",
+ "tracing",
  "worker",
 ]
 

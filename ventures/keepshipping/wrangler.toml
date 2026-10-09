@@ -24,6 +24,13 @@ namespace_id = "2001"
 limit = 30
 period = 60
 
+# The billing module's dispute poll (`DISPUTE_POLL_CRON` in `src/billing/`):
+# Polar sends no dispute webhooks, so open, won and lost are read from its
+# API here, hourly (issue #177, ADR 0202). The waitlist module's sweeps run
+# on the same dispatch.
+[triggers]
+crons = ["0 * * * *"]
+
 [[d1_databases]]
 binding = "DB"
 database_name = "keepshipping-waitlist"
