@@ -38,9 +38,28 @@ DESCRIPTION = (
     "line, the ports and adapters, the diagnostics, and the decisions behind them."
 )
 
-# The two groups, read as directory prefixes. Not a page list: the tree is read
-# at run time, so a doc added to docs/ appears without touching this file.
-GROUPS = (("Guides", ""), ("Decisions", "adr/"))
+# Group labels for the directories we know, read as directory prefixes. Not a
+# page list: the whole tree is read at run time, so a doc added to docs/ -- or a
+# new subdirectory of docs/ -- appears without touching this file. A directory
+# not named here becomes its own group, labelled after the directory and listed
+# after these, so nothing under docs/ is ever left off the site.
+GROUPS = (("Guides", ""), ("Decisions", "adr/"), ("Research", "research/"))
+
+
+def group_of(rel: str) -> str:
+    """The group a doc belongs to: the label of its top-level directory."""
+    top = rel.split("/", 1)[0] + "/" if "/" in rel else ""
+    for label, prefix in GROUPS:
+        if prefix == top:
+            return label
+    return top.rstrip("/").replace("-", " ").replace("_", " ").capitalize()
+
+
+def group_order(pages: list[dict]) -> list[str]:
+    """Known groups in GROUPS order, then any others alphabetically."""
+    known = [label for label, _ in GROUPS]
+    extra = sorted({page["group"] for page in pages} - set(known))
+    return known + extra
 
 FENCE = re.compile(r"^```(\S*)\s*$")
 HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
@@ -116,14 +135,12 @@ class Build:
         return f"/{head}/{out}" if head else f"/{out}"
 
     def discover(self) -> None:
-        for group, prefix in GROUPS:
-            directory = self.docs / prefix.rstrip("/") if prefix else self.docs
-            if not directory.is_dir():
+        for path in sorted(self.docs.rglob("*.md")):
+            rel = path.relative_to(self.docs).as_posix()
+            if not path.is_file() or any(part.startswith(".") for part in rel.split("/")):
                 continue
-            for path in sorted(directory.glob("*.md")):
-                rel = f"{prefix}{path.name}"
-                self.by_rel[rel] = self.url_for(rel)
-                self.pages.append({"group": group, "rel": rel, "path": path, "url": self.by_rel[rel]})
+            self.by_rel[rel] = self.url_for(rel)
+            self.pages.append({"group": group_of(rel), "rel": rel, "path": path, "url": self.by_rel[rel]})
         self.pages.sort(key=lambda page: page["rel"])
 
     def load(self) -> None:
@@ -430,7 +447,7 @@ def page_html(title: str, body: str, pages: list[dict]) -> str:
 
 def index_html(pages: list[dict]) -> str:
     out = [f"<h1>{esc(TITLE)} {esc(TAGLINE)}</h1>", f"<p>{esc(DESCRIPTION)}</p>"]
-    for group, _ in GROUPS:
+    for group in group_order(pages):
         members = [page for page in pages if page["group"] == group]
         if members:
             out.append(f"<h2>{esc(group)}</h2>\n<ul>")
@@ -453,7 +470,7 @@ def llms_txt(pages: list[dict]) -> str:
         "llms-full.txt for everything at once.",
         "",
     ]
-    for group, _ in GROUPS:
+    for group in group_order(pages):
         members = [page for page in pages if page["group"] == group]
         if members:
             out += [f"## {group}", ""]
