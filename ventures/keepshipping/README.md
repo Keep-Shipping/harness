@@ -20,6 +20,13 @@ composition: the venture's name and domain, the product code
   (`status_redirect`).
 - `GET /v1/waitlist/admin/export.csv` — Bearer `ADMIN_TOKEN` CSV export.
 
+Alongside the routes, the hourly cron (`[triggers] crons` in `wrangler.toml`,
+shared with the billing module's dispute poll) runs the waitlist module's
+sweeps: purging `pending` entries past
+`RETENTION_DAYS_PENDING`, and pruning send-cooldown claims whose window has
+closed. Without it nothing expires — the handler is mounted, but only a
+declared trigger reaches it.
+
 ## Deploy
 
 ```sh
@@ -59,6 +66,16 @@ fields — as a `wrangler.toml` `[vars]` entry or a secret; it is merged
 field by field (nested `light`/`dark` objects merge key by key) over the
 composed theme at send time.
 
+## Build
+
+The Worker is built by `worker-build --release` (the `[build]` command in
+`wrangler.toml`); `wrangler deploy` runs it for you. Run it locally to see
+the same artefact CI checks:
+
+```sh
+cd ventures/keepshipping && worker-build --release
+```
+
 ## Test
 
 ```sh
@@ -68,7 +85,11 @@ cargo test -p keepshipping-waitlist
 The integration tests mount the same module composition `src/lib.rs`
 serves, against the testing kit's fakes: captcha refusals, rate-limit
 `429`, unknown-product `400`, clean `202` + pending row, and the
-`NotConfigured` mailer path. `tests/mail.rs` snapshots the themed confirm
+`NotConfigured` mailer path. `tests/harness.rs` asserts that the very
+composition the Worker serves builds, and that `/__health` lists the
+waitlist module with a version and the port declarations it reads. It
+cannot check that a deployment *binds* those ports — those bindings exist
+only on a real Workers `Env`. `tests/mail.rs` snapshots the themed confirm
 and confirmed mails (HTML and text) and round-trips the theme JSON.
 
 ## Pending before launch
