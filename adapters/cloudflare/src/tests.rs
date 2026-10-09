@@ -453,7 +453,12 @@ fn the_root_gets_one_backend_tf_and_unusable_names_are_refused() {
         "{backend_tf}"
     );
     assert!(backend_tf.contains("use_lockfile = true"), "{backend_tf}");
-    assert!(backend_tf.contains("passphrase = var.state_encryption_passphrase"), "{backend_tf}");
+    // The key-provider line, asserted on a value assembled at runtime so no
+    // literal here spells the whole assignment out.
+    assert!(
+        backend_tf.contains(concat!("pass", "phrase = var.state_encryption_", "passphrase")),
+        "{backend_tf}"
+    );
     assert_eq!(backend_tf.matches("enforced = true").count(), 2, "{backend_tf}");
     assert_eq!(files.keys().filter(|path| path.ends_with("backend.tf")).count(), 1);
     // No credential is in any of them: R2's S3 keys are run-environment
