@@ -113,7 +113,7 @@ fn columns_in(block: &str) -> BTreeSet<String> {
     block
         .lines()
         .filter_map(|line| {
-            let first = line.trim().split_whitespace().next()?;
+            let first = line.split_whitespace().next()?;
             // A table constraint may open with its paren: `UNIQUE(email_normalized, product)`.
             let word = first.split('(').next().unwrap_or(first);
             (!CONSTRAINTS.contains(&word.to_uppercase().as_str())).then(|| word.to_string())
