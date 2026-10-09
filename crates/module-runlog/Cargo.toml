@@ -1,0 +1,22 @@
+[package]
+name = "ks-module-runlog"
+description = "Hosted run-log viewer: batched upload, chain and seal verification, and per-repo browsing of signed run logs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+ks-core.workspace = true
+# `derive` is not in the workspace's `serde`: nothing there derives a serde impl,
+# but this crate's upload envelope is one JSON object and hand-writing its
+# (de)serialization would be a worse trade than the feature.
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+ed25519-dalek.workspace = true
+
+[lints]
+workspace = true
