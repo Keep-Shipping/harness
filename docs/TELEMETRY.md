@@ -119,15 +119,15 @@ The closed vocabularies are named here rather than left to the receiver, so
 that a new kind cannot become a free-form field:
 
 - `enum(cli)` is the top-level word `dispatch()` matches in
-  `crates/cli/src/main.rs`, fifteen of them: `approve`, `blocks`,
+  `crates/cli/src/main.rs`, seventeen of them: `--version`, `about`, `approve`, `blocks`,
   `check`, `decide`, `decisions`, `deny`, `fmt`, `graph`, `import`,
   `log`, `lsp`, `policy`, `resume`, `run`, `runs`.
 - `enum(action)` is `ActionKind::NAMES` in `crates/core/src/step.rs`:
   `apply`, `build`, `deploy`, `destroy`, `other`, `plan`, `read-secrets`.
 - `enum(code)` is `Code::ALL` in `crates/lang/src/diagnostic.rs`, the
-  33 codes `KS0001`–`KS0005`, `KS0101`–`KS0102`, `KS0201`–`KS0206`,
+  34 codes `KS0001`–`KS0005`, `KS0101`–`KS0102`, `KS0201`–`KS0206`,
   `KS0301`–`KS0306`, `KS0401`–`KS0405`, `KS0501`–`KS0502`,
-  `KS0601`–`KS0602`, `KS0610`–`KS0611`, `KS0701`–`KS0702`, `KS0801`.
+  `KS0601`–`KS0603`, `KS0610`–`KS0611`, `KS0701`–`KS0702`, `KS0801`.
   No field uses it today; it exists in the type set for the one payload
   that would want it, a diagnostic-code-keyed count map of the same shape
   as `action_counts`, and adding that field is a schema bump.
