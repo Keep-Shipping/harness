@@ -77,6 +77,7 @@ use crate::args::{
 use crate::blocks::wait;
 use crate::drive::{Done, Outcome, Parking, StepRunner};
 use crate::progress::{Renderer, RunEvent};
+use crate::render::Format;
 
 fn main() -> ExitCode {
     // A panic is a bug in keepshipping, not a problem with the user's file:
@@ -166,6 +167,16 @@ fn run(args: &[String]) -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     }
+    // The dry-run graph is written for people; inside a machine format it
+    // would corrupt the stream, the way `check --secrets` would.
+    if o.dry_run && o.format != Format::Human {
+        eprintln!(
+            "error: --dry-run prints a graph for people; it does not combine with --format {}",
+            o.format.as_str()
+        );
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    }
     let path = o.path.as_deref().unwrap_or("ship.ks");
     // `--ci` is the caller saying a CI is in charge, which settles it even
     // where the environment is empty: the flag is the assertion, and it
@@ -205,8 +216,17 @@ fn run(args: &[String]) -> ExitCode {
     };
     let diags = &site.checked.diagnostics;
     if !diags.is_empty() {
-        let mut out = std::io::stdout().lock();
-        let _ = render::human(&mut out, path, &site.src, diags, render::use_color());
+        // In json mode even the pre-run diagnostics keep stdout parseable:
+        // they are `check`'s human rendering, so a machine stream must not
+        // carry them — they go to stderr with every other notice, and stdout
+        // stays empty or pure JSON Lines, nothing else.
+        if o.format == Format::Json {
+            let mut err = std::io::stderr().lock();
+            let _ = render::human(&mut err, path, &site.src, diags, render::use_color());
+        } else {
+            let mut out = std::io::stdout().lock();
+            let _ = render::human(&mut out, path, &site.src, diags, render::use_color());
+        }
     }
     if check::fails(&o, diags) {
         return ExitCode::from(1);
@@ -328,6 +348,20 @@ fn selected(
             return ExitCode::from(2);
         }
     };
+    // In json mode the stream opens before the gate, because a refusal is an
+    // outcome the closing line states and a stream with no opening line could
+    // not be told from one that never got this far. The human environment line
+    // stays where it was — after the gate — so a refused run still prints
+    // nothing on stdout.
+    let what = workflow.name().map(str::to_string).unwrap_or_else(|| stem(&site.file));
+    if o.format == Format::Json {
+        let mut out = std::io::stdout().lock();
+        let _ = progress::json_line(
+            &mut out,
+            &[("event", "run_started"), ("what", &what), ("env", env)],
+            &[],
+        );
+    }
     let waiting = match policy::gate(
         workflow,
         &steps,
@@ -338,16 +372,32 @@ fn selected(
     ) {
         Some(policy::Gate::Refused { step, why }) => {
             eprintln!("refusing to start: step `{step}` — {why}");
+            // The refusal happened before anything ran, so there is no run id
+            // and no parking: the step and the rule are all there is to say.
+            if o.format == Format::Json {
+                let mut out = std::io::stdout().lock();
+                let _ = progress::json_line(
+                    &mut out,
+                    &[
+                        ("event", "run_finished"),
+                        ("status", "policy_refused"),
+                        ("step", &step),
+                        ("why", &why),
+                    ],
+                    &[("exit", u64::from(ks_engine::exec::EXIT_POLICY_REFUSED))],
+                );
+            }
             return ExitCode::from(ks_engine::exec::EXIT_POLICY_REFUSED);
         }
         Some(policy::Gate::Wait { step, why }) => Some((step, why)),
         None => None,
     };
-    println!("environment: {env}");
+    if o.format != Format::Json {
+        println!("environment: {env}");
+    }
 
-    let what = workflow.name().map(str::to_string).unwrap_or_else(|| stem(&site.file));
     let tty = std::io::stdout().is_terminal() && std::env::var("TERM").is_ok_and(|t| t != "dumb");
-    let shared = Mutex::new(renderer(tty, o.verbose));
+    let shared = Mutex::new(renderer(o.format, tty, o.verbose));
     // Where a run that has to wait is written down, so the job can end and
     // `keepshipping resume` pick it up (#97). Nothing touches the disk unless
     // the run actually parks.
@@ -391,6 +441,14 @@ fn selected(
         let Some(run) = parking.park(&step, &[], &on) else {
             return ExitCode::from(1);
         };
+        // The stream opened, so it has to close here too: this park never
+        // reaches the outcome match below.
+        finish_line(
+            o.format,
+            "waiting_for_approval",
+            ks_engine::exec::EXIT_WAITING_FOR_APPROVAL,
+            &[("run", run.as_str()), ("step", &step), ("on", on.as_str())],
+        );
         return resume::park_notice(&run, &step, &on);
     }
     let mut approver: Box<dyn drive::Approver> = if is_agent {
@@ -423,21 +481,61 @@ fn selected(
             &what,
         )
     });
-    match outcome {
-        Outcome::Shipped => ExitCode::SUCCESS,
+    // The code and the json stream's `exit` are one mapping, the Outcome's
+    // own table, read once: the last line states what the exit code states.
+    let code = outcome.exit_code();
+    let exit = outcome.exit();
+    match &outcome {
+        Outcome::Shipped => {
+            finish_line(o.format, "shipped", exit, &[]);
+            code
+        }
         // Waiting is not failing: the run parked at an approval, which is the
         // engine's own exit 4, and the notice says what carries it on.
-        Outcome::Waiting { run, step, on } => resume::park_notice(&run, &step, &on),
-        Outcome::Declined | Outcome::Failed => ExitCode::from(1),
+        Outcome::Waiting { run, step, on } => {
+            finish_line(
+                o.format,
+                "waiting_for_approval",
+                exit,
+                &[("run", run.as_str()), ("step", step.as_str()), ("on", on.as_str())],
+            );
+            resume::park_notice(run, step, on)
+        }
+        // A denial keeps its own code: a human's `no`, not a breakage.
+        Outcome::Declined => {
+            finish_line(o.format, "denied", exit, &[]);
+            code
+        }
+        Outcome::Failed => {
+            finish_line(o.format, "failed", exit, &[]);
+            code
+        }
     }
 }
 
-/// The renderer the run's lines go through: animated at a terminal, plain
-/// everywhere else.
-fn renderer(tty: bool, verbose: bool) -> Box<dyn Renderer + Send> {
+/// The renderer the run's lines go through: JSON Lines in `--format json`,
+/// animated at a terminal otherwise, and plain everywhere else.
+fn renderer(format: Format, tty: bool, verbose: bool) -> Box<dyn Renderer + Send> {
     // `Stdout` is `Send`, `StdoutLock` is not: the ticker thread holds the
     // renderer behind a lock of its own.
-    Box::new(progress::Run::new(std::io::stdout(), verbose, tty))
+    match format {
+        Format::Json => Box::new(progress::Json::new(std::io::stdout())),
+        _ => Box::new(progress::Run::new(std::io::stdout(), verbose, tty)),
+    }
+}
+
+/// The closing `run_finished` Line, in json mode: the status words and the
+/// same exit number the process returns, so a reader of stdout alone knows
+/// how the run ended. Human output has no such line, and there the call does
+/// nothing.
+fn finish_line(format: Format, status: &str, exit: u8, extra: &[(&str, &str)]) {
+    if format != Format::Json {
+        return;
+    }
+    let mut fields = vec![("event", "run_finished"), ("status", status)];
+    fields.extend_from_slice(extra);
+    let mut out = std::io::stdout().lock();
+    let _ = progress::json_line(&mut out, &fields, &[("exit", u64::from(exit))]);
 }
 
 /// The file's name without its extension, for a file that names no workflow.

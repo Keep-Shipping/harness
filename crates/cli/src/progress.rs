@@ -10,7 +10,7 @@
 //! line, which the tests prove by replaying the animated bytes through
 //! `screen`.
 
-use std::io::Write;
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 /// One thing that happened in a run.
@@ -260,6 +260,132 @@ impl<W: Write> Renderer for Run<W> {
     }
 }
 
+/// One field of a JSON Line: a string to escape, a number or a boolean to
+/// write raw, or a string that is not there, which JSON spells `null`. The
+/// keys are this module's own fixed literals, so they ride through unescaped.
+#[derive(Clone, Copy)]
+enum Field<'a> {
+    Str(&'a str, &'a str),
+    Num(&'a str, u64),
+    Bool(&'a str, bool),
+    Null(&'a str),
+}
+
+/// Writes one JSON Line — `{"version":1,...}`, RFC 8259, one per line — the
+/// one writer of the shape, so the renderer and [`json_line`] cannot drift:
+/// `version` first, then the fields as given, then the newline.
+fn write_line(w: &mut impl Write, fields: &[Field<'_>]) -> io::Result<()> {
+    w.write_all(b"{\"version\":1")?;
+    for field in fields {
+        match *field {
+            Field::Str(key, value) => write!(w, ",\"{key}\":{}", crate::render::json_str(value))?,
+            Field::Num(key, value) => write!(w, ",\"{key}\":{value}")?,
+            Field::Bool(key, true) => write!(w, ",\"{key}\":true")?,
+            Field::Bool(key, false) => write!(w, ",\"{key}\":false")?,
+            Field::Null(key) => write!(w, ",\"{key}\":null")?,
+        }
+    }
+    w.write_all(b"}\n")?;
+    w.flush()
+}
+
+/// One JSON Line for events the CLI emits outside `drive` — the opening
+/// `run_started` and the closing `run_finished`. `nums` are written as JSON
+/// numbers; everything else is escaped.
+pub fn json_line(
+    w: &mut impl Write,
+    fields: &[(&str, &str)],
+    nums: &[(&str, u64)],
+) -> io::Result<()> {
+    let mut all: Vec<Field<'_>> =
+        fields.iter().map(|(key, value)| Field::Str(key, value)).collect();
+    all.extend(nums.iter().map(|(key, num)| Field::Num(key, *num)));
+    write_line(w, &all)
+}
+
+/// Emits one JSON object per event, RFC 8259, one per line: the same JSON
+/// Lines shape `check --format json` keeps, escaped by the same escaper.
+/// stdout stays parseable because every human notice already goes to stderr.
+pub struct Json<W> {
+    out: W,
+}
+
+impl<W: Write> Json<W> {
+    pub fn new(out: W) -> Self {
+        Self { out }
+    }
+
+    /// One line for `fields`, in the order given.
+    fn line(&mut self, fields: &[Field<'_>]) {
+        let _ = write_line(&mut self.out, fields);
+    }
+}
+
+impl<W: Write> Renderer for Json<W> {
+    fn event(&mut self, e: &RunEvent) {
+        match e {
+            RunEvent::Checked { path } => {
+                self.line(&[Field::Str("event", "checked"), Field::Str("path", path)])
+            }
+            RunEvent::Started { step } => {
+                self.line(&[Field::Str("event", "step_started"), Field::Str("step", step)])
+            }
+            // Machines asked for json, so they get everything: `-v` is a
+            // person's dial, not a machine's.
+            RunEvent::Log { step, line } => self.line(&[
+                Field::Str("event", "step_log"),
+                Field::Str("step", step),
+                Field::Str("line", line),
+            ]),
+            RunEvent::Finished { step, summary, took } => self.line(&[
+                Field::Str("event", "step_finished"),
+                Field::Str("step", step),
+                Field::Str("summary", summary),
+                Field::Num("took_ms", millis(*took)),
+            ]),
+            RunEvent::Failed { step, error, took } => self.line(&[
+                Field::Str("event", "step_failed"),
+                Field::Str("step", step),
+                Field::Str("error", error),
+                Field::Num("took_ms", millis(*took)),
+            ]),
+            RunEvent::Asking { step, question } => self.line(&[
+                Field::Str("event", "approval_asked"),
+                Field::Str("step", step),
+                Field::Str("question", question),
+            ]),
+            RunEvent::Answered { step, approved, by, typed } => self.line(&[
+                Field::Str("event", "approval_answered"),
+                Field::Str("step", step),
+                Field::Bool("approved", *approved),
+                match by {
+                    Some(who) => Field::Str("by", who),
+                    None => Field::Null("by"),
+                },
+                Field::Bool("typed", *typed),
+            ]),
+            // Shipped, declined and waiting are said by the `run_finished`
+            // line main.rs closes the stream with; saying them twice would
+            // leave two lines claiming to be the last.
+            RunEvent::Shipped { .. } | RunEvent::Declined { .. } | RunEvent::Waiting { .. } => {}
+            RunEvent::Parked { run, step } => self.line(&[
+                Field::Str("event", "parked"),
+                Field::Str("run", run),
+                Field::Str("step", step),
+            ]),
+        }
+    }
+
+    // Nothing is in flight to redraw: every line lands once, whole.
+    fn tick(&mut self) {}
+}
+
+/// A duration as whole milliseconds, for the `took_ms` field. A duration
+/// absurd enough to overflow `u64` has run longer than the run could have.
+fn millis(took: Duration) -> u64 {
+    u64::try_from(took.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// What a person would be left looking at: the bytes with `\r\x1b[2K`
 /// applied, so a redrawn line replaces the one before it. Enough of a
 /// terminal to prove the animated rendering says what the plain one says.
@@ -421,5 +547,56 @@ mod tests {
         assert!(bytes.ends_with("▸ build   signed                    38s\n"), "{bytes:?}");
         // Whatever the spinner drew, the person is left with the summary.
         assert_eq!(screen(bytes.as_bytes()), "▸ build   signed                    38s\n");
+    }
+
+    /// The json renderer's event table: one object per line, `version` first,
+    /// the same information the human renderer puts on its lines, and the
+    /// events the closing `run_finished` line speaks for left out. `-v` is
+    /// not consulted: a machine that asked for json gets the logs too.
+    #[test]
+    fn json_lines_say_what_the_human_lines_say_one_object_each() {
+        let events = [
+            RunEvent::Checked { path: "ship.ks".into() },
+            RunEvent::Started { step: "build".into() },
+            RunEvent::Log { step: "build".into(), line: "pulling \"acme/api\"".into() },
+            RunEvent::Finished {
+                step: "build".into(),
+                summary: "signed".into(),
+                took: Duration::from_millis(1380),
+            },
+            RunEvent::Asking { step: "review".into(), question: "approve 3 changes?".into() },
+            RunEvent::Answered { step: "review".into(), approved: false, by: None, typed: false },
+            RunEvent::Parked { run: "01HF7YAT00R3M2XK7A9B4CDEF".into(), step: "review".into() },
+            // Said by the `run_finished` line main.rs writes, so not here.
+            RunEvent::Shipped { what: "api".into(), took: Duration::ZERO },
+            RunEvent::Declined { step: "review".into() },
+            RunEvent::Waiting { step: "review".into(), on: "a human".into(), notified: None },
+        ];
+        let mut out = Vec::new();
+        {
+            let mut json = Json::new(&mut out);
+            for event in &events {
+                json.event(event);
+            }
+            // The ticker has no line in flight: it writes nothing.
+            json.tick();
+        }
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            concat!(
+                "{\"version\":1,\"event\":\"checked\",\"path\":\"ship.ks\"}\n",
+                "{\"version\":1,\"event\":\"step_started\",\"step\":\"build\"}\n",
+                "{\"version\":1,\"event\":\"step_log\",\"step\":\"build\",",
+                "\"line\":\"pulling \\\"acme/api\\\"\"}\n",
+                "{\"version\":1,\"event\":\"step_finished\",\"step\":\"build\",",
+                "\"summary\":\"signed\",\"took_ms\":1380}\n",
+                "{\"version\":1,\"event\":\"approval_asked\",\"step\":\"review\",",
+                "\"question\":\"approve 3 changes?\"}\n",
+                "{\"version\":1,\"event\":\"approval_answered\",\"step\":\"review\",",
+                "\"approved\":false,\"by\":null,\"typed\":false}\n",
+                "{\"version\":1,\"event\":\"parked\",\"run\":\"01HF7YAT00R3M2XK7A9B4CDEF\",",
+                "\"step\":\"review\"}\n",
+            )
+        );
     }
 }

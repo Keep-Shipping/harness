@@ -161,6 +161,7 @@ ship:
       case $? in
         0|1) exit 0 ;;                       # shipped, or a step failed
         4) echo "parked; approve with: keepshipping approve <run>" ; exit 0 ;;
+        6) echo "denied; a person said no — the run had its answer, do not re-run it" ; exit 6 ;;
         *) exit $? ;;
       esac
 ```
