@@ -76,6 +76,27 @@ the same artefact CI checks:
 cd ventures/keepshipping && worker-build --release
 ```
 
+## Console fleet view
+
+`/console/fleet` (issue #169) renders one screen of every zone, Pages site
+and Worker the account's Terraform manages, plus a detail page per site.
+It is read-only and fail-closed: it answers `GET`/`HEAD` only, and until
+all three config values below are set it answers `503`.
+
+- **Snapshot contract** — a pipeline (the nightly check) writes a JSON
+  snapshot to KV binding `FLEET`, key `fleet.json`: `{account,
+  generated_at, terraform: {repo, ref}, sites: [{id, name, kind:
+  zone|pages|worker, venture, domains, defined_at: {path, line}, deploys,
+  tls, dns, baseline, drift, resources}]}` with `deploys` newest first.
+  Optional fields (`deploys`, `tls`, `dns`, `baseline`, `drift`,
+  `resources`) render as "Not checked yet" / "Never deployed" until the
+  pipeline fills them in. The shape is the `Fleet` struct in `src/fleet/`.
+- **Auth** — `AUTH_ISSUER` + `AUTH_CLIENT_ID` build a token verifier
+  (`cratefield-auth-client`); the token comes from `Authorization: Bearer`
+  or the `ks_console` cookie, must have a verified `email` on the
+  `CONSOLE_EMAILS` allowlist (comma-separated, case-insensitive), or the
+  page answers `401`/`403`.
+
 ## Test
 
 ```sh

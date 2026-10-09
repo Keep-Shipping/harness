@@ -15,6 +15,12 @@ enabled = true
 
 [vars]
 ENV = "production"
+# The console fleet view (issue #169) is fail-closed: until all three are
+# set, /console/fleet answers 503. Fill them in and uncomment to switch it
+# on. CONSOLE_EMAILS is the comma-separated allowlist (case-insensitive).
+# CONSOLE_EMAILS = "ada@factory0.ventures"
+# AUTH_ISSUER = "https://auth.factory0.ventures"
+# AUTH_CLIENT_ID = "keepshipping-console"
 
 [[ratelimits]]
 name = "RATE_LIMITER"
@@ -39,6 +45,14 @@ database_name = "keepshipping-waitlist"
 # to someone else's.
 database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
+
+# The console fleet view (issue #169): the nightly check writes the fleet
+# snapshot here (key `fleet.json`), which /console/fleet renders.
+[[kv_namespaces]]
+binding = "FLEET"
+# Placeholder: replace with the id `wrangler kv namespace create FLEET`
+# prints, as with the D1 database above.
+id = "00000000000000000000000000000000"
 
 [[routes]]
 pattern = "api.keepshipping.run"

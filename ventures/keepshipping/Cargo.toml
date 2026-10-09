@@ -25,6 +25,11 @@ cratefield-adapter-owlpost = "0.2"
 cratefield-adapter-polar = "0.2"
 cratefield-adapter-resend = "0.4"
 cratefield-adapter-turnstile = "0.3"
+# The console fleet view's token verifier (issue #169), shared with the
+# runtime's own `auth_from_env` wiring.
+cratefield-auth-client = "0.3"
+percent-encoding = "2"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = { version = "0.3", default-features = false, features = ["std", "formatting", "parsing", "macros"] }
 tracing = "0.1"

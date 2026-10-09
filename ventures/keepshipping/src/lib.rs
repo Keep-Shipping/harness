@@ -47,6 +47,8 @@
 mod billing;
 mod origin;
 
+pub mod fleet;
+
 pub use billing::{Billing, DISPUTE_POLL_CRON, Plan, entitlements};
 pub use origin::{SITE_ORIGINS, write_origin_rejected};
 
@@ -283,6 +285,10 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> worker::Result<Respo
     let origin = req.headers().get("origin").ok().flatten();
     if write_origin_rejected(req.method().as_ref(), origin.as_deref(), &SITE_ORIGINS) {
         return origin_refused();
+    }
+    // The console fleet view (issue #169); `None` falls through.
+    if let Some(response) = fleet::handle(&req, &env).await {
+        return response;
     }
     let (harness, runtime) = &*instance(&env);
     serve(harness, runtime, req, env, ctx).await

@@ -1,0 +1,131 @@
+/* The fleet console (issue #169): static, no JS, no framework. The palette
+   is src/mail-theme.json (radius 0 is the brand); dark follows the OS; the
+   status colours are the only additions, picked for >= 4.5:1 on both. */
+:root {
+  --bg: #eef0f3;
+  --card: #fbfcfd;
+  --border: #ced1d6;
+  --ink: #11161f;
+  --text: #3e434b;
+  --muted: #4e535b;
+  --accent: #1950cc;
+  --code-bg: #e6efff;
+  --ok: #1a7f37;
+  --warn: #8a6100;
+  --bad: #b42318;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #11161f;
+    --card: #1a1f29;
+    --border: #3d434d;
+    --ink: #ffffff;
+    --text: #d5d7db;
+    --muted: #a1a5ab;
+    --accent: #9cbeff;
+    --code-bg: #1e2735;
+    --ok: #7ee2a8;
+    --warn: #e2c04f;
+    --bad: #ff9d8f;
+  }
+}
+* { box-sizing: border-box; }
+html {
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.55 "Bricolage Grotesque", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+a { color: var(--accent); }
+a:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+body { margin: 0 auto; max-width: 80rem; padding: 0 1rem 3rem; }
+.skip { position: absolute; left: -100vw; }
+.skip:focus {
+  left: 1rem;
+  top: 1rem;
+  z-index: 2;
+  background: var(--card);
+  border: 1px solid var(--border);
+  padding: 0.5rem 1rem;
+}
+.bar {
+  display: flex;
+  gap: 0.75rem;
+  align-items: baseline;
+  padding: 1rem 0;
+  border-bottom: 1px solid var(--border);
+}
+.wordmark { font-weight: 700; color: var(--ink); }
+.section { color: var(--muted); font-size: 0.9rem; }
+h1 { color: var(--ink); font-size: 1.4rem; margin: 1.25rem 0 0.25rem; }
+h2 { color: var(--ink); font-size: 1rem; margin: 1.5rem 0 0.25rem; }
+.meta { color: var(--muted); font-size: 0.9rem; margin: 0 0 1rem; }
+code {
+  font-family: "DM Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  background: var(--code-bg);
+  color: var(--ink);
+  padding: 0.05em 0.3em;
+}
+/* Narrow-first: each row is a stacked card; the table semantics stay. */
+table, tbody, tr, th, td { display: block; }
+thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+tr { background: var(--card); border: 1px solid var(--border); margin: 1rem 0; padding: 0.75rem; }
+th, td { text-align: left; vertical-align: top; padding: 0.3rem 0; border: 0; overflow-wrap: break-word; }
+tbody th { color: var(--ink); font-weight: 600; padding: 0.25rem 0; }
+td { border-top: 1px solid var(--border); }
+td:first-of-type { border-top: 0; margin-top: 0.5rem; }
+td::before {
+  content: attr(data-label);
+  display: block;
+  color: var(--muted);
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+.badge { border: 1px solid var(--border); color: var(--muted); font-size: 0.75rem; padding: 0 0.4em; }
+.change { font-size: 0.85rem; margin-left: 0.5rem; }
+.status { font-weight: 600; }
+.ok { color: var(--ok); }
+.warn { color: var(--warn); }
+.bad { color: var(--bad); }
+.unknown { color: var(--muted); font-weight: 400; }
+ul.plain { list-style: none; margin: 0; padding: 0; }
+ul.plain li { border-top: 1px solid var(--border); padding: 0.4rem 0; }
+ul.plain li:first-child { border-top: 0; }
+dl.summary { display: grid; grid-template-columns: max-content 1fr; gap: 0.3rem 1rem; }
+dl.summary dt { color: var(--muted); }
+dl.summary dd { margin: 0; }
+ul.failing { margin: 0.3rem 0 0; padding-left: 1.1rem; }
+.notice {
+  background: var(--card);
+  border: 1px solid var(--border);
+  margin: 3rem auto;
+  max-width: 36rem;
+  padding: 1.5rem;
+}
+.notice h1 { margin-top: 0; }
+.offscreen { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+/* Wide: back to one row per site in a real table. */
+@media (min-width: 48em) {
+  table {
+    display: table;
+    width: 100%;
+    border: 1px solid var(--border);
+    border-collapse: collapse;
+    background: var(--card);
+  }
+  tbody { display: table-row-group; }
+  tr { display: table-row; border: 0; margin: 0; padding: 0; }
+  th, td { display: table-cell; padding: 0.6rem 0.75rem; font-size: 0.9rem; }
+  td { border-top: 1px solid var(--border); }
+  td::before { content: none; }
+  thead { position: static; width: auto; height: auto; overflow: visible; clip-path: none; }
+  thead th {
+    color: var(--muted);
+    font-size: 0.72rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+  tbody th { font-size: 1rem; }
+}
