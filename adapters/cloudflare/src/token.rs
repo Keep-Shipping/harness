@@ -66,7 +66,7 @@ fn canon(name: &str) -> String {
 /// the token itself is never in here, nor in the [`Display`](fmt::Display).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeError {
-    /// Granted beyond the managed set and beyond [`ALLOWED_EXTRA`].
+    /// Granted beyond the managed set and beyond `ALLOWED_EXTRA`.
     pub extra: Vec<String>,
     /// Needed by the managed resource types and not granted.
     pub missing: Vec<String>,
@@ -90,8 +90,8 @@ impl fmt::Display for ScopeError {
 impl std::error::Error for ScopeError {}
 
 /// The scope gate: `granted` must cover every group `required` names (already
-/// [`canon`]ical, as [`required_groups`] builds it) and carry nothing beyond
-/// them but [`ALLOWED_EXTRA`] — either way, a refusal naming the difference.
+/// `canon`ical, as [`required_groups`] builds it) and carry nothing beyond
+/// them but `ALLOWED_EXTRA` — either way, a refusal naming the difference.
 pub fn check_scope(
     granted: &BTreeSet<String>,
     required: &BTreeSet<String>,

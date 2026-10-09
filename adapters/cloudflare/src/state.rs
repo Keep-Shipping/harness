@@ -104,7 +104,7 @@ impl StateBackend {
     }
 }
 
-/// Writes the root's [`BACKEND_FILE`] into `files` — [`generate`](crate::generate)'s
+/// Writes the root's `BACKEND_FILE` into `files` — [`generate`](crate::generate)'s
 /// output — giving the whole deployable unit one state.
 pub fn add_backend(files: &mut BTreeMap<String, String>, backend: &StateBackend) {
     files.insert(BACKEND_FILE.to_string(), backend.backend_tf());
