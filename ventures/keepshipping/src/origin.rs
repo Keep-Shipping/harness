@@ -11,11 +11,14 @@
 //! `lib.rs` consults it before `serve`, so a refused write costs one string
 //! comparison, not a D1 round trip or a Turnstile siteverify call.
 
-/// The origins the waitlist form is served from: the apex over TLS and its
-/// `www` alias. One list, shared by the venture's CORS allowlist and this
+/// The origins this site is served from: the apex over TLS, its `www`
+/// alias, and the worker's own API host — which serves the standard setup
+/// console (issue #273), whose HTML forms POST back to the host they were
+/// served from. One list, shared by the venture's CORS allowlist and this
 /// guard, so a future origin can only be added in one place — and the guard
 /// then demands it on writes too.
-pub const SITE_ORIGINS: [&str; 2] = ["https://keepshipping.run", "https://www.keepshipping.run"];
+pub const SITE_ORIGINS: [&str; 3] =
+    ["https://keepshipping.run", "https://www.keepshipping.run", "https://api.keepshipping.run"];
 
 /// Whether the request described by `method` + `origin` is refused.
 ///
@@ -67,6 +70,13 @@ mod tests {
         assert!(!write_origin_rejected(
             "POST",
             Some("https://www.keepshipping.run"),
+            &SITE_ORIGINS
+        ));
+        // The setup console's pages are served by the worker itself, so
+        // its forms post from the API host.
+        assert!(!write_origin_rejected(
+            "POST",
+            Some("https://api.keepshipping.run"),
             &SITE_ORIGINS
         ));
         assert!(!write_origin_rejected("POST", Some("HTTPS://KEEPSHIPPING.RUN"), &SITE_ORIGINS));
