@@ -8,6 +8,10 @@
 /// What a built-in step kind does, in one line.
 pub fn kind_doc(kind: &str) -> Option<&'static str> {
     Some(match kind {
+        "gsc.sitemap_submit" => {
+            "Submit a sitemap to Google Search Console so indexing starts as soon as the domain \
+             is verified."
+        }
         "oci.image" => "Build a container image from a Dockerfile, and publish its digest and tag.",
         "oci.artifact" => {
             "Push files as an OCI artifact by digest, optionally attached to an image and signed."

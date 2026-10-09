@@ -50,12 +50,17 @@
 #![forbid(unsafe_code)]
 
 mod billing;
+mod gsc;
 mod origin;
 mod setup;
 
 pub mod fleet;
 
 pub use billing::{Billing, DISPUTE_POLL_CRON, Plan, entitlements};
+pub use gsc::{
+    Gsc, GscModule, SECRET_NAME as GSC_SECRET_NAME, Status as GscStatus, gsc_module,
+    search_console_module,
+};
 pub use origin::{SITE_ORIGINS, write_origin_rejected};
 pub use setup::{GitHubPullRequests, PullRequests, Setup};
 
@@ -146,6 +151,23 @@ pub fn setup_module(env: &Env) -> Setup {
         )))),
         _ => Setup::new(None),
     }
+}
+
+/// The venture's Search Console console module (issue #274), mounted next
+/// to the waitlist module: live verification/sitemap reads as a Google
+/// service account plus Terraform module generation — no Google API call
+/// mutates anything. With `GOOGLE_SERVICE_ACCOUNT_JSON` unset the status
+/// reads answer a `not-ready` page and the module generation keeps working.
+fn gsc(env: &Env) -> GscModule {
+    // A secret as trimmed text, blank counting as absent — the same rule
+    // the mailer and the Polar token read by.
+    let secret = env
+        .secret(gsc::SECRET_NAME)
+        .ok()
+        .map(|secret| secret.to_string())
+        .map(|key| key.trim().to_owned())
+        .filter(|key| !key.is_empty());
+    gsc::gsc_module(gsc::Gsc::new(Arc::new(FetchClient), Arc::new(WorkersClock), secret))
 }
 
 /// The Polar adapter the secrets select (ADR 0202): `POLAR_ACCESS_TOKEN` for
@@ -300,6 +322,9 @@ fn instance(env: &Env) -> Arc<(Harness, Cloudflare)> {
             // composition here rather than inside `composition()`.
             let harness = composition()
                 .module(setup_module(env))
+                // The Search Console console (#274) also reads `Env`;
+                // it nests under its own `/v1/console`.
+                .module(gsc(env))
                 .runtime(runtime.clone())
                 .build()
                 .expect("the composition is static; `tests/harness.rs` builds the same one");

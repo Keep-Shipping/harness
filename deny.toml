@@ -36,3 +36,5 @@ unknown-git = "deny"
 
 [advisories]
 version = 2
+# RUSTSEC-2023-0071: signing-only use, no decryption, no upstream fix, engine step gsc.sitemap_submit (#274).
+ignore = ["RUSTSEC-2023-0071"]

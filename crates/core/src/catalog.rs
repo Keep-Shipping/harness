@@ -125,6 +125,17 @@ impl Catalog {
                 },
             );
         };
+        // `gsc.sitemap_submit` runs right after the `tofu.apply` of the
+        // domain-verification module. Its `credentials` input carries a
+        // resolved secret value; the type system marks no input as secret, so
+        // the step's own doc and redaction carry that promise.
+        add(
+            "gsc.sitemap_submit",
+            &[("credentials", Type::String), ("site", Type::String), ("sitemap", Type::String)],
+            &[("site", Type::String), ("sitemap", Type::String), ("submitted", Type::Bool)],
+            false,
+            false,
+        );
         add(
             "oci.image",
             &[

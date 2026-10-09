@@ -9,6 +9,7 @@ use std::sync::Arc;
 use ks_core::ports::script_host::ValueType;
 use ks_core::step::{StepKind, TypeDef};
 
+use crate::gsc_sitemap_submit::GscSitemapSubmit;
 use crate::k8s_rollout::K8sRollout;
 use crate::oci_artifact::OciArtifactStep;
 use crate::oci_image::OciImage;
@@ -32,6 +33,7 @@ pub fn builtin_steps() -> Vec<Arc<dyn StepKind>> {
     let decide: Option<Arc<dyn StepKind>> = None;
 
     [
+        Some(Arc::new(GscSitemapSubmit) as Arc<dyn StepKind>),
         Some(Arc::new(K8sRollout) as Arc<dyn StepKind>),
         Some(Arc::new(OciImage)),
         Some(Arc::new(OciArtifactStep)),

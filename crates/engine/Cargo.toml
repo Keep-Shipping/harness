@@ -9,6 +9,9 @@ repository.workspace = true
 
 [dependencies]
 ks-core.workspace = true
+# `sha2` is rsa's own gate for `SigningKey<Sha256>`'s digest OID; the crate
+# then re-exports the same sha2 0.10 the workspace already pins.
+rsa = { version = "0.9", features = ["sha2"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true

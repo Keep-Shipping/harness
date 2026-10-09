@@ -11,6 +11,7 @@ pub mod decide;
 pub mod denial;
 pub mod deploy_verify;
 pub mod exec;
+pub mod gsc_sitemap_submit;
 pub mod journal;
 pub mod k8s_rollout;
 pub mod oci_artifact;
