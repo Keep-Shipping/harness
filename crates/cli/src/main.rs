@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod about;
 mod actor;
 mod approve;
 mod args;
@@ -118,6 +119,10 @@ fn dispatch() -> ExitCode {
         Some("resume") => resume::resume(&args[1..]),
         Some("decisions") => decisions::decisions(&args[1..]),
         Some("decide") => decide::decide(&args[1..]),
+        // What Keep Shipping itself is built with (#178), from the vendored
+        // Factory Zero registry entry — and the binary's `--version`.
+        Some("about") => about::about(&args[1..]),
+        Some("--version") => about::version(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)

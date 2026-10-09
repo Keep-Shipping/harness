@@ -36,4 +36,7 @@ getrandom = { version = "0.4", default-features = false, features = ["wasm_js"] 
 cratefield-testing = "0.5"
 http = "1"
 insta = "1"
+# The mail guard reads the venture's vendored Factory Zero registry entry
+# (#178): no "Sent with Owlpost" footer while Owlpost is not in it.
+ks-core.workspace = true
 pollster = "0.4"

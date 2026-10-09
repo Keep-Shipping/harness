@@ -18,6 +18,7 @@
 use std::fmt;
 
 use hmac::{Hmac, KeyInit, Mac};
+use ks_core::built_with;
 use ks_core::ports::approval::{
     ApprovalError, ApprovalRequest, Artifact, Identity, Outcome, Ticket, Verdict,
 };
@@ -133,8 +134,39 @@ member of <code>{team}</code>.</p>\n\
 <textarea id=\"comment\" name=\"comment\" rows=\"4\"></textarea>\n\
 <button type=\"submit\" name=\"outcome\" value=\"approve\">Approve</button> \
 <button type=\"submit\" name=\"outcome\" value=\"deny\">Deny</button>\n\
-</form>\n</body>\n</html>\n",
+</form>\n{about}\
+</body>\n</html>\n",
+        about = about_html(),
     ))
+}
+
+/// The quiet "Built with" section at the foot of the review page
+/// ([#178](https://github.com/Keep-Shipping/harness/issues/178)): the sister
+/// ventures and third parties the product runs on, each labelled live or
+/// planned exactly as the Factory Zero registry says, and the subprocessors
+/// list it publishes. Vendored into `ks-core`, so rendering fetches nothing.
+fn about_html() -> String {
+    let entries = built_with::venture()
+        .uses
+        .iter()
+        .map(|u| {
+            format!(
+                "<a href=\"{url}\" rel=\"noopener noreferrer\">{name}</a> ({status})",
+                url = escape(&u.url),
+                name = escape(&u.name),
+                status = u.status.as_str(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "<h2>Built with</h2>\n\
+<p class=\"built-with\">{entries}</p>\n\
+<p class=\"subprocessors\">Subprocessors: \
+<a href=\"{subprocessors}\" rel=\"noopener noreferrer\">factory0.ventures/ventures/keep-shipping/</a></p>\n",
+        entries = entries,
+        subprocessors = escape(built_with::SUBPROCESSORS_URL),
+    )
 }
 
 /// Records `form` as the answer `session` gave to `ticket`. The approver is
@@ -206,4 +238,72 @@ fn escape(text: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use ks_core::built_with::Status;
+    use ks_core::ports::approval::Team;
+
+    /// The section names every use, links it, and labels it with the status
+    /// the registry gave it — never the other word — and points at the
+    /// subprocessors list.
+    #[test]
+    fn the_about_section_names_links_and_labels_every_use() {
+        let html = about_html();
+        for u in &built_with::venture().uses {
+            let entry = format!(
+                "<a href=\"{}\" rel=\"noopener noreferrer\">{}</a> ({})",
+                escape(&u.url),
+                escape(&u.name),
+                u.status.as_str()
+            );
+            assert!(html.contains(&entry), "{}: {html}", u.name);
+            let other = match u.status {
+                Status::Live => "planned",
+                Status::Planned => "live",
+            };
+            // The label sits in the same anchor tail, so checking the entry's
+            // own rendered form above already binds it; this catches a second
+            // stray copy of the other word slipping in.
+            let tail = &html[html.find(&entry).expect("found above") + entry.len()..];
+            let next_entry = tail.find("<a href=").map(|at| &tail[..at]).unwrap_or(tail);
+            assert!(!next_entry.contains(&format!("({other})")), "{}: {tail}", u.name);
+        }
+        assert!(html.contains("<h2>Built with</h2>"), "{html}");
+        assert!(
+            html.contains(&format!(
+                "Subprocessors: <a href=\"{}\" rel=\"noopener noreferrer\">\
+                 factory0.ventures/ventures/keep-shipping/</a>",
+                escape(built_with::SUBPROCESSORS_URL)
+            )),
+            "{html}"
+        );
+    }
+
+    /// The section travels with the page, after the form and before the page
+    /// closes.
+    #[test]
+    fn the_review_page_carries_the_about_section() {
+        let request = ApprovalRequest {
+            run: ks_core::ids::RunId::from_parts(1_700_000_000_000, 7),
+            step: "apply-infra".to_string(),
+            summary: "3 to create, 1 to destroy".to_string(),
+            artifacts: Vec::new(),
+            from: Team::parse("@acme-deployers").expect("a well-formed team handle"),
+            reason: "production deploy".to_string(),
+            proposed_by: Identity::human("ada"),
+        };
+        let ticket = Ticket::new("t-1".to_string());
+        let page = review_page(&request, &ticket, &GitHubSession::new("grace"), b"key")
+            .expect("the host has a form key");
+        assert!(page.contains("<h2>Built with</h2>"), "{page}");
+        // After the form, before the body closes.
+        let form = page.find("</form>").expect("the form");
+        let about = page.find("<h2>Built with</h2>").expect("the section");
+        let body_close = page.find("</body>").expect("the body close");
+        assert!(form < about && about < body_close, "{page}");
+    }
 }

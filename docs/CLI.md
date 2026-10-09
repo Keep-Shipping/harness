@@ -53,6 +53,12 @@ implemented end to end today; `run` is not.
 - `keepshipping import github-actions [<workflow.yml | dir>] [--out DIR] [--force]` — translate
   GitHub Actions workflows into site files (default input `.github/workflows`, default `--out .`),
   best effort. [Importing from GitHub Actions](#importing-from-github-actions) below.
+- `keepshipping about` — what Keep Shipping itself is built with: the sister ventures and third
+  parties in the venture's Factory Zero registry entry, each labelled `live` or `planned` as the
+  registry says, plus the subprocessors list.
+  [What Keep Shipping is built with](#what-keep-shipping-is-built-with) below.
+- `keepshipping --version` — the version and the same built-with summary on one line, so a script
+  can read both back off the installed file.
 
 There is **no `--as` flag** on `approve` or `deny`. The approver named in the state and the log is
 the environment's own (`$USER`, then `$USERNAME`, then `local`): a label for the run log, not a
@@ -513,3 +519,42 @@ run at the first failure and skips every step that had not started.
 
 **Rollback.** A `deploy` that failed or timed out is rolled back, and what rollback reported is
 recorded on the step. Nothing else is.
+
+## What Keep Shipping is built with
+
+`keepshipping about` prints the venture's entry in the Factory Zero registry — the sister ventures
+and third parties the product runs on, in the registry's own order and words, each labelled `live`
+(in use today) or `planned` (decided and tracked, not in use yet):
+
+```text
+Keep Shipping (FZ-012)
+https://keepshipping.run/
+
+Built with
+  Built with      Cratefield     planned  https://cratefield.com/
+                  The hosted parts (waitlist, approvals, run logs) are planned as a Cratefield venture.
+  Bug reports to  SupportGenius  planned  https://supportgeni.us/
+                  Errors and bug reports become deduplicated GitHub issues, through the Cratefield error reporter.
+  Payments by     Polar          planned  https://polar.sh
+                  Paid plans through Polar as Merchant of Record, via the Cratefield Payments port. Nothing is on sale yet.
+  Typefaces from  Google Fonts   live     https://fonts.google.com
+                  The site’s typefaces (Bricolage Grotesque, DM Mono), loaded from Google.
+  Hosted on       Cloudflare     live     https://www.cloudflare.com
+                  The site.
+
+Subprocessors: https://factory0.ventures/ventures/keep-shipping/
+Source: vendored from https://factory0.ventures/stack.json (no network at runtime).
+```
+
+The entry is vendored into `ks-core` (`crates/core/src/built_with.json`) from
+[stack.json](https://factory0.ventures/stack.json); nothing is fetched at run time, so the command
+answers offline like the rest of the binary. The cost of vendoring is drift, so
+`KS_STACK_SYNC=1 cargo test -p ks-core --test stack_sync` compares the vendored copy against the
+published registry and fails on any difference; CI runs it in the `gates` job.
+
+`keepshipping --version` prints the version and the same summary on one line:
+
+```text
+keepshipping 0.0.0
+Built with: Cratefield (planned), SupportGenius (planned), Polar (planned), Google Fonts (live), Cloudflare (live)
+```

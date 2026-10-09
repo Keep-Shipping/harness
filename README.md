@@ -14,7 +14,7 @@ Keep Shipping is a **harness** in the style of Factory Zero's [Cratefield harnes
 ```
 ship.ks ──► ks-lang (parse, format) ──► ks-core (types, check, diagnostics)
                                               │
-keepshipping (ks-cli): check · run · fmt · graph · approve · log verify · blocks · import
+keepshipping (ks-cli): check · run · fmt · graph · approve · log verify · blocks · import · about
 ks-lsp: the same ks-core, for editors
                                               ▼
                   ks-engine (DAG, run state, policy gates, approvals, run log)

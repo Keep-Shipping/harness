@@ -32,6 +32,7 @@ pub mod auto_rule;
 pub mod block;
 pub mod block_diff;
 pub mod block_trust;
+pub mod built_with;
 mod catalog;
 mod check;
 pub mod context;

@@ -120,6 +120,11 @@ jobs:
           cargo test --workspace \
             || { echo "::error::tests failed. Fix: run 'cargo test --workspace' locally, make it pass, and commit."; exit 1; }
 
+      - name: Built-with registry sync (network)
+        run: |
+          KS_STACK_SYNC=1 cargo test -p ks-core --test stack_sync \
+            || { echo "::error::the vendored built_with.json has drifted from the published Factory Zero registry. Fix: re-vendor the FZ-012 entry from https://factory0.ventures/stack.json into crates/core/src/built_with.json and commit."; exit 1; }
+
       - name: docs
         env:
           RUSTDOCFLAGS: -D warnings

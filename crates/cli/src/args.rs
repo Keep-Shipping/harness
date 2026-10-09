@@ -44,7 +44,9 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
        keepshipping decisions report [--json]
        keepshipping decisions export
        keepshipping decide --explain [RUN-ID]
-       keepshipping lsp";
+       keepshipping about
+       keepshipping lsp
+       keepshipping --version";
 
 /// Which subcommand's flags `parse_args` accepts. `--format`, `--all`,
 /// `--warnings-as-errors`, `--secrets`, `--fix` and `--repro` belong to `check` alone; `run`

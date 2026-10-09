@@ -10,5 +10,11 @@ repository.workspace = true
 [dependencies]
 ks-lang.workspace = true
 
+# Test-only: the stack-sync test parses both the vendored entry and the
+# published registry with it. Not a normal dependency — ks-core stays
+# dependency-free for wasm32 (the CI wasm gate).
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true
