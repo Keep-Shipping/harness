@@ -50,6 +50,7 @@
 #![forbid(unsafe_code)]
 
 mod billing;
+mod edits;
 mod gsc;
 mod origin;
 mod setup;
@@ -57,6 +58,7 @@ mod setup;
 pub mod fleet;
 
 pub use billing::{Billing, DISPUTE_POLL_CRON, Plan, entitlements};
+pub use edits::Edits;
 pub use gsc::{
     Gsc, GscModule, SECRET_NAME as GSC_SECRET_NAME, Status as GscStatus, gsc_module,
     search_console_module,
@@ -168,6 +170,14 @@ fn gsc(env: &Env) -> GscModule {
         .map(|key| key.trim().to_owned())
         .filter(|key| !key.is_empty());
     gsc::gsc_module(gsc::Gsc::new(Arc::new(FetchClient), Arc::new(WorkersClock), secret))
+}
+
+/// The venture's edit-as-code module (issue #170): console forms whose
+/// submit is a Terraform pull request in the infrastructure repository.
+/// Public so the integration tests mount the same module the worker serves.
+#[must_use]
+pub fn edits_module() -> Edits {
+    Edits
 }
 
 /// The Polar adapter the secrets select (ADR 0202): `POLAR_ACCESS_TOKEN` for
@@ -289,7 +299,7 @@ fn mailer(env: &Env) -> Arc<dyn Mailer> {
     }
 }
 
-/// The composition without a runtime: venture, module and themed
+/// The composition without a runtime: venture, modules and themed
 /// templates, in the order the builder validates them. Split out of
 /// `instance` because the runtime is the only per-isolate leg — the
 /// `Env` it reads does not exist until an event brings one — and
@@ -298,7 +308,11 @@ fn mailer(env: &Env) -> Arc<dyn Mailer> {
 /// rather than a parallel one.
 #[must_use]
 pub fn composition() -> HarnessBuilder {
-    Harness::builder().venture(venture()).module(module()).templates(templates())
+    Harness::builder()
+        .venture(venture())
+        .module(module())
+        .module(edits_module())
+        .templates(templates())
 }
 
 /// The frozen composition: built once per isolate on first use, immutable
@@ -313,7 +327,12 @@ fn instance(env: &Env) -> Arc<(Harness, Cloudflare)> {
                 .db("DB")
                 .rate_limiter("RATE_LIMITER")
                 .mailer_arc(mailer(env))
-                .payments_arc(payments(env));
+                .payments_arc(payments(env))
+                // Token verification from AUTH_ISSUER + AUTH_CLIENT_ID; with
+                // both unset the port is `Unconfigured`, which answers 503 to
+                // a presented credential and leaves anonymous calls alone —
+                // every pre-auth page keeps working with no auth configured.
+                .auth_from_env();
             let runtime = match captcha(env) {
                 Some(captcha) => runtime.captcha_arc(Arc::new(captcha)),
                 None => runtime,
@@ -352,7 +371,16 @@ fn origin_refused() -> worker::Result<Response> {
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, ctx: Context) -> worker::Result<Response> {
     let origin = req.headers().get("origin").ok().flatten();
-    if write_origin_rejected(req.method().as_ref(), origin.as_deref(), &SITE_ORIGINS) {
+    // The host the request itself was addressed to: a same-origin form post
+    // carries it as `Origin`, and that is as good as the site allowlist.
+    let serving = req.url().ok().map(|url| url.origin().ascii_serialization());
+    if write_origin_rejected(
+        req.method().as_ref(),
+        origin.as_deref(),
+        req.path().as_str(),
+        serving.as_deref(),
+        &SITE_ORIGINS,
+    ) {
         return origin_refused();
     }
     // The console fleet view (issue #169); `None` falls through.

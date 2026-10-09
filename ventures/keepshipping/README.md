@@ -32,6 +32,15 @@ composition: the venture's name and domain, the product code
   `Accept: application/json`) an edit-as-code payload. Reads only — no
   Google API call mutates anything; the submission itself stays the
   engine's `gsc.sitemap_submit` step.
+- `GET /v1/edits` — edit as code (#170, [docs/EDIT_AS_CODE.md](../../docs/EDIT_AS_CODE.md)):
+  console forms whose submit is a Terraform pull request against
+  `EDITS_REPO`, never a Cloudflare API call. `GET /v1/edits/new?kind=...`
+  renders a form, `POST /v1/edits` records the change and queues its pull
+  request, `GET /v1/edits/{id}` shows the plan in words,
+  `POST /v1/edits/{id}/plan` is the CI plan callback (Bearer
+  `EDITS_RUNNER_TOKEN`), and `POST /v1/edits/{id}/approve` fires the apply
+  dispatch for exactly the plan that was read. Every page needs a
+  signed-in caller.
 - `GET /v1/setup` — the standard setup console (#273): a plain-words
   checklist per domain — Google Search Console, Gmail Postmaster Tools,
   Bing Webmaster Tools, SPF, DKIM, DMARC, MTA-STS, TLS-RPT — with a live
@@ -67,6 +76,8 @@ wrangler secret put RESEND_API_KEY    # fallback mailer, used when no Owlpost ke
 wrangler secret put TURNSTILE_SECRET  # Turnstile widget on keepshipping.run
 wrangler secret put SETUP_GITHUB_TOKEN # opens the setup console's pull requests
 wrangler secret put GOOGLE_SERVICE_ACCOUNT_JSON  # Search Console status reads (#274)
+wrangler secret put EDITS_GITHUB_TOKEN   # opens the edit-as-code pull requests (#170)
+wrangler secret put EDITS_RUNNER_TOKEN   # the CI plan callback's Bearer (#170)
 wrangler deploy
 ```
 
@@ -92,6 +103,10 @@ The setup console needs `SETUP_GITHUB_REPO` (a var, `owner/repo`) plus
 the target branch, `main` by default) to file its pull requests — with
 either missing it still serves, saves and answers status, and says on the
 page that connecting to GitHub is needed before the change can be filed.
+Edit as code reads `EDITS_REPO`, `EDITS_BASE_BRANCH` and `EDITS_INFRA_DIR`
+(vars in `wrangler.toml`); until `EDITS_GITHUB_TOKEN` exists its pages
+render and changes queue, but nothing is delivered — the cron picks the
+queue up once the secret lands.
 
 ## Mail theme
 
