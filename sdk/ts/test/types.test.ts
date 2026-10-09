@@ -89,12 +89,11 @@ function mustNotTypeCheck(): void {
   // @ts-expect-error outputs cannot be Secret in v1.
   step({ inputs: {}, outputs: { token: secret() }, run: () => ({ token: "" }) })
 
+  // Kept on one line: TypeScript 7 reports the overload failure on the `outputs`
+  // property rather than on the call, so a wrapped call would leave the
+  // directive unused and the error unclaimed.
   // @ts-expect-error `applied` is an int, so `run` may not return a string for it.
-  step({
-    inputs: {},
-    outputs: { applied: int(), name: string() },
-    run: () => ({ applied: "3", name: "migrations" }),
-  })
+  step({ inputs: {}, outputs: { applied: int(), name: string() }, run: () => ({ applied: "3", name: "migrations" }) })
 
   // @ts-expect-error a declared output may not be missing from the return.
   step({ inputs: {}, outputs: { applied: int() }, run: () => ({ skipped: 0 }) })
