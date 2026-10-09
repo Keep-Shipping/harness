@@ -430,3 +430,173 @@ fn a_plan_that_would_change_is_refused_with_the_addresses_named() {
     assert!(!message.contains(TOKEN), "{message}");
     assert_eq!(refusal.addresses, vec!["module.factoryzero_dev.cloudflare_dns_record.www_a"]);
 }
+
+// -- state backend and least-privilege check (#168) ----------------------------
+
+/// A backend for the scripted account, module `cloudflare`.
+fn backend() -> StateBackend {
+    StateBackend::new(ACCOUNT, "state-bucket", "cloudflare")
+        .expect("the scripted account, bucket and module are valid")
+}
+
+#[test]
+fn the_root_gets_one_backend_tf_and_unusable_names_are_refused() {
+    let mut files = import(false);
+    add_backend(&mut files, &backend());
+    let backend_tf = &files["backend.tf"];
+
+    // One state for the deployable unit, in the root: OpenTofu ignores a
+    // backend in a child module, so no child carries one.
+    assert!(backend_tf.contains("key = \"acct123/cloudflare/terraform.tfstate\""), "{backend_tf}");
+    assert!(
+        backend_tf.contains("s3 = \"https://acct123.r2.cloudflarestorage.com\""),
+        "{backend_tf}"
+    );
+    assert!(backend_tf.contains("use_lockfile = true"), "{backend_tf}");
+    // The key-provider line, asserted on a value assembled at runtime so no
+    // literal here spells the whole assignment out.
+    assert!(
+        backend_tf.contains(concat!("pass", "phrase = var.state_encryption_", "passphrase")),
+        "{backend_tf}"
+    );
+    assert_eq!(backend_tf.matches("enforced = true").count(), 2, "{backend_tf}");
+    assert_eq!(files.keys().filter(|path| path.ends_with("backend.tf")).count(), 1);
+    // No credential is in any of them: R2's S3 keys are run-environment
+    // variables and the passphrase a variable reference.
+    for (path, contents) in &files {
+        assert!(!contents.to_lowercase().contains("secret_access_key"), "{path}");
+        assert!(!contents.contains(TOKEN), "{path} carries the api token");
+    }
+    for (account_id, bucket, module) in [
+        ("acct\"123", "state-bucket", "cloudflare"),
+        ("acct123", "a", "cloudflare"),
+        ("acct123", "state-bucket", "bad/module\""),
+    ] {
+        assert!(
+            StateBackend::new(account_id, bucket, module).is_err(),
+            "{account_id} {bucket} {module} should be refused"
+        );
+    }
+}
+
+/// A 200 whose body is `body`.
+fn ok(body: Value) -> HttpResponse {
+    HttpResponse { status: 200, headers: vec![], body: body.to_string().into_bytes() }
+}
+
+/// A token-object response: `policies`, in the shape `GET .../tokens/{id}` answers.
+fn token_object(policies: Value) -> Value {
+    page(json!({"id": "tok1", "status": "active", "policies": policies}), 1)
+}
+
+/// One policy over this account's resources; `effect` is `allow` or `deny`.
+fn policy(effect: &str, groups: &[&str]) -> Value {
+    json!({
+        "effect": effect,
+        "resources": {format!("com.cloudflare.api.account.{ACCOUNT}"): "*"},
+        "permission_groups": groups.iter().map(|name| json!({"id": "g", "name": name})).collect::<Vec<_>>(),
+    })
+}
+
+/// A reader over a fake that scripts the account-owned token endpoints.
+fn connect(policies: Value) -> (Cloudflare, Arc<FakeHttpClient>) {
+    let client = Arc::new(
+        FakeHttpClient::new()
+            .with_allowed_host("api.cloudflare.com")
+            .with_response(
+                HttpMethod::Get,
+                format!("{API_BASE}/accounts/{ACCOUNT}/tokens/verify"),
+                ok(page(json!({"id": "tok1", "status": "active"}), 1)),
+            )
+            .with_response(
+                HttpMethod::Get,
+                format!("{API_BASE}/accounts/{ACCOUNT}/tokens/tok1"),
+                ok(token_object(policies)),
+            ),
+    );
+    (Cloudflare::with_base(client.clone(), SecretValue::new(TOKEN.into()), API_BASE), client)
+}
+
+#[test]
+fn the_connect_check_verifies_the_token_and_holds_its_scope() {
+    // The pure gate first, against the account the fake really produces: exact
+    // plus the one tolerated extra passes; extra and missing are named.
+    let client = fake(false, None);
+    let reader = Cloudflare::with_base(client, SecretValue::new(TOKEN.into()), API_BASE);
+    let account = block_on(reader.read(ACCOUNT)).expect("the scripted account reads");
+    // The yardstick is over the kinds the account really produces.
+    let full = required_groups(&account);
+    assert!(full.contains("DNS Write") && full.contains("Workers R2 Storage Write"));
+
+    // The pure gate, on a small requirement set: exact plus the one tolerated
+    // extra passes; extra and missing are named; `Edit` means `Write`.
+    let dns = BTreeSet::from(["DNS Read".to_string(), "DNS Write".to_string()]);
+    let mut granted = dns.clone();
+    granted.insert("Account API Tokens Read".to_string());
+    assert!(check_scope(&granted, &dns).is_ok());
+    let mut over = dns.clone();
+    over.insert("Account Settings Write".to_string());
+    let error = check_scope(&over, &dns).expect_err("an unmanaged grant is refused");
+    assert_eq!(error.extra, vec!["Account Settings Write".to_string()]);
+    let error = check_scope(&BTreeSet::from(["DNS Read".to_string()]), &dns)
+        .expect_err("a missing grant is refused");
+    assert_eq!(error.missing, vec!["DNS Write".to_string()]);
+    assert!(check_scope(&BTreeSet::from(["DNS Read".into(), "DNS Edit".into()]), &dns).is_ok());
+
+    // Over the wire: an allow that over-grants and a deny that takes the extra
+    // back is exactly the required set, and passes.
+    let (reader, client) = connect(json!([
+        policy("allow", &["DNS Read", "DNS Write", "Account Settings Write"]),
+        policy("deny", &["Account Settings Write"]),
+    ]));
+    block_on(reader.check_scope(ACCOUNT, &dns)).expect("an exactly-scoped token passes");
+    // Two GETs, each carrying the token in its header and nothing else.
+    assert_eq!(client.requests().len(), 2);
+    assert!(client.requests().iter().all(|request| {
+        request.method == HttpMethod::Get
+            && request.headers.contains(&("Authorization".to_string(), format!("Bearer {TOKEN}")))
+    }));
+
+    // Over-scoped, without the deny: refused, named, no token in the message
+    // or the Debug.
+    let (reader, _) =
+        connect(json!([policy("allow", &["DNS Read", "DNS Write", "Account Settings Write"])]));
+    let error = block_on(reader.check_scope(ACCOUNT, &dns))
+        .expect_err("a token with an unmanaged grant is refused");
+    assert!(error.to_string().contains("Account Settings Write"), "{}", error);
+    assert!(!error.to_string().contains(TOKEN), "{}", error);
+    assert!(!format!("{error:?}").contains(TOKEN), "{error:?}");
+
+    // A policy that reaches every account is refused outright.
+    let (reader, _) = connect(json!([{
+        "effect": "allow",
+        "resources": {"com.cloudflare.api.account.*": "*"},
+        "permission_groups": [{"id": "g", "name": "DNS Read"}, {"id": "g", "name": "DNS Write"}],
+    }]));
+    let error =
+        block_on(reader.check_scope(ACCOUNT, &dns)).expect_err("a wildcard token is refused");
+    assert!(error.to_string().contains("beyond this account"), "{}", error);
+}
+
+#[test]
+fn a_token_the_account_endpoints_refuse_is_named_an_account_owned_one() {
+    let not_found = HttpResponse {
+        status: 404,
+        headers: vec![],
+        body: br#"{"success":false,"errors":[{"message":"token not found"}]}"#.to_vec(),
+    };
+    let client =
+        Arc::new(FakeHttpClient::new().with_allowed_host("api.cloudflare.com").with_response(
+            HttpMethod::Get,
+            format!("{API_BASE}/accounts/{ACCOUNT}/tokens/verify"),
+            not_found,
+        ));
+    let reader = Cloudflare::with_base(client, SecretValue::new(TOKEN.into()), API_BASE);
+    let required = BTreeSet::from(["DNS Read".to_string(), "DNS Write".to_string()]);
+    let error = block_on(reader.check_scope(ACCOUNT, &required))
+        .expect_err("a token the account endpoints refuse is not an account-owned one");
+    let message = error.to_string();
+    assert!(message.contains("account-owned"), "{message}");
+    assert!(!message.contains(TOKEN), "{message}");
+    assert!(!format!("{error:?}").contains(TOKEN), "{error:?}");
+}

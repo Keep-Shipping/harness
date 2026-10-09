@@ -14,7 +14,9 @@
 //! for has succeeded. **Variables travel only as `TF_VAR_*`
 //! environment entries**, never as `-var` arguments: a value must never
 //! appear in `argv`, where every process can read it. Every command runs
-//! non-interactively — nobody is there to answer a prompt.
+//! non-interactively — nobody is there to answer a prompt. And `plan` and
+//! `apply`, the commands that take the state lock, wait out a concurrent run
+//! (`-lock-timeout`) instead of failing because it went first.
 //!
 //! The port is async but the work is a subprocess: each method blocks its
 //! thread inside the returned future, acceptable because the engine drives
@@ -24,7 +26,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ks_core::ports::BoxFuture;
 use ks_core::ports::iac::{
@@ -52,7 +54,14 @@ static PLANS_WRITTEN: AtomicU64 = AtomicU64::new(0);
 /// Both tools' text for a saved plan that no longer matches the state.
 const STALE_PLAN: &str = "Saved plan is stale";
 
-/// Both tools' text for losing the race for the state lock.
+/// How long `plan` and `apply` wait for the state lock before giving up: two
+/// concurrent runs on one module queue instead of failing outright. Set with
+/// [`IacCli::lock_timeout`].
+const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Both tools' text for giving up on the state lock. With `-lock-timeout` the
+/// tool has already waited out the whole window before saying this, so it
+/// reports a queue that did not clear rather than a race lost at the start.
 const LOCKED: &str = "Error acquiring the state lock";
 
 /// No variables to pass: the commands that take none.
@@ -77,6 +86,7 @@ pub struct IacCli {
     version: String,
     workspace: Option<String>,
     var_files: Vec<PathBuf>,
+    lock_timeout: Duration,
 }
 
 impl IacCli {
@@ -84,7 +94,14 @@ impl IacCli {
     pub fn new(kind: IacKind, bin: impl Into<PathBuf>) -> Result<IacCli, IacError> {
         let bin = bin.into();
         let version = version_of(&bin)?;
-        Ok(IacCli { kind, bin, version, workspace: None, var_files: Vec::new() })
+        Ok(IacCli {
+            kind,
+            bin,
+            version,
+            workspace: None,
+            var_files: Vec::new(),
+            lock_timeout: DEFAULT_LOCK_TIMEOUT,
+        })
     }
 
     /// The default binary for `kind` (`tofu` / `terraform`) on `PATH`.
@@ -108,6 +125,21 @@ impl IacCli {
     pub fn var_file(mut self, path: impl Into<PathBuf>) -> IacCli {
         self.var_files.push(path.into());
         self
+    }
+
+    /// Sets how long `plan` and `apply` wait for the state lock before giving
+    /// up; five minutes unless this is called. The wait is the tool's own
+    /// (`-lock-timeout`), so a second run on the same module holds still until
+    /// the first is done — and only then reports if the lock never freed.
+    pub fn lock_timeout(mut self, lock_timeout: Duration) -> IacCli {
+        self.lock_timeout = lock_timeout;
+        self
+    }
+
+    /// That wait as the tool wants it on the command line: `Duration`'s debug
+    /// formatting (`300s`, `1.5s`) is exactly the Go duration it parses.
+    fn lock_timeout_arg(&self) -> String {
+        format!("-lock-timeout={:?}", self.lock_timeout)
     }
 
     /// Where a saved plan lives, as the tool must be told: the `.ks`
@@ -146,7 +178,7 @@ impl IacCli {
         if outcome.status.success() {
             return Ok(String::from_utf8_lossy(&outcome.stdout).into_owned());
         }
-        Err(tool_error(&outcome))
+        Err(tool_error(&outcome, self.lock_timeout))
     }
 
     /// Runs the tool and reports everything it produced, failing runs
@@ -199,8 +231,14 @@ impl IacCli {
             vars.iter().map(|(name, value)| (format!("TF_VAR_{name}"), value.clone())).collect();
 
         let file = plan_file(dir)?;
-        let mut plan =
-            argv(&["plan", "-no-color", "-input=false", &format!("-out={}", file.display())]);
+        let mut plan = argv(&[
+            "plan",
+            "-no-color",
+            "-input=false",
+            // `plan` takes the state lock: wait out a concurrent run.
+            &self.lock_timeout_arg(),
+            &format!("-out={}", file.display()),
+        ]);
         plan.extend(self.var_files.iter().map(|path| format!("-var-file={}", path.display())));
         self.run(dir, &plan, &plan_env)?;
 
@@ -289,7 +327,9 @@ fn version_of(bin: &Path) -> Result<String, IacError> {
             exit_code: None,
         })?;
     if !probe.status.success() {
-        return Err(tool_error(&probe));
+        // The version probe never takes the state lock, so there is no wait
+        // worth naming in a failure.
+        return Err(tool_error(&probe, Duration::ZERO));
     }
     let stdout = String::from_utf8_lossy(&probe.stdout);
     let version = serde_json::from_str::<serde_json::Value>(&stdout)
@@ -311,17 +351,17 @@ fn diagnostics(outcome: &Output) -> String {
     text.trim().to_string()
 }
 
-/// Maps a failed run onto the port's errors: a lost state-lock race gets its
-/// own message, everything else is the tool's trimmed text and exit code.
-/// Nothing is dropped — an unexplained failure is worse than a wordy one.
-/// What lands here is only what the tool printed; values we pass by
-/// environment are never echoed by us.
-fn tool_error(outcome: &Output) -> IacError {
+/// Maps a failed run onto the port's errors: a state lock that did not free
+/// up within `lock_timeout` gets its own message, everything else is the
+/// tool's trimmed text and exit code. Nothing is dropped — an unexplained
+/// failure is worse than a wordy one. What lands here is only what the tool
+/// printed; values we pass by environment are never echoed by us.
+fn tool_error(outcome: &Output, lock_timeout: Duration) -> IacError {
     let text = diagnostics(outcome);
     let message = if text.is_empty() {
         "the tool failed without saying why".to_string()
     } else if text.contains(LOCKED) {
-        format!("state is locked by another run: {text}")
+        format!("state is still locked by another run after waiting {lock_timeout:?}: {text}")
     } else {
         text
     };
@@ -389,14 +429,22 @@ impl IacTool for IacCli {
             let (dir, file) = IacCli::locate(plan)?;
             let outcome = self.spawn(
                 dir,
-                &argv(&["apply", "-no-color", "-input=false", "-json", &file]),
+                // As `plan`: hold still for a concurrent apply, do not lose.
+                &argv(&[
+                    "apply",
+                    "-no-color",
+                    "-input=false",
+                    "-json",
+                    &self.lock_timeout_arg(),
+                    &file,
+                ]),
                 &NO_ENV,
             )?;
             if !outcome.status.success() && diagnostics(&outcome).contains(STALE_PLAN) {
                 return Err(IacError::StalePlan);
             }
             if !outcome.status.success() {
-                return Err(tool_error(&outcome));
+                return Err(tool_error(&outcome, self.lock_timeout));
             }
             // Only once the apply has succeeded, and only once the summary has
             // been read: on a stale plan or a failed apply the file must
@@ -528,22 +576,25 @@ mod tests {
     fn a_failed_run_never_loses_the_tools_own_message() {
         let on_stdout = failure(br#"{"@message":"Error: Failed to read plan"}"#, b"", 1);
         assert!(
-            matches!(&tool_error(&on_stdout), IacError::Tool { message, exit_code: Some(1) }
+            matches!(&tool_error(&on_stdout, DEFAULT_LOCK_TIMEOUT),
+                IacError::Tool { message, exit_code: Some(1) }
                 if message.contains("Failed to read plan")),
             "stdout diagnostics must survive"
         );
         let locked = failure(b"", b"  Error acquiring the state lock  ", 1);
         assert!(
-            matches!(&tool_error(&locked), IacError::Tool { message, exit_code: Some(1) }
-                if message.starts_with("state is locked by another run")),
-            "a lost lock race gets its own message"
+            matches!(&tool_error(&locked, DEFAULT_LOCK_TIMEOUT),
+                IacError::Tool { message, exit_code: Some(1) }
+                if message.starts_with("state is still locked by another run after waiting")),
+            "a lock wait that ran out gets its own message"
         );
         assert_eq!(
-            tool_error(&failure(b"", b"  something else  ", 2)),
+            tool_error(&failure(b"", b"  something else  ", 2), DEFAULT_LOCK_TIMEOUT),
             IacError::Tool { message: "something else".to_string(), exit_code: Some(2) }
         );
         assert!(
-            matches!(tool_error(&failure(b"", b"", 9)), IacError::Tool { message, .. }
+            matches!(tool_error(&failure(b"", b"", 9), DEFAULT_LOCK_TIMEOUT),
+                IacError::Tool { message, .. }
                 if message.contains("without saying why")),
             "silence is still a failure, and says so"
         );

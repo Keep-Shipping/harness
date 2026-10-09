@@ -44,18 +44,28 @@
 //!   generated module is reusable: `account_id` is `var.cloudflare_account_id`.
 //!   A zone's own id *is* literal inside its zone module — it is not secret, and
 //!   every object in that module hangs off it.
+//!
+//! Two
+//! [#168](https://github.com/Keep-Shipping/harness/issues/168) additions sit
+//! beside them: [`add_backend`] writes the generated root's R2 state backend,
+//! and [`Cloudflare::check_scope`] holds the token's policies against the least
+//! privilege the generated modules need, on connect.
 
 #![forbid(unsafe_code)]
 
 mod generate;
 mod hcl;
 mod plan;
+mod state;
+mod token;
 
 #[cfg(test)]
 mod tests;
 
 pub use generate::generate;
 pub use plan::{PlannedChanges, check_empty_plan};
+pub use state::{StateBackend, StateError, add_backend};
+pub use token::{ScopeError, check_scope, required_groups};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -218,6 +228,13 @@ pub enum Error {
         /// The listing path that ran away.
         path: String,
     },
+    /// The token verified but its permissions do not fit this slice: something
+    /// is missing, something extra is granted, or a policy reaches beyond this
+    /// account. The message carries permission group names, never the token.
+    Scope {
+        /// The difference, in plain words.
+        message: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -230,6 +247,9 @@ impl fmt::Display for Error {
             Error::Api { message } => write!(f, "Cloudflare rejected the read: {message}"),
             Error::TooManyPages { path } => {
                 write!(f, "Cloudflare listing {path} did not end within {MAX_PAGES} pages")
+            }
+            Error::Scope { message } => {
+                write!(f, "the token's scope does not fit this slice: {message}")
             }
         }
     }
