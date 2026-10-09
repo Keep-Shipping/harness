@@ -1,0 +1,88 @@
+{
+  "account": "Factory Zero",
+  "generated_at": "2026-10-09T06:00:00Z",
+  "terraform": { "repo": "Factory-Zero/infra", "ref": "9f31c02d8b7a1e55c0aa4e2f6d3b90c17a84e5f1" },
+  "sites": [
+    {
+      "id": "factory0-ventures",
+      "name": "factory0.ventures",
+      "kind": "zone",
+      "venture": "Factory Zero",
+      "domains": ["factory0.ventures"],
+      "defined_at": { "path": "modules/factory0/main.tf", "line": 8 },
+      "deploys": [
+        { "commit": "c0ffee1a2b3c4d5e6f708192a3b4c5d6e7f80912", "at": "2026-10-07T11:05:00Z", "by": "grace" }
+      ],
+      "tls": { "status": "expiring" },
+      "dns": { "status": "ok" },
+      "baseline": { "score": 88, "failing": [] },
+      "drift": "in_sync"
+    },
+    {
+      "id": "factoryzero-dev",
+      "name": "factoryzero.dev",
+      "kind": "zone",
+      "venture": "Factory Zero",
+      "domains": ["factoryzero.dev"],
+      "defined_at": { "path": "modules/factoryzero_dev/main.tf", "line": 8 },
+      "deploys": [
+        { "commit": "9d8c7b6a5f4e3d2c1b0a99887766554433221100", "at": "2026-09-28T14:30:00Z", "by": "ada" }
+      ],
+      "tls": { "status": "failing" },
+      "dns": { "status": "problem", "note": "nameservers still point at the old registrar" },
+      "baseline": { "score": 61, "failing": ["HSTS is not enabled", "no CAA record"] },
+      "drift": "unknown",
+      "resources": [
+        { "kind": "cloudflare_zone", "name": "factoryzero.dev", "defined_at": { "path": "modules/factoryzero_dev/main.tf", "line": 15 } }
+      ]
+    },
+    {
+      "id": "keepshipping-run",
+      "name": "keepshipping.run",
+      "kind": "zone",
+      "venture": "Keep Shipping",
+      "domains": ["keepshipping.run", "www.keepshipping.run"],
+      "defined_at": { "path": "modules/keepshipping_run/main.tf", "line": 12 },
+      "deploys": [
+        { "commit": "b7e4a9c2f1d0e384a5c6b7d8e9f0a1b2c3d4e5f6", "at": "2026-10-08T17:42:00Z", "by": "ada" },
+        { "commit": "5a3c1e9d7b2f04a8c6e0d2b4a6f8c0e2d4b6a8c0", "at": "2026-10-01T09:15:00Z", "by": "grace" }
+      ],
+      "tls": { "status": "ok" },
+      "dns": { "status": "ok" },
+      "baseline": { "score": 92, "failing": ["DMARC policy is not p=reject on www.keepshipping.run"] },
+      "drift": "in_sync",
+      "resources": [
+        { "kind": "cloudflare_dns_record", "name": "apex", "defined_at": { "path": "modules/keepshipping_run/dns.tf", "line": 40 } },
+        { "kind": "cloudflare_dns_record", "name": "www", "defined_at": { "path": "modules/keepshipping_run/dns.tf", "line": 48 } }
+      ]
+    },
+    {
+      "id": "keepshipping-site",
+      "name": "keepshipping-site",
+      "kind": "pages",
+      "venture": "Keep Shipping",
+      "domains": ["keepshipping.run", "www.keepshipping.run"],
+      "defined_at": { "path": "modules/keepshipping_site/main.tf", "line": 5 },
+      "deploys": [
+        { "commit": "e1d2c3b4a5f60718293a4b5c6d7e8f90a1b2c3d4", "at": "2026-10-08T20:10:00Z", "by": "ada" }
+      ],
+      "tls": { "status": "ok" },
+      "dns": { "status": "ok" },
+      "baseline": { "score": 95, "failing": [] },
+      "drift": "drifted",
+      "resources": [
+        { "kind": "cloudflare_pages_project", "name": "keepshipping-site", "defined_at": { "path": "modules/keepshipping_site/main.tf", "line": 9 } }
+      ]
+    },
+    {
+      "id": "keepshipping-waitlist",
+      "name": "keepshipping-waitlist",
+      "kind": "worker",
+      "venture": "Keep Shipping",
+      "domains": ["api.keepshipping.run"],
+      "defined_at": { "path": "modules/keepshipping_waitlist/main.tf", "line": 8 },
+      "tls": { "status": "ok" },
+      "dns": { "status": "ok" }
+    }
+  ]
+}
