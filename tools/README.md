@@ -40,7 +40,10 @@ tools/deploy.sh --deploy --yes       # actually run wrangler
 
 `--branch` defaults to the current git branch, so deploying from a feature
 branch is a preview rather than production. `--project` defaults to
-`keepshipping-docs`.
+`keepshipping-docs`. That Pages project exists on the Factory0 account (production branch
+`main`, created as a classic Pages project with
+`wrangler pages project create keepshipping-docs --production-branch=main --force`
+from an empty directory); `wrangler pages deploy` does not create it.
 
 The output is **deterministic** — no timestamps, no git sha, nothing that
 varies between two machines holding the same `docs/`. The site is deployed by
