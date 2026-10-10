@@ -14,6 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
+use std::process::ExitCode;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -137,6 +138,26 @@ pub enum Outcome {
     /// `keepshipping resume <run>`: the job is over, so no process is held
     /// open waiting for a human.
     Waiting { run: RunId, step: String, on: WaitReason },
+}
+
+impl Outcome {
+    /// The process exit code for this outcome: the table docs/CLI.md keeps.
+    pub fn exit_code(&self) -> ExitCode {
+        ExitCode::from(self.exit())
+    }
+
+    /// The same code as the number, for the JSON Line that states it —
+    /// `ExitCode` does not give its digits back, and run and resume must not
+    /// keep a second copy of the table to print one.
+    pub fn exit(&self) -> u8 {
+        match self {
+            Outcome::Shipped => 0,
+            Outcome::Failed => ks_engine::exec::EXIT_FAILED,
+            // A denial is not a failure: nothing broke, a human said no.
+            Outcome::Declined => ks_engine::exec::EXIT_DENIED,
+            Outcome::Waiting { .. } => ks_engine::exec::EXIT_WAITING_FOR_APPROVAL,
+        }
+    }
 }
 
 /// The steps a run covers, in the order it runs them: all of them,
@@ -951,5 +972,59 @@ steps:
         // A closed stdin answers for nobody and echoes nothing.
         let mut approver = TtyApprover::new(std::io::Cursor::new("".as_bytes()));
         assert_eq!(approver.ask("approve 3 changes?"), NOBODY_ANSWERED);
+    }
+
+    /// The whole exit-code table docs/CLI.md keeps, read in one place: the
+    /// engine's codes, the status names they answer to, and what each of a
+    /// run's outcomes returns. A code that moves without this test moving is
+    /// a documented number that lies.
+    #[test]
+    fn the_exit_code_table_is_the_documented_one() {
+        use ks_engine::exec::{
+            EXIT_CANCELLED, EXIT_DENIED, EXIT_FAILED, EXIT_POLICY_REFUSED,
+            EXIT_WAITING_FOR_APPROVAL, RunStatus,
+        };
+
+        // The codes themselves: | code | status | meaning |, in the docs.
+        let codes = [
+            ("failed", EXIT_FAILED, 1),
+            ("waiting_for_approval", EXIT_WAITING_FOR_APPROVAL, 4),
+            ("policy_refused", EXIT_POLICY_REFUSED, 5),
+            ("denied", EXIT_DENIED, 6),
+            ("cancelled", EXIT_CANCELLED, 130),
+        ];
+        for (name, code, documented) in codes {
+            assert_eq!(code, documented, "{name}");
+        }
+
+        // The same table as `RunStatus` spells it, which is how the engine
+        // reports a run and how the docs name the rows.
+        let statuses = [
+            ("succeeded", RunStatus::Succeeded, 0),
+            ("failed", RunStatus::Failed, EXIT_FAILED),
+            ("cancelled", RunStatus::Cancelled, EXIT_CANCELLED),
+            ("waiting_for_approval", RunStatus::WaitingForApproval, EXIT_WAITING_FOR_APPROVAL),
+            ("policy_refused", RunStatus::PolicyRefused, EXIT_POLICY_REFUSED),
+        ];
+        for (name, status, code) in statuses {
+            assert_eq!(status.exit_code(), code, "{name}");
+        }
+
+        // What a run's own outcomes return, including the one code the CLI
+        // raises itself: a denial is a human's `no`, not a failure.
+        let on = WaitReason::Approval { question: "approve?".into() };
+        let outcomes = [
+            ("shipped", Outcome::Shipped, 0),
+            ("failed", Outcome::Failed, EXIT_FAILED),
+            ("denied", Outcome::Declined, EXIT_DENIED),
+            (
+                "waiting_for_approval",
+                Outcome::Waiting { run: parked_run(), step: "review".into(), on },
+                EXIT_WAITING_FOR_APPROVAL,
+            ),
+        ];
+        for (name, outcome, code) in outcomes {
+            assert_eq!(outcome.exit_code(), ExitCode::from(code), "{name}");
+        }
     }
 }

@@ -248,7 +248,9 @@ fn missing_files_and_bad_flags_are_usage_errors() {
     let (code, _, stderr) = keepshipping(&["check", "--format", "xml"]);
     assert_eq!(code, 2);
     assert!(stderr.contains("usage: keepshipping"), "{stderr}");
-    let (code, _, stderr) = keepshipping(&["run", "--format", "json"]);
+    // `run` now takes `--format human|json` of its own; `github` is still the
+    // diagnostic format it has no use for.
+    let (code, _, stderr) = keepshipping(&["run", "--format", "github"]);
     assert_eq!(code, 2);
     assert!(stderr.contains("usage: keepshipping"), "{stderr}");
 }

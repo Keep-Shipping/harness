@@ -676,7 +676,7 @@ fn continue_run(
         .unwrap_or_else(|| file.display().to_string());
     let by: Vec<&Step> = steps.iter().collect();
     let tty = std::io::stdout().is_terminal() && std::env::var("TERM").is_ok_and(|t| t != "dumb");
-    let shared = Mutex::new(crate::renderer(tty, false));
+    let shared = Mutex::new(crate::renderer(crate::render::Format::Human, tty, false));
     let started = Instant::now();
     let outcome = {
         let mut approver: Box<dyn Approver + '_> = if is_agent {
@@ -725,7 +725,9 @@ fn continue_run(
         }
         // The park already wrote the record.
         Outcome::Waiting { run, step, on } => park_notice(&run, &step, &on),
-        Outcome::Declined | Outcome::Failed => ExitCode::from(1),
+        // The outcome's own table: a declined approval is exit 6, a failed
+        // step exit 1, and `run` must not say anything different.
+        outcome => outcome.exit_code(),
     }
 }
 

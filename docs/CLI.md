@@ -9,7 +9,7 @@ implemented end to end today; `run` is not.
   findings are printed, and how a run fails, is in [DIAGNOSTICS.md](DIAGNOSTICS.md).
 - `keepshipping run [FILE]` — check the file, choose an environment (`--env NAME`,
   `--event "push main"`, `--actor human|agent|ci`, `--as human|agent[:name]|ci`,
-  `--non-interactive`, `--base REF`, `--ci`), print it, and stop. `--input KEY=VALUE`
+  `--non-interactive`, `--base REF`, `--ci`, `--format human|json`), print it, and stop. `--input KEY=VALUE`
   (repeatable; a value beginning `@secret:` names a secret rather than carrying one) is checked
   before the run starts and echoed by `--dry-run`; no step is handed one yet. With `--only STEP` it
   names the inputs for one script step — see [DIAGNOSTICS.md](DIAGNOSTICS.md) for the grammar.
@@ -19,6 +19,8 @@ implemented end to end today; `run` is not.
   `--ci` answers for the CI it is in — see [CI.md](CI.md) for what it detects, and what it does
   not. `--sha SHA` states the commit for such a run, and needs `--ci` with it: on its own the flag
   would say nothing, so it is a usage error rather than a silently dropped option.
+  `--format json` swaps the terminal picture for JSON Lines a machine can read —
+  [run --format json](#run---format-json) below.
   Execution is not wired to the CLI yet: the planner and executor exist in `ks-engine` and
   `run` will hand them the plan. What `--as` means when it is left out is in
   [Who the run thinks it is](#who-the-run-thinks-it-is).
@@ -389,9 +391,11 @@ for a bug in keepshipping, and a workflow somebody wrote is not one. Exit 2 for 
 
 ## Exit codes
 
-Codes 0–3 are the CLI's own and are stable. 4, 5 and 130 come from `ks_engine::exec::RunStatus`.
-4 is what a run returns when it parks, and `keepshipping resume` returns it for a run that is
-still waiting; 5 is what `resume` returns when policy refuses what is left of the run. Otherwise
+Codes 0–3 are the CLI's own and are stable. 4, 5 and 130 come from `ks_engine::exec::RunStatus`,
+and 6 from `ks_engine::exec::EXIT_DENIED`, which the CLI raises: a declined approval is an
+outcome of a run, but no `RunStatus` names it, because the executor never decides it — a person
+does. 4 is what a run returns when it parks, and `keepshipping resume` returns it for a run that
+is still waiting; 5 is what `resume` returns when policy refuses what is left of the run. Otherwise
 they are what a run will return once `run` is wired to the executor.
 
 | Code | Status | Meaning |
@@ -402,6 +406,7 @@ they are what a run will return once `run` is wired to the executor.
 | 3 | — | internal: an unexpected I/O error or a panic — a bug in keepshipping, never in your file |
 | 4 | `waiting_for_approval` | a step needs an approval nobody gave, or the effective policy asked about it before it ran: the run wrote itself down and stopped there, and nothing after the approval ran. `keepshipping resume <run>` carries it on; an agent's run (`--as agent`) needs `keepshipping approve <run>` from a human first |
 | 5 | `policy_refused` | policy refused the run: the refused step and everything that needs it are skipped, and anything else in the run still runs. A step the effective policy — the baseline ∩ the default branch's `policy:` ∩ this file's ([ADR 0012](adr/0012-policy-authority.md)) — refuses stops the run before the first step |
+| 6 | — | denied: an approval was declined — a person said no, or nobody could answer and the run had nowhere to park. Nothing after the approval ran, and nothing broke: this is not `failed` (1), and policy never spoke, so it is not `policy_refused` (5) either. A run that could be written down parks instead (4); the decline is what a run with no record to leave ends on |
 | 130 | `cancelled` | the run was cancelled (Ctrl-C, a cancelled CI job) — 128 + `SIGINT`, as a shell reports it |
 
 ## Parking and resuming
@@ -469,6 +474,57 @@ A resume that passes drives what is left; an approval further on parks the run a
 record says are done are not run again. No step kind is executable from the CLI yet, so today a
 resumed run stops at its first remaining step with `` `{kind}` steps are not built in yet `` and
 exits 1 — past the approval, which is the part this covers.
+
+## run --format json
+
+`run --format json` replaces the terminal picture with JSON Lines on stdout: one object per line,
+each naming its `event` and opening with `"version":1`, so a machine can watch a run without
+parsing glyphs and spinner frames. A reader that does not recognise a line can still skip it, and
+a reader that does not recognise a field can still use the line — new fields arrive without a new
+version, and a new version means the old lines changed meaning. What a person would read — the
+park notice, the approval prompt, a refusal — stays on stderr, exactly where the human format
+puts it, so the stream stays pure enough to pipe.
+
+| event | when | fields |
+|---|---|---|
+| `run_started` | the stream's first line, before policy speaks — a refusal is an outcome the closing line states, so even a refused run opens | `what`, `env` |
+| `checked` | the file passed the pre-run check | `path` |
+| `step_started` | a step began | `step` |
+| `step_log` | a line of the step's own output — every line, `-v` or not: the reader asked for the stream, it gets everything the human `-v` would | `step`, `line` |
+| `step_finished` | a step finished | `step`, `summary`, `took_ms` |
+| `step_failed` | a step failed; the run stops there | `step`, `error`, `took_ms` |
+| `approval_asked` | an approval step is asking | `step`, `question` |
+| `approval_answered` | the answer, and who gave it — `by` is null when nobody was there to answer | `step`, `approved` (boolean), `by` (string or null) |
+| `parked` | the run wrote itself down | `run`, `step` |
+| `run_finished` | the stream's last line, always | `status`, `exit`, plus what the status names |
+
+The closing line's `exit` is the number in [Exit codes](#exit-codes), and its `status` says which
+one: `shipped`, `failed`, `denied`, `waiting_for_approval` or `policy_refused` — the same words a
+human run ends on. A run the effective policy refuses before the first step still opens and
+closes the stream; the refusal itself (`refusing to start: …`) is stderr's to say, and the line
+carries the step and the reason. A park closes with `waiting_for_approval` and the run id, and
+the same id is in the notice on stderr — `keepshipping approve <run>` — so a script and its
+human read the same run either way.
+
+Two combinations are usage errors (exit 2), before any line is written: `--format github`, which
+stays `check`-only, and `--dry-run`, whose graph is drawn for people — a graph inside a machine
+stream is corruption, the way `check --secrets` listing inside GitHub annotations would be. And
+the stream only opens once the file checks clean: a file that fails the pre-run check exits 1
+with `check`'s own diagnostics and no JSON at all, because there is no run to have started.
+
+A run that parks ends like this:
+
+```
+$ keepshipping run --as agent --format json
+{"version":1,"event":"run_started","what":"api","env":"default"}
+{"version":1,"event":"run_finished","status":"waiting_for_approval","run":"01HF7YAT00R3M2XK7A9B4CDEF","step":"apply","on":"agent","exit":4}
+$ echo $?
+4
+```
+
+with the park notice a person reads — `parked at apply …`, `keepshipping approve …` — on stderr.
+The goldens in `crates/cli/tests/fixtures/run_json/` pin the bytes; the tests re-run with
+`UPDATE_GOLDEN=1 cargo test -p ks-cli --test run_json`.
 
 ## Failure semantics
 

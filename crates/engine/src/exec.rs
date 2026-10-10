@@ -24,6 +24,10 @@ pub const EXIT_FAILED: u8 = 1;
 pub const EXIT_WAITING_FOR_APPROVAL: u8 = 4;
 /// Policy refused the run: exit 5.
 pub const EXIT_POLICY_REFUSED: u8 = 5;
+/// An approval was declined — a person said no, or nobody could answer and the
+/// run had nowhere to park: exit 6. Not [`EXIT_FAILED`]: nothing broke. Not
+/// [`EXIT_POLICY_REFUSED`]: policy never spoke.
+pub const EXIT_DENIED: u8 = 6;
 /// The run was cancelled (Ctrl-C, a cancelled CI job): 128 + `SIGINT`, as a shell reports it.
 pub const EXIT_CANCELLED: u8 = 130;
 

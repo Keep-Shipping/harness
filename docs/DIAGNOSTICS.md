@@ -13,11 +13,12 @@ Every finding carries a stable `KSxxxx` code — what each one means lives in
 | 2 | usage: an unknown flag or format, a missing value, a file that cannot be checked (missing, a directory, not UTF-8, permission denied), or no `ship.ks` to check |
 | 3 | internal: an unexpected I/O error, or a panic — a bug in keepshipping, never in your file |
 
-`run` keeps the same scale: 1 when the file fails the check, when a step
-fails, or when an approval is declined; 2 for usage and environment-selection
-problems. The full list, including the codes a *run* will add once `run` is
-wired to the engine (4 waiting for an approval, 5 policy refused, 130
-cancelled), is in [CLI.md](CLI.md).
+`run` keeps the same scale: 1 when the file fails the check or a step fails;
+6 when an approval is declined — nothing broke and policy never spoke, a
+person said no; 2 for usage and environment-selection problems. The full
+list, including the codes a *run* will add once `run` is wired to the engine
+(4 waiting for an approval, 5 policy refused, 130 cancelled), is in
+[CLI.md](CLI.md).
 
 ## `fmt --upgrade`
 
@@ -181,6 +182,7 @@ a captured run reads like a terminal's.
 | `--only STEP` | run `STEP` and the steps it depends on; repeatable |
 | `--skip STEP` | drop `STEP` and everything downstream of it; repeatable |
 | `--input KEY=VALUE` | hand the steps this run takes an explicit input; repeatable |
+| `--format human\|json` | the lines above for a person, or JSON Lines a machine can read ([CLI.md](CLI.md)) |
 | `--dry-run` | graph the run and check it; run nothing |
 | `-v` | stream each step's own output |
 

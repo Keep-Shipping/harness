@@ -22,7 +22,8 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
                           [--actor human|agent|ci] [--context local|ci] [--secrets] [--fix] [--repro]
        keepshipping run [FILE] [--env NAME] [--event \"push main\"] [--actor human|agent|ci]
                         [--as human|agent[:name]|ci] [--base REF]
-                        [--context local|ci] [--non-interactive] [--ci] [--sha SHA] [--until STEP]
+                        [--context local|ci] [--format human|json] [--non-interactive] [--ci]
+                        [--sha SHA] [--until STEP]
                         [--only STEP]... [--skip STEP]... [--input KEY=VALUE]... [--allow-partial]
                         [--dry-run] [-v]
        keepshipping graph [FILE] [--env NAME] [--event \"push main\"] [--format text|dot|json]
@@ -48,9 +49,11 @@ usage: keepshipping check [FILE] [--all] [--format human|json|github]
        keepshipping lsp
        keepshipping --version";
 
-/// Which subcommand's flags `parse_args` accepts. `--format`, `--all`,
-/// `--warnings-as-errors`, `--secrets`, `--fix` and `--repro` belong to `check` alone; `run`
-/// rejects them like any other unrecognized option. `--until`, `--skip` and
+/// Which subcommand's flags `parse_args` accepts. `--format` belongs to `check`
+/// and to `run` — the diagnostic formats for the one, `human|json` for the
+/// other, `github` still check-only — while `--all`, `--warnings-as-errors`,
+/// `--secrets`, `--fix` and `--repro` belong to `check` alone; `run`
+/// rejects those like any other unrecognized option. `--until`, `--skip` and
 /// `--allow-partial` belong to `run` alone, and `--context` to both.
 /// `blocks search` has its own `--format` (human or json, no github
 /// annotations), `--index`, `--limit` and `--offline`. `graph` has its own `--format` —
@@ -221,7 +224,9 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
             "--format" if command == Command::Graph => {
                 o.graph_format = GraphFormat::parse(&flag_value(&mut rest)?)?
             }
-            "--format" if matches!(command, Command::Check | Command::BlocksSearch) => {
+            "--format"
+                if matches!(command, Command::Check | Command::Run | Command::BlocksSearch) =>
+            {
                 o.format = Format::parse(&flag_value(&mut rest)?)?
             }
             "--all" if command == Command::Check => o.all = true,
@@ -318,8 +323,9 @@ pub fn parse_args(args: &[String], command: Command) -> Option<Options> {
             _ => return None,
         }
     }
-    // GitHub annotations describe source spans; a search result has none.
-    if command == Command::BlocksSearch && o.format == Format::Github {
+    // GitHub annotations describe source spans; a search result has none, and
+    // a run emits no diagnostics to annotate.
+    if o.format == Format::Github && matches!(command, Command::BlocksSearch | Command::Run) {
         return None;
     }
     Some(o)

@@ -1,0 +1,2 @@
+{"version":1,"event":"run_started","what":"api","env":"default"}
+{"version":1,"event":"run_finished","status":"policy_refused","step":"build","why":"`build` is never allowed for agent (default branch)","exit":5}
