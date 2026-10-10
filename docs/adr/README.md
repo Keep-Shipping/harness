@@ -35,3 +35,4 @@ A guard test (`cargo test -p ks-testing --test adr_guard`) checks every ADR belo
 | [0200](0200-hosted-venture-on-the-cratefield-harness.md) | Hosted venture on the Cratefield harness | Accepted |
 | [0201](0201-hosted-on-cloudflare.md) | Hosted on Cloudflare | Proposed |
 | [0202](0202-billing-through-polar.md) | Billing through Polar | Accepted |
+| [0203](0203-pricing-not-set.md) | Pricing not set | Proposed |
