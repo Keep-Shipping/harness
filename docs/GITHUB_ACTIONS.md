@@ -31,8 +31,8 @@ jobs:
           version: 1.2.3
 ```
 
-`1.2.3` is the exact version you pinned — an example, not a release that exists. The
-crate versions are still `0.0.0` and nothing is published yet.
+`1.2.3` is the exact version you pinned — an example. The first release is `0.1.0`; the
+[releases page](https://github.com/Keep-Shipping/harness/releases) lists what exists.
 
 Both `uses:` are pinned to a commit SHA, not a tag: a tag is a name somebody can move,
 and a SHA is the artifact you read. The action's own SHA is a placeholder until the
