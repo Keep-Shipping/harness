@@ -266,9 +266,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-adapter-owlpost"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebc9b1f8b4d8a697a6f0fb2337c414c2c461dafceaf9e8a6bf00cc6a6640faff"
+checksum = "5c75e66bcebe4c4d73d34c9c68417b42a6eca8361336ef2fc2755c42809d6b24"
 dependencies = [
  "async-trait",
  "bytes",
@@ -298,9 +298,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-adapter-resend"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "270bc3fa6b2a9cb5acba5028cccf0fdfa6015c0abe6adaa3d1b6b6a2f455027d"
+checksum = "e721581ca495926d1468ea800eb1035e2eafbeb1f1646369611540fe05620a95"
 dependencies = [
  "async-trait",
  "bytes",
@@ -308,6 +308,7 @@ dependencies = [
  "http",
  "serde",
  "serde_json",
+ "time",
  "tracing",
 ]
 
@@ -327,9 +328,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-adapter-turnstile"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c9a5887fe245caf04f5a66d3c91e07321f7cb8363610191db9dfc9a5e51fdb1"
+checksum = "c49eabd92b2bd6664be766ef741a8bf76825fd045c3c4b76a41408db71dfaf9d"
 dependencies = [
  "async-trait",
  "bytes",
@@ -342,15 +343,16 @@ dependencies = [
 
 [[package]]
 name = "cratefield-auth-client"
-version = "0.3.0"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "212f03772edd81edba3f30dbbe82e1c4cf27bd83838cb99204212175b0f6eb12"
+checksum = "6c631da66affc4133afce0a265b0115d4fd5fb3534d6d4d26b00a294f1416473"
 dependencies = [
  "async-trait",
  "axum",
  "base64ct",
  "bytes",
  "cratefield-core",
+ "futures-util",
  "http",
  "p256",
  "serde",
@@ -394,9 +396,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-mail-templates"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81b17e3cd128a8e7f281cfa3ec16284e011fd141eeed5eee12beb8f9c3762350"
+checksum = "eab5b5565cb9ff892911fd6f7248f6976ca1fffb70cf91289ea5c676ea520bc4"
 dependencies = [
  "cratefield-core",
  "getrandom 0.4.3",
@@ -407,9 +409,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-module-waitlist"
-version = "0.4.0"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "541ea59113956d8699e1ea1bcae3ad7ecbc33e7715993ccc3c228a635762049d"
+checksum = "65218f816c4ba589a1584f564c1dd502b8c6632403e48c63b088a14d9e2bdf1b"
 dependencies = [
  "axum",
  "cratefield-core",
@@ -445,23 +447,26 @@ dependencies = [
 
 [[package]]
 name = "cratefield-runtime-cloudflare"
-version = "0.4.0"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93ecc68b9f1b8034852d0287a3feb32745b5e78eff362d2d61167e212c91e272"
+checksum = "139cf599e86e03b6ef6fdebe60c8eec0e2d3058fae0424477a9f0a157f2fc942"
 dependencies = [
  "async-trait",
  "axum",
+ "base64",
  "bytes",
  "cratefield-auth-client",
  "cratefield-core",
  "futures-core",
  "futures-util",
  "getrandom 0.4.3",
+ "hmac",
  "http",
  "sea-query",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "subtle",
  "time",
  "tower",
  "tracing",
@@ -471,9 +476,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-testing"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "192db47c5e91d18a62ef87cca8e77de4e4fb7059eed0105ecef0840f915ee650"
+checksum = "2eae270620234a4659281154c70232a9b6289456766d99a7903bee065484fde2"
 dependencies = [
  "async-trait",
  "axum",
@@ -482,6 +487,7 @@ dependencies = [
  "cratefield-adapter-sqlite",
  "cratefield-core",
  "futures-core",
+ "futures-util",
  "hmac",
  "http",
  "pollster 0.4.0",
@@ -2385,9 +2391,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.53.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
 dependencies = [
  "libc",
  "mio",
