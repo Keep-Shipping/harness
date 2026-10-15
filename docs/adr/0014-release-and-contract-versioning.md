@@ -73,8 +73,11 @@ artifact whose origin a user can check.
   only, with no `v0` floating tag, so there is no `v1`-style major tag
   to pin the way `actions/checkout@v4` is. While `publish = false`
   stands, every package is excluded from release and
-  `release-plz release` finds nothing to release: the step is present
-  and pinned, and currently inert.
+  `release-plz release` finds nothing to release.
+  *Amended 2026-10-15:* the inert step was removed from `release.yml`
+  after it failed the first tag (v0.1.0) for want of a `GITHUB_TOKEN`.
+  Release notes come from `gh release create --generate-notes`; the step
+  returns, with a token, when a crate is first published.
 
 ## Consequences
 - A step author pins `ks-core` and checks the table in
