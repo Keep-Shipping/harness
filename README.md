@@ -84,7 +84,7 @@ Start with [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Licence
 
-Apache-2.0. Everything here is open: the harness, the CLI, the language server, the built-in steps and adapters. The hosted control plane and team-only features live in private repositories. See [LICENSE](LICENSE) and [ADR 0006](docs/adr/0006-licence-and-open-source-model.md).
+MIT. Everything here is open: the harness, the CLI, the language server, the built-in steps and adapters. The hosted control plane and team-only features live in private repositories. See [LICENSE](LICENSE) and [ADR 0016](docs/adr/0016-mit-licence.md).
 
 ---
 

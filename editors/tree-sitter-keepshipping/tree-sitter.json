@@ -12,7 +12,7 @@
   ],
   "metadata": {
     "version": "0.0.1",
-    "license": "LicenseRef-KeepShipping-Proprietary",
+    "license": "MIT",
     "description": "Keep Shipping site files (ship.ks)"
   },
   "bindings": {

@@ -15,7 +15,7 @@ they think of a *demo*, because there is none to react to.
 One batch has to settle three decisions:
 
 1. **What to price.** There is no price per call and no price per token anywhere in this
-   repository, and nothing in the Apache-2.0 code is the paid part: [ADR 0006](adr/0006-licence-and-open-source-model.md)
+   repository, and nothing in the MIT code is the paid part: [ADR 0006](adr/0006-licence-and-open-source-model.md)
    puts "the hosted control plane, team-only features" in private repositories, and accepts fork
    risk because "the moat is the **hosted service and the adapters**". The number we are missing is
    the one a prospect says out loud in question 6.

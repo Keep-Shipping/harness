@@ -85,4 +85,4 @@ The ADR guard test enforces this: `cargo test -p ks-testing --test adr_guard`.
 
 ## Licence
 
-Apache-2.0 — see [LICENSE](LICENSE) and [ADR 0006](docs/adr/0006-licence-and-open-source-model.md). Contributions are accepted under the same terms (Apache-2.0 section 5: inbound is outbound); there is no CLA and no DCO. Copyright is Factory Zero Pte. Ltd.
+MIT — see [LICENSE](LICENSE) and [ADR 0016](docs/adr/0016-mit-licence.md). Contributions are accepted under the same terms (inbound is outbound: by opening a pull request you license it under MIT); there is no CLA and no DCO. Copyright is Factory Zero Pte. Ltd.

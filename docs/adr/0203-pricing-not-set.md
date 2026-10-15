@@ -42,8 +42,8 @@ Keep Shipping.
   team features**. It is the only candidate that prices what actually costs
   money — the hosted parts
   [ADR 0005](0005-local-first-core-with-optional-hosted-services.md) scopes
-  and [ADR 0202](0202-billing-through-polar.md) bills — while the Apache-2.0
-  core stays free ([ADR 0006](0006-licence-and-open-source-model.md)).
+  and [ADR 0202](0202-billing-through-polar.md) bills — while the MIT
+  core stays free ([ADR 0016](0016-mit-licence.md)).
 - The other three are ordered behind it, not rejected. Per repository becomes
   right if interviews show teams adopting it repo by repo rather than as one
   team; per seat if the buyer expects seats and the agent-is-not-a-seat

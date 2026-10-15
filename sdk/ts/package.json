@@ -2,7 +2,7 @@
   "name": "@keepshipping/sdk",
   "version": "0.1.0-pre.0",
   "description": "TypeScript escape-hatch steps for Keep Shipping.",
-  "license": "Apache-2.0",
+  "license": "MIT",
   "type": "module",
   "exports": {
     ".": {

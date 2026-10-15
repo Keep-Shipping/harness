@@ -18,7 +18,7 @@ allow = [
   "Zlib",
 ]
 
-# Workspace crates are Apache-2.0 (ADR 0006) and unpublished
+# Workspace crates are MIT (ADR 0016) and unpublished
 # (publish = false), so they are checked against the allow list above too.
 private = { ignore = false }
 
