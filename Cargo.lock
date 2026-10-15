@@ -1200,7 +1200,7 @@ dependencies = [
 
 [[package]]
 name = "keepshipping-waitlist"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1240,7 +1240,7 @@ dependencies = [
 
 [[package]]
 name = "ks-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "ks-core",
@@ -1256,7 +1256,7 @@ dependencies = [
 
 [[package]]
 name = "ks-cloudflare"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ks-core",
  "ks-testing",
@@ -1265,7 +1265,7 @@ dependencies = [
 
 [[package]]
 name = "ks-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ks-lang",
  "serde_json",
@@ -1273,7 +1273,7 @@ dependencies = [
 
 [[package]]
 name = "ks-deno-script-host"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ks-core",
  "ks-testing",
@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "ks-engine"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ks-core",
  "ks-lang",
@@ -1299,7 +1299,7 @@ dependencies = [
 
 [[package]]
 name = "ks-github"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ks-core",
  "ks-lang",
@@ -1309,7 +1309,7 @@ dependencies = [
 
 [[package]]
 name = "ks-helm-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ks-core",
  "ks-testing",
@@ -1318,7 +1318,7 @@ dependencies = [
 
 [[package]]
 name = "ks-hosted-approvals"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "hmac",
  "ks-core",
@@ -1330,7 +1330,7 @@ dependencies = [
 
 [[package]]
 name = "ks-jev"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ks-core",
  "ks-testing",
@@ -1339,11 +1339,11 @@ dependencies = [
 
 [[package]]
 name = "ks-lang"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "ks-lsp"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ks-core",
  "ks-lang",
@@ -1352,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "ks-module-approvals"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "cratefield-core",
@@ -1371,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "ks-module-runlog"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "ks-core",
@@ -1382,7 +1382,7 @@ dependencies = [
 
 [[package]]
 name = "ks-oci-distribution"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ks-cli",
  "ks-core",
@@ -1393,7 +1393,7 @@ dependencies = [
 
 [[package]]
 name = "ks-testing"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ks-core",
  "ks-lang",
@@ -1403,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "ks-tofu-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ks-core",
  "ks-testing",

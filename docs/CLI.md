@@ -611,6 +611,6 @@ published registry and fails on any difference; CI runs it in the `gates` job.
 `keepshipping --version` prints the version and the same summary on one line:
 
 ```text
-keepshipping 0.0.0
+keepshipping 0.1.0
 Built with: Cratefield (planned), SupportGenius (planned), Polar (planned), Google Fonts (live), Cloudflare (live)
 ```
