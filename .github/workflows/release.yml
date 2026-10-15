@@ -317,25 +317,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # release-plz reads the conventional commits since the last tag.
+          # --verify-tag below needs the tag; full history keeps it simple.
           fetch-depth: 0
-
-      - name: Install release-plz
-        # release-plz, from the repository that publishes it. The action has no
-        # major-version tag: it ships `v0.5.x` and no `v0` floating tag, so
-        # the pin names one exact release and its commit.
-        #
-        # It needs no credential from the checkout: the action passes
-        # `GITHUB_TOKEN` explicitly to the release-plz binary and resolves the
-        # committer through `gh`, which reads the same environment variable.
-        # So the checkout above can keep `persist-credentials: false` and leave
-        # nothing in .git/config for a later step to pick up.
-        #
-        # Today this step is a no-op at tag time — every package is
-        # `publish = false`, so release-plz has nothing to release — but the
-        # pin is here and correct so that the day publishing is switched on,
-        # this is not a workflow that fails on a reference that never existed.
-        uses: release-plz/action@18641b6c63063cc5ff8786ebf69cd57e8541bae1 # v0.5.140
 
       - name: Download every archive plus the signed checksums
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -371,14 +354,10 @@ jobs:
           # conventional commits since the previous tag — the same source
           # release-plz would read.
           #
-          # release-plz cannot write them here. Its `release` command writes no
-          # changelog file and its JSON output carries only `package_name`,
-          # `prs`, `tag` and `version` — no notes — and its action outputs
-          # (`prs`, `releases`, `releases_created`) carry no notes either. And
-          # it would have nothing to release anyway: `publish = false` is set
-          # workspace-wide while the repository is private (ADR 0006), so
-          # every package is non-publishable and `release-plz release` reports
-          # nothing to release.
+          # There is no release-plz step: every package is `publish = false`,
+          # so it had nothing to do, and on v0.1.0 it still failed for want of
+          # a GITHUB_TOKEN. Add it back, with a token, the day a crate is
+          # published.
           #
           # The SBOMs ride along as their own assets, named for the archive
           # they describe. SHA256SUMS names them too, so the cosign signature
