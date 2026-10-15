@@ -83,6 +83,19 @@ fi
 # Build under --check and tell a warning from a crash: the generator exits 1
 # for warnings, 2 for usage/IO, and the word "warning:" only appears on the
 # former. Anything else is a build that did not happen.
+# site.py writes into $OUT but never removes anything, so a page dropped from
+# docs/ (or newly marked Internal) would ship again from the last build's
+# leftovers. Start empty -- but only clear a directory that is a previous docs
+# build, never an arbitrary --out.
+if [ -d "$OUT" ]; then
+  if [ "$OUT" = "$OUT_DEFAULT" ] || [ -f "$OUT/llms-full.txt" ]; then
+    rm -rf -- "$OUT"
+  else
+    echo "deploy.sh: $OUT exists and is not a previous docs build; refusing to build over it" >&2
+    exit 2
+  fi
+fi
+
 echo "deploy.sh: building $OUT from docs/ (branch $BRANCH)"
 LOG="$(mktemp)"
 trap 'rm -f "$LOG"' EXIT
