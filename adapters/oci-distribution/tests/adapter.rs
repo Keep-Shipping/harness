@@ -157,6 +157,25 @@ fn pulled_bytes_that_do_not_hash_to_the_digest_they_were_served_under_are_a_mism
 }
 
 #[test]
+fn a_manifest_endpoint_that_serves_a_blob_wrapped_as_a_manifest_falls_back_to_the_blob() {
+    // distribution 2.8.3 answers the manifest endpoint for a blob digest with a
+    // 200 whose bytes are the blob re-wrapped (and so do not hash to the digest).
+    // That is not the content: the blob endpoint has it, and it is verified.
+    let digest = digest_of(b"layer bytes");
+    let fake = Arc::new(
+        scripted()
+            .with_response(
+                HttpMethod::Get,
+                manifest_url(&digest.to_string()),
+                ok(b"{\"layer bytes\",\"signatures\":[]}"),
+            )
+            .with_response(HttpMethod::Get, blob_url(&digest), ok(b"layer bytes")),
+    );
+    let registry = insecure(&fake);
+    assert_eq!(block_on(registry.pull(REPOSITORY, &digest)), Ok(b"layer bytes".to_vec()));
+}
+
+#[test]
 fn pulling_a_blob_that_is_there_returns_its_exact_bytes() {
     let digest = digest_of(b"layer bytes");
     let fake = Arc::new(
