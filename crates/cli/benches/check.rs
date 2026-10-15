@@ -17,13 +17,10 @@ const WARM_P95_BUDGET: Duration = Duration::from_millis(100);
 const WARM_RUNS: usize = 50;
 
 /// What a cold check of a site with a script step may take. It runs `node`,
-/// so it has a budget of its own rather than the bare site's. Set to the
-/// ADR 0009/0013 cold ceiling (1 s), not tighter: a cold start is one node
-/// process on a shared runner, and `ubuntu-latest` measured 688 ms on a
-/// single cold sample (CI `bench` job, the run that panicked at 500 ms).
-/// Local macOS measures ~100 ms on the same path, so the spread is the
-/// runner, not the checker.
-const SCRIPT_COLD_BUDGET: Duration = Duration::from_secs(1);
+/// so it has a budget of its own rather than the bare site's. ubuntu-latest
+/// measures ~85 ms with Node 22 pinned in the bench job; the 0.7-1 s seen
+/// before came from the runner's unpinned default Node, not the checker.
+const SCRIPT_COLD_BUDGET: Duration = Duration::from_millis(500);
 /// …and what its warm checks, which read the cache and spawn nothing, must
 /// stay under. The bare site's budget would hide what this one is for.
 const SCRIPT_WARM_P95_BUDGET: Duration = Duration::from_millis(50);
