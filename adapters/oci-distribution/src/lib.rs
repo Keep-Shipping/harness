@@ -488,18 +488,35 @@ impl Registry for OciDistribution {
                     &format!("{}/v2/{}/manifests/{reference}", endpoint.base, endpoint.name),
                 ))
                 .await?;
-            let bytes = if manifest.status == 404 {
-                // Not a manifest: a blob is the other thing a digest can name.
-                let blob = self
-                    .request(HttpRequest::new(
-                        HttpMethod::Get,
-                        format!("{}/v2/{}/blobs/{reference}", endpoint.base, endpoint.name),
-                    ))
-                    .await?;
-                Self::ok(blob, &endpoint, &reference)?.body
-            } else {
-                Self::ok(manifest, &endpoint, &reference)?.body
+            // The manifest endpoint is only authoritative for manifests. A digest
+            // that names a blob may be answered there with a 404, a server error,
+            // or (distribution 2.8.3) a 200 carrying the blob re-wrapped as a
+            // signed manifest, whose bytes do not hash to the digest. Any of those
+            // means "not this endpoint's content": the blob endpoint is asked.
+            let manifest_error = match Self::ok(manifest, &endpoint, &reference) {
+                Ok(response) if sha256_digest(&response.body) == *digest => {
+                    return Ok(response.body);
+                }
+                Ok(response) => RegistryError::DigestMismatch {
+                    expected: digest.clone(),
+                    actual: sha256_digest(&response.body),
+                },
+                Err(error) => error,
             };
+            let blob = self
+                .request(HttpRequest::new(
+                    HttpMethod::Get,
+                    format!("{}/v2/{}/blobs/{reference}", endpoint.base, endpoint.name),
+                ))
+                .await?;
+            if blob.status == 404 {
+                // Neither endpoint has it: the manifest endpoint's answer is the
+                // one to report.
+                return Err(manifest_error);
+            }
+            let bytes = Self::ok(blob, &endpoint, &reference)?.body;
+            // Whichever endpoint served it, the bytes must be the content the
+            // digest names.
             verify(digest, &bytes)?;
             Ok(bytes)
         })
