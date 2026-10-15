@@ -55,6 +55,8 @@ mod gsc;
 mod origin;
 mod setup;
 
+pub mod signin;
+
 pub mod fleet;
 
 pub use billing::{Billing, DISPUTE_POLL_CRON, Plan, entitlements};

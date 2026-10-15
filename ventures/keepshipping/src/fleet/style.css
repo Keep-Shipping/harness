@@ -56,6 +56,18 @@ body { margin: 0 auto; max-width: 80rem; padding: 0 1rem 3rem; }
 }
 .wordmark { font-weight: 700; color: var(--ink); }
 .section { color: var(--muted); font-size: 0.9rem; }
+.signout { margin: 0 0 0 auto; }
+.signout button {
+  font: inherit;
+  font-size: 0.9rem;
+  color: var(--accent);
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 0;
+  padding: 0.2rem 0.6rem;
+  cursor: pointer;
+}
+.signout button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 h1 { color: var(--ink); font-size: 1.4rem; margin: 1.25rem 0 0.25rem; }
 h2 { color: var(--ink); font-size: 1rem; margin: 1.5rem 0 0.25rem; }
 .meta { color: var(--muted); font-size: 0.9rem; margin: 0 0 1rem; }

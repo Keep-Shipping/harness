@@ -5,23 +5,167 @@
 //! by `tests/fleet.rs`; what is left here is only the Workers wiring. It
 //! fails closed at every step: an unconfigured console is `503`, a missing
 //! or unverifiable token is `401`, an email off the allowlist is `403`.
+//!
+//! The sign-in routes (`/console/login`, `/console/callback`,
+//! `/console/logout`) are wired here too; the flow itself is
+//! [`crate::signin`], equally pure and tested natively.
 
 use std::sync::{Arc, OnceLock};
 
 use cratefield_auth_client::AuthClient;
+use cratefield_core::{Clock, HmacSigner};
 use cratefield_runtime_cloudflare::{FetchClient, WorkersClock};
 use worker::{Env, Headers, Method, Request, Response};
 
 use super::{
-    Fleet, Route, bearer_token, cookie_value, email_allowed, notice_page, render_index,
-    render_site, route,
+    Fleet, Route, bearer_token, cookie_value, notice_page, render_index, render_site, route,
 };
+use crate::signin::{self, CALLBACK_PATH, Client, LOGIN_PATH, LOGOUT_PATH, Reply};
 
 /// Answers console paths, or `None` when the path is not the console's and
 /// the request should fall through to the harness.
 pub async fn handle(req: &Request, env: &Env) -> Option<worker::Result<Response>> {
-    let route = route(&req.path())?;
+    let path = req.path();
+    if let Some(step) = sign_in_step(&path) {
+        return Some(serve_sign_in(req, env, step).await);
+    }
+    let route = route(&path)?;
     Some(serve(req, env, route).await)
+}
+
+/// The three sign-in routes, matched exactly (trailing slash tolerant).
+#[derive(Clone, Copy)]
+enum Step {
+    Login,
+    Callback,
+    Logout,
+}
+
+fn sign_in_step(path: &str) -> Option<Step> {
+    match path.trim_end_matches('/') {
+        LOGIN_PATH => Some(Step::Login),
+        CALLBACK_PATH => Some(Step::Callback),
+        LOGOUT_PATH => Some(Step::Logout),
+        _ => None,
+    }
+}
+
+/// A config value as trimmed text, blank counting as absent — the same rule
+/// the secrets are read by. Vars and secrets both qualify: the issuer and
+/// client id are public, the allowlist may be sensitive.
+fn read(env: &Env, name: &str) -> Option<String> {
+    env.var(name)
+        .ok()
+        .map(|value| value.to_string())
+        .or_else(|| env.secret(name).ok().map(|secret| secret.to_string()))
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+async fn serve_sign_in(req: &Request, env: &Env, step: Step) -> worker::Result<Response> {
+    let allowed = match step {
+        Step::Login | Step::Callback => matches!(req.method(), Method::Get),
+        // A state change: POST only, behind the worker's origin guard.
+        Step::Logout => matches!(req.method(), Method::Post),
+    };
+    if !allowed {
+        let allow = if matches!(step, Step::Logout) { "POST" } else { "GET" };
+        return page_with(
+            405,
+            &notice_page(
+                "Method not allowed",
+                "This sign-in step does not answer that method.",
+                None,
+            ),
+            &[("allow", allow)],
+        );
+    }
+    let (Some(issuer), Some(client_id), Some(allowlist)) =
+        (read(env, "AUTH_ISSUER"), read(env, "AUTH_CLIENT_ID"), read(env, "CONSOLE_EMAILS"))
+    else {
+        return page(503, &notice_page("Console not configured", CONFIGURED_COPY, None));
+    };
+    let client_secret = read(env, "AUTH_CLIENT_SECRET");
+    let client =
+        Client { issuer: &issuer, client_id: &client_id, client_secret: client_secret.as_deref() };
+    if matches!(step, Step::Logout) {
+        return reply(&signin::logout(&client));
+    }
+    // The login cookie is signed, and the refresh cookie sealed, with keys
+    // from `HARNESS_SECRET`: a console without it cannot sign anyone in.
+    let Some((signer, secret)) = signer(env) else {
+        return page(503, &notice_page("Console not configured", SIGNER_COPY, None));
+    };
+    let previous = read(env, "HARNESS_SECRET_PREVIOUS");
+    let Some(keys) = signin::Keys::new(&signer, &secret, previous.as_deref()) else {
+        return page(503, &notice_page("Console not configured", SIGNER_COPY, None));
+    };
+    let url = req.url()?;
+    let origin = url.origin().ascii_serialization();
+    let now = WorkersClock.now().unix_timestamp();
+    let cookies = req.headers().get("cookie").ok().flatten();
+    let verifier = console_auth(&issuer, &client_id);
+    let answer = if matches!(step, Step::Login) {
+        let next = url.query_pairs().find(|(name, _)| name == "next").map(|(_, v)| v.into_owned());
+        signin::login(
+            &client,
+            &allowlist,
+            &origin,
+            next.as_deref(),
+            cookies.as_deref(),
+            &keys,
+            &FetchClient,
+            &verifier,
+            now,
+        )
+        .await
+    } else {
+        signin::finish(
+            &client,
+            &allowlist,
+            &origin,
+            url.query(),
+            cookies.as_deref(),
+            &keys,
+            &FetchClient,
+            &verifier,
+            now,
+        )
+        .await
+    };
+    reply(&answer)
+}
+
+/// The harness signer over `HARNESS_SECRET` (+ `HARNESS_SECRET_PREVIOUS`),
+/// and the secret itself for the refresh cookie's sealer.
+fn signer(env: &Env) -> Option<(HmacSigner, String)> {
+    let secret = read(env, "HARNESS_SECRET")?;
+    let signer = HmacSigner::new(secret.clone(), read(env, "HARNESS_SECRET_PREVIOUS")).ok()?;
+    Some((signer.with_clock(Arc::new(WorkersClock)), secret))
+}
+
+/// A [`Reply`] as a response: a redirect, or a notice page with the
+/// console's security headers; `Set-Cookie` either way.
+fn reply(answer: &Reply) -> worker::Result<Response> {
+    let response = match (&answer.location, &answer.notice) {
+        (Some(location), _) => {
+            let headers = Headers::new();
+            headers.set("location", location)?;
+            headers.set("cache-control", "private, no-store")?;
+            headers.set("referrer-policy", "no-referrer")?;
+            Response::empty()?.with_status(answer.status).with_headers(headers)
+        }
+        (None, Some(notice)) => page(
+            answer.status,
+            &notice_page(
+                &notice.title,
+                &notice.message,
+                notice.link.as_ref().map(|(href, text)| (href.as_str(), text.as_str())),
+            ),
+        )?,
+        (None, None) => Response::empty()?.with_status(answer.status),
+    };
+    with_cookies(response, &answer.set_cookies)
 }
 
 async fn serve(req: &Request, env: &Env, route: Route) -> worker::Result<Response> {
@@ -37,44 +181,83 @@ async fn serve(req: &Request, env: &Env, route: Route) -> worker::Result<Respons
         );
     }
 
-    // A config value as trimmed text, blank counting as absent — the same
-    // rule the secrets are read by. Vars and secrets both qualify: the
-    // issuer and client id are public, the allowlist may be sensitive.
-    let read = |name: &str| {
-        env.var(name)
-            .ok()
-            .map(|value| value.to_string())
-            .or_else(|| env.secret(name).ok().map(|secret| secret.to_string()))
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-    };
     let (Some(issuer), Some(client_id), Some(allowlist)) =
-        (read("AUTH_ISSUER"), read("AUTH_CLIENT_ID"), read("CONSOLE_EMAILS"))
+        (read(env, "AUTH_ISSUER"), read(env, "AUTH_CLIENT_ID"), read(env, "CONSOLE_EMAILS"))
     else {
         return page(503, &notice_page("Console not configured", CONFIGURED_COPY, None));
     };
 
-    // Who: a bearer token in the header, else the console cookie.
+    // Who: a bearer token in the header, else the console cookie; a
+    // cookie session that has lapsed is renewed from the refresh cookie
+    // before the 401 (a bearer header is the caller's own business).
     let headers = req.headers();
-    let token = bearer_token(headers.get("authorization").ok().flatten().as_deref())
-        .or_else(|| cookie_value(headers.get("cookie").ok().flatten().as_deref(), COOKIE));
-    let Some(token) = token else {
-        return unauthorized(&issuer);
+    let bearer = bearer_token(headers.get("authorization").ok().flatten().as_deref());
+    let cookie_header = headers.get("cookie").ok().flatten();
+    let from_cookie = bearer.is_none();
+    let token = bearer.or_else(|| cookie_value(cookie_header.as_deref(), COOKIE));
+    let here = req.path();
+    let verifier = console_auth(&issuer, &client_id);
+    let verified = match token {
+        Some(token) => match verifier.verify(&token).await {
+            Ok(claims) => Some(claims),
+            Err(error) => {
+                tracing::warn!(%error, "console: token rejected");
+                None
+            }
+        },
+        None => None,
     };
-    let claims = match console_auth(&issuer, &client_id).verify(&token).await {
-        Ok(claims) => claims,
-        Err(error) => {
-            tracing::warn!(%error, "console: token rejected");
-            return unauthorized(&issuer);
+    let (claims, set_cookies) = match verified {
+        Some(claims) => (claims, Vec::new()),
+        None if from_cookie => {
+            match renew(env, &issuer, &client_id, cookie_header.as_deref(), &verifier).await {
+                signin::Refresh::Renewed { claims, set_cookies } => (claims, set_cookies),
+                signin::Refresh::SignedOut { set_cookies } => {
+                    return with_cookies(unauthorized(&here)?, &set_cookies);
+                }
+                signin::Refresh::Unavailable => return unauthorized(&here),
+            }
         }
+        None => return unauthorized(&here),
     };
-    let Some(email) = claims.email.filter(|_| claims.email_verified == Some(true)) else {
-        return page(403, &notice_page("Not allowed", FORBIDDEN_COPY, None));
-    };
-    if !email_allowed(&email, &allowlist) {
+    if !signin::allowed(&claims, &allowlist) {
         return page(403, &notice_page("Not allowed", FORBIDDEN_COPY, None));
     }
+    with_cookies(fleet_page(env, route).await?, &set_cookies)
+}
 
+/// A server-side refresh from the `ks_console_refresh` cookie, or signed
+/// out when the deployment has no `HARNESS_SECRET` to open it with.
+async fn renew(
+    env: &Env,
+    issuer: &str,
+    client_id: &str,
+    cookie_header: Option<&str>,
+    verifier: &AuthClient,
+) -> signin::Refresh {
+    let Some((signer, secret)) = signer(env) else {
+        return signin::Refresh::Unavailable;
+    };
+    let previous = read(env, "HARNESS_SECRET_PREVIOUS");
+    let Some(keys) = signin::Keys::new(&signer, &secret, previous.as_deref()) else {
+        return signin::Refresh::Unavailable;
+    };
+    let client_secret = read(env, "AUTH_CLIENT_SECRET");
+    let client = Client { issuer, client_id, client_secret: client_secret.as_deref() };
+    let now = WorkersClock.now().unix_timestamp();
+    signin::refresh(&client, cookie_header, &keys, &FetchClient, verifier, now).await
+}
+
+/// `Set-Cookie` headers appended to a finished response.
+fn with_cookies(mut response: Response, cookies: &[String]) -> worker::Result<Response> {
+    for cookie in cookies {
+        response.headers_mut().append("set-cookie", cookie)?;
+    }
+    Ok(response)
+}
+
+/// The fleet itself, for a caller already let in.
+async fn fleet_page(env: &Env, route: Route) -> worker::Result<Response> {
     // What: the snapshot the nightly check writes. A missing key is the
     // honest empty state, not an error; a read that fails is a broken
     // console rather than an empty fleet; a snapshot that does not parse
@@ -171,25 +354,23 @@ fn page_with(status: u16, html: &str, extra: &[(&str, &str)]) -> worker::Result<
     Ok(Response::from_html(html)?.with_status(status).with_headers(headers))
 }
 
-/// A 401 that tells the client the scheme it should have used.
-fn unauthorized(issuer: &str) -> worker::Result<Response> {
+/// A 401 that tells the client the scheme it should have used, and gives a
+/// person the console's own sign-in, coming straight back to `here`.
+fn unauthorized(here: &str) -> worker::Result<Response> {
+    let href = signin::login_href(here);
     page_with(
         401,
-        &notice_page("Sign in required", SIGN_IN_COPY, sign_in(issuer)),
+        &notice_page("Sign in required", SIGN_IN_COPY, Some((&href, "Sign in"))),
         &[("www-authenticate", "Bearer")],
     )
-}
-
-/// The "Sign in" link target, only for an https issuer.
-fn sign_in(issuer: &str) -> Option<(&str, &str)> {
-    issuer.starts_with("https://").then_some((issuer, "Sign in"))
 }
 
 const COOKIE: &str = "ks_console";
 const CONFIGURED_COPY: &str = "This deployment is missing AUTH_ISSUER, AUTH_CLIENT_ID or \
      CONSOLE_EMAILS, so the console is switched off. Set them (see the README) and deploy again.";
-const SIGN_IN_COPY: &str = "Open this page signed in to the auth service; your session token is \
-     missing or has expired.";
+const SIGN_IN_COPY: &str = "Your console session is missing or has expired. Sign in to continue.";
+const SIGNER_COPY: &str = "This deployment has no HARNESS_SECRET, which signs the sign-in \
+     attempt, so nobody can sign in. Set it (see the README) and deploy again.";
 const FORBIDDEN_COPY: &str = "Your account is not on this console's allowlist (CONSOLE_EMAILS). \
      Ask an operator to add it.";
 const BROKEN_COPY: &str = "The fleet snapshot in storage is not the shape this page expects. The \

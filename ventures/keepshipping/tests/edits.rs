@@ -438,6 +438,8 @@ fn signed_out_callers_get_the_sign_in_page_not_a_stack_trace() {
         ] {
             assert_eq!(status, StatusCode::UNAUTHORIZED);
             assert!(body.contains("Sign in to continue"), "{body}");
+            // The console's own sign-in, coming straight back here.
+            assert!(body.contains("href=\"/console/login?next=%2Fv1%2Fedits"), "{body}");
             // No way back to a list that would only 401 too.
             assert!(!body.contains("All changes"), "{body}");
         }

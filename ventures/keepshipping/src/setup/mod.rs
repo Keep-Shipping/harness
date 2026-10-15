@@ -582,7 +582,8 @@ async fn account_of(
             ),
         ));
     };
-    match auth.identify(headers).await {
+    // The console session cookie counts as the bearer header it carries.
+    match auth.identify(&crate::signin::session_credentials(headers)).await {
         Ok(caller) => {
             caller.id().map_or_else(|| Err(refuse_anonymous(html)), |id| Ok(id.to_owned()))
         }
@@ -600,6 +601,9 @@ async fn account_of(
 }
 
 fn refuse_anonymous(html: bool) -> Response {
+    if html {
+        return page::sign_in_page();
+    }
     refusal(html, StatusCode::UNAUTHORIZED, "Sign in first", Problem::new(&SLUGS.unauthenticated))
 }
 

@@ -368,6 +368,10 @@ fn an_anonymous_caller_is_asked_to_sign_in() {
     assert_eq!(response.status, StatusCode::UNAUTHORIZED);
     let page = page_of(&response);
     assert!(page.contains("Sign in required"), "{page}");
+    assert!(
+        page.contains("href=\"/console/login?next=%2Fv1%2Fconsole%2Fsearch-console\""),
+        "{page}"
+    );
     // The JSON twin answers the same refusal as a problem, so the Standard
     // setup page's fetch sees it as one.
     let response = pollster::block_on(request(

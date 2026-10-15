@@ -225,7 +225,7 @@ pub fn render_index(snapshot: &Fleet) -> String {
         repo = esc(&snapshot.terraform.repo),
         rev = esc(short(&snapshot.terraform.revision)),
     );
-    layout(&format!("{account} fleet", account = snapshot.account), &body)
+    signed_in_layout(&format!("{account} fleet", account = snapshot.account), &body)
 }
 
 /// One row. `th scope="row"` makes the site name the row's heading for
@@ -326,7 +326,7 @@ pub fn render_site(snapshot: &Fleet, id: &str) -> Option<String> {
         resources = resources_list(site, terraform),
         deploys = deploys_list(site),
     );
-    Some(layout(&site.name, &body))
+    Some(signed_in_layout(&site.name, &body))
 }
 
 /// The one small-page layout (empty state and every error): title, plain
@@ -348,9 +348,23 @@ fn notice_page(title: &str, message: &str, link: Option<(&str, &str)>) -> String
     )
 }
 
+/// [`layout`] for a signed-in page: the bar carries the sign-out button, a
+/// form posting to `/console/logout` (a POST, so a link elsewhere cannot
+/// sign anyone out; the worker's origin guard checks it is same-origin).
+fn signed_in_layout(title: &str, body: &str) -> String {
+    layout_with(title, body, SIGN_OUT)
+}
+
+const SIGN_OUT: &str = "<form class=\"signout\" method=\"post\" action=\"/console/logout\">\
+     <button type=\"submit\">Sign out</button></form>";
+
 /// The one layout every console page shares: fonts, the inlined stylesheet,
 /// a skip link, the wordmark bar.
 fn layout(title: &str, body: &str) -> String {
+    layout_with(title, body, "")
+}
+
+fn layout_with(title: &str, body: &str, bar_extra: &str) -> String {
     format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n\
          <meta charset=\"utf-8\">\n\
@@ -363,7 +377,7 @@ fn layout(title: &str, body: &str) -> String {
          </head>\n<body>\n\
          <a class=\"skip\" href=\"#main\">Skip to content</a>\n\
          <header class=\"bar\"><span class=\"wordmark\">Keep Shipping</span>\
-         <span class=\"section\">Fleet console</span></header>\n\
+         <span class=\"section\">Fleet console</span>{bar_extra}</header>\n\
          {body}</body>\n</html>\n",
         title = esc(title),
         style = STYLE,
