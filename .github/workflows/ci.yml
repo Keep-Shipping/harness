@@ -377,7 +377,18 @@ jobs:
       - name: Restore the cargo build cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # The script cold path spawns `node`, and its extractor needs
+      # `registerHooks` (Node >= 22.15). Pin it rather than measure whatever
+      # the runner image ships this month.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
       - name: Bench the check path against its budget
         run: |
+          # Bare node startup, for reading the script cold number against.
+          node --version
+          time node -e ''
           cargo bench -p ks-cli --bench check \
             || { echo "::error::the check budget is blown (cold 1 s, warm p95 100 ms). Fix: run 'cargo bench -p ks-cli --bench check' locally, read the numbers, and make the check path fast again before adding anything to it."; exit 1; }
