@@ -72,9 +72,9 @@ pub(crate) fn escape(text: &str) -> String {
 }
 
 /// The 401 body: signed-out is a normal state, so it is a page, not a
-/// stack trace. With a sign-in page configured (`EDITS_SIGN_IN_URL`) the
-/// link leads there and straight back; without one, plain words and no
-/// dead link. No "all changes" footer — the list would only 401 too.
+/// stack trace. The link leads to the console sign-in (or the configured
+/// `EDITS_SIGN_IN_URL`) and straight back; `None` renders plain words and
+/// no dead link. No "all changes" footer — the list would only 401 too.
 pub(crate) fn signed_out(sign_in: Option<String>) -> String {
     let link = match sign_in {
         Some(href) => {

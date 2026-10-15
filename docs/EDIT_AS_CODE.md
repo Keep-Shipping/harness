@@ -73,17 +73,19 @@ harness's token verifier (`AUTH_ISSUER` + `AUTH_CLIENT_ID`); with both unset
 the port is `Unconfigured` and the pages answer 503 rather than serve
 anonymously. Browsers may present the credential two ways: an
 `Authorization: Bearer` header (a page's `fetch`), or the session cookie the
-venture's sign-in sets:
+console sign-in (`/console/login`, see the venture README) sets:
 
-- name `ks_session`, holding the same JWT a Bearer header would carry;
-- scoped to the console host, `HttpOnly`, `Secure`, `SameSite=Lax`.
+- name `ks_console`, holding the same JWT a Bearer header would carry;
+- scoped to the console host (host-only), `Path=/`, `HttpOnly`, `Secure`,
+  `SameSite=Lax`, for the token's lifetime.
 
 SameSite=Lax plus the worker's origin guard (writes must carry an allowlisted
 or same-origin `Origin`) are what keep a cookie-bearing form post safe
-against cross-site forgery. The 401 page links to `EDITS_SIGN_IN_URL` when
-that var is set, with `return=<where the visitor was>` so the sign-in can
-come straight back; without it the page says so in words instead of showing
-a dead link.
+against cross-site forgery. The 401 page links to the console sign-in,
+`/console/login?next=<where the visitor was>`, which comes straight back —
+renewing silently from the refresh cookie when the session has only lapsed.
+Setting `EDITS_SIGN_IN_URL` points the link at another sign-in page instead,
+with `return=<where the visitor was>`.
 
 ## Configuration
 
@@ -92,7 +94,7 @@ a dead link.
 | `EDITS_REPO` | the infrastructure repository, `owner/name` (required) |
 | `EDITS_BASE_BRANCH` | the branch pull requests target, usually `main` (required) |
 | `EDITS_INFRA_DIR` | directory the zone modules live under; empty = repository root |
-| `EDITS_SIGN_IN_URL` | the venture sign-in page the 401 page links to (optional) |
+| `EDITS_SIGN_IN_URL` | another sign-in page for the 401 link (optional; default: the console's own `/console/login`) |
 | `EDITS_GITHUB_TOKEN` | secret: the token that opens pull requests and fires dispatches. Until it is set the pages render and the queue waits — nothing fails |
 | `EDITS_RUNNER_TOKEN` | secret: the Bearer the CI plan callback must present |
 | `EDITS_GITHUB_API_BASE` | overrides `https://api.github.com` (tests, self-hosted) |

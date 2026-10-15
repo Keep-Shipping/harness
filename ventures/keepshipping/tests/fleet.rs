@@ -160,6 +160,8 @@ fn pages_are_static_and_keyboard_friendly() {
     assert!(html.contains(":focus-visible"));
     assert!(html.contains("<th scope=\"col\">") && html.contains("<th scope=\"row\">"));
     assert!(!html.contains("<script"), "no JS anywhere");
+    // Signing out is a same-origin POST, never a link.
+    assert!(html.contains("<form class=\"signout\" method=\"post\" action=\"/console/logout\">"));
 }
 
 #[test]

@@ -146,6 +146,17 @@ pub(crate) fn error_page(status: StatusCode, title: &str, detail: &str) -> Respo
     html_response(status, page(title, None, &body))
 }
 
+/// The signed-out page (401): the console sign-in, coming back to the
+/// setup index.
+pub(crate) fn sign_in_page() -> Response {
+    let body = format!(
+        "<h1>Sign in first</h1><p class=\"error\">This console needs a signed-in account.</p>\
+         <p><a href=\"{}\">Sign in</a> and you will come straight back here.</p>",
+        escape(&crate::signin::login_href("/v1/setup"))
+    );
+    html_response(StatusCode::UNAUTHORIZED, page("Sign in first", None, &body))
+}
+
 /// `GET /v1/setup`: the domains already set up, and the box to name a new
 /// one (the handler turns `?domain=` into the checklist's address).
 pub fn index_page(domains: &[String]) -> String {

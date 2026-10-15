@@ -28,6 +28,11 @@ cratefield-adapter-turnstile = "0.3"
 # The console fleet view's token verifier (issue #169), shared with the
 # runtime's own `auth_from_env` wiring.
 cratefield-auth-client = "0.3"
+# The console sign-in (`src/signin.rs`): PKCE, `state` and the authorize URL
+# from the harness's own OAuth client rather than a hand-rolled copy.
+# Locked at 0.3.0: 0.3.1 moves to cratefield-core 0.9, which would put a
+# second core in the graph until the venture itself moves.
+cratefield-oauth-client = "0.3"
 percent-encoding = "2"
 serde = { version = "1", features = ["derive"] }
 # The setup change's files go to GitHub's contents API base64-encoded.
@@ -63,6 +68,10 @@ cratefield-testing = "0.5"
 hmac = "0.13"
 http = "1"
 insta = "1"
+# `tests/signin.rs` mints ES256 tokens the way the auth service does, so the
+# console's real verifier checks them; already in the graph through
+# cratefield-auth-client.
+p256 = { version = "0.14", features = ["ecdsa"] }
 # The mail guard reads the venture's vendored Factory Zero registry entry
 # (#178): no "Sent with Owlpost" footer while Owlpost is not in it.
 ks-core.workspace = true

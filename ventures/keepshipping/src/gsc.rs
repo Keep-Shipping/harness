@@ -785,7 +785,8 @@ async fn caller_of(state: &ModuleState, headers: &HeaderMap) -> Caller {
                 .to_owned(),
         );
     };
-    match auth.identify(headers).await {
+    // The console session cookie counts as the bearer header it carries.
+    match auth.identify(&crate::signin::session_credentials(headers)).await {
         Ok(caller) => match caller.id() {
             Some(id) => Caller::SignedIn(id.to_owned()),
             None => Caller::NeedsSignIn,
@@ -1051,7 +1052,11 @@ fn render_page(zone: Option<&str>, status: Option<&Status>) -> String {
 fn sign_in_page() -> Response {
     html_page(
         StatusCode::UNAUTHORIZED,
-        &document("<h1>Sign in required</h1>\n<p>Sign in to see your Search Console status.</p>"),
+        &document(&format!(
+            "<h1>Sign in required</h1>\n<p><a href=\"{}\">Sign in</a> to see your Search \
+             Console status.</p>",
+            escape(&crate::signin::login_href("/v1/console/search-console"))
+        )),
     )
 }
 

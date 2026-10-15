@@ -21,12 +21,18 @@ enabled = true
 
 [vars]
 ENV = "production"
-# The console fleet view (issue #169) is fail-closed: until all three are
-# set, /console/fleet answers 503. Fill them in and uncomment to switch it
-# on. CONSOLE_EMAILS is the comma-separated allowlist (case-insensitive).
+# The console (fleet view #169, and its sign-in at /console/login) is
+# fail-closed: until all three are set, /console/* answers 503. Fill them in
+# and uncomment to switch it on. CONSOLE_EMAILS is the comma-separated
+# allowlist (case-insensitive). The example is the STAGING auth instance and
+# its console client (a public client: PKCE, no secret); production is
+# https://auth.keepshipping.run with its own client id. The client must have
+# https://console.keepshipping.run/console/callback registered. Sign-in also
+# needs the HARNESS_SECRET secret (it signs the login cookie and seals the
+# refresh cookie); a confidential client adds the AUTH_CLIENT_SECRET secret.
 # CONSOLE_EMAILS = "ada@factory0.ventures"
-# AUTH_ISSUER = "https://auth.factory0.ventures"
-# AUTH_CLIENT_ID = "keepshipping-console"
+# AUTH_ISSUER = "https://auth-staging.keepshipping.run"
+# AUTH_CLIENT_ID = "01M4ZZN100JG23BKKX4P3YXA3D"
 
 # Edit as code (issue #170, docs/EDIT_AS_CODE.md): where the console's
 # Terraform pull requests go. EDITS_REPO is `owner/name`; files land under
@@ -39,8 +45,8 @@ ENV = "production"
 EDITS_REPO = "keepshipping/infra"
 EDITS_BASE_BRANCH = "main"
 EDITS_INFRA_DIR = ""
-# The sign-in page the console's 401 links to (with ?return=… set).
-# Empty/absent means the 401 page uses words instead of a link.
+# An external sign-in page for the edit-as-code 401 (with ?return=… set).
+# Empty/absent means the console's own /console/login?next=… — the default.
 EDITS_SIGN_IN_URL = ""
 
 [[ratelimits]]

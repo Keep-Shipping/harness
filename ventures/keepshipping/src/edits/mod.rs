@@ -302,44 +302,23 @@ async fn author_of(
 }
 
 /// The credentials a browser brings: an `Authorization` header when the
-/// page's fetch sent one, otherwise the console's session cookie. The
-/// venture's sign-in sets `ks_session` on the console host — HttpOnly,
-/// Secure, SameSite=Lax (the cookie contract in docs/EDIT_AS_CODE.md) —
-/// and SameSite=Lax plus the origin guard are what keep a form post
-/// carrying it safe against cross-site forgery. The verifier is the same
-/// bearer-token one; the cookie only becomes its header.
+/// page's fetch sent one, otherwise the console's session cookie
+/// (`ks_console`, set by the console sign-in — the cookie contract in
+/// docs/EDIT_AS_CODE.md) as that header. See
+/// [`crate::signin::session_credentials`].
 fn session_credentials(headers: &HeaderMap) -> HeaderMap {
-    let cookie = headers.get(header::COOKIE).and_then(|value| value.to_str().ok());
-    let token = cookie.and_then(|value| {
-        value.split(';').filter_map(|pair| pair.trim().split_once('=')).find_map(|(name, value)| {
-            (name == SESSION_COOKIE && !value.trim().is_empty()).then(|| value.trim().to_owned())
-        })
-    });
-    match (headers.contains_key(header::AUTHORIZATION), token) {
-        (true, _) | (false, None) => headers.clone(),
-        (false, Some(token)) => {
-            let mut with_bearer = headers.clone();
-            if let Ok(value) = format!("Bearer {token}").parse() {
-                with_bearer.insert(header::AUTHORIZATION, value);
-            }
-            with_bearer
-        }
-    }
+    crate::signin::session_credentials(headers)
 }
 
-/// The console's session cookie, set by the venture's sign-in.
-const SESSION_COOKIE: &str = "ks_session";
-
-/// Where the 401 page should send a signed-out visitor, if the deployment
-/// names a sign-in page (`EDITS_SIGN_IN_URL`, a non-secret var): that page
-/// plus `return=<where they were>`. `None` renders plain words instead of
-/// a dead link.
+/// Where the 401 page should send a signed-out visitor: the console's own
+/// sign-in (`/console/login?next=<where they were>`), unless the deployment
+/// names another sign-in page (`EDITS_SIGN_IN_URL`, a non-secret var) —
+/// then that page plus `return=<where they were>`.
 fn sign_in_link(ctx: &ModuleContext, path: &str) -> Option<String> {
-    let base = ModuleConfig::new(Edits::NAME, ctx.config.as_ref()).get_opt("SIGN_IN_URL")?;
-    let base = base.trim();
-    if base.is_empty() {
-        return None;
-    }
+    let configured = ModuleConfig::new(Edits::NAME, ctx.config.as_ref()).get_opt("SIGN_IN_URL");
+    let Some(base) = configured.as_deref().map(str::trim).filter(|base| !base.is_empty()) else {
+        return Some(crate::signin::login_href(path));
+    };
     let glue = if base.contains('?') { '&' } else { '?' };
     let back = form_urlencoded::Serializer::new(String::new())
         .append_pair("return", &format!("{}{path}", ctx.venture.public_url))

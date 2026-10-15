@@ -186,7 +186,51 @@ all three config values below are set it answers `503`.
   (`cratefield-auth-client`); the token comes from `Authorization: Bearer`
   or the `ks_console` cookie, must have a verified `email` on the
   `CONSOLE_EMAILS` allowlist (comma-separated, case-insensitive), or the
-  page answers `401`/`403`.
+  page answers `401`/`403`. The 401 page's "Sign in" goes to the console's
+  own sign-in, below.
+
+## Sign-in
+
+The console signs people in against a Cratefield auth instance with the
+authorization-code flow and S256 PKCE (`src/signin.rs`):
+
+- `GET /console/login?next=<path>` — a fresh `state` and PKCE verifier go
+  into `ks_console_login` (signed with `HARNESS_SECRET`, 10 minutes,
+  `Path=/console`), and the browser goes to
+  `{AUTH_ISSUER}/v1/auth-core/authorize` with `client_id`, `redirect_uri =
+  https://<console host>/console/callback`, `response_type=code`, `state`
+  and the challenge. A browser that still holds a refresh cookie is renewed
+  in place and sent straight to `next` instead.
+- `GET /console/callback` — the `state` must match the login cookie; the
+  code is exchanged (with the verifier, plus `AUTH_CLIENT_SECRET` for a
+  confidential client) at `{AUTH_ISSUER}/v1/auth-core/token`; the access
+  token must pass the verifier above and the allowlist (`403`, no cookie,
+  otherwise). Then `ks_console` (the access token; `Path=/`, `Max-Age` = its
+  lifetime, 10 minutes) and `ks_console_refresh` (the refresh token, sealed
+  with a key derived from `HARNESS_SECRET`; `Path=/console`, 30 days) are
+  set and the browser goes to `next`.
+- When the access cookie has lapsed or no longer verifies, a `/console`
+  page refreshes server-side (`grant_type=refresh_token`), always keeping
+  the rotated refresh token, and sets both cookies again before falling
+  back to the 401; a refused refresh clears both. `/v1` pages do not see
+  the refresh cookie — their "Sign in" goes through `/console/login`,
+  which renews the same way.
+- `POST /console/logout` (the fleet pages' "Sign out"; same-origin, behind
+  the origin guard) clears both cookies and links the auth service's own
+  sign-out.
+
+`next` is honoured only as a same-origin path under `/console`,
+`/v1/edits`, `/v1/setup` or `/v1/console`; anything else lands on
+`/console/fleet`. Every cookie is HttpOnly, Secure, SameSite=Lax and
+host-only. Neither codes nor tokens are logged.
+
+The deployment needs, beyond the three vars above: the `HARNESS_SECRET`
+secret (already required by the harness); the console registered as a
+client at the issuer with `https://console.keepshipping.run/console/callback`
+as its redirect URI; and, only for a confidential client,
+`wrangler secret put AUTH_CLIENT_SECRET`. Staging's issuer is
+`https://auth-staging.keepshipping.run` (a public client); production's is
+`https://auth.keepshipping.run`.
 
 ## Test
 
