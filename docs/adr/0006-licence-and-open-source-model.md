@@ -1,6 +1,6 @@
 # ADR 0006: Licence and open-source model
 
-Status: accepted, 2026-10-06
+Status: superseded by [ADR 0016](0016-mit-licence.md) (MIT instead of Apache-2.0), 2026-10-15; accepted 2026-10-06
 
 ## Context
 Keep Shipping's harness runs inside other people's CI and holds their deploy

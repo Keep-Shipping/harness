@@ -5,7 +5,7 @@
   "publisher": "Keep-Shipping",
   "version": "0.0.1",
   "preview": true,
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "MIT",
   "categories": ["Programming Languages"],
   "engines": { "vscode": "^1.91.0" },
   "main": "./extension.js",

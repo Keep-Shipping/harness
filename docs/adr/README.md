@@ -22,7 +22,7 @@ A guard test (`cargo test -p ks-testing --test adr_guard`) checks every ADR belo
 | [0003](0003-workflow-syntax.md) | Workflow syntax | Accepted |
 | [0004](0004-secrets.md) | Secrets | Accepted |
 | [0005](0005-local-first-core-with-optional-hosted-services.md) | Local-first core with optional hosted services | Accepted |
-| [0006](0006-licence-and-open-source-model.md) | Licence and open-source model | Accepted |
+| [0006](0006-licence-and-open-source-model.md) | Licence and open-source model | Superseded by 0016 |
 | [0008](0008-github-actions-first.md) | GitHub Actions first | Accepted |
 | [0009](0009-typescript-escape-hatch-runtime.md) | TypeScript escape-hatch runtime | Accepted |
 | [0010](0010-image-build-backend.md) | Image build backend | Proposed |
@@ -31,6 +31,7 @@ A guard test (`cargo test -p ks-testing --test adr_guard`) checks every ADR belo
 | [0013](0013-rust-workspace.md) | Rust workspace | Accepted |
 | [0014](0014-release-and-contract-versioning.md) | Release and contract versioning | Accepted |
 | [0015](0015-telemetry-policy.md) | Telemetry policy | Accepted |
+| [0016](0016-mit-licence.md) | MIT licence | Accepted |
 | [0100](0100-step-contract-and-composition-checks.md) | Step contract and composition checks | Accepted |
 | [0200](0200-hosted-venture-on-the-cratefield-harness.md) | Hosted venture on the Cratefield harness | Accepted |
 | [0201](0201-hosted-on-cloudflare.md) | Hosted on Cloudflare | Proposed |

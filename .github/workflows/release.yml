@@ -116,7 +116,7 @@ jobs:
           mkdir -p "$stage"
           cp "$bin" "$stage/keepshipping"
           # Keep Shipping ships LICENSE and README next to the binary so the
-          # Apache-2.0 licence (ADR 0006) travels with it.
+          # MIT licence (ADR 0016) travels with it.
           cp LICENSE README.md "$stage/" \
             || echo "::notice::LICENSE or README.md is missing from the tag; the archive carries the binary only."
           # .tar.gz on macOS, .tar.xz on Linux: the two platforms disagree about
