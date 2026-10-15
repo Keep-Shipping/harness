@@ -203,6 +203,9 @@ jobs:
           # unexpected result; the `timeout` catches hangs. The fixtures
           # carry intentional errors, so exit 1 is the one acceptable
           # outcome.
+          # A bare `run:` is `bash -e {0}`, without pipefail, so the pipeline's
+          # status would be tee's 0 and `|| rc=` would never fire.
+          set -o pipefail
           rc=0
           # `sudo … > file` redirects as the *unprivileged* outer shell anyway,
           # so the output is piped through tee instead: it lands in the file
