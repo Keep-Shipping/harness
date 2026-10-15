@@ -320,19 +320,22 @@ jobs:
           # --verify-tag below needs the tag; full history keeps it simple.
           fetch-depth: 0
 
-      - name: Download every archive plus the signed checksums
+      # Two downloads, not one: `pattern` is a single glob, so a two-line
+      # value matches no artifact at all (v0.1.0 downloaded 0 of 5). The
+      # per-target archives and SBOMs are `keepshipping-<target>`; SHA256SUMS
+      # and its signature are the `checksums` artifact.
+      - name: Download every archive and SBOM
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
-          # Two patterns, one per line: the per-target archives and SBOMs are
-          # uploaded as `keepshipping-<target>`, but SHA256SUMS and its
-          # signature are uploaded as `checksums`. A single `keepshipping-*`
-          # would silently skip them and the release would have nothing signed
-          # to attach.
-          pattern: |
-            keepshipping-*
-            checksums
+          pattern: keepshipping-*
           merge-multiple: true
+
+      - name: Download the signed checksums
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: checksums
+          path: dist
 
       - name: Create the release
         # `gh`, which the runner already has, rather than a third-party action:
@@ -363,7 +366,12 @@ jobs:
           # they describe. SHA256SUMS names them too, so the cosign signature
           # and the SLSA provenance attestation both cover them.
           shopt -s nullglob
-          assets=(dist/*.tar.gz dist/*.tar.xz dist/*.cdx.json dist/SHA256SUMS dist/SHA256SUMS.bundle)
+          assets=(dist/*.tar.gz dist/*.tar.xz dist/*.cdx.json)
+          # nullglob drops only unmatched globs; a literal path stays whether or
+          # not it exists, so add these two only when they do.
+          for f in dist/SHA256SUMS dist/SHA256SUMS.bundle; do
+            [ -f "$f" ] && assets+=("$f")
+          done
           ((${#assets[@]} == 10)) \
             || { echo "::error::expected 10 release assets (4 archives, 4 SBOMs, SHA256SUMS and its bundle), found ${#assets[@]}: ${assets[*]}. Fix: check the release matrix covers every target, that each 'Upload the archive and its SBOM' step ran, and that the 'Upload the checksums and the signature' step ran."; exit 1; }
           gh release create "$TAG" \
