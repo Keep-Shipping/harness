@@ -97,6 +97,8 @@ trap cleanup EXIT
 # so the test exercises this function rather than a second code path.
 download() {
   local url="$1" dest="$2"
+  # bash 3.2 (macOS /bin/bash) treats an empty "${header[@]}" as unbound
+  # under `set -u`; the ${a[@]+...} form expands to nothing instead.
   local -a header=()
   # A private release needs a token. `-L` without `--location-trusted` already drops
   # the header on a redirect; the case below refuses to attach it anywhere else.
@@ -105,7 +107,7 @@ download() {
       https://github.com/*) header=(-H "Authorization: Bearer $GH_TOKEN") ;;
     esac
   fi
-  curl -fsSL --retry 3 --retry-delay 1 --retry-connrefused "${header[@]}" \
+  curl -fsSL --retry 3 --retry-delay 1 --retry-connrefused ${header[@]+"${header[@]}"} \
     -o "$dest" "$url" \
     || die "could not download $url. Fix: check the version and that the release $TAG is published."
 }
