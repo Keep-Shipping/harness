@@ -97,7 +97,9 @@ jobs:
           # drives the Linux builds; the darwin builds use plain cargo.
           build=(cargo build --release --locked -p ks-cli --bin keepshipping --target "${{ matrix.target }}")
           if [ "${{ runner.os }}" = "Linux" ]; then
-            build=(cross "${build[@]}")
+            # `cross` replaces `cargo`, it does not wrap it: `cross build`, not
+            # `cross cargo build` (which fails "no such command: `cargo`").
+            build=(cross "${build[@]:1}")
           fi
           "${build[@]}" \
             || { echo "::error::the release build failed for ${{ matrix.target }}. Fix: run 'cargo build --release --locked -p ks-cli --bin keepshipping --target ${{ matrix.target }}' locally (with 'cross' for Linux targets) and fix the build before tagging."; exit 1; }
