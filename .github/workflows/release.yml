@@ -169,7 +169,7 @@ jobs:
           echo "wrote $base.cdx.json"
 
       - name: Upload the archive and its SBOM
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: keepshipping-${{ matrix.target }}
           # The exact names the Archive and SBOM steps wrote, for every matrix
@@ -203,7 +203,7 @@ jobs:
           persist-credentials: false
 
       - name: Download every archive
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           pattern: keepshipping-*
@@ -295,7 +295,7 @@ jobs:
           subject-checksums: dist/SHA256SUMS
 
       - name: Upload the checksums and the signature
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: checksums
           path: |
@@ -333,10 +333,10 @@ jobs:
         # `publish = false`, so release-plz has nothing to release — but the
         # pin is here and correct so that the day publishing is switched on,
         # this is not a workflow that fails on a reference that never existed.
-        uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5.139
+        uses: release-plz/action@18641b6c63063cc5ff8786ebf69cd57e8541bae1 # v0.5.140
 
       - name: Download every archive plus the signed checksums
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           # Two patterns, one per line: the per-target archives and SBOMs are
