@@ -97,7 +97,9 @@
 //! - **Non-Linux**: `/proc/self/fd` and the FIFO route are Linux. Any other
 //!   platform is a clear error naming it, not a silent fallback.
 //!
-//! ```
+//! ```no_run
+//! # // no_run: `new` is a clear error off linux-x86_64 (above), and doc tests
+//! # // run on every platform the gates do.
 //! # fn main() -> Result<(), ks_core::ports::script_host::ScriptHostError> {
 //! use ks_deno_script_host::DenoScriptHost;
 //!
