@@ -76,25 +76,94 @@ SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 INLINE = re.compile(r"(`+)(.+?)\1|\[([^\]]*)\]\(([^)\s]+)\)|\*\*([^*]+)\*\*|\*([^*]+)\*")
 
 STYLES = """\
-:root { color-scheme: light dark; }
-body { max-width: 46rem; margin: 0 auto; padding: 2rem 1rem 4rem;
-       font: 16px/1.6 system-ui, sans-serif; }
-h1, h2, h3, h4 { line-height: 1.25; margin: 2rem 0 .6rem; }
-h1 { margin-top: 0; } a { color: inherit; } li { margin: .2rem 0; }
-nav a { margin-right: 1rem; }
-code { font: .9em ui-monospace, monospace; background: rgba(127,127,127,.15);
-       padding: .1em .3em; border-radius: 3px; }
-pre { background: rgba(127,127,127,.15); padding: .8rem; overflow-x: auto;
-      border-radius: 4px; } pre code { background: none; padding: 0; }
-table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
-th, td { border: 1px solid rgba(127,127,127,.5); padding: .35rem .5rem;
+/* Matches keepshipping.run: Bricolage Grotesque + DM Mono, the same ink,
+   paper and blue, square marks, a dark footer. */
+:root { --ink: oklch(0.2 0.02 262); --paper: oklch(0.955 0.004 255);
+        --blue: oklch(0.48 0.2 263); --muted: oklch(0.45 0.02 262);
+        --rule: oklch(0.86 0.008 262); --code: oklch(0.915 0.006 262);
+        --mono: 'DM Mono', ui-monospace, monospace; }
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--paper); color: var(--ink);
+             -webkit-font-smoothing: antialiased; }
+body { font: 17px/1.6 'Bricolage Grotesque', system-ui, sans-serif;
+       min-height: 100vh; display: flex; flex-direction: column; }
+a { color: var(--blue); text-underline-offset: 3px; }
+a:hover { color: var(--ink); }
+::selection { background: var(--blue); color: #fff; }
+.skip { position: absolute; left: -9999px; top: 8px; padding: 8px 12px;
+        background: var(--ink); color: #fff; z-index: 10; }
+.skip:focus { left: 8px; }
+.top { max-width: 1240px; width: 100%; margin: 0 auto;
+       padding: 20px clamp(20px,5vw,48px); display: flex; align-items: center;
+       justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.brand { display: flex; align-items: center; gap: 10px; text-decoration: none;
+         color: var(--ink); font-weight: 800; font-size: 19px; letter-spacing: -0.02em; }
+.brand:hover { color: var(--ink); }
+.brand i { width: 14px; height: 14px; background: var(--blue); display: block; }
+.brand span { font: 500 14px var(--mono); color: var(--muted); letter-spacing: 0; }
+.top nav { display: flex; align-items: center; gap: 22px; font: 14px var(--mono); }
+.top nav a { color: var(--ink); text-decoration: none; }
+.top nav a:hover { text-decoration: underline; }
+.top nav a.cta { color: #fff; background: var(--ink); padding: 9px 14px; }
+.top nav a.cta:hover { background: var(--blue); text-decoration: none; }
+.wrap { max-width: 1240px; width: 100%; margin: 0 auto; flex: 1;
+        padding: clamp(16px,3vw,32px) clamp(20px,5vw,48px) clamp(56px,8vw,112px);
+        display: grid; grid-template-columns: 250px minmax(0,1fr); gap: clamp(28px,4vw,64px); }
+.side { font: 13.5px/1.45 var(--mono); position: sticky; top: 20px; align-self: start;
+        max-height: calc(100vh - 40px); overflow-y: auto; padding-right: 8px; }
+.back { display: none; font: 14px var(--mono); margin: 0 0 20px; }
+.side h2 { font: 500 12px var(--mono); text-transform: uppercase; letter-spacing: .08em;
+           color: var(--muted); margin: 22px 0 8px; }
+.side h2:first-of-type { margin-top: 0; }
+.side ul { list-style: none; margin: 0; padding: 0; }
+.side li { margin: 0; }
+.side a { display: block; padding: 4px 0 4px 10px; border-left: 2px solid transparent;
+          color: var(--ink); text-decoration: none; }
+.side a:hover { border-left-color: var(--rule); }
+.side a[aria-current="page"] { border-left-color: var(--blue); color: var(--blue); }
+main { min-width: 0; max-width: 46rem; }
+h1, h2, h3, h4 { line-height: 1.15; letter-spacing: -0.02em; margin: 2.2rem 0 .7rem; }
+h1 { margin-top: 0; font-weight: 800; font-size: clamp(36px,5vw,56px); letter-spacing: -0.045em; line-height: 1; }
+h2 { font-weight: 700; font-size: 28px; } h3 { font-size: 21px; } h4 { font-size: 18px; }
+li { margin: .25rem 0; }
+code { font: .86em var(--mono); background: var(--code); padding: .1em .35em; }
+pre { background: var(--ink); color: oklch(0.93 0.005 262); padding: 16px 18px;
+      overflow-x: auto; font-size: 14px; line-height: 1.7; }
+pre code { background: none; padding: 0; color: inherit; font-size: inherit; }
+table { border-collapse: collapse; width: 100%; margin: 1.2rem 0; font-size: 15px;
+        display: block; overflow-x: auto; }
+th, td { border-bottom: 1px solid var(--rule); padding: .5rem .7rem .5rem 0;
          text-align: left; vertical-align: top; }
-th { background: rgba(127,127,127,.12); }
-blockquote { margin: 1rem 0; padding: .1rem 1rem;
-             border-left: 3px solid rgba(127,127,127,.5); }
-hr { border: 0; border-top: 1px solid rgba(127,127,127,.4); margin: 2rem 0; }
-footer { margin-top: 3rem; font-size: .9rem; color: rgba(127,127,127,.9); }
+th { font: 500 13px var(--mono); text-transform: uppercase; letter-spacing: .05em;
+     color: var(--muted); border-bottom: 2px solid var(--ink); }
+blockquote { margin: 1.2rem 0; padding: .2rem 1.1rem; border-left: 4px solid var(--blue);
+             background: #fff; }
+hr { border: 0; border-top: 1px solid var(--rule); margin: 2.4rem 0; }
+.foot { background: var(--ink); color: oklch(0.85 0.006 262); }
+.foot div { max-width: 1240px; margin: 0 auto; padding: 28px clamp(20px,5vw,48px);
+            display: flex; flex-wrap: wrap; justify-content: space-between;
+            align-items: center; gap: 16px; font: 14px var(--mono); }
+.foot code { background: none; color: #fff; padding: 0; }
+.foot a { color: oklch(0.85 0.006 262); } .foot a:hover { color: #fff; }
+.foot nav { display: flex; gap: 24px; flex-wrap: wrap; }
+.foot .mark { display: flex; align-items: center; gap: 10px; color: #fff; }
+.foot .mark i { width: 10px; height: 10px; background: oklch(0.62 0.17 263); display: block; }
+@media (max-width: 900px) {
+  .wrap { grid-template-columns: minmax(0,1fr); }
+  .side { display: none; }
+  .back { display: block; }
+}
 """
+
+
+INTERNAL = re.compile(r"^>\s*\*\*Internal\.\*\*")
+
+
+def is_internal(text: str) -> bool:
+    """A doc that opens with a `> **Internal.**` callout (within its first 20
+    lines) is the team's runbook, not user documentation: it stays in the repo
+    and is left off the public site. Links to it point at GitHub instead."""
+    return any(INTERNAL.match(line) for line in text.split("\n")[:20])
 
 
 def esc(text: str) -> str:
@@ -117,6 +186,7 @@ class Build:
         self.docs, self.repo_root, self.verbose = docs.resolve(), repo_root.resolve(), verbose
         self.warnings: list[tuple[str, int, str]] = []
         self.by_rel: dict[str, str] = {}  # rel path in docs/ -> page url
+        self.internal: set[str] = set()  # docs/ paths marked Internal: not published
         self.pages: list[dict] = []
 
     def warn(self, rel: str, line: int, message: str) -> None:
@@ -138,6 +208,9 @@ class Build:
         for path in sorted(self.docs.rglob("*.md")):
             rel = path.relative_to(self.docs).as_posix()
             if not path.is_file() or any(part.startswith(".") for part in rel.split("/")):
+                continue
+            if is_internal(path.read_text(encoding="utf-8")):
+                self.internal.add(rel)
                 continue
             self.by_rel[rel] = self.url_for(rel)
             self.pages.append({"group": group_of(rel), "rel": rel, "path": path, "url": self.by_rel[rel]})
@@ -201,6 +274,8 @@ class Build:
         if not resolved.startswith(".."):
             if resolved in self.by_rel:
                 return self.by_rel[resolved] + suffix
+            if resolved in self.internal:
+                return f"{REPO_BLOB}/docs/{resolved}{suffix}"
             self.warn(page["rel"], line, f"link target {url!r} does not resolve to a doc (docs/{resolved}.md)")
             return None
 
@@ -418,19 +493,24 @@ class Build:
 # -- output ---------------------------------------------------------------
 
 
-def nav_html(pages: list[dict]) -> str:
-    """Home plus the first page of each group. The landing page is the table
-    of contents; a full sidebar would be more code than this site needs."""
-    links = ['<a href="/">Home</a>']
-    seen: set[str] = set()
-    for page in pages:
-        if page["group"] not in seen:
-            seen.add(page["group"])
-            links.append(f'<a href="{page["url"]}">{esc(page["title"])}</a>')
-    return f'<nav aria-label="Pages">{"".join(links)}</nav>'
+def nav_html(pages: list[dict], current: str = "") -> str:
+    """Every page, grouped, with the current one marked. Wide screens only: a
+    phone gets a single "All docs" link to the index (the full table of
+    contents) instead of every page listed above the text."""
+    out = ['<nav class="side" aria-label="All docs">']
+    for group in group_order(pages):
+        members = [page for page in pages if page["group"] == group]
+        if members:
+            out.append(f'<h2>{esc(group)}</h2><ul>')
+            for page in members:
+                mark = ' aria-current="page"' if page["url"] == current else ""
+                out.append(f'<li><a href="{page["url"]}"{mark}>{esc(page["title"])}</a></li>')
+            out.append("</ul>")
+    out.append("</nav>")
+    return "".join(out)
 
 
-def page_html(title: str, body: str, pages: list[dict]) -> str:
+def page_html(title: str, body: str, pages: list[dict], current: str = "") -> str:
     """The one HTML shell. No build date, no version, nothing that varies."""
     return (
         "<!doctype html>\n"
@@ -438,9 +518,24 @@ def page_html(title: str, body: str, pages: list[dict]) -> str:
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
         f"<title>{esc(title)} — {esc(TITLE)}</title>\n"
         f'<meta name="description" content="{html.escape(DESCRIPTION, quote=True)}">\n'
+        '<link rel="icon" href="https://keepshipping.run/assets/favicon.svg" type="image/svg+xml">\n'
+        '<link rel="preconnect" href="https://fonts.googleapis.com">\n'
+        '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
+        '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:'
+        'opsz,wght@12..96,400;12..96,500;12..96,700;12..96,800&family=DM+Mono:wght@400;500&display=swap">\n'
         '<link rel="stylesheet" href="/styles.css">\n</head>\n<body>\n'
-        f"{nav_html(pages)}\n<main>\n{body}\n</main>\n"
-        f"<footer>{esc(TITLE)} {esc(TAGLINE)} — built from <code>docs/</code>.</footer>\n"
+        '<a class="skip" href="#main">Skip to content</a>\n'
+        '<header class="top"><a class="brand" href="/" aria-label="Keep Shipping documentation home">'
+        f"<i aria-hidden=\"true\"></i>{esc(TITLE)} <span>{esc(TAGLINE)}</span></a>"
+        '<nav aria-label="Site"><a href="https://keepshipping.run/">keepshipping.run</a>'
+        '<a href="https://github.com/Keep-Shipping">GitHub</a>'
+        '<a class="cta" href="https://keepshipping.run/#early-access">Early access</a></nav></header>\n'
+        f'<div class="wrap">{nav_html(pages, current)}\n<main id="main">\n'
+        f'{"<p class=back><a href=/>← All docs</a></p>" if current else ""}\n{body}\n</main></div>\n'
+        '<footer class="foot"><div><span class="mark"><i aria-hidden="true"></i>docs.keepshipping.run</span>'
+        '<span>© 2026 <a href="https://factory0.ventures/">Factory Zero Pte. Ltd.</a> · built from <code>docs/</code></span>'
+        '<nav aria-label="Footer"><a href="https://keepshipping.run/">Home</a>'
+        '<a href="https://keepshipping.run/privacy">Privacy</a><a href="/llms.txt">llms.txt</a></nav></div></footer>\n'
         "</body>\n</html>\n"
     )
 
@@ -533,7 +628,7 @@ def build(docs: Path, out: Path, check: bool, verbose: bool) -> int:
             continue
         target = out / page["url"].lstrip("/")
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(page_html(page["title"], page["body"], builder.pages), encoding="utf-8")
+        target.write_text(page_html(page["title"], page["body"], builder.pages, page["url"]), encoding="utf-8")
         if verbose:
             print(f"site.py: {page['rel']} -> {page['url']}")
     for name, text in (

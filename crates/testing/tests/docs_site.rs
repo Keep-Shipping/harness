@@ -44,8 +44,9 @@ const GENERATOR_OWNED: &[&str] = &["styles.css", "robots.txt", "sitemap.xml"];
 /// `<main>`. Borrowed when the page has no body, which never happens for a
 /// real page, and owned when it does.
 fn chrome(page: &str) -> Cow<'_, str> {
-    match (page.split_once("<main>"), page.rsplit_once("</main>")) {
-        (Some((before, _)), Some((_, after))) => Cow::Owned(format!("{before}{after}")),
+    // `<main` with or without attributes (`<main id="main">`, the skip link's target).
+    match (page.find("<main"), page.rsplit_once("</main>")) {
+        (Some(at), Some((_, after))) => Cow::Owned(format!("{}{after}", &page[..at])),
         _ => Cow::Borrowed(page),
     }
 }
@@ -168,7 +169,15 @@ fn tree(dir: &Path) -> BTreeMap<String, String> {
     out
 }
 
-/// Every `.md` under `docs/`, as docs-relative `/`-separated paths, sorted.
+/// A doc opening with a `> **Internal.**` callout is left off the site
+/// (`is_internal` in `tools/site.py`).
+fn is_internal(path: &Path) -> bool {
+    fs::read_to_string(path).expect("a doc should be readable").lines().take(20).any(|line| {
+        line.strip_prefix('>').is_some_and(|rest| rest.trim_start().starts_with("**Internal.**"))
+    })
+}
+
+/// Every published `.md` under `docs/`, as docs-relative `/`-separated paths, sorted.
 /// Recursive because `docs/adr/` is published too, its README index included.
 fn source_docs(docs: &Path) -> Vec<String> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
@@ -180,7 +189,8 @@ fn source_docs(docs: &Path) -> Vec<String> {
         for path in entries {
             if path.is_dir() {
                 walk(root, &path, out);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            } else if path.extension().and_then(|e| e.to_str()) == Some("md") && !is_internal(&path)
+            {
                 out.push(
                     path.strip_prefix(root)
                         .expect("under docs/")
