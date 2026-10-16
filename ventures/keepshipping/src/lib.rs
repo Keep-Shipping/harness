@@ -394,7 +394,7 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> worker::Result<Respo
     // A bare host or `/console` has no page of its own: send it to the
     // console's start page, which signs the visitor in first.
     if is_console_entry(req.method().as_ref(), req.path().as_str()) {
-        let mut headers = worker::Headers::new();
+        let headers = worker::Headers::new();
         headers.set("location", signin::DEFAULT_NEXT)?;
         return Ok(Response::empty()?.with_status(302).with_headers(headers));
     }
