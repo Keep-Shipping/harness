@@ -97,6 +97,19 @@ pub async fn connected_at(env: &Env, secret: &str) -> Result<Option<String>, Fai
     }))
 }
 
+/// The names of the accounts the stored token can list, for the connect
+/// page. Empty when there is no token or the listing fails: the page then
+/// simply does not say.
+pub async fn visible_accounts(env: &Env, secret: &str) -> Vec<String> {
+    let Ok(Some(token)) = load_token(env, secret).await else {
+        return Vec::new();
+    };
+    list::<Account>(&token, "/accounts")
+        .await
+        .map(|accounts| accounts.into_iter().map(|account| account.name).collect())
+        .unwrap_or_default()
+}
+
 /// The token as stored, opened; `None` when there is none or it does not open.
 async fn load_token(env: &Env, secret: &str) -> Result<Option<String>, Failed> {
     let Some(row) = stored(env).await? else {

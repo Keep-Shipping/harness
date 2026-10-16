@@ -340,7 +340,13 @@ async fn connect_form(env: &Env) -> worker::Result<Response> {
         return page(503, &notice_page("Console not configured", SEALER_COPY, None));
     };
     match api::connected_at(env, &secret).await {
-        Ok(connected) => page(200, &connect_page(connected.as_deref(), None)),
+        Ok(connected) => {
+            let accounts = match connected {
+                Some(_) => api::visible_accounts(env, &secret).await,
+                None => Vec::new(),
+            };
+            page(200, &connect_page(connected.as_deref(), &accounts, None))
+        }
         Err(failed) => page(
             failed.status,
             &notice_page("Could not check the connection", failed.message, None),

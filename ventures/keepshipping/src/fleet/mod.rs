@@ -418,8 +418,13 @@ pub(crate) fn notice_page(title: &str, message: &str, link: Option<(&str, &str)>
 /// form posting to `/console/logout` (a POST, so a link elsewhere cannot
 /// sign anyone out; the worker's origin guard checks it is same-origin).
 pub(crate) fn signed_in_layout(title: &str, body: &str) -> String {
-    layout_with(title, body, SIGN_OUT)
+    layout_with(title, body, &format!("{NAV}{SIGN_OUT}"))
 }
+
+/// The console's own pages, on every signed-in page's bar.
+const NAV: &str = "<nav class=\"consolenav\" aria-label=\"Console\">\
+     <a href=\"/console/fleet\">Sites</a>\
+     <a href=\"/console/connect/cloudflare\">Cloudflare connection</a></nav>";
 
 const SIGN_OUT: &str = "<form class=\"signout\" method=\"post\" action=\"/console/logout\">\
      <button type=\"submit\">Sign out</button></form>";
@@ -442,7 +447,7 @@ fn layout_with(title: &str, body: &str, bar_extra: &str) -> String {
          <style>\n{style}</style>\n\
          </head>\n<body>\n\
          <a class=\"skip\" href=\"#main\">Skip to content</a>\n\
-         <header class=\"bar\"><span class=\"wordmark\">Keep Shipping</span>\
+         <header class=\"bar\"><a class=\"wordmark\" href=\"/console/fleet\">Keep Shipping</a>\
          <span class=\"section\">Fleet console</span>{bar_extra}</header>\n\
          {body}</body>\n</html>\n",
         title = esc(title),
@@ -484,10 +489,36 @@ pub fn email_allowed(email: &str, allowlist: &str) -> bool {
 }
 
 fn domains_text(site: &Site) -> String {
-    if site.domains.is_empty() {
+    let Some(main) = main_domain(&site.domains) else {
         return "<span class=\"unknown\">—</span>".to_owned();
+    };
+    let rest: Vec<String> =
+        site.domains.iter().filter(|domain| *domain != main).map(|domain| esc(domain)).collect();
+    if rest.is_empty() {
+        return esc(main);
     }
-    site.domains.iter().map(|domain| esc(domain)).collect::<Vec<_>>().join(", ")
+    format!(
+        "{main}<details class=\"more\"><summary>+{count} more</summary>{rest}</details>",
+        main = esc(main),
+        count = rest.len(),
+        rest = rest.join("<br>"),
+    )
+}
+
+/// The domain a person means by the site: a custom domain over the
+/// platform's own (`*.pages.dev`, `*.workers.dev`), the apex over `www.`,
+/// then the shortest; the listed order breaks ties.
+#[must_use]
+pub fn main_domain(domains: &[String]) -> Option<&String> {
+    let platform =
+        |domain: &str| domain.ends_with(".pages.dev") || domain.ends_with(".workers.dev");
+    domains
+        .iter()
+        .enumerate()
+        .min_by_key(|(index, domain)| {
+            (platform(domain), domain.starts_with("www."), domain.len(), *index)
+        })
+        .map(|(_, domain)| domain)
 }
 
 fn deploy_text(site: &Site) -> String {
