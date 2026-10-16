@@ -502,8 +502,8 @@ async fn fleet_page(env: &Env, route: Route) -> worker::Result<Response> {
         }
     };
     match route {
-        Route::Index => page(200, &render_index(&snapshot)),
-        Route::Site(id) => match render_site(&snapshot, &id) {
+        Route::Index => page(200, &render_index(&snapshot, &api::now())),
+        Route::Site(id) => match render_site(&snapshot, &id, &api::now()) {
             Some(html) => page(200, &html),
             None => page(
                 404,

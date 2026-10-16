@@ -13,8 +13,11 @@ fn fixture() -> fleet::Fleet {
     serde_json::from_str(FIXTURE).expect("fixtures/fleet.json is a valid snapshot")
 }
 
+/// The fixture's own `generated_at`: "checked … just now".
+const NOW: &str = "2026-10-09T06:00:00Z";
+
 fn index() -> String {
-    fleet::render_index(&fixture())
+    fleet::render_index(&fixture(), NOW)
 }
 
 #[test]
@@ -38,13 +41,16 @@ fn the_index_lists_every_site_with_its_last_deploy_and_terraform_link() {
     // older one, and the time in plain words. A site never deployed says
     // so rather than leaving an empty cell.
     assert!(html.contains(
-        "<code>b7e4a9c</code> · ada · <time datetime=\"2026-10-08T17:42:00Z\">8 Oct 2026, 17:42 UTC</time> · 12 hours ago"
+        "<time datetime=\"2026-10-08T17:42:00Z\" title=\"8 Oct 2026, 17:42 UTC · ada\">12 hours ago</time>"
     ));
+    assert!(html.contains("<code>b7e4a9c</code>"));
     assert!(!html.contains("5a3c1e9"), "older deploy must not be the shown one");
     assert!(html.contains("Never deployed"));
     // The summary line and the count of sites needing attention: one
     // expiring certificate, one failing one, one site changed outside code.
-    assert!(html.contains("5 sites · 3 need attention"));
+    assert!(html.contains("5 sites in Factory Zero"));
+    assert!(html.contains("<span class=\"n\">3</span> Need attention"));
+    assert!(html.contains("3 sites need attention"));
     assert!(html.contains(
         "checked <time datetime=\"2026-10-09T06:00:00Z\">9 Oct 2026, 06:00 UTC</time> · just now"
     ));
@@ -60,7 +66,7 @@ fn the_index_lists_every_site_with_its_last_deploy_and_terraform_link() {
         assert!(page.contains(&format!(">{short}:{line}</a>")), "no short link for {path}");
     }
     for site in &snapshot.sites {
-        let detail = fleet::render_site(&snapshot, &site.id).expect("known id");
+        let detail = fleet::render_site(&snapshot, &site.id, NOW).expect("known id");
         if let Some(at) = &site.defined_at {
             for page in [&html, detail.as_str()] {
                 expects(page, &at.path, at.line, rev);
@@ -77,7 +83,7 @@ fn the_index_lists_every_site_with_its_last_deploy_and_terraform_link() {
 
 #[test]
 fn the_detail_page_lists_resources_deploys_and_optional_fields() {
-    let html = fleet::render_site(&fixture(), "keepshipping-run").expect("known id");
+    let html = fleet::render_site(&fixture(), "keepshipping-run", NOW).expect("known id");
     assert!(html.contains("&larr; All sites"));
     assert!(html.contains("DNS record"), "resource kinds in plain words");
     assert!(html.contains("<strong>apex</strong>"));
@@ -87,17 +93,17 @@ fn the_detail_page_lists_resources_deploys_and_optional_fields() {
     assert!(html.contains("92/100"));
     assert!(html.contains("DMARC policy is not p=reject on www.keepshipping.run"));
     // Optional fields read as not-checked, never as blank.
-    let worker = fleet::render_site(&fixture(), "keepshipping-waitlist").expect("known id");
+    let worker = fleet::render_site(&fixture(), "keepshipping-waitlist", NOW).expect("known id");
     assert!(worker.contains("Not checked yet"));
     assert!(worker.contains("None recorded") && worker.contains("Never deployed"));
 }
 
 #[test]
 fn an_unknown_id_renders_nothing() {
-    assert_eq!(fleet::render_site(&fixture(), "no-such-site"), None);
-    assert_eq!(fleet::render_site(&fixture(), ""), None);
+    assert_eq!(fleet::render_site(&fixture(), "no-such-site", NOW), None);
+    assert_eq!(fleet::render_site(&fixture(), "", NOW), None);
     // No prefix matches, either: ids match exactly.
-    assert_eq!(fleet::render_site(&fixture(), "keepshipping-ru"), None);
+    assert_eq!(fleet::render_site(&fixture(), "keepshipping-ru", NOW), None);
 }
 
 #[test]
@@ -136,13 +142,12 @@ fn hostile_snapshot_strings_stay_escaped() {
         }]
     }))
     .expect("the hostile snapshot is still valid JSON against the contract");
-    let html = fleet::render_index(&hostile);
+    let html = fleet::render_index(&hostile, NOW);
     assert!(!html.contains("<script>"), "no raw script tag: {html}");
     assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     // The entity the attacker planted is shown as text ("&amp;quot;"), the
     // real quote is escaped ("&quot;"): nothing raw survives either way.
     assert!(html.contains("&amp;quot; onclick=&quot;steal()"));
-    assert!(html.contains("&lt;b&gt;ada"));
     // Attribute contexts escape too — the repo lands inside an href/title.
     assert!(html.contains("Factory-Zero/infra&quot;, onmouseover=&quot;x"));
     // An unparseable timestamp is shown as-is, never reformatted into a lie.
@@ -151,8 +156,10 @@ fn hostile_snapshot_strings_stay_escaped() {
     // gets no link at all — just plain text.
     assert!(!html.contains("href=\"https://github.com/"));
     assert!(html.contains("<span class=\"unknown\">main.tf:1</span>"));
-    let detail = fleet::render_site(&hostile, "evil").expect("known id");
+    let detail = fleet::render_site(&hostile, "evil", NOW).expect("known id");
     assert!(!detail.contains("<script>"));
+    // The trigger is in the site page's deploy history, escaped.
+    assert!(detail.contains("&lt;b&gt;ada"));
 }
 
 #[test]
