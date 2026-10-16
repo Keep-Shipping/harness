@@ -388,3 +388,45 @@ fn a_test_hostname_outside_every_imported_zone_is_not_created() {
     let files = plan_files(&scoped, &test, &backend());
     assert!(!files["modules/test-env/main.tf"].contains("cloudflare_dns_record"));
 }
+
+#[test]
+fn the_workflow_pins_actions_by_full_sha_and_keeps_event_values_out_of_scripts() {
+    let files = pages_files(&full_test(Some(DbKind::Postgres)));
+    let workflow = &files[".github/workflows/infra.yml"];
+    assert!(
+        workflow
+            .contains("opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2")
+    );
+    assert!(
+        workflow
+            .contains("actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2")
+    );
+    assert!(
+        workflow.contains(
+            "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2"
+        )
+    );
+    assert_eq!(workflow.matches("tofu_wrapper: false").count(), 2);
+    assert!(!workflow.contains("TODO"), "{workflow}");
+    // Every `${{ }}` that carries a caller-controlled value sits in an env or
+    // with value, never in a `run:` script.
+    for line in workflow.lines().filter(|line| line.contains("${{")) {
+        let controlled = line.contains("client_payload")
+            || line.contains("head_ref")
+            || line.contains("event.pull_request");
+        if controlled {
+            let trimmed = line.trim_start();
+            let is_value = trimmed.starts_with("ref:")
+                || trimmed.starts_with("name:")
+                || trimmed.starts_with("run-id:")
+                || trimmed.starts_with("github-token:")
+                || trimmed.chars().next().is_some_and(|ch| ch.is_ascii_uppercase())
+                    && trimmed.contains(": ${{");
+            assert!(is_value, "a caller-controlled value outside env/with: {line}");
+        }
+    }
+    // The apply job refuses without a digest and reads the saved plan from the run that made it.
+    assert!(workflow.contains("refusing to apply"));
+    assert!(workflow.contains("approved/tfplan"));
+    assert!(workflow.contains("actions: read"));
+}

@@ -469,9 +469,10 @@ fn output_pairs(test: &TestEnv) -> Vec<(&'static str, &'static str)> {
 
 // -- the workflow and the README ---------------------------------------------
 
-/// The CI workflow: plan on each pull request and post the plan back; apply
-/// the exact approved plan on `repository_dispatch`. Secrets are named here
-/// and their values never appear in the file.
+/// The CI workflow: plan on each pull request, post the plan back, and keep the
+/// saved plan as an artifact; apply exactly that saved plan on
+/// `repository_dispatch`. Secrets are named here and their values never appear
+/// in the file. Event values reach the shell only through `env:`, never inline.
 fn workflow(database: Option<DbKind>, destinations: bool) -> String {
     let mut env = String::from(
         "      TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}\n      TF_VAR_cloudflare_account_id: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}\n      TF_VAR_state_encryption_passphrase: ${{ secrets.STATE_ENCRYPTION_PASSPHRASE }}\n      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}\n      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}\n",
@@ -492,10 +493,13 @@ fn workflow(database: Option<DbKind>, destinations: bool) -> String {
             let _ = writeln!(env, "      TF_VAR_{name}: ${{{{ secrets.{secret} }}}}");
         }
     }
-    format!(
-        r#"# Written by Keep Shipping. Pull requests are planned and the plan is posted
+    WORKFLOW.replace("__TF_ENV__\n", &env)
+}
+
+/// The workflow text. `__TF_ENV__` is replaced by the variables both jobs need.
+const WORKFLOW: &str = r#"# Written by Keep Shipping. Pull requests are planned and the plan is posted
 # back to the console; approval sends a repository_dispatch and this workflow
-# applies exactly the plan that was checked. Regenerated when the setup is
+# applies the saved plan that was checked. Regenerated when the setup is
 # re-run, so change the setup rather than this file.
 name: infra
 
@@ -515,74 +519,112 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     env:
-{env}    steps:
+__TF_ENV__
+    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # TODO pin sha: no full commit SHA for opentofu/setup-opentofu is recorded in this repository yet.
-      - uses: opentofu/setup-opentofu@v1
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_wrapper: false
       - name: Initialise
         run: tofu init -input=false
       - name: Plan
         run: tofu plan -input=false -lock-timeout=5m -out=tfplan
       - name: Render the plan as JSON
         run: tofu show -json tfplan > plan.json
+      - name: Fingerprint the saved plan
+        id: fingerprint
+        run: echo "sha=$(sha256sum tfplan | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Keep the saved plan for the apply
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tfplan-${{ github.event.pull_request.head.sha }}
+          path: tfplan
+          retention-days: 7
+          if-no-files-found: error
       - name: Post the plan to Keep Shipping
         if: startsWith(github.head_ref, 'ks-edit/')
         env:
-          CONSOLE_URL: ${{{{ vars.KEEPSHIPPING_CONSOLE_URL }}}}
-          RUNNER_TOKEN: ${{{{ secrets.EDITS_RUNNER_TOKEN }}}}
-          HEAD_SHA: ${{{{ github.event.pull_request.head.sha }}}}
-          HEAD_REF: ${{{{ github.head_ref }}}}
+          CONSOLE_URL: ${{ vars.KEEPSHIPPING_CONSOLE_URL }}
+          RUNNER_TOKEN: ${{ secrets.EDITS_RUNNER_TOKEN }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.head_ref }}
+          PLAN_SHA: ${{ steps.fingerprint.outputs.sha }}
         run: |
           set -euo pipefail
-          edit_id="${{HEAD_REF#ks-edit/}}"
-          plan_sha="$(sha256sum tfplan | cut -d' ' -f1)"
-          jq -n --arg head "$HEAD_SHA" --arg sha "$plan_sha" --slurpfile plan plan.json \
-            '{{head_sha: $head, plan_file_sha256: $sha, plan: $plan[0]}}' > body.json
+          edit_id="${HEAD_REF#ks-edit/}"
+          jq -n --arg head "$HEAD_SHA" --arg sha "$PLAN_SHA" --slurpfile plan plan.json \
+            '{head_sha: $head, plan_file_sha256: $sha, plan: $plan[0]}' > body.json
           curl --fail-with-body --silent --show-error -X POST \
-            -H "Authorization: Bearer ${{RUNNER_TOKEN}}" \
+            -H "Authorization: Bearer ${RUNNER_TOKEN}" \
             -H "Content-Type: application/json" \
             --data-binary @body.json \
-            "${{CONSOLE_URL}}/v1/edits/${{edit_id}}/plan"
+            "${CONSOLE_URL}/v1/edits/${edit_id}/plan"
 
   apply:
     if: github.event_name == 'repository_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     concurrency:
       group: infra-apply
       cancel-in-progress: false
     env:
-{env}    steps:
+__TF_ENV__
+    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{{{ github.event.client_payload.head_sha }}}}
+          ref: ${{ github.event.client_payload.head_sha }}
           persist-credentials: false
-      # TODO pin sha: see the plan job.
-      - uses: opentofu/setup-opentofu@v1
-      - name: Initialise
-        run: tofu init -input=false
-      - name: Plan again
-        run: tofu plan -input=false -lock-timeout=5m -out=tfplan
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_wrapper: false
+      - name: Find the plan run for this commit
+        id: find
+        env:
+          HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          run_id="$(gh run list --repo "$GH_REPO" --workflow infra.yml --commit "$HEAD_SHA" \
+            --event pull_request --status success --limit 1 --json databaseId \
+            --jq '.[0].databaseId')"
+          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+            echo "No successful plan run for this commit; refusing to apply." >&2
+            exit 1
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+      - name: Fetch the saved plan
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tfplan-${{ github.event.client_payload.head_sha }}
+          path: approved
+          run-id: ${{ steps.find.outputs.run_id }}
+          github-token: ${{ github.token }}
       - name: Check this is the approved plan
         env:
-          APPROVED: ${{{{ github.event.client_payload.plan_file_sha256 }}}}
+          APPROVED: ${{ github.event.client_payload.plan_file_sha256 }}
         run: |
           set -euo pipefail
           if [ -z "$APPROVED" ]; then
             echo "The approval carries no plan digest; refusing to apply." >&2
             exit 1
           fi
-          actual="$(sha256sum tfplan | cut -d' ' -f1)"
+          actual="$(sha256sum approved/tfplan | cut -d' ' -f1)"
           if [ "$actual" != "$APPROVED" ]; then
-            echo "The plan changed since it was approved; refusing to apply." >&2
+            echo "The saved plan does not match the approved digest; refusing to apply." >&2
             exit 1
           fi
+      - name: Initialise
+        run: tofu init -input=false
+      # tofu refuses a saved plan whose state has moved on since it was made, so a
+      # stale plan fails here rather than applying changes nobody checked.
       - name: Apply the approved plan
-        run: tofu apply -input=false tfplan
-"#
-    )
-}
+        run: tofu apply -input=false approved/tfplan
+"#;
 
 /// The README for the infra repository, in plain words.
 fn readme(test: bool, destinations: bool) -> String {
