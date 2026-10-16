@@ -110,6 +110,15 @@ impl Kind {
             Kind::Worker => "Worker",
         }
     }
+
+    /// The tag in a table row, where the column already says it is an app.
+    fn short(self) -> &'static str {
+        match self {
+            Kind::Zone => "Domain",
+            Kind::Pages => "Pages",
+            Kind::Worker => "Worker",
+        }
+    }
 }
 
 /// One managed site. The optional fields ([`Site::deploys`], [`Site::tls`],
@@ -265,145 +274,363 @@ pub fn route(path: &str) -> Option<Route> {
     }
 }
 
-/// The whole fleet: one row per site, sorted by venture then name so the
-/// same snapshot always renders the same page.
+/// The whole fleet: a summary, what needs attention, then one section per
+/// venture with its apps (Pages sites and Workers, each environment under
+/// its production row) and its domains. The order is fixed (venture,
+/// group, production first), so the same snapshot always renders the same page; `now`
+/// (RFC 3339) is what the relative times are measured from.
 #[must_use]
-pub fn render_index(snapshot: &Fleet) -> String {
+pub fn render_index(snapshot: &Fleet, now: &str) -> String {
+    let terraform = snapshot.terraform.as_ref();
     let mut sites: Vec<&Site> = snapshot.sites.iter().collect();
     sites.sort_by_key(|&site| sort_key(site));
-    let attention = sites.iter().filter(|site| needs_attention(site)).count();
-    let count = format!(
-        "{} site{} · {} {} attention",
-        sites.len(),
-        if sites.len() == 1 { "" } else { "s" },
-        attention,
-        if attention == 1 { "needs" } else { "need" },
+    let attention: Vec<&Site> =
+        sites.iter().copied().filter(|site| needs_attention(site)).collect();
+    let count = |kind: Kind| sites.iter().filter(|site| site.kind == kind).count();
+    let stats = format!(
+        "<ul class=\"stats\" aria-label=\"Summary\">\n{}{}{}{}</ul>\n",
+        stat(count(Kind::Zone), "Domain", "Domains", ""),
+        stat(count(Kind::Pages), "Pages site", "Pages sites", ""),
+        stat(count(Kind::Worker), "Worker", "Workers", ""),
+        stat(
+            attention.len(),
+            "Needs attention",
+            "Need attention",
+            if attention.is_empty() { "" } else { " bad" },
+        ),
     );
-    let rows = sites
-        .iter()
-        .map(|site| site_row(site, snapshot.terraform.as_ref(), &snapshot.generated_at))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let terraform = match &snapshot.terraform {
+    let source = match terraform {
         Some(terraform) => format!(
-            "Terraform {repo} at <code>{rev}</code>",
+            " · Terraform {repo} at <code>{rev}</code>",
             repo = esc(&terraform.repo),
             rev = esc(short(&terraform.revision, 7)),
         ),
-        None => "Not managed by Terraform yet".to_owned(),
+        None => String::new(),
     };
-    let gaps = if snapshot.gaps.is_empty() {
+    let ventures = ventures(&sites);
+    let jump = if ventures.len() > 1 {
+        format!(
+            "<nav class=\"jump\" aria-label=\"Ventures\">{}</nav>\n",
+            ventures
+                .iter()
+                .enumerate()
+                .map(|(index, (venture, members))| format!(
+                    "<a href=\"#venture-{index}\">{name} <span class=\"count\">{count}</span></a>",
+                    name = venture_name(venture),
+                    count = members.len(),
+                ))
+                .collect::<String>()
+        )
+    } else {
+        String::new()
+    };
+    let sections = ventures
+        .iter()
+        .enumerate()
+        .map(|(index, (venture, members))| venture_section(index, venture, members, terraform, now))
+        .collect::<String>();
+    let body = format!(
+        "<main id=\"main\" class=\"wrap\">\n\
+         <div class=\"pagehead\">\n<div>\n<h1>Sites</h1>\n\
+         <p class=\"sub\">{total} site{plural} in {account} · checked {when}{source}</p>\n</div>\n\
+         {REFRESH_FORM}\n</div>\n\
+         {stats}{gaps}{attention}{note}{jump}{sections}</main>\n",
+        total = sites.len(),
+        plural = if sites.len() == 1 { "" } else { "s" },
+        account = esc(&snapshot.account),
+        when = time_html(&snapshot.generated_at, now),
+        gaps = gaps_callout(&snapshot.gaps),
+        attention = attention_callout(&attention),
+        note = if terraform.is_none() { TERRAFORM_NOTE } else { "" },
+    );
+    signed_in_layout("Sites", Tab::Sites, &body)
+}
+
+/// One summary figure: `<li class="stat"><span class="n">37</span> Domains</li>`.
+fn stat(count: usize, one: &str, many: &str, class: &str) -> String {
+    format!(
+        "<li class=\"stat{class}\"><span class=\"n\">{count}</span> {}</li>\n",
+        if count == 1 { one } else { many }
+    )
+}
+
+/// Said once, above the tables, instead of in every row: the checks that
+/// need Terraform are left out of the tables until it is connected.
+const TERRAFORM_NOTE: &str = "<p class=\"callout info\"><strong>Not managed by Terraform yet.</strong> \
+     Baseline scores, code drift and links to the code come from Terraform, so they appear once \
+     it is connected.</p>\n";
+
+/// The parts of Cloudflare the last refresh could not read, as a list.
+fn gaps_callout(gaps: &[String]) -> String {
+    if gaps.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<section class=\"callout warn\" aria-labelledby=\"gaps-title\">\n\
+         <h2 id=\"gaps-title\">Not read this time</h2>\n\
+         <p>Everything else on this page is current. These could not be read:</p>\n\
+         <ul>\n{}</ul>\n</section>\n",
+        gaps.iter().map(|gap| format!("<li>{}</li>\n", esc(gap))).collect::<String>()
+    )
+}
+
+/// The sites that need attention, each with what is wrong in words.
+fn attention_callout(sites: &[&Site]) -> String {
+    if sites.is_empty() {
+        return String::new();
+    }
+    let items = sites
+        .iter()
+        .map(|site| {
+            format!(
+                "<li><a href=\"/console/fleet/{id}\">{name}</a>{venture} <span class=\"why\">{why}</span></li>\n",
+                id = utf8_percent_encode(&site.id, ID),
+                name = esc(&site.name),
+                venture = if site.venture.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" <span class=\"muted\">{}</span>", esc(&site.venture))
+                },
+                why = esc(&attention_reasons(site).join("; ")),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<section class=\"callout bad\" aria-labelledby=\"attention-title\">\n\
+         <h2 id=\"attention-title\">{count} {noun} attention</h2>\n<ul>\n{items}</ul>\n</section>\n",
+        count = sites.len(),
+        noun = if sites.len() == 1 { "site needs" } else { "sites need" },
+    )
+}
+
+/// What [`needs_attention`] found, in words, with the snapshot's notes.
+fn attention_reasons(site: &Site) -> Vec<String> {
+    let with = |words: &str, note: Option<&String>| match note.map(|n| n.trim()) {
+        Some(note) if !note.is_empty() => format!("{words}: {note}"),
+        _ => words.to_owned(),
+    };
+    let mut reasons = Vec::new();
+    if let Some(tls) = &site.tls {
+        match tls.status {
+            TlsStatus::Expiring => {
+                reasons.push(with("HTTPS certificate expiring soon", tls.note.as_ref()))
+            }
+            TlsStatus::Failing => reasons.push(with("HTTPS failing", tls.note.as_ref())),
+            TlsStatus::Ok | TlsStatus::Unknown => {}
+        }
+    }
+    if let Some(dns) = &site.dns
+        && dns.status == DnsStatus::Problem
+    {
+        reasons.push(with("DNS problem", dns.note.as_ref()));
+    }
+    if site.drift == Some(Drift::Drifted) {
+        reasons.push("Changed outside code".to_owned());
+    }
+    reasons
+}
+
+/// The sorted sites cut into runs of one venture each, in order.
+fn ventures<'a>(sites: &[&'a Site]) -> Vec<(String, Vec<&'a Site>)> {
+    let mut out: Vec<(String, Vec<&Site>)> = Vec::new();
+    for &site in sites {
+        let venture = site.venture.trim();
+        match out.last_mut() {
+            Some((name, members)) if name == venture => members.push(site),
+            _ => out.push((venture.to_owned(), vec![site])),
+        }
+    }
+    out
+}
+
+/// A venture's heading; sites with none are grouped as "No venture".
+fn venture_name(venture: &str) -> String {
+    if venture.is_empty() { "No venture".to_owned() } else { esc(venture) }
+}
+
+/// One venture: its heading and counts, its apps table, its domains table.
+fn venture_section(
+    index: usize,
+    venture: &str,
+    sites: &[&Site],
+    terraform: Option<&Terraform>,
+    now: &str,
+) -> String {
+    let (zones, apps): (Vec<&Site>, Vec<&Site>) =
+        sites.iter().copied().partition(|site| site.kind == Kind::Zone);
+    let counts = [(apps.len(), "app", "apps"), (zones.len(), "domain", "domains")]
+        .iter()
+        .filter(|(count, _, _)| *count > 0)
+        .map(|(count, one, many)| format!("{count} {}", if *count == 1 { one } else { many }))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let checks = terraform.is_some();
+    let extra_head = if checks {
+        "<th scope=\"col\" class=\"c-score\">Baseline</th><th scope=\"col\" class=\"c-code\">Code</th>\
+         <th scope=\"col\" class=\"c-file\">Defined in</th>"
+    } else {
+        ""
+    };
+    let table_class = if checks { "sites checks" } else { "sites" };
+    let apps_table = if apps.is_empty() {
         String::new()
     } else {
         format!(
-            "<p class=\"gaps\"><strong>Not read this time:</strong> {}.</p>\n",
-            snapshot.gaps.iter().map(|gap| esc(gap)).collect::<Vec<_>>().join("; ")
+            "<table class=\"{table_class}\">\n\
+             <caption>Apps <span class=\"count\">{count}</span></caption>\n\
+             <thead><tr><th scope=\"col\">App</th><th scope=\"col\" class=\"c-domain\">Domain</th>\
+             <th scope=\"col\" class=\"c-deploy\">Last deploy</th><th scope=\"col\" class=\"c-status\">HTTPS</th>\
+             <th scope=\"col\" class=\"c-status\">DNS</th>{extra_head}</tr></thead>\n\
+             <tbody>\n{rows}</tbody>\n</table>\n",
+            count = apps.len(),
+            rows = apps.iter().map(|site| app_row(site, terraform, now)).collect::<String>(),
         )
     };
-    let body = format!(
-        "<main id=\"main\">\n<h1>{account} fleet</h1>\n\
-         <p class=\"meta\">{count} · checked {when} · {terraform}</p>\n\
-         {gaps}\
-         <p>{REFRESH_FORM}</p>\n\
-         <table>\n\
-         <caption class=\"offscreen\">Every site with its last deploy, HTTPS, DNS, baseline and \
-         code state</caption>\n\
-         <thead><tr><th scope=\"col\">Site</th><th scope=\"col\">Venture</th>\
-         <th scope=\"col\">Domains</th><th scope=\"col\">Last deploy</th><th scope=\"col\">HTTPS</th>\
-         <th scope=\"col\">DNS</th><th scope=\"col\">Baseline</th><th scope=\"col\">Code</th>\
-         <th scope=\"col\">Defined in</th></tr></thead>\n\
-         <tbody>\n{rows}</tbody>\n</table>\n</main>\n",
-        account = esc(&snapshot.account),
-        count = count,
-        // The snapshot's own time is its reference, so its relative part is
-        // "just now" on this page; the deploy times are measured from it.
-        when = time_html(&snapshot.generated_at, &snapshot.generated_at),
-        terraform = terraform,
-        REFRESH_FORM = REFRESH_FORM,
-    );
-    signed_in_layout(&format!("{account} fleet", account = snapshot.account), &body)
+    let zones_table = if zones.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<table class=\"{table_class} zones\">\n\
+             <caption>Domains <span class=\"count\">{count}</span></caption>\n\
+             <thead><tr><th scope=\"col\">Domain</th>\
+             <th scope=\"col\" class=\"c-deploy\">Last change</th><th scope=\"col\" class=\"c-status\">HTTPS</th>\
+             <th scope=\"col\" class=\"c-status\">DNS</th>{extra_head}</tr></thead>\n\
+             <tbody>\n{rows}</tbody>\n</table>\n",
+            count = zones.len(),
+            rows = zones.iter().map(|site| zone_row(site, terraform, now)).collect::<String>(),
+        )
+    };
+    format!(
+        "<section class=\"venture\" id=\"venture-{index}\" aria-labelledby=\"venture-{index}-title\">\n\
+         <div class=\"vhead\"><h2 id=\"venture-{index}-title\">{name}</h2>\
+         <span class=\"muted\">{counts}</span></div>\n\
+         {apps_table}{zones_table}</section>\n",
+        name = venture_name(venture),
+    )
 }
 
-/// The snapshot's refresh button: a POST to the same-origin gate.
+/// The refresh button: a POST to the same-origin gate.
 pub(crate) const REFRESH_FORM: &str = "<form class=\"refresh\" method=\"post\" \
-     action=\"/console/fleet/refresh\"><button type=\"submit\">Refresh now</button></form>";
+     action=\"/console/fleet/refresh\"><button class=\"btn primary\" type=\"submit\">Refresh now</button></form>";
 
 /// The page for a console with no snapshot yet: connected, it offers the
 /// refresh; not connected, it points at the connect page.
 #[must_use]
-pub(crate) fn empty_snapshot_page(connected: bool) -> String {
-    let body = if connected {
-        format!(
-            "<main id=\"main\">\n<div class=\"notice\">\n<h1>No fleet snapshot yet</h1>\n\
-             <p>Your Cloudflare token is connected, but no snapshot has been written yet. \
-             Refresh to read the account now.</p>\n{REFRESH_FORM}\n</div>\n</main>\n"
+pub fn empty_snapshot_page(connected: bool) -> String {
+    let (message, action) = if connected {
+        (
+            "Your Cloudflare token is connected, but nothing has been read yet. Refresh to read \
+             the account now; it takes a few seconds.",
+            REFRESH_FORM.to_owned(),
         )
     } else {
-        "<main id=\"main\">\n<div class=\"notice\">\n<h1>No fleet snapshot yet</h1>\n\
-         <p>The fleet view is built from a read-only Cloudflare token. Connect one to see your \
-         domains, Pages sites and Workers.</p>\n\
-         <p><a href=\"/console/connect/cloudflare\">Connect Cloudflare</a></p>\n</div>\n</main>\n"
-            .to_owned()
+        (
+            "The console lists your domains, Pages sites and Workers from a read-only Cloudflare \
+             token. Connect one to get started.",
+            "<p><a class=\"btn primary\" href=\"/console/connect/cloudflare\">Connect Cloudflare</a></p>"
+                .to_owned(),
+        )
     };
-    signed_in_layout("No fleet snapshot yet", &body)
+    let body = format!(
+        "<main id=\"main\" class=\"wrap\">\n<div class=\"notice\">\n<h1>No sites yet</h1>\n\
+         <p>{message}</p>\n{action}\n</div>\n</main>\n"
+    );
+    signed_in_layout("No sites yet", Tab::Sites, &body)
 }
 
-/// One row. `th scope="row"` makes the site name the row's heading for
+/// One app row. `th scope="row"` makes the site name the row's heading for
 /// screen readers; each cell carries a `data-label` so the narrow card
-/// layout can name it without JS.
-fn site_row(site: &Site, terraform: Option<&Terraform>, reference: &str) -> String {
-    let change = if site.kind == Kind::Zone {
-        format!(
-            " <a class=\"change\" href=\"/v1/edits/new?kind=dns&amp;zone={zone}\">Change</a>",
-            zone = utf8_percent_encode(&site.name, QUERY),
-        )
-    } else {
-        String::new()
+/// layout can name it without JS. A non-production environment is drawn as
+/// a child of the row above it (the sort puts it there).
+fn app_row(site: &Site, terraform: Option<&Terraform>, now: &str) -> String {
+    let child = is_child(site);
+    // A Pages preview shares its project's name, so its branch names it.
+    let label = match (child, site.kind, site.environment.as_deref()) {
+        (true, Kind::Pages, Some(branch)) => esc(branch),
+        _ => esc(&site.name),
+    };
+    let tags = match (child, site.kind) {
+        (true, Kind::Pages) => "<span class=\"tag env\">preview</span>".to_owned(),
+        _ => format!("<span class=\"tag\">{}</span>{}", site.kind.short(), environment_badge(site)),
     };
     format!(
-        "<tr>\n\
-         <th scope=\"row\"><a href=\"/console/fleet/{id}\">{name}</a> \
-         <span class=\"badge\">{kind}</span>{environment}{change}</th>\n\
-         <td data-label=\"Venture\">{venture}</td>\n\
-         <td data-label=\"Domains\">{domains}</td>\n\
+        "<tr{class}>\n\
+         <th scope=\"row\"><div class=\"name\"><a href=\"/console/fleet/{id}\">{label}</a>{tags}</div></th>\n\
+         <td data-label=\"Domain\">{domains}</td>\n\
          <td data-label=\"Last deploy\">{deploy}</td>\n\
          <td data-label=\"HTTPS\">{tls}</td>\n\
          <td data-label=\"DNS\">{dns}</td>\n\
-         <td data-label=\"Baseline\">{baseline}</td>\n\
-         <td data-label=\"Code\">{drift}</td>\n\
-         <td data-label=\"Defined in\">{defined}</td>\n\
-         </tr>\n",
+         {checks}</tr>\n",
+        class = if child { " class=\"child\"" } else { "" },
         id = utf8_percent_encode(&site.id, ID),
-        name = esc(&site.name),
-        kind = site.kind.words(),
-        environment = environment_badge(site),
-        change = change,
-        venture = venture_text(site),
         domains = domains_text(site),
-        deploy = deploy_text(site, reference),
+        deploy = deploy_cell(site, now),
         tls = tls_span(site),
         dns = dns_span(site),
+        checks = check_cells(site, terraform),
+    )
+}
+
+/// One domain row, with the link to change its DNS as code.
+fn zone_row(site: &Site, terraform: Option<&Terraform>, now: &str) -> String {
+    format!(
+        "<tr>\n\
+         <th scope=\"row\"><div class=\"name\"><a href=\"/console/fleet/{id}\">{name}</a>\
+         <a class=\"action\" href=\"/v1/edits/new?kind=dns&amp;zone={zone}\">Change DNS</a></div></th>\n\
+         <td data-label=\"Last change\">{deploy}</td>\n\
+         <td data-label=\"HTTPS\">{tls}</td>\n\
+         <td data-label=\"DNS\">{dns}</td>\n\
+         {checks}</tr>\n",
+        id = utf8_percent_encode(&site.id, ID),
+        name = esc(&site.name),
+        zone = utf8_percent_encode(&site.name, QUERY),
+        deploy = deploy_cell(site, now),
+        tls = tls_span(site),
+        dns = dns_span(site),
+        checks = check_cells(site, terraform),
+    )
+}
+
+/// The baseline, code and defined-in cells: only with Terraform behind the
+/// snapshot, since that is where they come from.
+fn check_cells(site: &Site, terraform: Option<&Terraform>) -> String {
+    if terraform.is_none() {
+        return String::new();
+    }
+    format!(
+        "<td data-label=\"Baseline\">{baseline}</td>\n\
+         <td data-label=\"Code\">{drift}</td>\n\
+         <td data-label=\"Defined in\">{defined}</td>\n",
         baseline = baseline_text(site, terraform),
         drift = drift_span(site, terraform),
         defined = defined_link(terraform, site.defined_at.as_ref()),
     )
 }
 
-/// The small environment label after a site's name; empty for a lone site.
+/// Whether a site is drawn under the one above it: an environment other
+/// than production.
+fn is_child(site: &Site) -> bool {
+    matches!(site.environment.as_deref(), Some(environment) if environment != "production")
+}
+
+/// The small environment tag after a site's name; empty for a lone site.
 fn environment_badge(site: &Site) -> String {
     match site.environment.as_deref() {
-        Some(environment) => format!(" <span class=\"badge env\">{}</span>", esc(environment)),
+        Some(environment) => format!("<span class=\"tag env\">{}</span>", esc(environment)),
         None => String::new(),
     }
 }
 
-/// The index's order: venture, then the group (a Worker's base name, so its
-/// staging and test rows sit next to it), production or a lone site before
-/// the other environments, then environment, name and id for a stable order.
-fn sort_key(site: &Site) -> (String, String, u8, String, String, String) {
-    let rank = u8::from(!matches!(site.environment.as_deref(), None | Some("production")));
+/// The index's order: venture (sites with none last), then the group (a
+/// Worker's base name, so its staging and test rows sit next to it),
+/// production or a lone site before the other environments, then
+/// environment, name and id for a stable order.
+fn sort_key(site: &Site) -> (bool, String, String, u8, String, String, String) {
+    let rank = u8::from(is_child(site));
+    let venture = site.venture.trim();
     (
-        site.venture.clone(),
+        venture.is_empty(),
+        venture.to_owned(),
         group_name(site).to_owned(),
         rank,
         site.environment.clone().unwrap_or_default(),
@@ -421,19 +648,12 @@ fn group_name(site: &Site) -> &str {
     }
 }
 
-/// The venture column; an empty venture is an em dash, like an empty domain list.
-fn venture_text(site: &Site) -> String {
-    if site.venture.trim().is_empty() {
-        return "<span class=\"unknown\">—</span>".to_owned();
-    }
-    esc(&site.venture)
-}
-
-/// One site: status summary, resources, deploy history, and the exact
-/// Terraform file and line it is defined at. `None` when no site in the
-/// snapshot has this id — routing never guesses.
+/// One site: what it is, its status, its domains, its deploy history, and
+/// (with Terraform) the exact file and line it is defined at and the
+/// resources behind it. `None` when no site in the snapshot has this id —
+/// routing never guesses.
 #[must_use]
-pub fn render_site(snapshot: &Fleet, id: &str) -> Option<String> {
+pub fn render_site(snapshot: &Fleet, id: &str, now: &str) -> Option<String> {
     let site = snapshot.sites.iter().find(|candidate| candidate.id == id)?;
     let terraform = snapshot.terraform.as_ref();
     let failing = site
@@ -446,104 +666,161 @@ pub fn render_site(snapshot: &Fleet, id: &str) -> Option<String> {
                 items = baseline
                     .failing
                     .iter()
-                    .map(|check| format!("<li>{}</li>", esc(check)))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
+                    .map(|check| format!("<li>{}</li>\n", esc(check)))
+                    .collect::<String>(),
             )
         })
         .unwrap_or_default();
+    let mut tiles = vec![tile("HTTPS", &tls_span(site)), tile("DNS", &dns_span(site))];
+    if terraform.is_some() {
+        tiles.push(tile("Baseline", &format!("{}{failing}", baseline_text(site, terraform))));
+        tiles.push(tile("Code", &drift_span(site, terraform)));
+    }
+    let mut actions = Vec::new();
+    if let Some(domain) = main_domain(&site.domains) {
+        actions.push(format!(
+            "<a class=\"btn\" href=\"https://{href}\" target=\"_blank\" rel=\"noopener noreferrer\">Open {domain} ↗</a>",
+            href = utf8_percent_encode(domain, PATH),
+            domain = esc(domain),
+        ));
+    }
+    if site.kind == Kind::Zone {
+        actions.push(format!(
+            "<a class=\"btn\" href=\"/v1/edits/new?kind=dns&amp;zone={}\">Change DNS</a>",
+            utf8_percent_encode(&site.name, QUERY),
+        ));
+    }
+    let domains = if site.domains.is_empty() {
+        "<li class=\"unknown\">None</li>\n".to_owned()
+    } else {
+        let mut domains: Vec<&String> = site.domains.iter().collect();
+        let main = main_domain(&site.domains);
+        domains.sort_by_key(|domain| Some(*domain) != main);
+        domains
+            .iter()
+            .map(|domain| {
+                format!(
+                    "<li><a href=\"https://{href}\" target=\"_blank\" rel=\"noopener noreferrer\">{name}</a>{main}</li>\n",
+                    href = utf8_percent_encode(domain, PATH),
+                    name = esc(domain),
+                    main = if Some(*domain) == main { "<span class=\"tag\">main</span>" } else { "" },
+                )
+            })
+            .collect()
+    };
+    let code = match terraform {
+        Some(terraform) => format!(
+            "<section class=\"panel\">\n<h2>Defined in</h2>\n<p>{defined} in {repo}</p>\n\
+             <h3>Resources</h3>\n<ul class=\"rows\">\n{resources}</ul>\n</section>\n",
+            defined = defined_link(Some(terraform), site.defined_at.as_ref()),
+            repo = esc(&terraform.repo),
+            resources = resources_list(site, Some(terraform)),
+        ),
+        None => TERRAFORM_NOTE.to_owned(),
+    };
+    let tags =
+        format!("<span class=\"tag\">{}</span>{}", site.kind.words(), environment_badge(site));
     let body = format!(
-        "<main id=\"main\">\n\
-         <p><a href=\"/console/fleet\">&larr; All sites</a></p>\n\
-         <h1>{name}</h1>\n<p class=\"meta\">{kind}{environment} · {venture} · in {account}</p>\n\
-         <dl class=\"summary\">\n\
-         <dt>HTTPS</dt><dd>{tls}</dd>\n\
-         <dt>DNS</dt><dd>{dns}</dd>\n\
-         <dt>Baseline</dt><dd>{baseline}{failing}</dd>\n\
-         <dt>Code</dt><dd>{drift}</dd>\n\
-         </dl>\n\
-         <h2>Defined in</h2>\n\
-         <p>{defined}{repo}</p>\n\
-         <h2>Resources</h2>\n<ul class=\"plain\">\n{resources}</ul>\n\
-         <h2>Deploys</h2>\n<ul class=\"plain\">\n{deploys}</ul>\n\
-         </main>\n",
+        "<main id=\"main\" class=\"wrap\">\n\
+         <nav class=\"crumbs\" aria-label=\"Breadcrumb\"><a href=\"/console/fleet\">&larr; All sites</a>\
+         <span aria-hidden=\"true\">/</span><span>{venture}</span></nav>\n\
+         <div class=\"pagehead\">\n<div>\n<h1>{name}</h1>\n\
+         <p class=\"sub\">{tags} <span>in {account} · checked {when}</span></p>\n</div>\n\
+         <div class=\"actions\">{actions}</div>\n</div>\n\
+         <ul class=\"tiles\">\n{tiles}</ul>\n\
+         <div class=\"columns\">\n\
+         <section class=\"panel\">\n<h2>Deploys</h2>\n<ol class=\"rows deploys\">\n{deploys}</ol>\n</section>\n\
+         <section class=\"panel\">\n<h2>Domains</h2>\n<ul class=\"rows\">\n{domains}</ul>\n</section>\n\
+         </div>\n{code}</main>\n",
+        venture = venture_name(site.venture.trim()),
         name = esc(&site.name),
-        kind = site.kind.words(),
-        environment = site
-            .environment
-            .as_deref()
-            .map(|environment| format!(" · {}", esc(environment)))
-            .unwrap_or_default(),
-        venture = venture_text(site),
         account = esc(&snapshot.account),
-        tls = tls_span(site),
-        dns = dns_span(site),
-        baseline = baseline_text(site, terraform),
-        failing = failing,
-        drift = drift_span(site, terraform),
-        defined = defined_link(terraform, site.defined_at.as_ref()),
-        repo =
-            terraform.map(|terraform| format!(" in {}", esc(&terraform.repo))).unwrap_or_default(),
-        resources = resources_list(site, terraform),
-        deploys = deploys_list(site, &snapshot.generated_at),
+        when = time_html(&snapshot.generated_at, now),
+        actions = actions.join(""),
+        tiles = tiles.join(""),
+        deploys = deploys_list(site, now),
     );
-    Some(signed_in_layout(&site.name, &body))
+    Some(signed_in_layout(&site.name, Tab::Sites, &body))
 }
 
-/// The one small-page layout (empty state and every error): title, plain
-/// message, optional link.
-pub(crate) fn notice_page(title: &str, message: &str, link: Option<(&str, &str)>) -> String {
+/// One status tile on a site's page.
+fn tile(label: &str, value: &str) -> String {
+    format!("<li class=\"tile\"><span class=\"label\">{label}</span><div>{value}</div></li>\n")
+}
+
+/// The one small-page layout (every error): title, plain message, optional
+/// link.
+#[must_use]
+pub fn notice_page(title: &str, message: &str, link: Option<(&str, &str)>) -> String {
     let link = link
         .map(|(href, text)| {
-            format!("<p><a href=\"{href}\">{text}</a></p>", href = esc(href), text = esc(text))
+            format!(
+                "<p><a class=\"btn\" href=\"{href}\">{text}</a></p>\n",
+                href = esc(href),
+                text = esc(text)
+            )
         })
         .unwrap_or_default();
     layout(
         title,
         &format!(
-            "<main id=\"main\">\n<div class=\"notice\">\n<h1>{title}</h1>\n<p>{message}</p>\n\
+            "<main id=\"main\" class=\"wrap\">\n<div class=\"notice\">\n<h1>{title}</h1>\n<p>{message}</p>\n\
              {link}</div>\n</main>\n",
             title = esc(title),
             message = esc(message),
         ),
+        "",
     )
 }
 
-/// [`layout`] for a signed-in page: the bar carries the sign-out button, a
-/// form posting to `/console/logout` (a POST, so a link elsewhere cannot
-/// sign anyone out; the worker's origin guard checks it is same-origin).
-pub(crate) fn signed_in_layout(title: &str, body: &str) -> String {
-    layout_with(title, body, &format!("{NAV}{SIGN_OUT}"))
+/// Which console page the bar marks as the current one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Sites,
+    Cloudflare,
 }
 
-/// The console's own pages, on every signed-in page's bar.
-const NAV: &str = "<nav class=\"consolenav\" aria-label=\"Console\">\
-     <a href=\"/console/fleet\">Sites</a>\
-     <a href=\"/console/connect/cloudflare\">Cloudflare connection</a></nav>";
+/// [`layout`] for a signed-in page: the bar carries the console's pages,
+/// `current` marked, and the sign-out button — a form posting to
+/// `/console/logout` (a POST, so a link elsewhere cannot sign anyone out;
+/// the worker's origin guard checks it is same-origin).
+pub(crate) fn signed_in_layout(title: &str, current: Tab, body: &str) -> String {
+    let link = |tab: Tab, href: &str, words: &str| {
+        format!(
+            "<a href=\"{href}\"{current}>{words}</a>",
+            current = if tab == current { " aria-current=\"page\"" } else { "" },
+        )
+    };
+    let bar = format!(
+        "<nav class=\"tabs\" aria-label=\"Console\">{sites}{cloudflare}</nav>{SIGN_OUT}",
+        sites = link(Tab::Sites, "/console/fleet", "Sites"),
+        cloudflare = link(Tab::Cloudflare, "/console/connect/cloudflare", "Cloudflare connection"),
+    );
+    layout(title, body, &bar)
+}
 
 const SIGN_OUT: &str = "<form class=\"signout\" method=\"post\" action=\"/console/logout\">\
      <button type=\"submit\">Sign out</button></form>";
 
-/// The one layout every console page shares: fonts, the inlined stylesheet,
-/// a skip link, the wordmark bar.
-fn layout(title: &str, body: &str) -> String {
-    layout_with(title, body, "")
-}
-
-fn layout_with(title: &str, body: &str, bar_extra: &str) -> String {
+/// The one layout every console page shares: fonts, the inlined
+/// stylesheet, a skip link, the top bar (`bar` is what follows the
+/// wordmark).
+fn layout(title: &str, body: &str, bar: &str) -> String {
     format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n\
          <meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-         <title>{title} · Keep Shipping fleet</title>\n\
+         <meta name=\"color-scheme\" content=\"light dark\">\n\
+         <title>{title} · Keep Shipping console</title>\n\
          <link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\n\
          <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>\n\
-         <link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,700&amp;family=DM+Mono:wght@400;500&amp;display=swap\">\n\
+         <link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&amp;family=DM+Mono:wght@400;500&amp;display=swap\">\n\
          <style>\n{style}</style>\n\
          </head>\n<body>\n\
          <a class=\"skip\" href=\"#main\">Skip to content</a>\n\
-         <header class=\"bar\"><a class=\"wordmark\" href=\"/console/fleet\">Keep Shipping</a>\
-         <span class=\"section\">Fleet console</span>{bar_extra}</header>\n\
+         <header class=\"top\"><div class=\"wrap top-in\">\
+         <a class=\"brand\" href=\"/console/fleet\"><span class=\"mark\" aria-hidden=\"true\"></span>\
+         Keep Shipping <span class=\"product\">Console</span></a>{bar}</div></header>\n\
          {body}</body>\n</html>\n",
         title = esc(title),
         style = STYLE,
@@ -593,10 +870,11 @@ fn domains_text(site: &Site) -> String {
         return esc(main);
     }
     format!(
-        "{main}<details class=\"more\"><summary>+{count} more</summary>{rest}</details>",
+        "{main}<details class=\"more\"><summary>+{count} more</summary>\
+         <ul>{rest}</ul></details>",
         main = esc(main),
         count = rest.len(),
-        rest = rest.join("<br>"),
+        rest = rest.iter().map(|domain| format!("<li>{domain}</li>")).collect::<String>(),
     )
 }
 
@@ -616,17 +894,54 @@ pub fn main_domain(domains: &[String]) -> Option<&String> {
         .map(|(_, domain)| domain)
 }
 
-fn deploy_text(site: &Site, reference: &str) -> String {
-    match site.deploys.first() {
-        Some(deploy) => deploy_line(deploy, reference),
-        None => "<span class=\"unknown\">Never deployed</span>".to_owned(),
-    }
+/// The last deploy in a table cell: when, on top, as the relative time
+/// (the full time and the trigger in its title); what, below, as the id,
+/// branch and message. A domain is never deployed, so it gets a dash.
+fn deploy_cell(site: &Site, now: &str) -> String {
+    let Some(deploy) = site.deploys.first() else {
+        return if site.kind == Kind::Zone {
+            "<span class=\"unknown\">—</span>".to_owned()
+        } else {
+            "<span class=\"unknown\">Never deployed</span>".to_owned()
+        };
+    };
+    let what = deploy_what(deploy);
+    format!(
+        "<div class=\"when\">{when}</div>{what}",
+        when = relative_time(deploy, now),
+        what = if what.is_empty() {
+            String::new()
+        } else {
+            format!("<div class=\"what\">{what}</div>")
+        },
+    )
 }
 
-/// One deploy in words, `·`-separated: what was deployed (the commit,
-/// version or upload id), the branch, the message, the trigger in words, and
-/// the time. Parts the snapshot does not carry are left out.
-fn deploy_line(deploy: &Deploy, reference: &str) -> String {
+/// A deploy's time as `3 days ago`, the full time and the trigger in words
+/// as its title; a time that does not parse is shown as it came.
+fn relative_time(deploy: &Deploy, now: &str) -> String {
+    let Ok(at) = OffsetDateTime::parse(&deploy.at, &Rfc3339) else {
+        return esc(&deploy.at);
+    };
+    let at = at.to_offset(UtcOffset::UTC);
+    let mut title = words(at);
+    if !deploy.by.trim().is_empty() {
+        title = format!("{title} · {}", trigger_words(&deploy.by));
+    }
+    let relative = OffsetDateTime::parse(now, &Rfc3339)
+        .map(|now| ago(at, now.to_offset(UtcOffset::UTC)))
+        .unwrap_or_else(|_| words(at));
+    format!(
+        "<time datetime=\"{datetime}\" title=\"{title}\">{relative}</time>",
+        datetime = esc(&deploy.at),
+        title = esc(&title),
+        relative = esc(&relative),
+    )
+}
+
+/// What a deploy put live, `·`-separated: the id, the branch, the message.
+/// Empty when the snapshot carries none of them.
+fn deploy_what(deploy: &Deploy) -> String {
     let mut parts = Vec::new();
     if let Some(what) = deployed_ref(deploy) {
         parts.push(what);
@@ -635,12 +950,23 @@ fn deploy_line(deploy: &Deploy, reference: &str) -> String {
         parts.push(esc(branch));
     }
     if let Some(message) = deploy.message.as_deref().map(message_line).filter(|m| !m.is_empty()) {
-        parts.push(esc(&message));
+        parts.push(format!("<span class=\"msg\">{}</span>", esc(&message)));
     }
+    parts.join(" · ")
+}
+
+/// One deploy in the site page's history, `·`-separated: what was deployed
+/// ([`deploy_what`]) and the trigger in words. Parts the snapshot does not
+/// carry are left out; the time is shown beside it.
+fn deploy_line_parts(deploy: &Deploy) -> String {
+    let mut parts = vec![deploy_what(deploy)];
     if !deploy.by.trim().is_empty() {
         parts.push(esc(&trigger_words(&deploy.by)));
     }
-    parts.push(time_html(&deploy.at, reference));
+    parts.retain(|part| !part.is_empty());
+    if parts.is_empty() {
+        return "<span class=\"unknown\">No details</span>".to_owned();
+    }
     parts.join(" · ")
 }
 
@@ -686,13 +1012,20 @@ pub fn message_line(message: &str) -> String {
 
 fn deploys_list(site: &Site, reference: &str) -> String {
     if site.deploys.is_empty() {
-        return "<li class=\"unknown\">Never deployed</li>".to_owned();
+        return "<li class=\"unknown\">Never deployed</li>\n".to_owned();
     }
     site.deploys
         .iter()
-        .map(|deploy| format!("<li>{}</li>", deploy_line(deploy, reference)))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .enumerate()
+        .map(|(index, deploy)| {
+            format!(
+                "<li><div class=\"when\">{live}{when}</div><div class=\"what\">{what}</div></li>\n",
+                live = if index == 0 { "<span class=\"tag live\">live</span>" } else { "" },
+                when = time_html(&deploy.at, reference),
+                what = deploy_line_parts(deploy),
+            )
+        })
+        .collect()
 }
 
 fn resources_list(site: &Site, terraform: Option<&Terraform>) -> String {
@@ -759,7 +1092,7 @@ fn dns_span(site: &Site) -> String {
 /// A status followed by its plain-words note, when there is one.
 fn with_note(status: String, note: Option<&str>) -> String {
     match note.map(str::trim).filter(|note| !note.is_empty()) {
-        Some(note) => format!("{status} <span class=\"unknown\">{}</span>", esc(note)),
+        Some(note) => format!("{status}<span class=\"note\">{}</span>", esc(note)),
         None => status,
     }
 }
@@ -1046,14 +1379,22 @@ mod tests {
     }
 
     #[test]
-    fn a_deploy_line_leaves_out_what_the_snapshot_does_not_carry() {
+    fn a_deploy_cell_puts_when_on_top_and_leaves_out_what_is_not_carried() {
         let mut full = deploy("4a1f9c2e7b3d", "github:push", DeployRef::Commit);
         full.branch = Some("main".to_owned());
         full.message = Some("fix the form".to_owned());
+        let mut pages = site("p", "kaje", Kind::Pages, None);
+        pages.deploys = vec![full.clone()];
         assert_eq!(
-            deploy_line(&full, "2026-10-08T18:42:00Z"),
-            "<code>4a1f9c2</code> · main · fix the form · git push · \
-             <time datetime=\"2026-10-08T17:42:00Z\">8 Oct 2026, 17:42 UTC</time> · 1 hour ago"
+            deploy_cell(&pages, "2026-10-08T18:42:00Z"),
+            "<div class=\"when\"><time datetime=\"2026-10-08T17:42:00Z\" \
+             title=\"8 Oct 2026, 17:42 UTC · git push\">1 hour ago</time></div>\
+             <div class=\"what\"><code>4a1f9c2</code> · main · <span class=\"msg\">fix the form</span></div>"
+        );
+        // The history line adds the trigger; the time sits beside it.
+        assert_eq!(
+            deploy_line_parts(&full),
+            "<code>4a1f9c2</code> · main · <span class=\"msg\">fix the form</span> · git push"
         );
         // A modified time alone: no id, no trigger, just the time.
         let bare = Deploy {
@@ -1064,10 +1405,15 @@ mod tests {
             message: None,
             refers_to: DeployRef::Commit,
         };
+        pages.deploys = vec![bare];
         assert_eq!(
-            deploy_line(&bare, "2026-10-14T20:05:45Z"),
-            "<time datetime=\"2026-10-14T19:05:44.123Z\">14 Oct 2026, 19:05 UTC</time> · 1 hour ago"
+            deploy_cell(&pages, "2026-10-14T20:05:45Z"),
+            "<div class=\"when\"><time datetime=\"2026-10-14T19:05:44.123Z\" \
+             title=\"14 Oct 2026, 19:05 UTC\">1 hour ago</time></div>"
         );
+        // Never deployed: said for an app, a dash for a domain.
+        assert!(deploy_cell(&site("w", "api", Kind::Worker, None), "t").contains("Never deployed"));
+        assert!(deploy_cell(&site("z", "a.com", Kind::Zone, None), "t").contains("—"));
     }
 
     #[test]
@@ -1102,7 +1448,7 @@ mod tests {
         assert_eq!(environment_badge(&site("p", "kaje", Kind::Pages, None)), "");
         assert_eq!(
             environment_badge(&site("p", "kaje", Kind::Pages, Some("feature/x"))),
-            " <span class=\"badge env\">feature/x</span>"
+            "<span class=\"tag env\">feature/x</span>"
         );
     }
 
@@ -1130,14 +1476,17 @@ mod tests {
             Some(Dns { status: DnsStatus::Problem, note: Some("Zone is <pending>".to_owned()) });
         let cell = dns_span(&bare);
         assert!(cell.contains("Problem"));
-        assert!(cell.ends_with("<span class=\"unknown\">Zone is &lt;pending&gt;</span>"), "{cell}");
+        assert!(cell.ends_with("<span class=\"note\">Zone is &lt;pending&gt;</span>"), "{cell}");
     }
 
     #[test]
     fn a_site_id_with_a_slash_links_and_routes_back() {
         let mut preview = site("pages:acct:kaje:feature/x", "kaje", Kind::Pages, Some("feature/x"));
         preview.domains = vec!["feature-x.kaje.pages.dev".to_owned()];
-        let row = site_row(&preview, None, "2026-10-16T09:00:00Z");
+        let row = app_row(&preview, None, "2026-10-16T09:00:00Z");
+        // A preview is named by its branch under its project's row.
+        assert!(row.contains("<tr class=\"child\">"), "{row}");
+        assert!(row.contains(">feature/x</a><span class=\"tag env\">preview</span>"), "{row}");
         assert!(row.contains("href=\"/console/fleet/pages:acct:kaje:feature%2Fx\""), "{row}");
         let Some(Route::Site(id)) = route("/console/fleet/pages:acct:kaje:feature%2Fx") else {
             panic!("the encoded id routes to its site");

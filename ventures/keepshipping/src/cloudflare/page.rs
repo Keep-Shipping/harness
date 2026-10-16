@@ -4,7 +4,7 @@
 //! worker, which seals it and redirects.
 
 use super::{PERMISSION_WORDS, PERMISSIONS, template_url};
-use crate::fleet::{esc, signed_in_layout, time_html};
+use crate::fleet::{Tab, esc, signed_in_layout, time_html};
 
 /// Where the paste form posts.
 pub const CONNECT_PATH: &str = "/console/connect/cloudflare";
@@ -31,63 +31,71 @@ pub fn connect_page(
         .join("\n");
     let status = match connected_at {
         Some(when) => format!(
-            "<p class=\"meta\">A token is connected, saved {when}.{reads}</p>\n\
-             <p>To read more accounts, create a new token with <strong>All accounts</strong> under \
-             Account Resources and paste it below: it replaces this one.</p>\n\
+            "<section class=\"panel status-card\" aria-labelledby=\"status-title\">\n\
+             <div class=\"status-head\"><h2 id=\"status-title\"><span class=\"status ok\">Connected</span></h2>\
              <form class=\"disconnect\" method=\"post\" action=\"{DISCONNECT_PATH}\">\
-             <button type=\"submit\">Disconnect Cloudflare</button></form>\n",
+             <button class=\"btn danger\" type=\"submit\">Disconnect Cloudflare</button></form></div>\n\
+             <p class=\"muted\">Token saved {when}.</p>\n{reads}\
+             <p class=\"hint\">To read more accounts, create a new token with <strong>All accounts</strong> \
+             under Account Resources and paste it below. It replaces this one.</p>\n</section>\n",
             when = time_html(when, now),
             reads = if accounts.is_empty() {
                 String::new()
             } else {
                 format!(
-                    " It can read {} account{}: {}.",
+                    "<p>It can read {} account{}:</p>\n<ul class=\"chips\">{}</ul>\n",
                     accounts.len(),
                     if accounts.len() == 1 { "" } else { "s" },
-                    accounts.iter().map(|name| esc(name)).collect::<Vec<_>>().join(", ")
+                    accounts
+                        .iter()
+                        .map(|name| format!("<li>{}</li>", esc(name)))
+                        .collect::<String>()
                 )
             },
         ),
-        None => "<p class=\"meta\">No Cloudflare token is connected.</p>\n".to_owned(),
+        None => "<section class=\"panel status-card\" aria-labelledby=\"status-title\">\n\
+                 <h2 id=\"status-title\"><span class=\"status unknown\">Not connected</span></h2>\n\
+                 <p class=\"muted\">No Cloudflare token is connected yet.</p>\n</section>\n"
+            .to_owned(),
     };
     let error = error
-        .map(|message| format!("<p class=\"error\" role=\"alert\">{}</p>\n", esc(message)))
+        .map(|message| format!("<p class=\"callout bad\" role=\"alert\">{}</p>\n", esc(message)))
         .unwrap_or_default();
     let body = format!(
-        "<main id=\"main\">\n\
-         <h1>Connect Cloudflare</h1>\n\
-         <p>The fleet view reads your Cloudflare account to list its domains, Pages sites and \
-         Workers, when each was last deployed, and whether each domain's HTTPS certificate is \
-         active. It only reads. The token below can change nothing: every permission is \
-         read-only.</p>\n\
+        "<main id=\"main\" class=\"wrap narrow\">\n\
+         <div class=\"pagehead\"><div>\n<h1>Cloudflare connection</h1>\n\
+         <p class=\"sub\">The console reads your Cloudflare accounts to list their domains, Pages \
+         sites and Workers, when each was last deployed, and whether HTTPS and DNS are healthy. \
+         Every permission it asks for is read-only, so it can change nothing.</p>\n</div></div>\n\
          {status}\
-         <h2>1. Create the token</h2>\n\
+         <ol class=\"steps\">\n\
+         <li class=\"panel\">\n<h2>Create a read-only token</h2>\n\
          <p>Cloudflare opens its token page with the permissions already chosen. Check them, \
-         choose Continue to summary, then Create Token.</p>\n\
-         <div class=\"actions\"><a class=\"button\" target=\"_blank\" rel=\"noopener noreferrer\" href=\"{href}\">\
-         Create a read-only token on Cloudflare</a></div>\n\
-         <p>The permissions it asks for:</p>\n\
-         <ul class=\"plain\">\n{permissions}\n</ul>\n\
-         <h2>2. Paste the token</h2>\n\
-         <p>Copy the token once Cloudflare shows it, then paste it here. It is checked with \
-         Cloudflare, sealed with a key only this console holds, and stored. It is never shown \
-         again.</p>\n\
+         choose <strong>Continue to summary</strong>, then <strong>Create Token</strong>.</p>\n\
+         <p><a class=\"btn primary\" target=\"_blank\" rel=\"noopener noreferrer\" href=\"{href}\">\
+         Create the token on Cloudflare ↗</a></p>\n\
+         <details class=\"perms\"><summary>The {count} permissions it asks for</summary>\n\
+         <ul>\n{permissions}\n</ul>\n</details>\n</li>\n\
+         <li class=\"panel\">\n<h2>Paste it here</h2>\n\
+         <p>It is checked with Cloudflare, sealed with a key only this console holds, and stored. \
+         It is never shown again.</p>\n\
          {error}\
          <form class=\"connect\" method=\"post\" action=\"{CONNECT_PATH}\" autocomplete=\"off\">\n\
          <label for=\"cf-token\">Cloudflare API token</label>\n\
          <input id=\"cf-token\" name=\"token\" type=\"password\" required autocomplete=\"off\" \
          autocapitalize=\"off\" spellcheck=\"false\">\n\
-         <div class=\"actions\"><button type=\"submit\">{submit}</button></div>\n\
-         </form>\n\
+         <button class=\"btn primary\" type=\"submit\">{submit}</button>\n\
+         </form>\n</li>\n</ol>\n\
          </main>\n",
         href = esc(&template_url()),
+        count = PERMISSIONS.len(),
         submit = if connected_at.is_some() {
-            "Replace the token and rebuild the fleet"
+            "Replace the token and refresh"
         } else {
-            "Connect and build the fleet"
+            "Connect and read the account"
         },
     );
-    signed_in_layout("Connect Cloudflare", &body)
+    signed_in_layout("Cloudflare connection", Tab::Cloudflare, &body)
 }
 
 #[cfg(test)]
@@ -117,7 +125,8 @@ mod tests {
         );
         assert!(page.contains("action=\"/console/connect/cloudflare/disconnect\""));
         assert!(page.contains("saved <time datetime=\"2026-10-15T09:00:00.123456Z\">15 Oct 2026, 09:00 UTC</time> · 23 hours ago."));
-        assert!(page.contains("It can read 1 account: Factory0."));
+        assert!(page.contains("It can read 1 account:"));
+        assert!(page.contains("<li>Factory0</li>"));
         assert!(page.contains("Replace the token"));
     }
 
