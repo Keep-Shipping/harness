@@ -51,6 +51,11 @@ pub struct Fleet {
     #[serde(default)]
     pub terraform: Option<Terraform>,
     pub sites: Vec<Site>,
+    /// Parts of the account the last collection could not read, in plain
+    /// words (a refused or failed listing). The rest of the snapshot is
+    /// still shown; these say what is missing from it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<String>,
 }
 
 /// The Terraform repository the sites are defined in.
@@ -226,9 +231,18 @@ pub fn render_index(snapshot: &Fleet) -> String {
         ),
         None => "Not managed by Terraform yet".to_owned(),
     };
+    let gaps = if snapshot.gaps.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<p class=\"gaps\"><strong>Not read this time:</strong> {}.</p>\n",
+            snapshot.gaps.iter().map(|gap| esc(gap)).collect::<Vec<_>>().join("; ")
+        )
+    };
     let body = format!(
         "<main id=\"main\">\n<h1>{account} fleet</h1>\n\
          <p class=\"meta\">{count} · checked {when} · {terraform}</p>\n\
+         {gaps}\
          <p>{REFRESH_FORM}</p>\n\
          <table>\n\
          <caption class=\"offscreen\">Every site with its last deploy, HTTPS, DNS, baseline and \

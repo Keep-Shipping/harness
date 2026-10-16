@@ -171,3 +171,4 @@ form.connect input {
 ol.steps { padding-left: 1.2rem; }
 ol.steps li { margin: 0.6rem 0; }
 .error { color: var(--bad, #b00020); }
+.gaps { border-left: 3px solid var(--bad, #b00020); padding-left: 0.6rem; }
