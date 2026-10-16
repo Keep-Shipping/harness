@@ -62,6 +62,7 @@ pub mod signin;
 pub mod cloudflare;
 pub mod fleet;
 pub mod github;
+pub mod onboard;
 
 pub use billing::{Billing, DISPUTE_POLL_CRON, Plan, entitlements};
 pub use edits::Edits;
