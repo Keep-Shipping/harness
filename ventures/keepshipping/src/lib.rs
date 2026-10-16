@@ -29,9 +29,11 @@
 //!   entry is captured as `pending` with no mail sent, so the form keeps
 //!   working while the sending subdomain (issue #146's open question) is
 //!   being verified;
-//! * without `TURNSTILE_SECRET` no captcha port exists at all, and the
-//!   harness refuses joins in `ENV=production` (fail-closed — see the
-//!   module's `verify_human_form`);
+//! * without `TURNSTILE_SECRET` no captcha port exists at all, so the
+//!   waitlist module is not mounted on this Worker (the console keeps its
+//!   `/v1/edits` routes; the live waitlist is a separate Worker) — with
+//!   the module mounted and no captcha the harness would refuse joins in
+//!   `ENV=production`, fail-closed;
 //! * billing (issue #177, ADR 0202) runs on `POLAR_ACCESS_TOKEN` +
 //!   `POLAR_WEBHOOK_SECRET` through the `cratefield-adapter-polar`
 //!   adapter: with the token missing the adapter reports `not configured`
@@ -59,6 +61,7 @@ pub mod signin;
 
 pub mod cloudflare;
 pub mod fleet;
+pub mod github;
 
 pub use billing::{Billing, DISPUTE_POLL_CRON, Plan, entitlements};
 pub use edits::Edits;
@@ -309,13 +312,30 @@ fn mailer(env: &Env) -> Arc<dyn Mailer> {
 /// everything else is static, so a native test can build the very
 /// composition the worker serves (`tests/harness.rs` does exactly that)
 /// rather than a parallel one.
+///
+/// This is the composition *with* the waitlist module; see
+/// [`composition_with`] for the console Worker's shape.
 #[must_use]
 pub fn composition() -> HarnessBuilder {
-    Harness::builder()
-        .venture(venture())
-        .module(module())
-        .module(edits_module())
-        .templates(templates())
+    composition_with(true)
+}
+
+/// [`composition`], with the waitlist module (and its mail templates)
+/// mounted only when `waitlist` is set.
+///
+/// The console Worker mounts the waitlist only when `TURNSTILE_SECRET` is
+/// configured. The waitlist's public joins are captcha-guarded, and in
+/// `ENV=production` the harness answers every `/v1/*` route `503
+/// not-production-ready` when a guarded module has no bound captcha — which
+/// would take the console's `/v1/edits` down with it. The live waitlist is
+/// a separate Worker, so this Worker has no joins to protect: leaving the
+/// module out here loses nothing and lets the edits module serve.
+#[must_use]
+pub fn composition_with(waitlist: bool) -> HarnessBuilder {
+    let builder = Harness::builder().venture(venture());
+    let builder = if waitlist { builder.module(module()) } else { builder };
+    let builder = builder.module(edits_module());
+    if waitlist { builder.templates(templates()) } else { builder }
 }
 
 /// The frozen composition: built once per isolate on first use, immutable
@@ -336,13 +356,18 @@ fn instance(env: &Env) -> Arc<(Harness, Cloudflare)> {
                 // a presented credential and leaves anonymous calls alone —
                 // every pre-auth page keeps working with no auth configured.
                 .auth_from_env();
-            let runtime = match captcha(env) {
+            // The waitlist is mounted exactly when its captcha is bound: a
+            // waitlist without one is refused on every `/v1/*` route in
+            // production (see `composition_with`).
+            let captcha = captcha(env);
+            let waitlist = captcha.is_some();
+            let runtime = match captcha {
                 Some(captcha) => runtime.captcha_arc(Arc::new(captcha)),
                 None => runtime,
             };
             // The setup module reads `Env`, so it joins the static
-            // composition here rather than inside `composition()`.
-            let harness = composition()
+            // composition here rather than inside `composition_with()`.
+            let harness = composition_with(waitlist)
                 .module(setup_module(env))
                 // The Search Console console (#274) also reads `Env`;
                 // it nests under its own `/v1/console`.

@@ -1076,6 +1076,7 @@ pub fn notice_page(title: &str, message: &str, link: Option<(&str, &str)>) -> St
 pub enum Tab {
     Sites,
     Cloudflare,
+    GitHub,
 }
 
 /// [`layout`] for a signed-in page: the bar carries the console's pages,
@@ -1090,9 +1091,10 @@ pub(crate) fn signed_in_layout(title: &str, current: Tab, body: &str) -> String 
         )
     };
     let bar = format!(
-        "<nav class=\"tabs\" aria-label=\"Console\">{sites}{cloudflare}</nav>{SIGN_OUT}",
+        "<nav class=\"tabs\" aria-label=\"Console\">{sites}{cloudflare}{github}</nav>{SIGN_OUT}",
         sites = link(Tab::Sites, "/console/fleet", "Sites"),
         cloudflare = link(Tab::Cloudflare, "/console/connect/cloudflare", "Cloudflare connection"),
+        github = link(Tab::GitHub, "/console/connect/github", "GitHub connection"),
     );
     layout(title, body, &bar)
 }

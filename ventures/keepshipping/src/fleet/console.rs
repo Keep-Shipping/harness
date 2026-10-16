@@ -26,6 +26,11 @@ use crate::cloudflare::page::{
     CONNECT_PATH, DEPLOY_CONNECT_PATH, DEPLOY_DISCONNECT_PATH, DISCONNECT_PATH, connect_page,
 };
 use crate::cloudflare::rollback::{self, Panel};
+use crate::github;
+use crate::github::page::{
+    CONNECT_PATH as GITHUB_CONNECT_PATH, DISCONNECT_PATH as GITHUB_DISCONNECT_PATH,
+    State as GitHubState, connect_page as github_connect_page,
+};
 use crate::signin::{self, CALLBACK_PATH, Client, LOGIN_PATH, LOGOUT_PATH, Reply};
 
 /// `same-origin`, not `no-referrer`: under `no-referrer` Chrome sends
@@ -62,6 +67,9 @@ enum Action {
     /// `POST` stores a pasted deploy token (rollbacks).
     ConnectDeploy,
     DisconnectDeploy,
+    /// `GET` shows the GitHub connection page, `POST` stores a pasted token.
+    GitHub,
+    GitHubDisconnect,
 }
 
 fn action_for(path: &str) -> Option<Action> {
@@ -71,6 +79,8 @@ fn action_for(path: &str) -> Option<Action> {
         REFRESH_PATH => Some(Action::Refresh),
         DEPLOY_CONNECT_PATH => Some(Action::ConnectDeploy),
         DEPLOY_DISCONNECT_PATH => Some(Action::DisconnectDeploy),
+        GITHUB_CONNECT_PATH => Some(Action::GitHub),
+        GITHUB_DISCONNECT_PATH => Some(Action::GitHubDisconnect),
         _ => None,
     }
 }
@@ -308,18 +318,21 @@ async fn serve_action(req: &mut Request, env: &Env, action: Action) -> worker::R
     let post = matches!(req.method(), Method::Post);
     let read_only = matches!(req.method(), Method::Get | Method::Head);
     let allowed = match action {
-        Action::Connect => post || read_only,
-        Action::Disconnect | Action::Refresh | Action::ConnectDeploy | Action::DisconnectDeploy => {
-            post
-        }
+        Action::Connect | Action::GitHub => post || read_only,
+        Action::Disconnect
+        | Action::Refresh
+        | Action::ConnectDeploy
+        | Action::DisconnectDeploy
+        | Action::GitHubDisconnect => post,
     };
     if !allowed {
         let allow = match action {
-            Action::Connect => "GET, HEAD, POST",
+            Action::Connect | Action::GitHub => "GET, HEAD, POST",
             Action::Disconnect
             | Action::Refresh
             | Action::ConnectDeploy
-            | Action::DisconnectDeploy => "POST",
+            | Action::DisconnectDeploy
+            | Action::GitHubDisconnect => "POST",
         };
         return page_with(
             405,
@@ -342,6 +355,9 @@ async fn serve_action(req: &mut Request, env: &Env, action: Action) -> worker::R
         Action::Refresh => refresh(env).await?,
         Action::ConnectDeploy => connect_save(req, env, true).await?,
         Action::DisconnectDeploy => disconnect_deploy(env).await?,
+        Action::GitHub if post => github_save(req, env).await?,
+        Action::GitHub => github_form(env).await?,
+        Action::GitHubDisconnect => github_disconnect(env).await?,
     };
     with_cookies(response, &session.set_cookies)
 }
@@ -427,6 +443,96 @@ async fn connect_save(req: &mut Request, env: &Env, deploy: bool) -> worker::Res
                 "Token not saved",
                 failed.message,
                 Some((CONNECT_PATH, "Back to the connect page")),
+            ),
+        ),
+    }
+}
+
+/// The GitHub connection page: who it is connected as, when GitHub can say.
+async fn github_form(env: &Env) -> worker::Result<Response> {
+    let Some(secret) = read(env, "HARNESS_SECRET") else {
+        return page(503, &notice_page("Console not configured", SEALER_COPY, None));
+    };
+    let saved = match github::connected_at(env, &secret).await {
+        Ok(saved) => saved,
+        Err(failed) => {
+            return page(
+                failed.status,
+                &notice_page("Could not check the connection", failed.message, None),
+            );
+        }
+    };
+    let html = match saved {
+        Some(saved) => {
+            let login = match github::client(env, &secret).await {
+                Ok(Some(client)) => client.whoami().await.ok(),
+                _ => None,
+            };
+            github_connect_page(
+                GitHubState::Connected { login: login.as_deref(), saved: &saved },
+                None,
+                &api::now(),
+            )
+        }
+        None => github_connect_page(GitHubState::Disconnected, None, &api::now()),
+    };
+    page(200, &html)
+}
+
+/// The GitHub paste: the token is checked with GitHub, sealed and stored by
+/// [`github::connect`]. A refusal is shown in words; the token is never
+/// echoed back.
+async fn github_save(req: &mut Request, env: &Env) -> worker::Result<Response> {
+    let Some(secret) = read(env, "HARNESS_SECRET") else {
+        return page(503, &notice_page("Console not configured", SEALER_COPY, None));
+    };
+    let body = req.text().await?;
+    if body.len() > 4096 {
+        return page(
+            413,
+            &notice_page(
+                "Token not saved",
+                "The form is larger than a token can be.",
+                Some((GITHUB_CONNECT_PATH, "Back to the GitHub connection")),
+            ),
+        );
+    }
+    let token = form_urlencoded::parse(body.as_bytes())
+        .find(|(name, _)| name == "token")
+        .map(|(_, value)| value.trim().to_owned())
+        .unwrap_or_default();
+    if token.is_empty() {
+        return page(
+            400,
+            &notice_page(
+                "Token not saved",
+                "Paste the token into the box first.",
+                Some((GITHUB_CONNECT_PATH, "Back to the GitHub connection")),
+            ),
+        );
+    }
+    match github::connect(env, &secret, &token).await {
+        Ok(_) => redirect(303, GITHUB_CONNECT_PATH),
+        Err(failed) => page(
+            failed.status,
+            &notice_page(
+                "Token not saved",
+                failed.message,
+                Some((GITHUB_CONNECT_PATH, "Back to the GitHub connection")),
+            ),
+        ),
+    }
+}
+
+async fn github_disconnect(env: &Env) -> worker::Result<Response> {
+    match github::disconnect(env).await {
+        Ok(()) => redirect(303, GITHUB_CONNECT_PATH),
+        Err(failed) => page(
+            failed.status,
+            &notice_page(
+                "Could not disconnect",
+                failed.message,
+                Some((GITHUB_CONNECT_PATH, "Back to the GitHub connection")),
             ),
         ),
     }
@@ -717,6 +823,12 @@ mod tests {
         assert!(action_for("/console/connect/cloudflarex").is_none());
         assert!(action_for("/console/connect/cloudflare/x/disconnect").is_none());
         assert!(action_for("/console/fleet/refresh/extra").is_none());
+        assert!(matches!(action_for("/console/connect/github"), Some(Action::GitHub)));
+        assert!(matches!(
+            action_for("/console/connect/github/disconnect"),
+            Some(Action::GitHubDisconnect)
+        ));
+        assert!(action_for("/console/connect/github/x").is_none());
     }
 
     #[test]
