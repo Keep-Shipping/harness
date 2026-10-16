@@ -18,8 +18,8 @@ use cratefield_runtime_cloudflare::{FetchClient, WorkersClock};
 use worker::{Env, Headers, Method, Request, Response};
 
 use super::{
-    Fleet, Route, bearer_token, cookie_value, empty_snapshot_page, notice_page, render_index,
-    render_site_with, route,
+    Filter, Fleet, Route, bearer_token, cookie_value, empty_snapshot_page, notice_page,
+    render_index, render_site_with, route,
 };
 use crate::cloudflare::api::{self, NOT_CONNECTED};
 use crate::cloudflare::page::{
@@ -549,7 +549,13 @@ async fn fleet_page(req: &mut Request, env: &Env, route: Route) -> worker::Resul
         }
     };
     match route {
-        Route::Index => page(200, &render_index(&snapshot, &api::now())),
+        Route::Index => {
+            let filter = Filter::from_query(
+                query_value(req, "view").as_deref(),
+                query_value(req, "venture").as_deref(),
+            );
+            page(200, &render_index(&snapshot, &api::now(), &filter))
+        }
         Route::Site(id) => {
             let Some(site) = snapshot.sites.iter().find(|site| site.id == id) else {
                 return no_such_site();

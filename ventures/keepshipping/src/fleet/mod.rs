@@ -281,132 +281,370 @@ pub fn route(path: &str) -> Option<Route> {
     }
 }
 
-/// The whole fleet: a summary, what needs attention, then one section per
-/// venture with its apps (Pages sites and Workers, each environment under
-/// its production row) and its domains. The order is fixed (venture,
-/// group, production first), so the same snapshot always renders the same page; `now`
-/// (RFC 3339) is what the relative times are measured from.
+/// Which list the index shows; picked in the sidebar, carried in the query
+/// string (`?view=domains`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum View {
+    /// Pages sites and Workers, environments folded into their production row.
+    #[default]
+    Apps,
+    Domains,
+    /// Every site with a problem, and what it is.
+    Attention,
+}
+
+impl View {
+    fn key(self) -> &'static str {
+        match self {
+            View::Apps => "apps",
+            View::Domains => "domains",
+            View::Attention => "attention",
+        }
+    }
+
+    fn words(self) -> &'static str {
+        match self {
+            View::Apps => "Apps",
+            View::Domains => "Domains",
+            View::Attention => "Needs attention",
+        }
+    }
+
+    fn holds(self, site: &Site) -> bool {
+        match self {
+            View::Apps => site.kind != Kind::Zone,
+            View::Domains => site.kind == Kind::Zone,
+            View::Attention => needs_attention(site),
+        }
+    }
+}
+
+/// What the index is narrowed to: a view and, optionally, one venture.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Filter {
+    pub view: View,
+    /// A venture name exactly as the snapshot has it; `None` is all of them.
+    pub venture: Option<String>,
+}
+
+impl Filter {
+    /// From the query string's `view` and `venture`; anything unknown falls
+    /// back to the default rather than erroring.
+    #[must_use]
+    pub fn from_query(view: Option<&str>, venture: Option<&str>) -> Self {
+        let view = match view {
+            Some("domains") => View::Domains,
+            Some("attention") => View::Attention,
+            _ => View::Apps,
+        };
+        let venture = venture.map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
+        Filter { view, venture }
+    }
+
+    /// The index URL for `view` and `venture`, escaped for an attribute.
+    fn href(view: View, venture: Option<&str>) -> String {
+        let mut href = format!("/console/fleet?view={}", view.key());
+        if let Some(venture) = venture {
+            href.push_str("&venture=");
+            href.push_str(&utf8_percent_encode(venture, QUERY).to_string());
+        }
+        esc(&href)
+    }
+}
+
+/// The fleet: a sidebar to pick a view (apps, domains, needs attention) and
+/// a venture, and one compact table of what was picked. Details — commits,
+/// every domain, environments, rollbacks — are on each site's own page. The
+/// order is fixed (venture, group, production first), so the same snapshot
+/// always renders the same page; `now` (RFC 3339) is what the relative
+/// times are measured from.
 #[must_use]
-pub fn render_index(snapshot: &Fleet, now: &str) -> String {
+pub fn render_index(snapshot: &Fleet, now: &str, filter: &Filter) -> String {
     let terraform = snapshot.terraform.as_ref();
     let mut sites: Vec<&Site> = snapshot.sites.iter().collect();
     sites.sort_by_key(|&site| sort_key(site));
-    let attention: Vec<&Site> =
-        sites.iter().copied().filter(|site| needs_attention(site)).collect();
-    let count = |kind: Kind| sites.iter().filter(|site| site.kind == kind).count();
-    let stats = format!(
-        "<ul class=\"stats\" aria-label=\"Summary\">\n{}{}{}{}</ul>\n",
-        stat(count(Kind::Zone), "Domain", "Domains", ""),
-        stat(count(Kind::Pages), "Pages site", "Pages sites", ""),
-        stat(count(Kind::Worker), "Worker", "Workers", ""),
-        stat(
-            attention.len(),
-            "Needs attention",
-            "Need attention",
-            if attention.is_empty() { "" } else { " bad" },
-        ),
-    );
-    let source = match terraform {
-        Some(terraform) => format!(
-            " · Terraform {repo} at <code>{rev}</code>",
-            repo = esc(&terraform.repo),
-            rev = esc(short(&terraform.revision, 7)),
-        ),
-        None => String::new(),
-    };
-    let ventures = ventures(&sites);
-    let jump = if ventures.len() > 1 {
-        format!(
-            "<nav class=\"jump\" aria-label=\"Ventures\">{}</nav>\n",
-            ventures
-                .iter()
-                .enumerate()
-                .map(|(index, (venture, members))| format!(
-                    "<a href=\"#venture-{index}\">{name} <span class=\"count\">{count}</span></a>",
-                    name = venture_name(venture),
-                    count = members.len(),
-                ))
-                .collect::<String>()
-        )
-    } else {
-        String::new()
-    };
-    let sections = ventures
+    let all_ventures = ventures(&sites);
+    // A venture the snapshot does not have reads as all of them.
+    let venture = filter
+        .venture
+        .as_deref()
+        .filter(|wanted| all_ventures.iter().any(|(name, _)| name == wanted));
+    let in_venture: Vec<&Site> = sites
         .iter()
-        .enumerate()
-        .map(|(index, (venture, members))| venture_section(index, venture, members, terraform, now))
-        .collect::<String>();
-    let body = format!(
-        "<main id=\"main\" class=\"wrap\">\n\
-         <div class=\"pagehead\">\n<div>\n<h1>Sites</h1>\n\
-         <p class=\"sub\">{total} site{plural} in {account} · checked {when}{source}</p>\n</div>\n\
-         {REFRESH_FORM}\n</div>\n\
-         {stats}{gaps}{attention}{note}{jump}{sections}</main>\n",
+        .copied()
+        .filter(|site| venture.is_none_or(|wanted| site.venture.trim() == wanted))
+        .collect();
+    let shown: Vec<&Site> =
+        in_venture.iter().copied().filter(|site| filter.view.holds(site)).collect();
+
+    let view_link = |view: View| {
+        let count = view_count(view, &in_venture);
+        let class = if view == View::Attention && count > 0 { " bad" } else { "" };
+        side_link(&Filter::href(view, venture), view.words(), count, view == filter.view, class)
+    };
+    let mut venture_links = vec![side_link(
+        &Filter::href(filter.view, None),
+        "All ventures",
+        sites.len(),
+        venture.is_none(),
+        "",
+    )];
+    for (name, members) in &all_ventures {
+        let class = if members.iter().any(|site| needs_attention(site)) { " flag" } else { "" };
+        venture_links.push(side_link(
+            &Filter::href(filter.view, Some(name)),
+            &venture_name(name),
+            members.len(),
+            venture == Some(name.as_str()),
+            class,
+        ));
+    }
+    let side = format!(
+        "<aside class=\"side\">\n\
+         <nav aria-label=\"View\"><h2 class=\"side-h\">View</h2><ul>{apps}{domains}{attention}</ul></nav>\n\
+         <nav aria-label=\"Ventures\"><h2 class=\"side-h\">Ventures</h2><ul>{ventures}</ul></nav>\n\
+         <div class=\"side-foot\"><p>{total} site{plural} in {account}<br>checked {when}</p>{REFRESH_FORM}</div>\n\
+         </aside>\n",
+        apps = view_link(View::Apps),
+        domains = view_link(View::Domains),
+        attention = view_link(View::Attention),
+        ventures = venture_links.concat(),
         total = sites.len(),
         plural = if sites.len() == 1 { "" } else { "s" },
         account = esc(&snapshot.account),
         when = time_html(&snapshot.generated_at, now),
-        gaps = gaps_callout(&snapshot.gaps),
-        attention = attention_callout(&attention),
-        note = if terraform.is_none() { TERRAFORM_NOTE } else { "" },
+    );
+
+    let attention = in_venture.iter().filter(|site| needs_attention(site)).count();
+    let banner = if filter.view != View::Attention && attention > 0 {
+        format!(
+            "<p class=\"callout bad\"><strong>{attention} {noun} attention.</strong> \
+             <a href=\"{href}\">Show {them}</a></p>\n",
+            noun = if attention == 1 { "site needs" } else { "sites need" },
+            href = Filter::href(View::Attention, venture),
+            them = if attention == 1 { "it" } else { "them" },
+        )
+    } else {
+        String::new()
+    };
+    let table = match filter.view {
+        View::Apps => apps_table(&shown, terraform, now, venture.is_none()),
+        View::Domains => domains_table(&shown, terraform, now, venture.is_none()),
+        View::Attention => attention_table(&shown),
+    };
+    let body = format!(
+        "<div class=\"shell wrap\">\n{side}<main id=\"main\" class=\"content\">\n\
+         <div class=\"pagehead\"><div>\n<h1>{title}</h1>\n\
+         <p class=\"sub\">{view} · {count}{source}</p>\n</div></div>\n\
+         {gaps}{banner}{table}</main>\n</div>\n",
+        title = venture.map_or_else(|| "All ventures".to_owned(), esc),
+        view = filter.view.words(),
+        count = view_count(filter.view, &in_venture),
+        source = terraform
+            .map(|terraform| format!(
+                " · Terraform {repo} at <code>{rev}</code>",
+                repo = esc(&terraform.repo),
+                rev = esc(short(&terraform.revision, 7)),
+            ))
+            .unwrap_or_default(),
+        gaps = gaps_note(&snapshot.gaps),
     );
     signed_in_layout("Sites", Tab::Sites, &body)
 }
 
-/// One summary figure: `<li class="stat"><span class="n">37</span> Domains</li>`.
-fn stat(count: usize, one: &str, many: &str, class: &str) -> String {
+/// How many rows `view` shows: apps count once with their environments
+/// folded in, as the table draws them.
+fn view_count(view: View, sites: &[&Site]) -> usize {
+    let held: Vec<&Site> = sites.iter().copied().filter(|site| view.holds(site)).collect();
+    match view {
+        View::Apps => {
+            ventures(&held).iter().map(|(_, members)| fold_environments(members).len()).sum()
+        }
+        View::Domains | View::Attention => held.len(),
+    }
+}
+
+/// One sidebar link with its count; `class` adds `bad` (a red count) or
+/// `flag` (a red mark: something in it needs attention).
+fn side_link(href: &str, words: &str, count: usize, current: bool, class: &str) -> String {
     format!(
-        "<li class=\"stat{class}\"><span class=\"n\">{count}</span> {}</li>\n",
-        if count == 1 { one } else { many }
+        "<li><a class=\"side-link{class}\" href=\"{href}\"{current}><span>{words}</span>\
+         <span class=\"count\">{count}</span></a></li>",
+        current = if current { " aria-current=\"page\"" } else { "" },
     )
 }
 
-/// Said once, above the tables, instead of in every row: the checks that
-/// need Terraform are left out of the tables until it is connected.
-const TERRAFORM_NOTE: &str = "<p class=\"callout info\"><strong>Not managed by Terraform yet.</strong> \
-     Baseline scores, code drift and links to the code come from Terraform, so they appear once \
-     it is connected.</p>\n";
-
-/// The parts of Cloudflare the last refresh could not read, as a list.
-fn gaps_callout(gaps: &[String]) -> String {
+/// The parts of Cloudflare the last refresh could not read, folded away.
+fn gaps_note(gaps: &[String]) -> String {
     if gaps.is_empty() {
         return String::new();
     }
     format!(
-        "<section class=\"callout warn\" aria-labelledby=\"gaps-title\">\n\
-         <h2 id=\"gaps-title\">Not read this time</h2>\n\
-         <p>Everything else on this page is current. These could not be read:</p>\n\
-         <ul>\n{}</ul>\n</section>\n",
-        gaps.iter().map(|gap| format!("<li>{}</li>\n", esc(gap))).collect::<String>()
+        "<details class=\"callout warn gaps\"><summary>Not read this time: {count} part{plural} \
+         of Cloudflare. The rest is current.</summary>\n<ul>\n{items}</ul>\n</details>\n",
+        count = gaps.len(),
+        plural = if gaps.len() == 1 { "" } else { "s" },
+        items = gaps.iter().map(|gap| format!("<li>{}</li>\n", esc(gap))).collect::<String>(),
     )
 }
 
-/// The sites that need attention, each with what is wrong in words.
-fn attention_callout(sites: &[&Site]) -> String {
-    if sites.is_empty() {
-        return String::new();
+/// The sorted sites cut into runs of one venture each, in order.
+fn ventures<'a>(sites: &[&'a Site]) -> Vec<(String, Vec<&'a Site>)> {
+    let mut out: Vec<(String, Vec<&Site>)> = Vec::new();
+    for &site in sites {
+        let venture = site.venture.trim();
+        match out.last_mut() {
+            Some((name, members)) if name == venture => members.push(site),
+            _ => out.push((venture.to_owned(), vec![site])),
+        }
     }
-    let items = sites
+    out
+}
+
+/// A venture's name; sites with none are grouped as "No venture".
+fn venture_name(venture: &str) -> String {
+    if venture.is_empty() { "No venture".to_owned() } else { esc(venture) }
+}
+
+/// The table's body: one `<tbody>` per venture with a heading row when all
+/// ventures are shown, one plain `<tbody>` otherwise.
+fn grouped(
+    sites: &[&Site],
+    columns: usize,
+    by_venture: bool,
+    rows: impl Fn(&[&Site]) -> String,
+) -> String {
+    if !by_venture {
+        return format!("<tbody>\n{}</tbody>\n", rows(sites));
+    }
+    ventures(sites)
+        .iter()
+        .map(|(name, members)| {
+            format!(
+                "<tbody>\n<tr class=\"group\"><th scope=\"colgroup\" colspan=\"{columns}\">{name}</th></tr>\n{rows}</tbody>\n",
+                name = venture_name(name),
+                rows = rows(members),
+            )
+        })
+        .collect()
+}
+
+/// The Terraform columns' headings, only with Terraform behind the snapshot.
+fn check_heads(terraform: Option<&Terraform>) -> (&'static str, usize) {
+    if terraform.is_some() {
+        (
+            "<th scope=\"col\" class=\"c-score\">Baseline</th><th scope=\"col\" class=\"c-code\">Code</th>\
+             <th scope=\"col\" class=\"c-file\">Defined in</th>",
+            3,
+        )
+    } else {
+        ("", 0)
+    }
+}
+
+fn empty_row(columns: usize, words: &str) -> String {
+    format!("<tbody><tr><td class=\"empty\" colspan=\"{columns}\">{words}</td></tr></tbody>\n")
+}
+
+/// Apps: one row per Pages project or Worker; its staging, test and preview
+/// environments are chips on that row, not rows of their own.
+fn apps_table(
+    sites: &[&Site],
+    terraform: Option<&Terraform>,
+    now: &str,
+    by_venture: bool,
+) -> String {
+    let (extra, extra_count) = check_heads(terraform);
+    let columns = 4 + extra_count;
+    let body = if sites.is_empty() {
+        empty_row(columns, "No apps here.")
+    } else {
+        grouped(sites, columns, by_venture, |members| {
+            fold_environments(members)
+                .iter()
+                .map(|(site, environments)| app_row(site, environments, terraform, now))
+                .collect()
+        })
+    };
+    format!(
+        "<table class=\"sites\">\n<caption class=\"offscreen\">Apps with their main domain, last \
+         deploy and health</caption>\n\
+         <thead><tr><th scope=\"col\">App</th><th scope=\"col\" class=\"c-domain\">Domain</th>\
+         <th scope=\"col\" class=\"c-deploy\">Deployed</th><th scope=\"col\" class=\"c-health\">Health</th>\
+         {extra}</tr></thead>\n{body}</table>\n"
+    )
+}
+
+/// Domains: one row per zone, its health, and its last change when the
+/// snapshot has any (a Terraform apply).
+fn domains_table(
+    sites: &[&Site],
+    terraform: Option<&Terraform>,
+    now: &str,
+    by_venture: bool,
+) -> String {
+    let (extra, extra_count) = check_heads(terraform);
+    let changes = sites.iter().any(|site| !site.deploys.is_empty());
+    let columns = 2 + usize::from(changes) + extra_count;
+    let body = if sites.is_empty() {
+        empty_row(columns, "No domains here.")
+    } else {
+        grouped(sites, columns, by_venture, |members| {
+            members
+                .iter()
+                .map(|site| {
+                    format!(
+                        "<tr>\n<th scope=\"row\"><div class=\"name\"><a href=\"/console/fleet/{id}\">{name}</a></div></th>\n\
+                         {change}<td data-label=\"Health\">{health}</td>\n{checks}</tr>\n",
+                        id = utf8_percent_encode(&site.id, ID),
+                        name = esc(&site.name),
+                        change = if changes {
+                            format!("<td data-label=\"Last change\">{}</td>\n", deployed_cell(site, now))
+                        } else {
+                            String::new()
+                        },
+                        health = health(site),
+                        checks = check_cells(site, terraform),
+                    )
+                })
+                .collect()
+        })
+    };
+    format!(
+        "<table class=\"sites\">\n<caption class=\"offscreen\">Domains with their health</caption>\n\
+         <thead><tr><th scope=\"col\">Domain</th>{change}\
+         <th scope=\"col\" class=\"c-health\">Health</th>{extra}</tr></thead>\n{body}</table>\n",
+        change = if changes { "<th scope=\"col\" class=\"c-deploy\">Last change</th>" } else { "" },
+    )
+}
+
+/// Needs attention: each site with a problem and what the problem is.
+fn attention_table(sites: &[&Site]) -> String {
+    if sites.is_empty() {
+        return "<div class=\"panel all-clear\"><p><span class=\"status ok\">Nothing needs \
+                attention.</span> Every checked site is healthy.</p></div>\n"
+            .to_owned();
+    }
+    let rows = sites
         .iter()
         .map(|site| {
             format!(
-                "<li><a href=\"/console/fleet/{id}\">{name}</a>{venture} <span class=\"why\">{why}</span></li>\n",
+                "<tr>\n<th scope=\"row\"><div class=\"name\"><a href=\"/console/fleet/{id}\">{name}</a>\
+                 <span class=\"tag\">{kind}</span></div></th>\n\
+                 <td data-label=\"Venture\">{venture}</td>\n\
+                 <td data-label=\"Problem\" class=\"bad\">{why}</td>\n</tr>\n",
                 id = utf8_percent_encode(&site.id, ID),
                 name = esc(&site.name),
-                venture = if site.venture.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(" <span class=\"muted\">{}</span>", esc(&site.venture))
-                },
+                kind = site.kind.short(),
+                venture = venture_name(site.venture.trim()),
                 why = esc(&attention_reasons(site).join("; ")),
             )
         })
         .collect::<String>();
     format!(
-        "<section class=\"callout bad\" aria-labelledby=\"attention-title\">\n\
-         <h2 id=\"attention-title\">{count} {noun} attention</h2>\n<ul>\n{items}</ul>\n</section>\n",
-        count = sites.len(),
-        noun = if sites.len() == 1 { "site needs" } else { "sites need" },
+        "<table class=\"sites\">\n<caption class=\"offscreen\">Sites that need attention</caption>\n\
+         <thead><tr><th scope=\"col\">Site</th><th scope=\"col\" class=\"c-venture\">Venture</th>\
+         <th scope=\"col\" class=\"c-problem\">Problem</th></tr></thead>\n<tbody>\n{rows}</tbody>\n</table>\n"
     )
 }
 
@@ -420,7 +658,7 @@ fn attention_reasons(site: &Site) -> Vec<String> {
     if let Some(tls) = &site.tls {
         match tls.status {
             TlsStatus::Expiring => {
-                reasons.push(with("HTTPS certificate expiring soon", tls.note.as_ref()))
+                reasons.push(with("HTTPS certificate expiring soon", tls.note.as_ref()));
             }
             TlsStatus::Failing => reasons.push(with("HTTPS failing", tls.note.as_ref())),
             TlsStatus::Ok | TlsStatus::Unknown => {}
@@ -437,84 +675,132 @@ fn attention_reasons(site: &Site) -> Vec<String> {
     reasons
 }
 
-/// The sorted sites cut into runs of one venture each, in order.
-fn ventures<'a>(sites: &[&'a Site]) -> Vec<(String, Vec<&'a Site>)> {
-    let mut out: Vec<(String, Vec<&Site>)> = Vec::new();
+/// Each app with the environments folded under it: a non-production site
+/// joins the row before it when that row is its production (same kind and
+/// group); one with no production row is a row of its own.
+fn fold_environments<'a>(sites: &[&'a Site]) -> Vec<(&'a Site, Vec<&'a Site>)> {
+    let mut rows: Vec<(&Site, Vec<&Site>)> = Vec::new();
     for &site in sites {
-        let venture = site.venture.trim();
-        match out.last_mut() {
-            Some((name, members)) if name == venture => members.push(site),
-            _ => out.push((venture.to_owned(), vec![site])),
+        if is_child(site)
+            && let Some((parent, environments)) = rows.last_mut()
+            && parent.kind == site.kind
+            && group_name(parent) == group_name(site)
+            && !is_child(parent)
+        {
+            environments.push(site);
+            continue;
         }
+        rows.push((site, Vec::new()));
     }
-    out
+    rows
 }
 
-/// A venture's heading; sites with none are grouped as "No venture".
-fn venture_name(venture: &str) -> String {
-    if venture.is_empty() { "No venture".to_owned() } else { esc(venture) }
-}
-
-/// One venture: its heading and counts, its apps table, its domains table.
-fn venture_section(
-    index: usize,
-    venture: &str,
-    sites: &[&Site],
+/// One app row. `th scope="row"` makes the name the row's heading for
+/// screen readers; each cell carries a `data-label` so the narrow card
+/// layout can name it without JS.
+fn app_row(
+    site: &Site,
+    environments: &[&Site],
     terraform: Option<&Terraform>,
     now: &str,
 ) -> String {
-    let (zones, apps): (Vec<&Site>, Vec<&Site>) =
-        sites.iter().copied().partition(|site| site.kind == Kind::Zone);
-    let counts = [(apps.len(), "app", "apps"), (zones.len(), "domain", "domains")]
-        .iter()
-        .filter(|(count, _, _)| *count > 0)
-        .map(|(count, one, many)| format!("{count} {}", if *count == 1 { one } else { many }))
-        .collect::<Vec<_>>()
-        .join(" · ");
-    let checks = terraform.is_some();
-    let extra_head = if checks {
-        "<th scope=\"col\" class=\"c-score\">Baseline</th><th scope=\"col\" class=\"c-code\">Code</th>\
-         <th scope=\"col\" class=\"c-file\">Defined in</th>"
-    } else {
-        ""
-    };
-    let table_class = if checks { "sites checks" } else { "sites" };
-    let apps_table = if apps.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "<table class=\"{table_class}\">\n\
-             <caption>Apps <span class=\"count\">{count}</span></caption>\n\
-             <thead><tr><th scope=\"col\">App</th><th scope=\"col\" class=\"c-domain\">Domain</th>\
-             <th scope=\"col\" class=\"c-deploy\">Last deploy</th><th scope=\"col\" class=\"c-status\">HTTPS</th>\
-             <th scope=\"col\" class=\"c-status\">DNS</th>{extra_head}</tr></thead>\n\
-             <tbody>\n{rows}</tbody>\n</table>\n",
-            count = apps.len(),
-            rows = apps.iter().map(|site| app_row(site, terraform, now)).collect::<String>(),
-        )
-    };
-    let zones_table = if zones.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "<table class=\"{table_class} zones\">\n\
-             <caption>Domains <span class=\"count\">{count}</span></caption>\n\
-             <thead><tr><th scope=\"col\">Domain</th>\
-             <th scope=\"col\" class=\"c-deploy\">Last change</th><th scope=\"col\" class=\"c-status\">HTTPS</th>\
-             <th scope=\"col\" class=\"c-status\">DNS</th>{extra_head}</tr></thead>\n\
-             <tbody>\n{rows}</tbody>\n</table>\n",
-            count = zones.len(),
-            rows = zones.iter().map(|site| zone_row(site, terraform, now)).collect::<String>(),
-        )
-    };
+    let lone = if is_child(site) { environment_badge(site) } else { String::new() };
     format!(
-        "<section class=\"venture\" id=\"venture-{index}\" aria-labelledby=\"venture-{index}-title\">\n\
-         <div class=\"vhead\"><h2 id=\"venture-{index}-title\">{name}</h2>\
-         <span class=\"muted\">{counts}</span></div>\n\
-         {apps_table}{zones_table}</section>\n",
-        name = venture_name(venture),
+        "<tr>\n\
+         <th scope=\"row\"><div class=\"name\"><a href=\"/console/fleet/{id}\">{name}</a>\
+         <span class=\"tag\">{kind}</span>{lone}{chips}</div></th>\n\
+         <td data-label=\"Domain\" class=\"domain\">{domain}</td>\n\
+         <td data-label=\"Deployed\">{deployed}</td>\n\
+         <td data-label=\"Health\">{health}</td>\n\
+         {checks}</tr>\n",
+        id = utf8_percent_encode(&site.id, ID),
+        name = esc(&site.name),
+        kind = site.kind.short(),
+        chips = environment_chips(site, environments),
+        domain = main_domain(&site.domains)
+            .map_or_else(|| "<span class=\"unknown\">—</span>".to_owned(), |domain| esc(domain)),
+        deployed = deployed_cell(site, now),
+        health = health(site),
+        checks = check_cells(site, terraform),
     )
 }
+
+/// A row's environments as small links: a Worker's by name (`staging`),
+/// a Pages project's previews as one count, linking to the project's page
+/// where they are listed.
+fn environment_chips(site: &Site, environments: &[&Site]) -> String {
+    let mut chips = String::new();
+    let mut previews = 0;
+    for environment in environments {
+        match environment.kind {
+            Kind::Pages => previews += 1,
+            Kind::Worker | Kind::Zone => chips.push_str(&format!(
+                "<a class=\"chip\" href=\"/console/fleet/{id}\">{env}</a>",
+                id = utf8_percent_encode(&environment.id, ID),
+                env = esc(environment.environment.as_deref().unwrap_or_default()),
+            )),
+        }
+    }
+    if previews > 0 {
+        chips.push_str(&format!(
+            "<a class=\"chip\" href=\"/console/fleet/{id}#environments\">{previews} preview{plural}</a>",
+            id = utf8_percent_encode(&site.id, ID),
+            plural = if previews == 1 { "" } else { "s" },
+        ));
+    }
+    chips
+}
+
+/// The last deploy as a relative time, the details in its title; "Never
+/// deployed" for an app without one, a dash for a domain.
+fn deployed_cell(site: &Site, now: &str) -> String {
+    match site.deploys.first() {
+        Some(deploy) => relative_time(deploy, now),
+        None if site.kind == Kind::Zone => "<span class=\"unknown\">—</span>".to_owned(),
+        None => "<span class=\"unknown\">Never deployed</span>".to_owned(),
+    }
+}
+
+/// HTTPS and DNS as one word: a problem names itself, all-good is
+/// "Healthy", anything unchecked is "Not checked". The title has both.
+fn health(site: &Site) -> String {
+    let tls = site.tls.as_ref().map(|tls| tls.status);
+    let dns = site.dns.as_ref().map(|dns| dns.status);
+    let failing = matches!(tls, Some(TlsStatus::Failing));
+    let dns_bad = matches!(dns, Some(DnsStatus::Problem));
+    let (class, words) = match (failing, dns_bad) {
+        (true, true) => ("bad", "HTTPS and DNS"),
+        (true, false) => ("bad", "HTTPS failing"),
+        (false, true) => ("bad", "DNS problem"),
+        (false, false) if matches!(tls, Some(TlsStatus::Expiring)) => ("warn", "Cert expiring"),
+        (false, false) if tls == Some(TlsStatus::Ok) && dns == Some(DnsStatus::Ok) => {
+            ("ok", "Healthy")
+        }
+        (false, false) => ("unknown", "Not checked"),
+    };
+    let tls_words = match tls {
+        Some(TlsStatus::Ok) => "secure",
+        Some(TlsStatus::Expiring) => "expiring soon",
+        Some(TlsStatus::Failing) => "failing",
+        Some(TlsStatus::Unknown) | None => "not checked",
+    };
+    let dns_words = match dns {
+        Some(DnsStatus::Ok) => "healthy",
+        Some(DnsStatus::Problem) => "problem",
+        Some(DnsStatus::Unknown) | None => "not checked",
+    };
+    let mut title = format!("HTTPS {tls_words}, DNS {dns_words}");
+    let reasons = attention_reasons(site);
+    if !reasons.is_empty() {
+        title = format!("{title}. {}", reasons.join("; "));
+    }
+    format!("<span class=\"status {class}\" title=\"{}\">{words}</span>", esc(&title))
+}
+
+/// Said on a site's page instead of empty Terraform fields.
+const TERRAFORM_NOTE: &str = "<p class=\"callout info\"><strong>Not managed by Terraform yet.</strong> \
+     Baseline scores, code drift and links to the code come from Terraform, so they appear once \
+     it is connected.</p>\n";
 
 /// The refresh button: a POST to the same-origin gate.
 pub(crate) const REFRESH_FORM: &str = "<form class=\"refresh\" method=\"post\" \
@@ -543,59 +829,6 @@ pub fn empty_snapshot_page(connected: bool) -> String {
          <p>{message}</p>\n{action}\n</div>\n</main>\n"
     );
     signed_in_layout("No sites yet", Tab::Sites, &body)
-}
-
-/// One app row. `th scope="row"` makes the site name the row's heading for
-/// screen readers; each cell carries a `data-label` so the narrow card
-/// layout can name it without JS. A non-production environment is drawn as
-/// a child of the row above it (the sort puts it there).
-fn app_row(site: &Site, terraform: Option<&Terraform>, now: &str) -> String {
-    let child = is_child(site);
-    // A Pages preview shares its project's name, so its branch names it.
-    let label = match (child, site.kind, site.environment.as_deref()) {
-        (true, Kind::Pages, Some(branch)) => esc(branch),
-        _ => esc(&site.name),
-    };
-    let tags = match (child, site.kind) {
-        (true, Kind::Pages) => "<span class=\"tag env\">preview</span>".to_owned(),
-        _ => format!("<span class=\"tag\">{}</span>{}", site.kind.short(), environment_badge(site)),
-    };
-    format!(
-        "<tr{class}>\n\
-         <th scope=\"row\"><div class=\"name\"><a href=\"/console/fleet/{id}\">{label}</a>{tags}</div></th>\n\
-         <td data-label=\"Domain\">{domains}</td>\n\
-         <td data-label=\"Last deploy\">{deploy}</td>\n\
-         <td data-label=\"HTTPS\">{tls}</td>\n\
-         <td data-label=\"DNS\">{dns}</td>\n\
-         {checks}</tr>\n",
-        class = if child { " class=\"child\"" } else { "" },
-        id = utf8_percent_encode(&site.id, ID),
-        domains = domains_text(site),
-        deploy = deploy_cell(site, now),
-        tls = tls_span(site),
-        dns = dns_span(site),
-        checks = check_cells(site, terraform),
-    )
-}
-
-/// One domain row, with the link to change its DNS as code.
-fn zone_row(site: &Site, terraform: Option<&Terraform>, now: &str) -> String {
-    format!(
-        "<tr>\n\
-         <th scope=\"row\"><div class=\"name\"><a href=\"/console/fleet/{id}\">{name}</a>\
-         <a class=\"action\" href=\"/v1/edits/new?kind=dns&amp;zone={zone}\">Change DNS</a></div></th>\n\
-         <td data-label=\"Last change\">{deploy}</td>\n\
-         <td data-label=\"HTTPS\">{tls}</td>\n\
-         <td data-label=\"DNS\">{dns}</td>\n\
-         {checks}</tr>\n",
-        id = utf8_percent_encode(&site.id, ID),
-        name = esc(&site.name),
-        zone = utf8_percent_encode(&site.name, QUERY),
-        deploy = deploy_cell(site, now),
-        tls = tls_span(site),
-        dns = dns_span(site),
-        checks = check_cells(site, terraform),
-    )
 }
 
 /// The baseline, code and defined-in cells: only with Terraform behind the
@@ -710,12 +943,6 @@ pub fn render_site_with(
             domain = esc(domain),
         ));
     }
-    if site.kind == Kind::Zone {
-        actions.push(format!(
-            "<a class=\"btn\" href=\"/v1/edits/new?kind=dns&amp;zone={}\">Change DNS</a>",
-            utf8_percent_encode(&site.name, QUERY),
-        ));
-    }
     let domains = if site.domains.is_empty() {
         "<li class=\"unknown\">None</li>\n".to_owned()
     } else {
@@ -749,7 +976,7 @@ pub fn render_site_with(
     let body = format!(
         "<main id=\"main\" class=\"wrap\">\n\
          <nav class=\"crumbs\" aria-label=\"Breadcrumb\"><a href=\"/console/fleet\">&larr; All sites</a>\
-         <span aria-hidden=\"true\">/</span><span>{venture}</span></nav>\n\
+         <span aria-hidden=\"true\">/</span><a href=\"{venture_href}\">{venture}</a></nav>\n\
          <div class=\"pagehead\">\n<div>\n<h1>{name}</h1>\n\
          <p class=\"sub\">{tags} <span>in {account} · checked {when}</span></p>\n</div>\n\
          <div class=\"actions\">{actions}</div>\n</div>\n\
@@ -757,9 +984,16 @@ pub fn render_site_with(
          <div class=\"columns\">\n<div class=\"stack\">\n\
          <section class=\"panel\">\n<h2>Deploys</h2>\n<ol class=\"rows deploys\">\n{deploys}</ol>\n</section>\n\
          {panel}</div>\n\
+         <div class=\"stack\">\n\
          <section class=\"panel\">\n<h2>Domains</h2>\n<ul class=\"rows\">\n{domains}</ul>\n</section>\n\
+         {environments}</div>\n\
          </div>\n{code}</main>\n",
+        environments = environments_panel(snapshot, site, now),
         venture = venture_name(site.venture.trim()),
+        venture_href = Filter::href(
+            if site.kind == Kind::Zone { View::Domains } else { View::Apps },
+            Some(site.venture.trim()).filter(|venture| !venture.is_empty()),
+        ),
         name = esc(&site.name),
         account = esc(&snapshot.account),
         when = time_html(&snapshot.generated_at, now),
@@ -768,6 +1002,43 @@ pub fn render_site_with(
         deploys = deploys_list(site, now),
     );
     Some(signed_in_layout(&site.name, Tab::Sites, &body))
+}
+
+/// The site's other environments (its production, staging, previews):
+/// the sites of the same venture, kind and group. Empty when it has none.
+fn environments_panel(snapshot: &Fleet, site: &Site, now: &str) -> String {
+    let mut siblings: Vec<&Site> = snapshot
+        .sites
+        .iter()
+        .filter(|other| {
+            other.id != site.id
+                && other.kind == site.kind
+                && other.kind != Kind::Zone
+                && other.venture.trim() == site.venture.trim()
+                && group_name(other) == group_name(site)
+        })
+        .collect();
+    if siblings.is_empty() {
+        return String::new();
+    }
+    siblings.sort_by_key(|&other| sort_key(other));
+    let rows = siblings
+        .iter()
+        .map(|other| {
+            format!(
+                "<li><a href=\"/console/fleet/{id}\">{env}</a> <span class=\"muted\">{name}</span>\
+                 <span class=\"aside\">{deployed}</span></li>\n",
+                id = utf8_percent_encode(&other.id, ID),
+                env = esc(other.environment.as_deref().unwrap_or("production")),
+                name = if other.kind == Kind::Pages { String::new() } else { esc(&other.name) },
+                deployed = deployed_cell(other, now),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<section class=\"panel\" id=\"environments\">\n<h2>Environments</h2>\n\
+         <ul class=\"rows\">\n{rows}</ul>\n</section>\n"
+    )
 }
 
 /// One status tile on a site's page.
@@ -887,24 +1158,6 @@ pub fn email_allowed(email: &str, allowlist: &str) -> bool {
     !email.is_empty() && allowlist.split(',').any(|entry| entry.trim().eq_ignore_ascii_case(email))
 }
 
-fn domains_text(site: &Site) -> String {
-    let Some(main) = main_domain(&site.domains) else {
-        return "<span class=\"unknown\">—</span>".to_owned();
-    };
-    let rest: Vec<String> =
-        site.domains.iter().filter(|domain| *domain != main).map(|domain| esc(domain)).collect();
-    if rest.is_empty() {
-        return esc(main);
-    }
-    format!(
-        "{main}<details class=\"more\"><summary>+{count} more</summary>\
-         <ul>{rest}</ul></details>",
-        main = esc(main),
-        count = rest.len(),
-        rest = rest.iter().map(|domain| format!("<li>{domain}</li>")).collect::<String>(),
-    )
-}
-
 /// The domain a person means by the site: a custom domain over the
 /// platform's own (`*.pages.dev`, `*.workers.dev`), the apex over `www.`,
 /// then the shortest; the listed order breaks ties.
@@ -921,29 +1174,6 @@ pub fn main_domain(domains: &[String]) -> Option<&String> {
         .map(|(_, domain)| domain)
 }
 
-/// The last deploy in a table cell: when, on top, as the relative time
-/// (the full time and the trigger in its title); what, below, as the id,
-/// branch and message. A domain is never deployed, so it gets a dash.
-fn deploy_cell(site: &Site, now: &str) -> String {
-    let Some(deploy) = site.deploys.first() else {
-        return if site.kind == Kind::Zone {
-            "<span class=\"unknown\">—</span>".to_owned()
-        } else {
-            "<span class=\"unknown\">Never deployed</span>".to_owned()
-        };
-    };
-    let what = deploy_what(deploy);
-    format!(
-        "<div class=\"when\">{when}</div>{what}",
-        when = relative_time(deploy, now),
-        what = if what.is_empty() {
-            String::new()
-        } else {
-            format!("<div class=\"what\">{what}</div>")
-        },
-    )
-}
-
 /// A deploy's time as `3 days ago`, the full time and the trigger in words
 /// as its title; a time that does not parse is shown as it came.
 fn relative_time(deploy: &Deploy, now: &str) -> String {
@@ -951,10 +1181,21 @@ fn relative_time(deploy: &Deploy, now: &str) -> String {
         return esc(&deploy.at);
     };
     let at = at.to_offset(UtcOffset::UTC);
-    let mut title = words(at);
-    if !deploy.by.trim().is_empty() {
-        title = format!("{title} · {}", trigger_words(&deploy.by));
+    let mut parts = vec![words(at)];
+    if !deploy.commit.trim().is_empty() {
+        let len = if deploy.refers_to == DeployRef::Commit { 7 } else { 8 };
+        parts.push(short(&deploy.commit, len).to_owned());
     }
+    if let Some(branch) = deploy.branch.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+        parts.push(branch.to_owned());
+    }
+    if let Some(message) = deploy.message.as_deref().map(message_line).filter(|m| !m.is_empty()) {
+        parts.push(message);
+    }
+    if !deploy.by.trim().is_empty() {
+        parts.push(trigger_words(&deploy.by));
+    }
+    let title = parts.join(" · ");
     let relative = OffsetDateTime::parse(now, &Rfc3339)
         .map(|now| ago(at, now.to_offset(UtcOffset::UTC)))
         .unwrap_or_else(|_| words(at));
@@ -1406,41 +1647,68 @@ mod tests {
     }
 
     #[test]
-    fn a_deploy_cell_puts_when_on_top_and_leaves_out_what_is_not_carried() {
+    fn a_deploy_reads_as_a_relative_time_with_the_details_in_its_title() {
         let mut full = deploy("4a1f9c2e7b3d", "github:push", DeployRef::Commit);
         full.branch = Some("main".to_owned());
         full.message = Some("fix the form".to_owned());
         let mut pages = site("p", "kaje", Kind::Pages, None);
         pages.deploys = vec![full.clone()];
         assert_eq!(
-            deploy_cell(&pages, "2026-10-08T18:42:00Z"),
-            "<div class=\"when\"><time datetime=\"2026-10-08T17:42:00Z\" \
-             title=\"8 Oct 2026, 17:42 UTC · git push\">1 hour ago</time></div>\
-             <div class=\"what\"><code>4a1f9c2</code> · main · <span class=\"msg\">fix the form</span></div>"
+            deployed_cell(&pages, "2026-10-08T18:42:00Z"),
+            "<time datetime=\"2026-10-08T17:42:00Z\" \
+             title=\"8 Oct 2026, 17:42 UTC · 4a1f9c2 · main · fix the form · git push\">1 hour ago</time>"
         );
-        // The history line adds the trigger; the time sits beside it.
+        // The site page's history line spells the same out in markup.
         assert_eq!(
             deploy_line_parts(&full),
             "<code>4a1f9c2</code> · main · <span class=\"msg\">fix the form</span> · git push"
         );
-        // A modified time alone: no id, no trigger, just the time.
-        let bare = Deploy {
-            commit: String::new(),
-            at: "2026-10-14T19:05:44.123Z".to_owned(),
-            by: String::new(),
-            branch: None,
-            message: None,
-            refers_to: DeployRef::Commit,
-        };
-        pages.deploys = vec![bare];
-        assert_eq!(
-            deploy_cell(&pages, "2026-10-14T20:05:45Z"),
-            "<div class=\"when\"><time datetime=\"2026-10-14T19:05:44.123Z\" \
-             title=\"14 Oct 2026, 19:05 UTC\">1 hour ago</time></div>"
-        );
         // Never deployed: said for an app, a dash for a domain.
-        assert!(deploy_cell(&site("w", "api", Kind::Worker, None), "t").contains("Never deployed"));
-        assert!(deploy_cell(&site("z", "a.com", Kind::Zone, None), "t").contains("—"));
+        assert!(
+            deployed_cell(&site("w", "api", Kind::Worker, None), "t").contains("Never deployed")
+        );
+        assert!(deployed_cell(&site("z", "a.com", Kind::Zone, None), "t").contains("—"));
+    }
+
+    #[test]
+    fn environments_fold_into_their_production_row_as_chips() {
+        let production = site("w1", "api", Kind::Worker, Some("production"));
+        let staging = site("w2", "api-staging", Kind::Worker, Some("staging"));
+        let lone = site("w3", "app-staging", Kind::Worker, Some("staging"));
+        let project = site("p1", "kaje", Kind::Pages, None);
+        let preview = site("p2", "kaje", Kind::Pages, Some("feature/x"));
+        let rows = fold_environments(&[&production, &staging, &lone, &project, &preview]);
+        let shape: Vec<(&str, usize)> =
+            rows.iter().map(|(site, envs)| (site.id.as_str(), envs.len())).collect();
+        assert_eq!(shape, [("w1", 1), ("w3", 0), ("p1", 1)]);
+        assert!(environment_chips(&production, &rows[0].1).contains(">staging</a>"));
+        assert!(environment_chips(&project, &rows[2].1).contains("1 preview</a>"));
+    }
+
+    #[test]
+    fn health_is_one_word_with_both_checks_in_its_title() {
+        let mut zone = site("z", "a.com", Kind::Zone, None);
+        assert!(health(&zone).contains(">Not checked<"));
+        zone.tls = Some(Tls { status: TlsStatus::Ok, note: None });
+        zone.dns = Some(Dns { status: DnsStatus::Ok, note: None });
+        assert!(health(&zone).contains("status ok") && health(&zone).contains(">Healthy<"));
+        zone.dns = Some(Dns { status: DnsStatus::Problem, note: Some("Zone is moved".to_owned()) });
+        let cell = health(&zone);
+        assert!(cell.contains(">DNS problem<"), "{cell}");
+        assert!(cell.contains("title=\"HTTPS secure, DNS problem. DNS problem: Zone is moved\""));
+    }
+
+    #[test]
+    fn a_filter_reads_the_query_and_falls_back_to_apps() {
+        assert_eq!(Filter::from_query(None, None), Filter::default());
+        let filter = Filter::from_query(Some("domains"), Some(" CHI "));
+        assert_eq!(filter.view, View::Domains);
+        assert_eq!(filter.venture.as_deref(), Some("CHI"));
+        assert_eq!(Filter::from_query(Some("nope"), Some("")).view, View::Apps);
+        assert_eq!(
+            Filter::href(View::Attention, Some("A&B")),
+            "/console/fleet?view=attention&amp;venture=A%26B"
+        );
     }
 
     #[test]
@@ -1510,10 +1778,7 @@ mod tests {
     fn a_site_id_with_a_slash_links_and_routes_back() {
         let mut preview = site("pages:acct:kaje:feature/x", "kaje", Kind::Pages, Some("feature/x"));
         preview.domains = vec!["feature-x.kaje.pages.dev".to_owned()];
-        let row = app_row(&preview, None, "2026-10-16T09:00:00Z");
-        // A preview is named by its branch under its project's row.
-        assert!(row.contains("<tr class=\"child\">"), "{row}");
-        assert!(row.contains(">feature/x</a><span class=\"tag env\">preview</span>"), "{row}");
+        let row = app_row(&preview, &[], None, "2026-10-16T09:00:00Z");
         assert!(row.contains("href=\"/console/fleet/pages:acct:kaje:feature%2Fx\""), "{row}");
         let Some(Route::Site(id)) = route("/console/fleet/pages:acct:kaje:feature%2Fx") else {
             panic!("the encoded id routes to its site");

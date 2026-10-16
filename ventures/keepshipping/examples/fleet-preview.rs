@@ -36,7 +36,13 @@ fn main() {
         fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
         fs::write(&path, html).expect("write");
     };
-    write("fleet/index.html", fleet::render_index(&snapshot, &now));
+    write("fleet/index.html", fleet::render_index(&snapshot, &now, &Default::default()));
+    for view in ["domains", "attention"] {
+        let filter = fleet::Filter::from_query(Some(view), None);
+        write(&format!("fleet/{view}.html"), fleet::render_index(&snapshot, &now, &filter));
+    }
+    let one = fleet::Filter::from_query(None, Some("Factory0"));
+    write("fleet/factory0.html", fleet::render_index(&snapshot, &now, &one));
     for site in &snapshot.sites {
         let id = utf8_percent_encode(&site.id, NON_ALPHANUMERIC).to_string();
         write(

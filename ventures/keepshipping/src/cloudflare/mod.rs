@@ -700,11 +700,14 @@ mod tests {
         inventory.gaps = vec!["Pages projects (Cloudflare Pages: Read)".to_owned()];
         let fleet = fleet_from(&inventory, "2026-10-16T00:00:00Z");
         assert_eq!(fleet.gaps, inventory.gaps);
-        let html = crate::fleet::render_index(&fleet, "2026-10-16T00:00:00Z");
+        let html = crate::fleet::render_index(&fleet, "2026-10-16T00:00:00Z", &Default::default());
         assert!(html.contains("Not read this time"), "{html}");
         assert!(html.contains("Pages projects (Cloudflare Pages: Read)"), "{html}");
         let none = fleet_from(&super::Inventory { gaps: Vec::new(), ..inventory }, "t");
-        assert!(!crate::fleet::render_index(&none, "t").contains("Not read this time"));
+        assert!(
+            !crate::fleet::render_index(&none, "t", &Default::default())
+                .contains("Not read this time")
+        );
     }
 
     #[test]
@@ -1023,9 +1026,9 @@ mod tests {
     #[test]
     fn the_mapped_snapshot_renders_without_terraform() {
         let fleet = fleet_from(&inventory(), "2026-10-16T09:00:00Z");
-        let index = render_index(&fleet, "2026-10-16T10:00:00Z");
-        assert!(index.contains("Not managed by Terraform yet"));
+        let index = render_index(&fleet, "2026-10-16T10:00:00Z", &Default::default());
         assert!(index.contains("Refresh now"));
+        assert!(!index.contains(">Baseline<"), "no Terraform columns without Terraform");
         let site = fleet.sites.iter().find(|site| site.name == "tickets-api").expect("worker");
         let page = render_site(&fleet, &site.id, "2026-10-16T10:00:00Z").expect("site page");
         assert!(page.contains("Not managed by Terraform yet"));
