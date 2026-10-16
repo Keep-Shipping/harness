@@ -19,9 +19,9 @@ use worker::{Env, Fetch, Headers, Method, Request, RequestInit};
 
 use super::seal::{self, Sealed};
 use super::{
-    Account, AccountError, CertificatePack, Envelope, Inventory, PagesProject, Verify,
-    WorkerDomain, WorkerScript, Zone, ZoneRecord, fleet_from, merge, pick_accounts,
-    token_is_active,
+    Account, AccountError, CertificatePack, Envelope, Inventory, PagesDeployment, PagesProject,
+    Verify, WorkerDeployments, WorkerDomain, WorkerScript, Zone, ZoneRecord, fleet_from, merge,
+    pick_accounts, token_is_active,
 };
 use crate::fleet::Fleet;
 
@@ -32,6 +32,10 @@ const API: &str = "https://api.cloudflare.com/client/v4";
 const PER_PAGE: u32 = 50;
 /// A hard stop on pagination: 40 pages of 50 is 2000 items per listing.
 const MAX_PAGES: u32 = 40;
+/// The preview deployments read per Pages project: one call, newest first.
+/// The docs give no maximum `per_page` for this list; 25 is well inside any
+/// limit and covers the five branches the snapshot keeps.
+const PREVIEW_PER_PAGE: u32 = 25;
 
 /// A failure the connect and refresh pages can show: an HTTP status to
 /// answer with, and what to tell the person, in plain words.
@@ -261,8 +265,74 @@ async fn certificates(token: &str, zone_id: &str) -> Option<Vec<CertificatePack>
     }
 }
 
-/// Reads the account: its zones (with certificate status), Pages projects,
-/// Workers scripts and their custom domains.
+/// The current time as RFC 3339 for the connect page's "saved" line and the
+/// snapshot's `generated_at`. Empty only if formatting fails, which the
+/// callers read as "no reference time".
+#[must_use]
+pub fn now() -> String {
+    WorkersClock.now().format(&Rfc3339).unwrap_or_default()
+}
+
+/// Each Pages project's recent preview deployments, for the snapshot's
+/// preview rows. A failed read is one named gap, not a failed snapshot.
+async fn read_previews(
+    token: &str,
+    account_id: &str,
+    pages: &mut [PagesProject],
+    gaps: &mut Vec<String>,
+) {
+    let mut failed = false;
+    for project in pages.iter_mut() {
+        let path = format!(
+            "/accounts/{account_id}/pages/projects/{}/deployments?env=preview&per_page={PREVIEW_PER_PAGE}",
+            project.name
+        );
+        match list_all::<PagesDeployment>(token, &path).await {
+            Ok(previews) => project.previews = previews,
+            Err(_) => failed = true,
+        }
+    }
+    if failed {
+        gaps.push("Pages preview deployments (Cloudflare Pages: Read)".to_owned());
+    }
+}
+
+/// Each Worker's active deployment (one call per script, `per_page=1`: the
+/// first deployment listed is the one serving traffic). A script whose read
+/// fails keeps its modified time as its last change. Only when every read
+/// fails is that a named gap.
+async fn read_worker_versions(
+    token: &str,
+    account_id: &str,
+    scripts: &mut [WorkerScript],
+    gaps: &mut Vec<String>,
+) {
+    let mut failed = 0;
+    for script in scripts.iter_mut() {
+        let url = format!(
+            "{API}/accounts/{account_id}/workers/scripts/{}/deployments?per_page=1",
+            script.id
+        );
+        match get::<WorkerDeployments>(token, &url).await {
+            Ok(envelope) => {
+                script.active =
+                    envelope.result.and_then(|listed| listed.deployments.into_iter().next());
+            }
+            Err(_) => failed += 1,
+        }
+    }
+    if !scripts.is_empty() && failed == scripts.len() {
+        gaps.push("Worker versions (Workers Scripts: Read)".to_owned());
+    }
+}
+
+/// Reads the account: its zones (with certificate status), Pages projects
+/// and their previews, Workers scripts with their active deployment, and
+/// their custom domains.
+///
+/// Subrequests: one zones listing per 50 zones, one certificate read per zone,
+/// the Pages listing, one preview read per Pages project, the Workers scripts
+/// and domains listings, and one deployments read per Worker script.
 async fn collect(token: &str, account: Account) -> Inventory {
     let mut gaps = Vec::new();
     let zones: Vec<Zone> = or_gap(
@@ -275,16 +345,18 @@ async fn collect(token: &str, account: Account) -> Inventory {
         let certificates = certificates(token, &zone.id).await;
         records.push(ZoneRecord { zone, certificates });
     }
-    let pages: Vec<PagesProject> = or_gap(
+    let mut pages: Vec<PagesProject> = or_gap(
         list_all(token, &format!("/accounts/{}/pages/projects", account.id)).await,
         "Pages projects (Cloudflare Pages: Read)",
         &mut gaps,
     );
-    let scripts: Vec<WorkerScript> = or_gap(
+    read_previews(token, &account.id, &mut pages, &mut gaps).await;
+    let mut scripts: Vec<WorkerScript> = or_gap(
         list_all(token, &format!("/accounts/{}/workers/scripts", account.id)).await,
         "Workers (Workers Scripts: Read)",
         &mut gaps,
     );
+    read_worker_versions(token, &account.id, &mut scripts, &mut gaps).await;
     let worker_domains: Vec<WorkerDomain> = or_gap(
         list_all(token, &format!("/accounts/{}/workers/domains", account.id)).await,
         "Workers custom domains (Workers Scripts: Read)",

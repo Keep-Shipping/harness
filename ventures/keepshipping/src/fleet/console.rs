@@ -345,7 +345,7 @@ async fn connect_form(env: &Env) -> worker::Result<Response> {
                 Some(_) => api::visible_accounts(env, &secret).await,
                 None => Vec::new(),
             };
-            page(200, &connect_page(connected.as_deref(), &accounts, None))
+            page(200, &connect_page(connected.as_deref(), &accounts, None, &api::now()))
         }
         Err(failed) => page(
             failed.status,

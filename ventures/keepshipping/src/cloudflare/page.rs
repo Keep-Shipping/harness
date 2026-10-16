@@ -4,22 +4,24 @@
 //! worker, which seals it and redirects.
 
 use super::{PERMISSION_WORDS, PERMISSIONS, template_url};
-use crate::fleet::{esc, signed_in_layout};
+use crate::fleet::{esc, signed_in_layout, time_html};
 
 /// Where the paste form posts.
 pub const CONNECT_PATH: &str = "/console/connect/cloudflare";
 /// Where disconnect posts.
 pub const DISCONNECT_PATH: &str = "/console/connect/cloudflare/disconnect";
 
-/// The connect page. `connected_at` is the time the stored token was saved
-/// (when one is stored and readable); `accounts` the account names that
-/// token can read, when they could be listed; `error` is a plain-words
-/// refusal from the last paste, if the page is shown after one.
+/// The connect page. `connected_at` is the RFC 3339 time the stored token was
+/// saved (when one is stored and readable), shown relative to `now`, also
+/// RFC 3339; `accounts` the account names that token can read, when they
+/// could be listed; `error` is a plain-words refusal from the last paste, if
+/// the page is shown after one.
 #[must_use]
 pub fn connect_page(
     connected_at: Option<&str>,
     accounts: &[String],
     error: Option<&str>,
+    now: &str,
 ) -> String {
     let permissions = PERMISSIONS
         .iter()
@@ -34,7 +36,7 @@ pub fn connect_page(
              Account Resources and paste it below: it replaces this one.</p>\n\
              <form class=\"disconnect\" method=\"post\" action=\"{DISCONNECT_PATH}\">\
              <button type=\"submit\">Disconnect Cloudflare</button></form>\n",
-            when = esc(when),
+            when = time_html(when, now),
             reads = if accounts.is_empty() {
                 String::new()
             } else {
@@ -94,7 +96,7 @@ mod tests {
 
     #[test]
     fn the_page_links_the_template_and_lists_every_permission_read_only() {
-        let page = connect_page(None, &[], None);
+        let page = connect_page(None, &[], None, "2026-10-16T09:00:00Z");
         assert!(page.contains("permissionGroupKeys=%5B%7B%22key%22%3A%22zone%22"));
         for (key, _) in PERMISSIONS {
             assert!(page.contains(&format!("<code>{key}</code>")), "{key} listed");
@@ -107,16 +109,21 @@ mod tests {
 
     #[test]
     fn a_connected_page_offers_disconnect_and_never_shows_a_token() {
-        let page = connect_page(Some("2026-10-16 09:00 UTC"), &["Factory0".to_owned()], None);
+        let page = connect_page(
+            Some("2026-10-15T09:00:00.123456Z"),
+            &["Factory0".to_owned()],
+            None,
+            "2026-10-16T09:00:00Z",
+        );
         assert!(page.contains("action=\"/console/connect/cloudflare/disconnect\""));
-        assert!(page.contains("saved 2026-10-16 09:00 UTC"));
+        assert!(page.contains("saved <time datetime=\"2026-10-15T09:00:00.123456Z\">15 Oct 2026, 09:00 UTC</time> · 23 hours ago."));
         assert!(page.contains("It can read 1 account: Factory0."));
         assert!(page.contains("Replace the token"));
     }
 
     #[test]
     fn an_error_is_escaped_and_announced() {
-        let page = connect_page(None, &[], Some("<b>nope</b>"));
+        let page = connect_page(None, &[], Some("<b>nope</b>"), "2026-10-16T09:00:00Z");
         assert!(page.contains("role=\"alert\""));
         assert!(page.contains("&lt;b&gt;nope&lt;/b&gt;"));
     }

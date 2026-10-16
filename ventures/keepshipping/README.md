@@ -194,24 +194,69 @@ below are set it answers `503`.
   row and the `fleet.json` snapshot.
 - **Collector** — with a token stored, the collector lists every account
   the token can see (`CF_ACCOUNT_ID`, an optional var, narrows it to one), and
-  for each, grouped by account on the page, its zones (with a certificate-pack check for HTTPS), its Pages projects
-  (domains and latest deployment), its Workers scripts and their custom
-  domains, and writes the snapshot to KV `FLEET` / `fleet.json`. It runs on
-  the hourly cron after the billing and waitlist sweeps, and from the
-  "Refresh now" button on the fleet and empty-state pages. Failures are
-  logged and the previous snapshot stays.
-- **What the API cannot give** — Terraform definitions, DNS health, baseline
-  scores and drift are not in the Cloudflare API. A collected snapshot has
-  no `terraform`, and its pages say "Not managed by Terraform yet". A
-  Worker's "deploy" row is its script etag (a content hash), not a commit.
-  Certificate status is "Secure" only when an active pack is found; anything
-  else reads as "Not checked yet".
+  for each, grouped by account on the page, its zones (with a certificate-pack
+  check and the zone's `status`), its Pages projects (custom domains, the
+  latest deployment, and the newest deployment of each of the five most
+  recent preview branches), and its Workers scripts (the active deployment's
+  version, message and trigger, and their custom domains). It writes the
+  snapshot to KV `FLEET` / `fleet.json`. It runs on the hourly cron after the
+  billing and waitlist sweeps, and from the "Refresh now" button on the fleet
+  and empty-state pages. Failures are logged and the previous snapshot stays.
+- **Endpoints read** — `GET /accounts`; `GET /zones?account.id=…` (paged);
+  `GET /zones/{id}/ssl/certificate_packs`; `GET /accounts/{id}/pages/projects`
+  (unpaged); `GET /accounts/{id}/pages/projects/{name}/deployments?env=preview&per_page=25`
+  (one per Pages project); `GET /accounts/{id}/workers/scripts` and
+  `/workers/domains` (unpaged); `GET /accounts/{id}/workers/scripts/{name}/deployments?per_page=1`
+  (one per Worker script; the first listed is the one serving traffic).
+- **Subrequests per snapshot** — with `Z` zones, `P` Pages projects, `W`
+  Worker scripts and `A` accounts read: `1 + Σ over accounts of
+  (⌈Z/50⌉ + Z + P + W + 3)` (the `+3` is the Pages, scripts and domains
+  listings; `P` and `W` are per-item reads, `⌈Z/50⌉` is the zone pages). A
+  listing failure does not add reads. Cloudflare caps the subrequests a single
+  Worker invocation may make, so check a large account's count against the
+  plan's limit before relying on the cron.
+- **Gaps** — a refused or failed listing is a named gap. If every Worker
+  deployments read fails, the gap is `Worker versions (Workers Scripts: Read)`;
+  a partial failure falls back to each script's modified time without a gap.
+  A failed preview read is the gap `Pages preview deployments (Cloudflare Pages: Read)`.
+- **HTTPS and DNS from the zones** — no extra reads. A zone's HTTPS is
+  "Secure" when an active certificate pack is found, else "Not checked yet";
+  its DNS is "Healthy" when `status` is `active`, else a problem noting the
+  status ("Zone is pending at Cloudflare"). A Pages or Worker site reads the
+  worst state of its custom domains' zones (the longest zone name the domain
+  ends in). `*.pages.dev` and `*.workers.dev` names read healthy. A domain
+  whose zone is not in a connected account reads unknown with the note
+  "Zone not in a connected account".
+- **What the API cannot give** — Terraform definitions, baseline scores and
+  code drift are not in the Cloudflare API. A collected snapshot has no
+  `terraform`, its pages say "Not managed by Terraform yet", and their
+  Baseline and Code cells read "Needs Terraform" (titled with the reason).
+- **Deploy rows** — a Pages deploy shows its 7-character commit, branch and
+  first line of the commit message when the trigger has them; a deployment
+  with no commit (a Wrangler upload) shows its 8-character id labelled
+  "upload". The trigger reads in words: `ad_hoc` is "uploaded with Wrangler",
+  `github:push` is "git push". A Worker's row is its active version (8
+  characters, "version …") with the deploy message and trigger (`upload` and
+  `deployment` read "wrangler deploy"). A Worker with no read deployment
+  shows only its modified time.
+- **Environments** — a Worker named `<base>-staging`, `-test`, `-dev` or
+  `-preview` is that environment and sorts beside `<base>`, which reads
+  "production" when such a group exists. A Pages project with previews
+  reads "production", and each preview branch is its own row labelled with
+  its branch.
+- **Dates** — every time reads `16 Oct 2026, 09:24 UTC` with a relative part
+  ("3 days ago"; the snapshot's own time is its reference for the deploy
+  rows, and the checked time reads "just now" by the same rule).
 - **Snapshot contract** — a JSON snapshot in KV binding `FLEET`, key
   `fleet.json`: `{account, generated_at, terraform?: {repo, ref}, sites:
-  [{id, name, kind: zone|pages|worker, venture, domains, defined_at?: {path,
-  line}, deploys, tls, dns, baseline, drift, resources}]}`, `deploys` newest
-  first. A pipeline that writes Terraform can still fill those fields; the
-  `Fleet` struct in `src/fleet/` is the shape.
+  [{id, name, kind: zone|pages|worker, environment?, venture, domains,
+  defined_at?: {path, line}, deploys, tls?: {status, note?}, dns?: {status,
+  note?}, baseline, drift, resources}]}`. `environment` is `production`, a
+  Worker suffix (`staging`, `test`, `dev`, `preview`), or a Pages preview's
+  branch. A deploy is `{commit, at, by, branch?, message?, refers_to?:
+  commit|version|upload}`, `deploys` newest first. Pages preview rows have
+  id `pages:{account}:{project}:{branch}`. A pipeline that writes Terraform
+  can still fill those fields; the `Fleet` struct in `src/fleet/` is the shape.
 - **Auth** — `AUTH_ISSUER` + `AUTH_CLIENT_ID` build a token verifier
   (`cratefield-auth-client`); the token comes from `Authorization: Bearer`
   or the `ks_console` cookie, must have a verified `email` on the

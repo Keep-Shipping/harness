@@ -37,13 +37,17 @@ fn the_index_lists_every_site_with_its_last_deploy_and_terraform_link() {
     // deploys[0] is the last deploy: the zone's newer commit, not the
     // older one, and the time in plain words. A site never deployed says
     // so rather than leaving an empty cell.
-    assert!(html.contains("<code>b7e4a9c</code> 2026-10-08 17:42 UTC · by ada"));
+    assert!(html.contains(
+        "<code>b7e4a9c</code> · ada · <time datetime=\"2026-10-08T17:42:00Z\">8 Oct 2026, 17:42 UTC</time> · 12 hours ago"
+    ));
     assert!(!html.contains("5a3c1e9"), "older deploy must not be the shown one");
     assert!(html.contains("Never deployed"));
     // The summary line and the count of sites needing attention: one
     // expiring certificate, one failing one, one site changed outside code.
     assert!(html.contains("5 sites · 3 need attention"));
-    assert!(html.contains("checked 2026-10-09 06:00 UTC"));
+    assert!(html.contains(
+        "checked <time datetime=\"2026-10-09T06:00:00Z\">9 Oct 2026, 06:00 UTC</time> · just now"
+    ));
     // Every site and every resource links to its exact Terraform file and
     // line — the acceptance criterion, checked against the index and each
     // detail page: short link text `main.tf:12`, full path in the title.
@@ -138,7 +142,7 @@ fn hostile_snapshot_strings_stay_escaped() {
     // The entity the attacker planted is shown as text ("&amp;quot;"), the
     // real quote is escaped ("&quot;"): nothing raw survives either way.
     assert!(html.contains("&amp;quot; onclick=&quot;steal()"));
-    assert!(html.contains("by &lt;b&gt;ada"));
+    assert!(html.contains("&lt;b&gt;ada"));
     // Attribute contexts escape too — the repo lands inside an href/title.
     assert!(html.contains("Factory-Zero/infra&quot;, onmouseover=&quot;x"));
     // An unparseable timestamp is shown as-is, never reformatted into a lie.
