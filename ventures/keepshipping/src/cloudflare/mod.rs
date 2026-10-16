@@ -187,18 +187,45 @@ pub enum AccountError {
     NotVisible,
 }
 
-/// The account to read: the one `CF_ACCOUNT_ID` names, else the first one
+/// The accounts to read: the one `CF_ACCOUNT_ID` names, else every account
 /// the token lists.
-pub fn pick_account<'a>(
+pub fn pick_accounts<'a>(
     accounts: &'a [Account],
     wanted: Option<&str>,
-) -> Result<&'a Account, AccountError> {
+) -> Result<Vec<&'a Account>, AccountError> {
     match wanted.map(str::trim).filter(|id| !id.is_empty()) {
-        Some(id) => {
-            accounts.iter().find(|account| account.id == id).ok_or(AccountError::NotVisible)
-        }
-        None => accounts.first().ok_or(AccountError::NoAccounts),
+        Some(id) => accounts
+            .iter()
+            .find(|account| account.id == id)
+            .map(|account| vec![account])
+            .ok_or(AccountError::NotVisible),
+        None if accounts.is_empty() => Err(AccountError::NoAccounts),
+        None => Ok(accounts.iter().collect()),
     }
+}
+
+/// One snapshot from several accounts' snapshots: every site, each already
+/// labelled with its account; gaps prefixed with the account they are in
+/// when there is more than one.
+#[must_use]
+pub fn merge(fleets: Vec<Fleet>, generated_at: &str) -> Fleet {
+    let several = fleets.len() > 1;
+    let account = match fleets.as_slice() {
+        [one] => one.account.clone(),
+        many => format!("{} Cloudflare accounts", many.len()),
+    };
+    let mut sites = Vec::new();
+    let mut gaps = Vec::new();
+    for fleet in fleets {
+        gaps.extend(
+            fleet
+                .gaps
+                .into_iter()
+                .map(|gap| if several { format!("{}: {gap}", fleet.account) } else { gap }),
+        );
+        sites.extend(fleet.sites);
+    }
+    Fleet { account, generated_at: generated_at.to_owned(), terraform: None, sites, gaps }
 }
 
 /// Whether a verify answer is a usable token.
@@ -224,7 +251,7 @@ pub fn fleet_from(inventory: &Inventory, generated_at: &str) -> Fleet {
             id: format!("zone:{}", record.zone.id),
             name: record.zone.name.clone(),
             kind: Kind::Zone,
-            venture: String::new(),
+            venture: inventory.account.name.clone(),
             domains: vec![record.zone.name.clone()],
             defined_at: None,
             deploys: Vec::new(),
@@ -257,10 +284,10 @@ pub fn fleet_from(inventory: &Inventory, generated_at: &str) -> Fleet {
             .filter(|deploy| !deploy.at.is_empty())
             .collect();
         sites.push(Site {
-            id: format!("pages:{}", project.name),
+            id: format!("pages:{}:{}", inventory.account.id, project.name),
             name: project.name.clone(),
             kind: Kind::Pages,
-            venture: String::new(),
+            venture: inventory.account.name.clone(),
             domains: project.domains.clone(),
             defined_at: None,
             deploys,
@@ -291,10 +318,10 @@ pub fn fleet_from(inventory: &Inventory, generated_at: &str) -> Fleet {
             _ => Vec::new(),
         };
         sites.push(Site {
-            id: format!("worker:{}", script.id),
+            id: format!("worker:{}:{}", inventory.account.id, script.id),
             name: script.id.clone(),
             kind: Kind::Worker,
-            venture: String::new(),
+            venture: inventory.account.name.clone(),
             domains,
             defined_at: None,
             deploys,
@@ -365,7 +392,7 @@ mod tests {
         let scripts: Envelope<Vec<WorkerScript>> = parse(SCRIPTS);
         let domains: Envelope<Vec<WorkerDomain>> = parse(WORKER_DOMAINS);
         let account =
-            pick_account(&accounts.result.expect("accounts"), None).expect("account").clone();
+            pick_accounts(&accounts.result.expect("accounts"), None).expect("account")[0].clone();
         let zones = zones
             .result
             .expect("zones")
@@ -408,16 +435,41 @@ mod tests {
     }
 
     #[test]
-    fn an_account_is_chosen_by_id_or_first() {
+    fn every_account_is_read_unless_one_is_named() {
         let accounts: Vec<Account> = parse::<Envelope<Vec<Account>>>(ACCOUNTS).result.unwrap();
-        assert_eq!(pick_account(&accounts, None).unwrap().name, "Factory Zero");
-        assert_eq!(pick_account(&accounts, Some("  ")).unwrap().name, "Factory Zero");
+        let names =
+            |picked: Vec<&Account>| picked.iter().map(|a| a.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(pick_accounts(&accounts, None).unwrap()), ["Factory Zero", "Other"]);
+        assert_eq!(names(pick_accounts(&accounts, Some("  ")).unwrap()), ["Factory Zero", "Other"]);
         assert_eq!(
-            pick_account(&accounts, Some("9f1c2b3d4e5f60718293a4b5c6d7e8f9")).unwrap().name,
-            "Other"
+            names(pick_accounts(&accounts, Some("9f1c2b3d4e5f60718293a4b5c6d7e8f9")).unwrap()),
+            ["Other"]
         );
-        assert_eq!(pick_account(&accounts, Some("not-mine")), Err(AccountError::NotVisible));
-        assert_eq!(pick_account(&[], None), Err(AccountError::NoAccounts));
+        assert_eq!(pick_accounts(&accounts, Some("not-mine")), Err(AccountError::NotVisible));
+        assert_eq!(pick_accounts(&[], None), Err(AccountError::NoAccounts));
+    }
+
+    #[test]
+    fn two_accounts_merge_into_one_snapshot_labelled_by_account() {
+        let first = inventory();
+        let mut second = inventory();
+        second.account = Account { id: "acct2".to_owned(), name: "Other".to_owned() };
+        second.gaps = vec!["Zones (Zone: Read)".to_owned()];
+        let merged = merge(vec![fleet_from(&first, "t"), fleet_from(&second, "t")], "t");
+        assert_eq!(merged.account, "2 Cloudflare accounts");
+        assert_eq!(merged.sites.len(), 2 * fleet_from(&first, "t").sites.len());
+        assert!(merged.sites.iter().any(|site| site.venture == "Other"));
+        let mut ids: Vec<&str> = merged.sites.iter().map(|site| site.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            merged.sites.len() - first.zones.len(),
+            "only zone ids repeat in this fixture"
+        );
+        assert_eq!(merged.gaps, ["Other: Zones (Zone: Read)"]);
+        let single = merge(vec![fleet_from(&first, "t")], "t");
+        assert_eq!(single.account, first.account.name);
     }
 
     #[test]

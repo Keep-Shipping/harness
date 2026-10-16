@@ -192,9 +192,9 @@ below are set it answers `503`.
   connect page then asks for it again.
 - **Disconnect** — `POST /console/connect/cloudflare/disconnect` deletes the
   row and the `fleet.json` snapshot.
-- **Collector** — with a token stored, the collector lists the account
-  (`CF_ACCOUNT_ID`, an optional var, picks one; otherwise the first listed),
-  its zones (with a certificate-pack check for HTTPS), its Pages projects
+- **Collector** — with a token stored, the collector lists every account
+  the token can see (`CF_ACCOUNT_ID`, an optional var, narrows it to one), and
+  for each, grouped by account on the page, its zones (with a certificate-pack check for HTTPS), its Pages projects
   (domains and latest deployment), its Workers scripts and their custom
   domains, and writes the snapshot to KV `FLEET` / `fleet.json`. It runs on
   the hourly cron after the billing and waitlist sweeps, and from the
