@@ -7,10 +7,12 @@
 //! serves must build, and the probe an operator reads must name the module
 //! that serves the traffic.
 
-use cratefield_core::{Port, Runtime};
+use std::sync::Arc;
+
+use cratefield_core::{MapConfig, Port, Ports, Runtime};
 use cratefield_testing::{TestHarness, request};
 use http::{Method, StatusCode};
-use keepshipping_waitlist::{composition, module, templates, venture};
+use keepshipping_waitlist::{composition, composition_with, module, templates, venture};
 
 /// A native stand-in for `Cloudflare` that claims every port, so
 /// `build()` validates what is static in the composition — the venture,
@@ -82,4 +84,51 @@ async fn health_lists_the_waitlist_module() {
         .collect();
     assert!(required.contains(&"Database"), "waitlist needs a Database binding: {required:?}");
     assert!(required.contains(&"Mailer"), "waitlist needs a Mailer binding: {required:?}");
+}
+
+/// Every port but the captcha: the console Worker's binding when
+/// `TURNSTILE_SECRET` is unset.
+struct NoCaptchaRuntime;
+
+impl Runtime for NoCaptchaRuntime {
+    fn provides(&self) -> Vec<Port> {
+        Port::ALL.iter().copied().filter(|port| *port != Port::Captcha).collect()
+    }
+}
+
+/// The console's shape (no waitlist, so no captcha) builds: this is the
+/// composition `instance()` produces when `TURNSTILE_SECRET` is unset.
+#[test]
+fn the_console_composition_without_the_waitlist_builds_without_a_captcha() {
+    composition_with(false)
+        .runtime(NoCaptchaRuntime)
+        .build()
+        .expect("the console composition builds with no captcha");
+}
+
+/// The regression behind the console's 503: a `/v1/*` route on a
+/// production deployment with the waitlist mounted and no captcha is
+/// refused `not-production-ready`, and the same deployment without the
+/// waitlist is not. The probe is the edits route, the one the console
+/// serves; what answers behind the guard is not asserted, since no
+/// database is wired here.
+#[pollster::test]
+async fn without_the_waitlist_a_production_v1_route_is_not_refused_for_want_of_a_captcha() {
+    let production =
+        || Ports::with_config(Arc::new(MapConfig::from_pairs([("ENV", "production")])));
+    let probe = |waitlist: bool| async move {
+        let harness = composition_with(waitlist)
+            .runtime(NoCaptchaRuntime)
+            .build()
+            .expect("composition builds");
+        let router = harness.router(production());
+        let response = request(&router, Method::GET, "/v1/edits/probe", None).await;
+        let refused =
+            serde_json::from_slice::<serde_json::Value>(response.body()).ok().and_then(|body| {
+                body["type"].as_str().map(|uri| uri.ends_with("not-production-ready"))
+            });
+        response.status == StatusCode::SERVICE_UNAVAILABLE && refused == Some(true)
+    };
+    assert!(probe(true).await, "with the waitlist and no captcha the guard refuses /v1/*");
+    assert!(!probe(false).await, "without the waitlist the guard has nothing to refuse");
 }

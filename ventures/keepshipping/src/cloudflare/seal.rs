@@ -18,6 +18,10 @@ pub const INFO: &[u8] = b"ks-console/cloudflare-token/v1";
 /// read token's ciphertext never opens as a deploy token or the reverse.
 pub const DEPLOY_INFO: &[u8] = b"ks-console/cloudflare-deploy-token/v1";
 
+/// [`INFO`] for the GitHub token the console talks to GitHub with
+/// (`src/github/`): its own key, so no other stored secret opens as one.
+pub const GITHUB_INFO: &[u8] = b"ks-console/github-token/v1";
+
 /// The GCM nonce length: 96 bits.
 pub const NONCE_LEN: usize = 12;
 
@@ -208,5 +212,13 @@ mod tests {
         let deploy = seal_for(DEPLOY_INFO, SECRET, TOKEN).unwrap();
         assert_eq!(open(SECRET, &deploy), Err(SealError::Open));
         assert_eq!(open_for(DEPLOY_INFO, SECRET, &deploy).as_deref(), Ok(TOKEN));
+    }
+
+    #[test]
+    fn the_github_token_never_opens_under_another_purposes_key() {
+        let github = seal_for(GITHUB_INFO, SECRET, TOKEN).unwrap();
+        assert_eq!(open_for(GITHUB_INFO, SECRET, &github).as_deref(), Ok(TOKEN));
+        assert_eq!(open(SECRET, &github), Err(SealError::Open));
+        assert_eq!(open_for(DEPLOY_INFO, SECRET, &github), Err(SealError::Open));
     }
 }

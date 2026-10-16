@@ -16,6 +16,7 @@
 use keepshipping_waitlist::cloudflare::page::connect_page;
 use keepshipping_waitlist::cloudflare::rollback::{self, Candidate, Panel};
 use keepshipping_waitlist::fleet::{self, Fleet};
+use keepshipping_waitlist::github::page::{State as GitHubState, connect_page as github_page};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use std::fs;
 use std::path::Path;
@@ -89,6 +90,15 @@ fn main() {
     write(
         "connect-error.html",
         connect_page(None, &[], None, Some("Cloudflare did not accept that token."), &now),
+    );
+    write("github.html", github_page(GitHubState::Disconnected, None, &now));
+    write(
+        "github-connected.html",
+        github_page(
+            GitHubState::Connected { login: Some("nick"), saved: &snapshot.generated_at },
+            None,
+            &now,
+        ),
     );
     write("empty.html", fleet::empty_snapshot_page(true));
     write(

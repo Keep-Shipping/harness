@@ -44,6 +44,12 @@ aes-gcm = "0.11"
 hkdf = "0.13"
 # Nonces are drawn from the OS (wasm: `crypto.getRandomValues`, below).
 getrandom = "0.4"
+# The GitHub connection's Actions secrets (`src/github/`) are sealed with
+# libsodium's sealed box under the repository's public key, the scheme
+# GitHub's secrets endpoint expects. `seal` brings its blake2 nonce; the
+# `getrandom` feature supplies the ephemeral key's randomness on wasm through
+# the same `getrandom 0.2` js backend the Search Console module already uses.
+crypto_box = { version = "0.9", default-features = false, features = ["alloc", "salsa20", "getrandom", "seal"] }
 form_urlencoded = "1"
 http = "1"
 # The Search Console module signs its JWT assertion with the same flow the
