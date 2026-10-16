@@ -43,6 +43,19 @@ fn block<T>(future: impl std::future::Future<Output = T>) -> T {
 }
 
 #[test]
+fn a_coverage_answer_is_used_only_when_it_is_this_apps_and_is_not_stored() {
+    let body = r#"{"id":7,"app_id":42,"account":{"login":"Nick","type":"User"},
+        "repository_selection":"selected"}"#;
+    let found = covering_installation(body, 42).expect("parses").expect("this app's");
+    assert_eq!(found.id, 7);
+    assert_eq!(covering_installation(body, 99).expect("parses"), None, "another app's");
+    assert!(covering_installation("not json", 42).is_err());
+    // Nothing is recorded by the lookup itself: the table stays empty.
+    let db = database();
+    assert!(block(installations(db)).expect("list").is_empty());
+}
+
+#[test]
 fn the_manifest_names_the_console_its_webhook_and_its_permissions() {
     let manifest = manifest("Keep Shipping console (keep-shipping)");
     assert_eq!(manifest["name"], "Keep Shipping console (keep-shipping)");
@@ -63,7 +76,7 @@ fn the_manifest_names_the_console_its_webhook_and_its_permissions() {
         "https://console.keepshipping.run/console/connect/github/app/installed"
     );
     assert_eq!(manifest["setup_on_update"], true);
-    assert_eq!(manifest["public"], false);
+    assert_eq!(manifest["public"], true, "installable on any account, not only the creator's");
     assert_eq!(manifest["default_events"], serde_json::json!(["pull_request", "workflow_run"]));
     let permissions = manifest["default_permissions"].as_object().expect("an object");
     let mut keys: Vec<(&str, &str)> = permissions
@@ -545,4 +558,17 @@ fn the_delete_link_is_built_from_the_slug_and_owner_not_the_public_page() {
     ] {
         assert_eq!(checked_advanced_url(&built).as_deref(), Some(built.as_str()));
     }
+}
+
+#[test]
+fn only_a_recorded_installation_is_acted_through() {
+    let one = |id| Installation {
+        id,
+        account: "Someone".into(),
+        account_type: "Organization".into(),
+        selection: "all".into(),
+    };
+    assert_eq!(recorded_only(one(7), &[one(7), one(8)]), Some(one(7)));
+    assert_eq!(recorded_only(one(9), &[one(7), one(8)]), None, "a stranger's installation");
+    assert_eq!(recorded_only(one(7), &[]), None);
 }

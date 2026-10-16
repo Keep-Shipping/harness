@@ -1,5 +1,9 @@
 //! The webhook's native tests: the signature (accepted, wrong, missing,
-//! malformed), the judging order, and the effect each event asks for.
+//! malformed), the judging order, the effect each event asks for, and what
+//! applying those effects does to a migrated database.
+
+use cratefield_adapter_sqlite::SqliteDatabase;
+use cratefield_core::{Database, SqlMigration};
 
 use super::*;
 
@@ -89,15 +93,15 @@ fn the_judging_order_is_event_then_secret_then_signature_then_body() {
     let header = sign(SECRET, INSTALL);
     assert!(matches!(
         judge(Some(SECRET), Some("installation"), Some(&header), INSTALL),
-        Ok(Effect::Save(_))
+        Ok(Effect::Refresh(_))
     ));
 }
 
 #[test]
-fn a_created_installation_is_saved_with_its_account_and_selection() {
+fn a_created_installation_is_refreshed_with_its_account_and_selection() {
     assert_eq!(
         effect_of("installation", INSTALL),
-        Some(Effect::Save(Installation {
+        Some(Effect::Refresh(Installation {
             id: 7,
             account: "nick".into(),
             account_type: "User".into(),
@@ -117,7 +121,7 @@ fn deleted_and_suspended_installations_are_removed_and_resumed_ones_saved() {
     let resumed = br#"{"action":"unsuspend","installation":{"id":9,
         "account":{"login":"x","type":"Organization"},"repository_selection":"selected"}}"#;
     assert!(
-        matches!(effect_of("installation", resumed), Some(Effect::Save(row)) if row.selection == "selected")
+        matches!(effect_of("installation", resumed), Some(Effect::Refresh(row)) if row.selection == "selected")
     );
     let unknown = br#"{"action":"something_new","installation":{"id":9,
         "account":{"login":"x","type":"Organization"}}}"#;
@@ -157,4 +161,85 @@ fn an_effect_does_not_print_the_account_of_a_secret_it_never_carries() {
     let shown = format!("{:?}", effect_of("installation", INSTALL));
     assert!(shown.contains("nick"));
     assert!(!shown.contains("whsec"));
+}
+
+/// A database with the console's app tables, from the venture's own migration.
+fn database() -> Arc<dyn Database> {
+    let db = SqliteDatabase::in_memory().expect("in-memory sqlite");
+    db.apply_migrations(
+        "console-github-app",
+        &[SqlMigration::new(
+            "0015",
+            "console_github_app",
+            include_str!("../../../migrations/0015_console_github_app.sql"),
+        )],
+    )
+    .expect("the app's schema applies");
+    Arc::new(db)
+}
+
+fn block<T>(future: impl std::future::Future<Output = T>) -> T {
+    pollster::block_on(future)
+}
+
+/// How many installation rows the database holds.
+fn rows(db: &Arc<dyn Database>) -> Vec<app::Installation> {
+    block(app::installations(Arc::clone(db))).expect("list")
+}
+
+/// Records installation 7 as the setup callback would, so a later delivery
+/// has a row to act on.
+fn record_seven(db: &Arc<dyn Database>) {
+    block(app::save_installation(
+        Arc::clone(db),
+        &Installation {
+            id: 7,
+            account: "nick".into(),
+            account_type: "User".into(),
+            selection: "selected".into(),
+        },
+        "2026-10-16T09:00:00Z",
+    ))
+    .expect("record");
+}
+
+#[test]
+fn a_created_delivery_for_an_unknown_installation_adds_no_row() {
+    let db = database();
+    let effect = effect_of("installation", INSTALL).expect("parses");
+    assert_eq!(block(apply(Arc::clone(&db), effect, "2026-10-16T09:01:00Z")), Ok(()));
+    assert!(rows(&db).is_empty(), "a public app's install must not add a row");
+}
+
+#[test]
+fn a_created_delivery_for_a_known_installation_refreshes_it() {
+    let db = database();
+    record_seven(&db);
+    let effect = effect_of("installation", INSTALL).expect("parses");
+    assert_eq!(block(apply(Arc::clone(&db), effect, "2026-10-16T09:01:00Z")), Ok(()));
+    let listed = rows(&db);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].selection, "all", "refreshed from the delivery");
+    assert_eq!(listed[0].account, "nick");
+}
+
+#[test]
+fn a_deleted_delivery_removes_a_known_installation() {
+    let db = database();
+    record_seven(&db);
+    let deleted = br#"{"action":"deleted","installation":{"id":7,
+        "account":{"login":"nick","type":"User"}}}"#;
+    let effect = effect_of("installation", deleted).expect("parses");
+    assert_eq!(block(apply(Arc::clone(&db), effect, "2026-10-16T09:02:00Z")), Ok(()));
+    assert!(rows(&db).is_empty());
+}
+
+#[test]
+fn a_repository_selection_change_updates_only_a_known_installation() {
+    let db = database();
+    let changed = br#"{"action":"added","installation":{"id":8,
+        "account":{"login":"other","type":"Organization"},"repository_selection":"all"}}"#;
+    let effect = effect_of("installation_repositories", changed).expect("parses");
+    assert_eq!(block(apply(Arc::clone(&db), effect, "2026-10-16T09:03:00Z")), Ok(()));
+    assert!(rows(&db).is_empty(), "an unknown id is not recorded");
 }
