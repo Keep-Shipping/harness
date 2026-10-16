@@ -88,6 +88,10 @@ enum Action {
     GitHubAppInstalled,
     /// `POST` forgets the app and its secrets in the console (not on GitHub).
     GitHubAppRemove,
+    /// `POST` asks GitHub for the app's installations and lists the new ones.
+    GitHubAppCheck,
+    /// `POST` adds one listed installation, after GitHub confirms it.
+    GitHubAppAdopt,
     /// `POST` re-wraps the stored data keys under the current master key.
     RewrapKeys,
 }
@@ -105,6 +109,8 @@ fn action_for(path: &str) -> Option<Action> {
         github_app::CREATED_PATH => Some(Action::GitHubAppCreated),
         github_app::INSTALLED_PATH => Some(Action::GitHubAppInstalled),
         github_app::REMOVE_PATH => Some(Action::GitHubAppRemove),
+        github_app::CHECK_PATH => Some(Action::GitHubAppCheck),
+        github_app::ADOPT_PATH => Some(Action::GitHubAppAdopt),
         KEYS_REWRAP_PATH => Some(Action::RewrapKeys),
         _ => None,
     }
@@ -393,6 +399,8 @@ async fn serve_action(req: &mut Request, env: &Env, action: Action) -> worker::R
         Action::GitHubAppCreated => github_app_created(req, env, &session.email).await?,
         Action::GitHubAppInstalled => github_app_installed(req, env).await?,
         Action::GitHubAppRemove => github_app_remove(env).await?,
+        Action::GitHubAppCheck => github_app_check(env).await?,
+        Action::GitHubAppAdopt => github_app_adopt(req, env).await?,
         Action::RewrapKeys => rewrap_keys(env).await?,
     };
     with_cookies(response, &session.set_cookies)
@@ -662,6 +670,60 @@ async fn github_app_remove(env: &Env) -> worker::Result<Response> {
     }
     github_app::forget_cached();
     redirect(303, &removed_location(advanced.as_deref()))
+}
+
+/// The check: GitHub is asked for the app's installations (with the app's
+/// own JWT) and the ones this console does not record are shown on the page.
+/// Nothing is recorded here; the person adds one with its own button.
+async fn github_app_check(env: &Env) -> worker::Result<Response> {
+    let db = match secrets::d1(env) {
+        Ok(db) => db,
+        Err(_) => return github_page(env, Some(secrets::NO_MASTER_KEY_COPY), None).await,
+    };
+    let now = WorkersClock.now().unix_timestamp();
+    match github_app::unrecorded_installations(db, &FetchClient, now).await {
+        Ok(new) => github_page_noticed(env, None, None, GitHubNotice::Found { new: &new }).await,
+        Err(failed) => github_page(env, Some(failed.message), None).await,
+    }
+}
+
+/// Adds one installation the check listed. The id is read from the form
+/// (digits only), then verified with GitHub as the setup callback verifies
+/// it: it must be this app's installation. The signed-in operator's choice
+/// is the authorisation, as it is for the setup callback.
+async fn github_app_adopt(req: &mut Request, env: &Env) -> worker::Result<Response> {
+    let back = Some((GITHUB_CONNECT_PATH, "Back to the GitHub connection"));
+    let body = req.text().await?;
+    let raw = if body.len() > 4096 {
+        String::new()
+    } else {
+        form_urlencoded::parse(body.as_bytes())
+            .find(|(key, _)| key == "installation_id")
+            .map(|(_, value)| value.into_owned())
+            .unwrap_or_default()
+    };
+    let Some(id) = github_app::installation_id_of(&raw) else {
+        return page(
+            400,
+            &notice_page(
+                "Installation not recorded",
+                "That is not an installation of the app. Check for new installations again and \
+                 add it from the list.",
+                back,
+            ),
+        );
+    };
+    let now = WorkersClock.now().unix_timestamp();
+    let db = match secrets::d1(env) {
+        Ok(db) => db,
+        Err(_) => return github_page(env, Some(secrets::NO_MASTER_KEY_COPY), None).await,
+    };
+    match github_app::record_installation(db, &FetchClient, id, now).await {
+        Ok(_) => redirect(303, GITHUB_CONNECT_PATH),
+        Err(failed) => {
+            page(failed.status, &notice_page("Installation not recorded", failed.message, back))
+        }
+    }
 }
 
 /// GitHub's redirect after it created the app: the `state` is checked (once,
@@ -1229,6 +1291,20 @@ mod tests {
         ));
         assert!(action_for("/console/connect/github/app/new/extra").is_none());
         assert!(matches!(
+            action_for("/console/connect/github/app/check"),
+            Some(Action::GitHubAppCheck)
+        ));
+        assert!(matches!(
+            action_for("/console/connect/github/app/check/"),
+            Some(Action::GitHubAppCheck)
+        ));
+        assert!(action_for("/console/connect/github/app/check/extra").is_none());
+        assert!(matches!(
+            action_for("/console/connect/github/app/adopt"),
+            Some(Action::GitHubAppAdopt)
+        ));
+        assert!(action_for("/console/connect/github/app/adopt/extra").is_none());
+        assert!(matches!(
             action_for("/console/connect/github/app/remove"),
             Some(Action::GitHubAppRemove)
         ));
@@ -1255,6 +1331,15 @@ mod tests {
         assert!(method_allowed(Action::GitHub, false, true));
         assert_eq!(allowed_methods(Action::GitHub), "GET, HEAD, POST");
         assert!(!method_allowed(Action::GitHubAppInstalled, true, false));
+    }
+
+    #[test]
+    fn the_check_and_adopt_answer_post_only() {
+        for action in [Action::GitHubAppCheck, Action::GitHubAppAdopt] {
+            assert!(method_allowed(action, true, false));
+            assert!(!method_allowed(action, false, true), "a GET is refused");
+            assert_eq!(allowed_methods(action), "POST");
+        }
     }
 
     #[test]

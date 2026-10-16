@@ -72,6 +72,12 @@ pub enum Notice<'a> {
         /// The app's advanced settings page on GitHub.
         advanced: Option<&'a str>,
     },
+    /// The check's result: the app's installations GitHub lists that the
+    /// console does not record yet. Empty when there are none.
+    Found {
+        /// The installations to offer for adding.
+        new: &'a [Installation],
+    },
 }
 
 /// What the page shows about the personal token.
@@ -169,7 +175,55 @@ fn notice_html(notice: Notice<'_>) -> String {
                  Delete it on GitHub too, so its name is free again.{link}</p>\n"
             )
         }
+        Notice::Found { new: [] } => {
+            "<p class=\"callout ok\" role=\"status\">Every installation of the app is already \
+             listed.</p>\n"
+                .to_owned()
+        }
+        Notice::Found { new } => {
+            let rows: String = new.iter().map(new_installation_row).collect();
+            format!(
+                "<section class=\"panel\" aria-labelledby=\"found-title\">\n\
+                 <h2 id=\"found-title\">Installations not listed yet</h2>\n\
+                 <p class=\"muted\">GitHub has these installations of the app that this console \
+                 does not list. Add only the ones that are yours: the app is public, so an \
+                 account you do not know can appear here, and adding it lets the console act in \
+                 its repositories.</p>\n\
+                 <ul class=\"rows installs\">\n{rows}</ul>\n</section>\n"
+            )
+        }
     }
+}
+
+/// The check button, shown in both created states: it asks GitHub for the
+/// app's installations and lists the ones this console does not record.
+fn check_form() -> String {
+    format!(
+        "<form class=\"check-installs\" method=\"post\" action=\"{CHECK}\">\n\
+         <p class=\"hint\">Use this if you installed the app from an organisation's settings \
+         and it is not listed above.</p>\n\
+         <button class=\"btn\" type=\"submit\">Check for new installations</button>\n\
+         </form>\n",
+        CHECK = app::CHECK_PATH,
+    )
+}
+
+/// One installation the check found, with the button that adds it. GitHub's
+/// text is escaped; the id is posted back and checked again on the server.
+fn new_installation_row(installation: &Installation) -> String {
+    let kind = if installation.is_user() { "Personal" } else { "Organisation" };
+    let reach =
+        if installation.selection == "all" { "all repositories" } else { "selected repositories" };
+    format!(
+        "<li><strong>{account}</strong> <span class=\"tag\">{kind}</span>\
+         <div class=\"what\">{reach}</div>\
+         <form method=\"post\" action=\"{ADOPT}\">\
+         <input type=\"hidden\" name=\"installation_id\" value=\"{id}\">\
+         <button class=\"btn\" type=\"submit\">Add</button></form></li>\n",
+        account = esc(&installation.account),
+        ADOPT = app::ADOPT_PATH,
+        id = installation.id,
+    )
 }
 
 /// The remove button, shown in both app states (created, and installed): a
@@ -242,10 +296,11 @@ fn app_card(overview: &Overview, app_error: Option<&str>) -> String {
          <span class=\"tag live\">recommended</span></h2><p>{status}</p></div>\n\
          <p class=\"muted\">App <a href=\"{page}\" rel=\"noopener noreferrer\">{slug}</a>, \
          created under {owner}.</p>\n\
-         {error}{shortfall}{installs}{remove}</section>\n",
+         {error}{shortfall}{installs}{check}{remove}</section>\n",
         page = esc(&app.html_url),
         slug = esc(&app.slug),
         owner = esc(&app.owner),
+        check = check_form(),
         remove = remove_form(),
     )
 }
@@ -696,5 +751,63 @@ mod tests {
         let page = connect_page(&overview, None, State::Disconnected, None, None, NOW);
         assert!(!page.contains("BEGIN"), "no key material in the markup");
         assert!(!page.contains("github_pat_"));
+    }
+
+    #[test]
+    fn the_check_lists_new_installations_and_escapes_each_login() {
+        let hostile = install(3, "<img src=x onerror=alert(1)>", "Organization", "all");
+        let fresh = [hostile, install(4, "keep-shipping", "User", "selected")];
+        let overview = Overview { app: Some(app("kp")), installations: vec![] };
+        let page = connect_page_noticed(
+            &overview,
+            None,
+            State::Disconnected,
+            None,
+            None,
+            Notice::Found { new: &fresh },
+            NOW,
+        );
+        assert!(page.contains("Installations not listed yet"));
+        assert!(!page.contains("<img"), "the hostile login is never raw HTML");
+        assert!(page.contains("&lt;img src=x onerror=alert(1)&gt;"));
+        assert!(page.contains("<strong>keep-shipping</strong>"));
+        assert!(page.contains("action=\"/console/connect/github/app/adopt\""));
+        assert!(page.contains("name=\"installation_id\" value=\"3\""));
+        assert!(page.contains("name=\"installation_id\" value=\"4\""));
+        assert!(page.contains("Organisation"));
+        assert!(page.contains("all repositories"));
+        assert!(page.contains("selected repositories"));
+    }
+
+    #[test]
+    fn the_check_button_is_offered_in_both_created_states_and_names_the_check() {
+        let created = Overview { app: Some(app("kp")), installations: vec![] };
+        let installed = Overview {
+            app: Some(app("kp")),
+            installations: vec![install(7, "nick", "User", "all")],
+        };
+        for overview in [created, installed] {
+            let page = connect_page(&overview, None, State::Disconnected, None, None, NOW);
+            assert!(page.contains("action=\"/console/connect/github/app/check\""));
+            assert!(page.contains("Check for new installations"));
+        }
+        let none = connect_page(&Overview::default(), None, State::Disconnected, None, None, NOW);
+        assert!(!none.contains("Check for new installations"), "no app, no check");
+    }
+
+    #[test]
+    fn a_check_with_nothing_new_says_so_in_one_line() {
+        let overview = Overview { app: Some(app("kp")), installations: vec![] };
+        let page = connect_page_noticed(
+            &overview,
+            None,
+            State::Disconnected,
+            None,
+            None,
+            Notice::Found { new: &[] },
+            NOW,
+        );
+        assert!(page.contains("Every installation of the app is already listed."));
+        assert!(!page.contains("Installations not listed yet"));
     }
 }
