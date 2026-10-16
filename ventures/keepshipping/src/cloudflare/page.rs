@@ -46,7 +46,7 @@ pub fn connect_page(connected_at: Option<&str>, error: Option<&str>) -> String {
          <h2>1. Create the token</h2>\n\
          <p>Cloudflare opens its token page with the permissions already chosen. Check them, \
          choose Continue to summary, then Create Token.</p>\n\
-         <div class=\"actions\"><a class=\"button\" rel=\"noopener noreferrer\" href=\"{href}\">\
+         <div class=\"actions\"><a class=\"button\" target=\"_blank\" rel=\"noopener noreferrer\" href=\"{href}\">\
          Create a read-only token on Cloudflare</a></div>\n\
          <p>The permissions it asks for:</p>\n\
          <ul class=\"plain\">\n{permissions}\n</ul>\n\

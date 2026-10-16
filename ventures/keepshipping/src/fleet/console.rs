@@ -25,6 +25,12 @@ use crate::cloudflare::api::{self, NOT_CONNECTED};
 use crate::cloudflare::page::{CONNECT_PATH, DISCONNECT_PATH, connect_page};
 use crate::signin::{self, CALLBACK_PATH, Client, LOGIN_PATH, LOGOUT_PATH, Reply};
 
+/// `same-origin`, not `no-referrer`: under `no-referrer` Chrome sends
+/// `Origin: null` on the console's own form posts, and the write guard in
+/// `origin.rs` rightly refuses that. `same-origin` still sends nothing to
+/// any other site.
+const REFERRER_POLICY: &str = "same-origin";
+
 /// The fleet snapshot's refresh button (a POST, same gate as the fleet).
 pub const REFRESH_PATH: &str = "/console/fleet/refresh";
 
@@ -195,7 +201,7 @@ fn reply(answer: &Reply) -> worker::Result<Response> {
             let headers = Headers::new();
             headers.set("location", location)?;
             headers.set("cache-control", "private, no-store")?;
-            headers.set("referrer-policy", "no-referrer")?;
+            headers.set("referrer-policy", REFERRER_POLICY)?;
             Response::empty()?.with_status(answer.status).with_headers(headers)
         }
         (None, Some(notice)) => page(
@@ -415,12 +421,12 @@ async fn refresh(env: &Env) -> worker::Result<Response> {
     }
 }
 
-/// A 303 to `location`, with the console's no-store and no-referrer headers.
+/// A 303 to `location`, with the console's no-store and referrer headers.
 fn redirect(status: u16, location: &str) -> worker::Result<Response> {
     let headers = Headers::new();
     headers.set("location", location)?;
     headers.set("cache-control", "private, no-store")?;
-    headers.set("referrer-policy", "no-referrer")?;
+    headers.set("referrer-policy", REFERRER_POLICY)?;
     Ok(Response::empty()?.with_status(status).with_headers(headers))
 }
 
@@ -541,7 +547,7 @@ fn page_with(status: u16, html: &str, extra: &[(&str, &str)]) -> worker::Result<
         "content-security-policy",
         "default-src 'none'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self'; frame-ancestors 'none'",
     )?;
-    headers.set("referrer-policy", "no-referrer")?;
+    headers.set("referrer-policy", REFERRER_POLICY)?;
     headers.set("x-content-type-options", "nosniff")?;
     for (name, value) in extra {
         headers.set(name, value)?;
