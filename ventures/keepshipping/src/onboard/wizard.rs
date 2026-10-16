@@ -14,8 +14,8 @@ use crate::github::Repo;
 /// The R2 bucket the infrastructure state lives in, created with the infra
 /// token on the first run.
 pub const STATE_BUCKET: &str = "ks-tofu-state";
-/// The console's public address, set as the repository's
-/// `KEEPSHIPPING_CONSOLE_URL` variable so the plan callback can find it.
+/// The console's public address. The generated workflow carries it, so the
+/// plan callback can find the console.
 pub const CONSOLE_URL: &str = "https://console.keepshipping.run";
 /// The branch prefix an edit's pull request uses: `ks-edit/<id>`, the shape
 /// the infra workflow and the edits module both read.

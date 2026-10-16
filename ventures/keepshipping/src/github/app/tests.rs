@@ -17,6 +17,7 @@ use rsa::{RsaPrivateKey, RsaPublicKey};
 use super::*;
 
 const NOW: i64 = 1_800_000_000;
+const ME: &str = "Nick@CHI.app ";
 
 fn test_key() -> RsaPrivateKey {
     RsaPrivateKey::new(&mut OsRng, 1024).expect("a test key")
@@ -74,7 +75,6 @@ fn the_manifest_names_the_console_its_webhook_and_its_permissions() {
         keys,
         vec![
             ("actions", "read"),
-            ("actions_variables", "write"),
             ("administration", "write"),
             ("contents", "write"),
             ("metadata", "read"),
@@ -276,27 +276,33 @@ fn the_app_token_debug_never_shows_the_token() {
 #[test]
 fn a_state_is_taken_once_and_only_in_time() {
     let db = database();
-    let state = block(issue_state(Arc::clone(&db), NOW)).expect("a state");
+    let state = block(issue_state(Arc::clone(&db), NOW, &subject_of(ME))).expect("a state");
     assert_eq!(state.len(), 64, "32 random bytes in hex");
     assert!(state.chars().all(|c| c.is_ascii_hexdigit()));
 
-    assert!(block(take_state(Arc::clone(&db), &state, NOW + 60)).expect("take"), "first use");
-    assert!(!block(take_state(Arc::clone(&db), &state, NOW + 61)).expect("take"), "second use");
-    assert!(!block(take_state(Arc::clone(&db), "not-issued", NOW)).expect("take"));
+    assert!(
+        block(take_state(Arc::clone(&db), &state, NOW + 60, &subject_of(ME))).expect("take"),
+        "first use"
+    );
+    assert!(
+        !block(take_state(Arc::clone(&db), &state, NOW + 61, &subject_of(ME))).expect("take"),
+        "second use"
+    );
+    assert!(!block(take_state(Arc::clone(&db), "not-issued", NOW, &subject_of(ME))).expect("take"));
 }
 
 #[test]
 fn a_state_expires_after_ten_minutes() {
     let db = database();
-    let state = block(issue_state(Arc::clone(&db), NOW)).expect("a state");
+    let state = block(issue_state(Arc::clone(&db), NOW, &subject_of(ME))).expect("a state");
     assert!(
-        !block(take_state(Arc::clone(&db), &state, NOW + 600)).expect("take"),
+        !block(take_state(Arc::clone(&db), &state, NOW + 600, &subject_of(ME))).expect("take"),
         "at ten minutes it is already expired"
     );
 
-    let late = block(issue_state(Arc::clone(&db), NOW)).expect("a state");
+    let late = block(issue_state(Arc::clone(&db), NOW, &subject_of(ME))).expect("a state");
     assert!(
-        block(take_state(Arc::clone(&db), &late, NOW + 599)).expect("take"),
+        block(take_state(Arc::clone(&db), &late, NOW + 599, &subject_of(ME))).expect("take"),
         "just inside the window it is good"
     );
 }
@@ -304,9 +310,12 @@ fn a_state_expires_after_ten_minutes() {
 #[test]
 fn issuing_a_state_sweeps_the_expired_ones() {
     let db = database();
-    let old = block(issue_state(Arc::clone(&db), NOW)).expect("a state");
-    block(issue_state(Arc::clone(&db), NOW + 1000)).expect("a later state");
-    assert!(!block(take_state(Arc::clone(&db), &old, NOW + 1000)).expect("take"), "swept");
+    let old = block(issue_state(Arc::clone(&db), NOW, &subject_of(ME))).expect("a state");
+    block(issue_state(Arc::clone(&db), NOW + 1000, &subject_of(ME))).expect("a later state");
+    assert!(
+        !block(take_state(Arc::clone(&db), &old, NOW + 1000, &subject_of(ME))).expect("take"),
+        "swept"
+    );
 }
 
 #[test]
@@ -335,14 +344,20 @@ fn installations_are_saved_refreshed_selected_and_removed() {
 fn the_app_row_reads_back_and_is_absent_before_it_is_created() {
     let db = database();
     assert_eq!(block(app_row(Arc::clone(&db))).expect("read"), None);
+    assert!(block(claim_app(Arc::clone(&db), NOW)).expect("claim"), "the first claim is taken");
+    assert!(
+        block(app_row(Arc::clone(&db))).expect("read").is_none(),
+        "a claim is not an app until it is finished"
+    );
     let app = AppRow {
         app_id: 42,
         slug: "ks".into(),
         client_id: "Iv1.x".into(),
         html_url: "https://github.com/apps/ks".into(),
         owner: "keep-shipping".into(),
+        permissions: serde_json::json!({"contents": "write"}),
     };
-    block(insert_app(Arc::clone(&db), &app, "2026-10-16T09:00:00Z")).expect("insert");
+    block(finish_app(Arc::clone(&db), &app)).expect("finish");
     assert_eq!(block(app_row(Arc::clone(&db))).expect("read"), Some(app.clone()));
     let overview = block(overview(db)).expect("overview");
     assert_eq!(overview.app, Some(app));
@@ -352,4 +367,80 @@ fn the_app_row_reads_back_and_is_absent_before_it_is_created() {
 #[test]
 fn the_stamp_is_rfc_3339_in_utc() {
     assert_eq!(stamp(NOW), "2027-01-15T08:00:00Z");
+}
+
+#[test]
+fn a_second_claim_on_the_app_row_is_refused_until_the_first_is_released() {
+    let db = database();
+    assert!(block(claim_app(Arc::clone(&db), NOW)).expect("claim"));
+    assert!(!block(claim_app(Arc::clone(&db), NOW + 1)).expect("claim"), "one row, one claim");
+    block(release_claim(Arc::clone(&db))).expect("release");
+    assert!(block(claim_app(Arc::clone(&db), NOW + 2)).expect("claim"), "free again");
+}
+
+#[test]
+fn a_stale_claim_from_an_unfinished_create_is_cleared_by_the_next_one() {
+    let db = database();
+    assert!(block(claim_app(Arc::clone(&db), NOW)).expect("claim"));
+    assert!(
+        !block(claim_app(Arc::clone(&db), NOW + 599)).expect("claim"),
+        "a claim inside the window still holds the row"
+    );
+    assert!(
+        block(claim_app(Arc::clone(&db), NOW + 600)).expect("claim"),
+        "one left past the window is cleared and taken"
+    );
+}
+
+#[test]
+fn a_state_is_bound_to_the_person_it_was_issued_to() {
+    let db = database();
+    let state = block(issue_state(Arc::clone(&db), NOW, &subject_of(ME))).expect("a state");
+    assert!(
+        !block(take_state(Arc::clone(&db), &state, NOW + 1, &subject_of("someone@else.app")))
+            .expect("take"),
+        "another person cannot return it"
+    );
+    assert!(
+        block(take_state(Arc::clone(&db), &state, NOW + 2, &subject_of("nick@chi.app")))
+            .expect("take"),
+        "the same person, in any letter case, can"
+    );
+}
+
+#[test]
+fn the_subject_hash_is_a_sha256_of_the_normalised_email() {
+    let hash = subject_of(" Nick@CHI.app ");
+    assert_eq!(hash.len(), 64);
+    assert_eq!(hash, subject_of("nick@chi.app"));
+    assert_ne!(hash, subject_of("nick@chi.apps"));
+    assert!(!hash.contains("nick"), "the email itself is not in the hash");
+}
+
+#[test]
+fn a_grant_short_of_a_required_permission_is_named_and_a_full_grant_is_not() {
+    let full = serde_json::json!({
+        "contents": "write", "pull_requests": "write", "workflows": "write",
+        "secrets": "write", "administration": "write", "actions": "read", "metadata": "read"
+    });
+    assert!(missing_permissions(&full).is_empty());
+    // More than needed is fine.
+    let more = serde_json::json!({
+        "contents": "write", "pull_requests": "write", "workflows": "write",
+        "secrets": "write", "administration": "write", "actions": "write", "metadata": "read"
+    });
+    assert!(missing_permissions(&more).is_empty());
+    // Lower than needed, and absent, are both named with the level needed.
+    let short = serde_json::json!({"contents": "read", "metadata": "read", "actions": "read"});
+    assert_eq!(
+        missing_permissions(&short),
+        [
+            "contents (write)",
+            "pull requests (write)",
+            "workflows (write)",
+            "secrets (write)",
+            "administration (write)"
+        ]
+    );
+    assert_eq!(missing_permissions(&serde_json::Value::Null).len(), 7);
 }

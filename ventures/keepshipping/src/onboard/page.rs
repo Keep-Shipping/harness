@@ -387,7 +387,7 @@ pub fn to_do(facts: Option<&Opened>, worker: bool, runner_set: bool) -> Vec<Stri
         lines.push(
             "Add a test database later: the app needs a database for its test environment and \
              none was given, so the test environment is planned without it. In the \
-             infrastructure repository go to Settings → Secrets and variables → Actions, set \
+             infrastructure repository go to Settings → Secrets and variables → Actions, under Secrets, set \
              TEST_DB_HOST, TEST_DB_PORT, TEST_DB_DATABASE, TEST_DB_USER and TEST_DB_PASSWORD, \
              then run the setup again."
                 .to_owned(),

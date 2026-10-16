@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      TF_VAR_cloudflare_account_id: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_cloudflare_account_id: "acct123"
       TF_VAR_state_encryption_passphrase: ${{ secrets.STATE_ENCRYPTION_PASSPHRASE }}
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -62,7 +62,7 @@ jobs:
       - name: Post the plan to Keep Shipping
         if: startsWith(github.head_ref, 'ks-edit/')
         env:
-          CONSOLE_URL: ${{ vars.KEEPSHIPPING_CONSOLE_URL }}
+          CONSOLE_URL: "https://console.keepshipping.run"
           RUNNER_TOKEN: ${{ secrets.EDITS_RUNNER_TOKEN }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           HEAD_REF: ${{ github.head_ref }}
@@ -89,7 +89,7 @@ jobs:
       cancel-in-progress: false
     env:
       TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      TF_VAR_cloudflare_account_id: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_cloudflare_account_id: "acct123"
       TF_VAR_state_encryption_passphrase: ${{ secrets.STATE_ENCRYPTION_PASSPHRASE }}
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -200,7 +200,7 @@ Set these in the repository's settings. Their values are never written to a file
 - `EDITS_RUNNER_TOKEN`: lets the workflow report each plan back to Keep Shipping.
 - `EMAIL_ROUTING_DESTINATIONS`: the email forwarding addresses, as one JSON object keyed by rule.
 
-Variables: `CLOUDFLARE_ACCOUNT_ID` and `KEEPSHIPPING_CONSOLE_URL`.
+The Cloudflare account id and the console's address are not secrets: the workflow file carries them.
 
 ## Test environment
 

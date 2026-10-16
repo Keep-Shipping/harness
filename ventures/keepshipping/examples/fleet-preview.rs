@@ -120,6 +120,10 @@ fn github_pages(snapshot: &Fleet, now: &str, write: &dyn Fn(&str, String)) {
         client_id: "Iv1.preview".to_owned(),
         html_url: "https://github.com/apps/keep-shipping-console".to_owned(),
         owner: "keep-shipping".to_owned(),
+        permissions: serde_json::json!({
+            "contents": "write", "pull_requests": "write", "workflows": "write",
+            "secrets": "write", "administration": "write", "actions": "read", "metadata": "read"
+        }),
     };
     let installed = Overview {
         app: Some(app.clone()),

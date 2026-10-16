@@ -268,18 +268,6 @@ pub fn open_pulls_url(owner: &str, name: &str, branch: &str) -> String {
     format!("{}?head={}&state=open", pulls_url(owner, name), segment(&format!("{owner}:{branch}")))
 }
 
-/// `POST /repos/{owner}/{name}/actions/variables`.
-#[must_use]
-pub fn variables_url(owner: &str, name: &str) -> String {
-    format!("{}/actions/variables", repo_url(owner, name))
-}
-
-/// `PATCH /repos/{owner}/{name}/actions/variables/{variable}`.
-#[must_use]
-pub fn variable_url(owner: &str, name: &str, variable: &str) -> String {
-    format!("{}/{}", variables_url(owner, name), segment(variable))
-}
-
 // ---------------------------------------------------------------------------
 // Pure: reading GitHub's answers.
 // ---------------------------------------------------------------------------
@@ -480,19 +468,30 @@ pub struct Client {
     /// `None` for a personal access token. For an installation token, whether
     /// the installation is on a personal account.
     installation: Option<bool>,
+    /// The personal access token, when one is stored: a call the installation
+    /// is refused (`403`/`404`) is retried once with it.
+    fallback: Option<String>,
 }
 
 impl Client {
     /// A client that speaks as the personal access token `token`.
     #[must_use]
     pub fn new(token: String) -> Self {
-        Self { token, installation: None }
+        Self { token, installation: None, fallback: None }
     }
 
     /// A client that speaks as an installation of the GitHub App.
     #[must_use]
     pub fn installation(token: String, user_account: bool) -> Self {
-        Self { token, installation: Some(user_account) }
+        Self { token, installation: Some(user_account), fallback: None }
+    }
+
+    /// The same client, able to fall back to `personal` for a call the
+    /// installation is refused.
+    #[must_use]
+    pub fn with_fallback(mut self, personal: Option<String>) -> Self {
+        self.fallback = personal;
+        self
     }
 
     /// The signed-in account's login (`GET /user`): the check that a token
@@ -551,13 +550,33 @@ impl Client {
 
     /// Creates a private repository with an initial commit (`auto_init`) so
     /// it has a default branch. An organisation's repository is created under
-    /// the organisation, the token's own under its account.
+    /// the organisation, the token's own under its account. An installation
+    /// on a personal account cannot create one: the personal token does it
+    /// when there is one, else the caller is told to create the repository
+    /// first.
     pub async fn create_repo(&self, owner: &str, name: &str) -> Result<Repo, Failed> {
-        let url = match self.installation {
-            // An installation cannot read the signed-in account (`/user`), and
-            // on a personal account it cannot create one.
-            Some(true) => return Err(APP_PERSONAL),
-            Some(false) => create_org_repo_url(owner),
+        match self.installation {
+            Some(true) => match &self.fallback {
+                Some(personal) => {
+                    Client::new(personal.clone()).post_new_repo(owner, name, None).await
+                }
+                None => Err(APP_PERSONAL),
+            },
+            Some(false) => self.post_new_repo(owner, name, Some(owner)).await,
+            None => self.post_new_repo(owner, name, None).await,
+        }
+    }
+
+    /// The `POST` that creates the repository: under `org` when given, else
+    /// under the signed-in account.
+    async fn post_new_repo(
+        &self,
+        owner: &str,
+        name: &str,
+        org: Option<&str>,
+    ) -> Result<Repo, Failed> {
+        let url = match org {
+            Some(org) => create_org_repo_url(org),
             None => {
                 let login = self.whoami().await?;
                 create_repo_url(owner, &login)
@@ -763,32 +782,6 @@ impl Client {
         Ok(true)
     }
 
-    /// Creates a repository variable, or updates it when it exists.
-    pub async fn put_variable(
-        &self,
-        owner: &str,
-        name: &str,
-        variable: &str,
-        value: &str,
-    ) -> Result<(), Failed> {
-        let payload = serde_json::json!({ "name": variable, "value": value }).to_string();
-        let (status, _) =
-            self.send(Method::Post, &variables_url(owner, name), Some(payload.clone())).await?;
-        if (200..300).contains(&status) {
-            return Ok(());
-        }
-        if status == 409 {
-            let (status, _) = self
-                .send(Method::Patch, &variable_url(owner, name, variable), Some(payload))
-                .await?;
-            if (200..300).contains(&status) {
-                return Ok(());
-            }
-        }
-        tracing::warn!(status, "console: github refused to store a variable");
-        Err(REFUSED)
-    }
-
     /// Puts `pr.files` on a new branch off `pr.base`, one commit per file, and
     /// opens the pull request. Every step tolerates a repeat, so a setup that
     /// failed half-way can be run again.
@@ -812,15 +805,39 @@ impl Client {
         self.send(Method::Get, url, None).await
     }
 
-    /// One call: the status and body, with the token only in the header.
+    /// One call. An installation the call is refused (`403`, `404`) is retried
+    /// once with the personal token, when there is one: an installation that
+    /// does not cover a repository must not cut off a personal token that does.
     async fn send(
         &self,
         method: Method,
         url: &str,
         body: Option<String>,
     ) -> Result<(u16, String), Failed> {
+        let first = self.send_as(&self.token, method.clone(), url, body.clone()).await?;
+        match (&self.fallback, self.installation, first.0) {
+            (Some(personal), Some(_), 403 | 404) => {
+                tracing::warn!(
+                    status = first.0,
+                    "console: the app was refused; trying the personal token"
+                );
+                self.send_as(personal, method, url, body).await
+            }
+            _ => Ok(first),
+        }
+    }
+
+    /// One call with `token`: the status and body, with the token only in the
+    /// header.
+    async fn send_as(
+        &self,
+        token: &str,
+        method: Method,
+        url: &str,
+        body: Option<String>,
+    ) -> Result<(u16, String), Failed> {
         let headers = Headers::new();
-        headers.set("authorization", &format!("Bearer {}", self.token)).map_err(|_| NETWORK)?;
+        headers.set("authorization", &format!("Bearer {token}")).map_err(|_| NETWORK)?;
         headers.set("accept", "application/vnd.github+json").map_err(|_| NETWORK)?;
         headers.set("x-github-api-version", API_VERSION).map_err(|_| NETWORK)?;
         headers.set("user-agent", USER_AGENT).map_err(|_| NETWORK)?;
@@ -908,14 +925,15 @@ pub async fn client(env: &Env, legacy_secret: Option<&str>) -> Result<Option<Cli
     Ok(load(env, legacy_secret).await?.map(|stored| Client::new(stored.into_token())))
 }
 
-/// The one way a caller gets a GitHub client. `owner` is the account the
-/// call is about, when there is one; `None` means any connection will do (a
-/// check that GitHub is connected at all).
+/// The one way a caller gets a client for an existing repository. `repo` is
+/// the `(owner, name)` the call is about; `None` means any connection will do
+/// (a check that GitHub is connected at all).
 ///
-/// The preference is the app (an installation covering the owner, or with no
-/// owner, the first installation) and then the personal token. A failure
-/// reading the app is logged and the personal token is tried, so a broken app
-/// does not cut off a working token.
+/// The app is preferred when one of its installations covers the repository
+/// (see [`app::token_for_repo`]); otherwise the personal token. The app's
+/// client keeps the personal token as its fallback, so a call the
+/// installation is refused is retried with it. A failure reading the app is
+/// logged and the personal token is used.
 ///
 /// # Errors
 ///
@@ -923,13 +941,13 @@ pub async fn client(env: &Env, legacy_secret: Option<&str>) -> Result<Option<Cli
 /// token; a missing connection is `Ok(None)`.
 pub async fn client_for(
     env: &Env,
-    owner: Option<&str>,
+    repo: Option<(&str, &str)>,
     legacy_secret: Option<&str>,
 ) -> Result<Option<Client>, Failed> {
     let db = secrets::d1(env).map_err(vault_failed)?;
     let now = WorkersClock.now().unix_timestamp();
-    let app = match owner {
-        Some(owner) => app::token_for_owner(db, &FetchClient, owner, None, now).await,
+    let app = match repo {
+        Some((owner, name)) => app::token_for_repo(db, &FetchClient, owner, name, now).await,
         None => match app::first_installation(db.clone()).await {
             Ok(Some(installation)) => {
                 app::token_for_installation(db, &FetchClient, &installation, now).await.map(Some)
@@ -938,14 +956,47 @@ pub async fn client_for(
             Err(failed) => Err(failed),
         },
     };
-    let app = app
-        .map(|token| token.map(|token| Client::installation(token.token, token.user_account)))
-        .unwrap_or_else(|failed| {
+    let personal = client(env, legacy_secret).await?;
+    Ok(prefer(app_client(app, personal.as_ref()), personal))
+}
+
+/// The client for creating a repository under `owner`: the installation whose
+/// account is `owner` (no repository coverage is asked, since the repository
+/// does not exist yet), else the personal token. `None` when neither is
+/// connected.
+///
+/// # Errors
+///
+/// [`Failed`] as [`client_for`].
+pub async fn client_for_owner(
+    env: &Env,
+    owner: &str,
+    legacy_secret: Option<&str>,
+) -> Result<Option<Client>, Failed> {
+    let db = secrets::d1(env).map_err(vault_failed)?;
+    let now = WorkersClock.now().unix_timestamp();
+    let app = app::token_for_owner(db, &FetchClient, owner, now).await;
+    let personal = client(env, legacy_secret).await?;
+    Ok(prefer(app_client(app, personal.as_ref()), personal))
+}
+
+/// The app's client from its token, with the personal token behind it. A
+/// failure reading the app is logged and reads as no app.
+fn app_client(
+    app: Result<Option<app::AppToken>, Failed>,
+    personal: Option<&Client>,
+) -> Option<Client> {
+    match app {
+        Ok(Some(token)) => Some(
+            Client::installation(token.token, token.user_account)
+                .with_fallback(personal.map(|client| client.token.clone())),
+        ),
+        Ok(None) => None,
+        Err(failed) => {
             tracing::warn!(message = failed.message, "console: the github app could not be used");
             None
-        });
-    let personal = client(env, legacy_secret).await?;
-    Ok(prefer(app, personal))
+        }
+    }
 }
 
 /// The first of two choices that is there: the app's, else the personal
@@ -956,22 +1007,43 @@ pub fn prefer<T>(app: Option<T>, personal: Option<T>) -> Option<T> {
 }
 
 /// Every repository any connection can see, the app's installations first and
-/// the personal token's after, each repository once.
+/// the personal token's after, each repository once. An installation that
+/// cannot be listed is logged and skipped; the others are still shown.
 ///
 /// # Errors
 ///
-/// [`Failed`] when a connection cannot answer.
+/// [`Failed`] when nothing could be listed and a connection failed.
 pub async fn list_repos(env: &Env, legacy_secret: Option<&str>) -> Result<Vec<Repo>, Failed> {
     let db = secrets::d1(env).map_err(vault_failed)?;
     let now = WorkersClock.now().unix_timestamp();
     let mut lists = Vec::new();
     for installation in app::installations(db.clone()).await? {
-        let token =
-            app::token_for_installation(db.clone(), &FetchClient, &installation, now).await?;
-        lists.push(Client::installation(token.token, token.user_account).list_repos().await?);
+        let listed = async {
+            let token =
+                app::token_for_installation(db.clone(), &FetchClient, &installation, now).await?;
+            Client::installation(token.token, token.user_account).list_repos().await
+        }
+        .await;
+        match listed {
+            Ok(repos) => lists.push(repos),
+            Err(failed) => tracing::warn!(
+                installation = installation.id,
+                message = failed.message,
+                "console: an installation could not be listed; skipped"
+            ),
+        }
     }
     if let Some(personal) = client(env, legacy_secret).await? {
-        lists.push(personal.list_repos().await?);
+        match personal.list_repos().await {
+            Ok(repos) => lists.push(repos),
+            Err(failed) if lists.is_empty() => return Err(failed),
+            Err(failed) => {
+                tracing::warn!(
+                    message = failed.message,
+                    "console: the personal token could not list repositories"
+                )
+            }
+        }
     }
     Ok(merge(lists))
 }
@@ -1148,7 +1220,7 @@ mod tests {
     }
 
     #[test]
-    fn the_branch_pull_request_and_variable_urls_are_built_from_encoded_parts() {
+    fn the_branch_pull_request_and_list_urls_are_built_from_encoded_parts() {
         assert_eq!(
             branch_ref_url("o", "r", "main"),
             "https://api.github.com/repos/o/r/git/ref/heads/main"
@@ -1162,11 +1234,6 @@ mod tests {
         assert_eq!(
             open_pulls_url("nick", "infra", "ks-edit/ks1"),
             "https://api.github.com/repos/nick/infra/pulls?head=nick%3Aks-edit%2Fks1&state=open"
-        );
-        assert_eq!(variables_url("o", "r"), "https://api.github.com/repos/o/r/actions/variables");
-        assert_eq!(
-            variable_url("o", "r", "KEEPSHIPPING_CONSOLE_URL"),
-            "https://api.github.com/repos/o/r/actions/variables/KEEPSHIPPING_CONSOLE_URL"
         );
     }
 

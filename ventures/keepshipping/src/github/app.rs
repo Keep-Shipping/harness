@@ -75,16 +75,56 @@ const FALLBACK_TOKEN_SECS: i64 = 50 * 60;
 pub const APP_NAME_MAX: usize = 64;
 
 /// The permissions the app asks for, as the manifest's `default_permissions`.
-const PERMISSIONS: [(&str, &str); 8] = [
+const PERMISSIONS: [(&str, &str); 7] = [
     ("contents", "write"),
     ("pull_requests", "write"),
     ("workflows", "write"),
     ("secrets", "write"),
-    ("actions_variables", "write"),
     ("administration", "write"),
     ("actions", "read"),
     ("metadata", "read"),
 ];
+
+/// What the console needs GitHub to have granted, checked against the
+/// conversion's `permissions` after the app is created.
+pub const REQUIRED: [(&str, &str); 7] = PERMISSIONS;
+
+/// The required permissions GitHub did not grant at the level needed, as
+/// `name (level)` words for the page. A missing permission and one granted
+/// only `read` where `write` is needed are both listed. Pure.
+#[must_use]
+pub fn missing_permissions(granted: &serde_json::Value) -> Vec<String> {
+    REQUIRED
+        .iter()
+        .filter(|(name, need)| {
+            let have = granted.get(*name).and_then(serde_json::Value::as_str).unwrap_or("");
+            level(have) < level(need)
+        })
+        .map(|(name, need)| format!("{} ({need})", name.replace('_', " ")))
+        .collect()
+}
+
+/// The rank of a GitHub permission level: none below read, read below write.
+fn level(access: &str) -> u8 {
+    match access {
+        "write" => 2,
+        "read" => 1,
+        _ => 0,
+    }
+}
+
+/// The SHA-256 of a person's email, as the state records it. Lower-cased and
+/// trimmed first, so the same person always hashes the same.
+#[must_use]
+pub fn subject_of(email: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(email.trim().to_ascii_lowercase().as_bytes());
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
 
 /// The console's own database refused a read or a write. Not GitHub's trouble.
 const DATABASE: Failed = Failed {
@@ -131,6 +171,16 @@ pub struct AppRow {
     pub html_url: String,
     /// The account the app was created under.
     pub owner: String,
+    /// The permissions GitHub granted, as the conversion reported them.
+    pub permissions: serde_json::Value,
+}
+
+impl AppRow {
+    /// The required permissions GitHub did not grant, for the page's warning.
+    #[must_use]
+    pub fn missing_permissions(&self) -> Vec<String> {
+        missing_permissions(&self.permissions)
+    }
 }
 
 /// One installation of the app: an account, and which of its repositories
@@ -321,6 +371,8 @@ struct ConversionBody {
     pem: String,
     webhook_secret: String,
     client_secret: String,
+    #[serde(default)]
+    permissions: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -355,6 +407,7 @@ pub fn read_conversion(body: &str) -> Result<Conversion, Failed> {
             client_id: parsed.client_id,
             html_url: parsed.html_url,
             owner: parsed.owner.login,
+            permissions: parsed.permissions,
         },
         pem: parsed.pem,
         webhook_secret: parsed.webhook_secret,
@@ -471,13 +524,14 @@ pub fn code_is_plausible(code: &str) -> bool {
 // The manifest state: random, single use, ten minutes.
 // ---------------------------------------------------------------------------
 
-/// Issues a `state` for the create form: 32 random bytes in hex, stored with
-/// its expiry. Expired rows are swept on the way in.
+/// Issues a `state` for the create form, bound to the person who asked for it
+/// (`subject` is their [`subject_of`] hash): 32 random bytes in hex, stored
+/// with its expiry. Expired rows are swept on the way in.
 ///
 /// # Errors
 ///
 /// [`Failed`] when there is no random source or the row cannot be stored.
-pub async fn issue_state(db: Arc<dyn Database>, now: i64) -> Result<String, Failed> {
+pub async fn issue_state(db: Arc<dyn Database>, now: i64, subject: &str) -> Result<String, Failed> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).map_err(|_| RANDOM)?;
     let mut state = String::with_capacity(64);
@@ -491,26 +545,33 @@ pub async fn issue_state(db: Arc<dyn Database>, now: i64) -> Result<String, Fail
     .await
     .map_err(|_| DATABASE)?;
     db.execute(&Statement::with_values(
-        "INSERT INTO console_github_app_state (state, expires_at) VALUES (?, ?)",
-        vec![state.clone().into(), (now + STATE_TTL_SECS).into()],
+        "INSERT INTO console_github_app_state (state, expires_at, subject_hash) VALUES (?, ?, ?)",
+        vec![state.clone().into(), (now + STATE_TTL_SECS).into(), subject.into()],
     ))
     .await
     .map_err(|_| DATABASE)?;
     Ok(state)
 }
 
-/// Takes a `state` back: true exactly once, and only while it has not
-/// expired. The row is deleted by the same statement that checks it, so two
-/// returns with one `state` cannot both succeed.
+/// Takes a `state` back: true exactly once, only while it has not expired, and
+/// only for the person it was issued to (`subject`, the same [`subject_of`]
+/// hash). The row is deleted by the same statement that checks all three, so
+/// two returns with one `state` cannot both succeed.
 ///
 /// # Errors
 ///
 /// [`Failed`] when the database cannot answer.
-pub async fn take_state(db: Arc<dyn Database>, state: &str, now: i64) -> Result<bool, Failed> {
+pub async fn take_state(
+    db: Arc<dyn Database>,
+    state: &str,
+    now: i64,
+    subject: &str,
+) -> Result<bool, Failed> {
     let removed = db
         .execute(&Statement::with_values(
-            "DELETE FROM console_github_app_state WHERE state = ? AND expires_at > ?",
-            vec![state.into(), now.into()],
+            "DELETE FROM console_github_app_state \
+             WHERE state = ? AND expires_at > ? AND subject_hash = ?",
+            vec![state.into(), now.into(), subject.into()],
         ))
         .await
         .map_err(|_| DATABASE)?;
@@ -530,7 +591,8 @@ pub async fn overview(db: Arc<dyn Database>) -> Result<Overview, Failed> {
     Ok(Overview { app: app_row(db.clone()).await?, installations: installations(db).await? })
 }
 
-/// The app row, when the console has created its app.
+/// The app row, when the console has created its app. A claim still being
+/// created (see [`claim_app`]) is not an app yet.
 ///
 /// # Errors
 ///
@@ -538,8 +600,8 @@ pub async fn overview(db: Arc<dyn Database>) -> Result<Overview, Failed> {
 pub async fn app_row(db: Arc<dyn Database>) -> Result<Option<AppRow>, Failed> {
     let rows = db
         .query(&Statement::new(
-            "SELECT app_id, slug, client_id, html_url, owner_login FROM console_github_app \
-             WHERE id = 1",
+            "SELECT app_id, slug, client_id, html_url, owner_login, permissions_json \
+             FROM console_github_app WHERE id = 1 AND app_id <> 0",
         ))
         .await
         .map_err(|_| DATABASE)?;
@@ -547,12 +609,14 @@ pub async fn app_row(db: Arc<dyn Database>) -> Result<Option<AppRow>, Failed> {
         return Ok(None);
     };
     let read = || -> Option<AppRow> {
+        let permissions: String = row.get("permissions_json")?;
         Some(AppRow {
             app_id: row.get("app_id")?,
             slug: row.get("slug")?,
             client_id: row.get("client_id")?,
             html_url: row.get("html_url")?,
             owner: row.get("owner_login")?,
+            permissions: serde_json::from_str(&permissions).unwrap_or_default(),
         })
     };
     read().map(Some).ok_or(SHAPE)
@@ -646,22 +710,66 @@ pub async fn set_selection(db: Arc<dyn Database>, id: i64, selection: &str) -> R
     Ok(())
 }
 
-async fn insert_app(db: Arc<dyn Database>, app: &AppRow, now: &str) -> Result<(), Failed> {
+/// Takes the app's one row before anything is written to the secrets store:
+/// an insert that only succeeds when no app row (claimed or made) exists. A
+/// claim left behind by a create that never finished, older than the state's
+/// lifetime, is cleared first. `false` means the console already has an app.
+///
+/// # Errors
+///
+/// [`Failed`] when the database cannot answer.
+pub async fn claim_app(db: Arc<dyn Database>, now: i64) -> Result<bool, Failed> {
     db.execute(&Statement::with_values(
-        "INSERT INTO console_github_app \
-         (id, app_id, slug, client_id, html_url, owner_login, created_at) \
-         VALUES (1, ?, ?, ?, ?, ?, ?)",
+        "DELETE FROM console_github_app WHERE id = 1 AND app_id = 0 AND created_at <= ?",
+        vec![stamp(now - STATE_TTL_SECS).into()],
+    ))
+    .await
+    .map_err(|_| DATABASE)?;
+    let inserted = db
+        .execute(&Statement::with_values(
+            "INSERT OR IGNORE INTO console_github_app \
+             (id, app_id, slug, client_id, html_url, owner_login, permissions_json, created_at) \
+             VALUES (1, 0, '', '', '', '', '{}', ?)",
+            vec![stamp(now).into()],
+        ))
+        .await
+        .map_err(|_| DATABASE)?;
+    Ok(inserted == 1)
+}
+
+/// Records the app a claim was made for, with the permissions GitHub granted.
+///
+/// # Errors
+///
+/// [`Failed`] when the database refuses the write.
+pub async fn finish_app(db: Arc<dyn Database>, app: &AppRow) -> Result<(), Failed> {
+    db.execute(&Statement::with_values(
+        "UPDATE console_github_app SET app_id = ?, slug = ?, client_id = ?, html_url = ?, \
+         owner_login = ?, permissions_json = ? WHERE id = 1 AND app_id = 0",
         vec![
             app.app_id.into(),
             app.slug.clone().into(),
             app.client_id.clone().into(),
             app.html_url.clone().into(),
             app.owner.clone().into(),
-            now.into(),
+            app.permissions.to_string().into(),
         ],
     ))
     .await
     .map_err(|_| DATABASE)?;
+    Ok(())
+}
+
+/// Gives a claim back, when the create did not finish. Touches nothing that
+/// is a finished app.
+///
+/// # Errors
+///
+/// [`Failed`] when the database refuses the write.
+pub async fn release_claim(db: Arc<dyn Database>) -> Result<(), Failed> {
+    db.execute(&Statement::new("DELETE FROM console_github_app WHERE id = 1 AND app_id = 0"))
+        .await
+        .map_err(|_| DATABASE)?;
     Ok(())
 }
 
@@ -712,9 +820,10 @@ fn ok(status: u16, what: &str) -> Result<(), Failed> {
     Err(if status >= 500 { NETWORK } else { REFUSED })
 }
 
-/// Creates the console's app from the manifest's `code`: exchanges the code
-/// with GitHub, stores the three secrets in the secrets store, then records
-/// the app. Refused when the console already has one.
+/// Creates the console's app from the manifest's `code`. The app's one row is
+/// claimed first, atomically, so two creates cannot both store secrets: the
+/// code is exchanged, the three secrets are stored, and the claim is finished
+/// with the app's facts. A failure after the claim gives it back.
 ///
 /// # Errors
 ///
@@ -730,9 +839,33 @@ pub async fn create_from_code(
     if !code_is_plausible(code) {
         return Err(CODE_REFUSED);
     }
-    if app_row(db.clone()).await?.is_some() {
+    if !claim_app(db.clone(), now).await? {
         return Err(ALREADY);
     }
+    match convert_and_store(env, http, code).await {
+        Ok(conversion) => {
+            finish_app(db, &conversion.app).await?;
+            Ok(conversion.app)
+        }
+        Err(failed) => {
+            if let Err(error) = release_claim(db).await {
+                tracing::warn!(
+                    message = error.message,
+                    "console: a create claim could not be released"
+                );
+            }
+            Err(failed)
+        }
+    }
+}
+
+/// The conversion and the three secrets, the work [`create_from_code`] does
+/// under its claim.
+async fn convert_and_store(
+    env: &Env,
+    http: &dyn HttpClient,
+    code: &str,
+) -> Result<Conversion, Failed> {
     let url = format!("{API}/app-manifests/{}/conversions", segment(code));
     let (status, body) = call(http, "POST", &url, None, None).await?;
     if !(200..300).contains(&status) {
@@ -740,21 +873,19 @@ pub async fn create_from_code(
         return Err(CODE_REFUSED);
     }
     let conversion = read_conversion(&body)?;
-    let store = |name: &'static str, value: &str| {
-        let value = value.to_owned();
-        async move {
-            secrets::put_value(env, name, &value).await.map_err(|_| Failed {
-                status: 503,
-                message: "The app was made on GitHub, but its secrets could not be stored. \
-                          Try again from the connection page.",
-            })
-        }
-    };
-    store(PRIVATE_KEY, &conversion.pem).await?;
-    store(WEBHOOK_SECRET, &conversion.webhook_secret).await?;
-    store(CLIENT_SECRET, &conversion.client_secret).await?;
-    insert_app(db, &conversion.app, &stamp(now)).await?;
-    Ok(conversion.app)
+    store_secret(env, PRIVATE_KEY, &conversion.pem).await?;
+    store_secret(env, WEBHOOK_SECRET, &conversion.webhook_secret).await?;
+    store_secret(env, CLIENT_SECRET, &conversion.client_secret).await?;
+    Ok(conversion)
+}
+
+/// Stores one of the app's secrets in the secrets store.
+async fn store_secret(env: &Env, name: &str, value: &str) -> Result<(), Failed> {
+    secrets::put_value(env, name, value).await.map_err(|_| Failed {
+        status: 503,
+        message: "The app was made on GitHub, but its secrets could not be stored. Try again \
+                  from the connection page.",
+    })
 }
 
 /// Checks an installation the setup redirect names, with the app's own JWT,
@@ -800,6 +931,15 @@ async fn private_key(db: Arc<dyn Database>) -> Result<RsaPrivateKey, Failed> {
 /// their unix expiry. Held in memory only.
 static TOKENS: OnceLock<Mutex<HashMap<i64, (String, i64)>>> = OnceLock::new();
 
+/// Which installation covers a repository, as this isolate last asked GitHub,
+/// by `owner/name` (lower-cased), with the unix time the answer was taken. Only
+/// positive answers are kept: a repository that does not exist yet is asked
+/// again.
+static COVERAGE: OnceLock<Mutex<HashMap<String, (Installation, i64)>>> = OnceLock::new();
+
+/// How long a coverage answer is trusted, in seconds.
+const COVERAGE_TTL_SECS: i64 = 300;
+
 fn cached_token(id: i64, now: i64) -> Option<String> {
     let cache = TOKENS.get()?.lock().ok()?;
     let (token, expires) = cache.get(&id)?;
@@ -812,10 +952,26 @@ fn remember_token(id: i64, token: &str, expires: i64) {
     }
 }
 
-/// A token for the installation that covers `owner`: the stored row whose
-/// account matches, else (when `repo` names one) GitHub's answer for that
-/// repository's installation, which is recorded when it is this app's. `None`
-/// when no installation covers the owner.
+fn coverage_key(owner: &str, name: &str) -> String {
+    format!("{}/{}", owner.to_ascii_lowercase(), name.to_ascii_lowercase())
+}
+
+fn cached_coverage(key: &str, now: i64) -> Option<Installation> {
+    let cache = COVERAGE.get()?.lock().ok()?;
+    let (found, taken) = cache.get(key)?;
+    (now - taken < COVERAGE_TTL_SECS).then(|| found.clone())
+}
+
+fn remember_coverage(key: String, found: Installation, now: i64) {
+    if let Ok(mut cache) = COVERAGE.get_or_init(Default::default).lock() {
+        cache.insert(key, (found, now));
+    }
+}
+
+/// A token for the installation that covers `owner`, for a caller with no
+/// repository in hand (creating one, or the connection check). The stored row
+/// whose account matches; `repo` is only used for the fallback discovery.
+/// `None` when no installation covers the owner.
 ///
 /// # Errors
 ///
@@ -824,28 +980,67 @@ pub async fn token_for_owner(
     db: Arc<dyn Database>,
     http: &dyn HttpClient,
     owner: &str,
-    repo: Option<&str>,
     now: i64,
 ) -> Result<Option<AppToken>, Failed> {
     if app_row(db.clone()).await?.is_none() {
         return Ok(None);
     }
     let rows = installations(db.clone()).await?;
-    if let Some(row) = pick_installation(&rows, owner) {
+    match pick_installation(&rows, owner) {
+        Some(row) => {
+            let row = row.clone();
+            mint(db, http, &row, now).await.map(Some)
+        }
+        None => Ok(None),
+    }
+}
+
+/// A token for the installation that covers one repository. An installation
+/// on `all` repositories covers the owner's repositories outright. One on
+/// `selected` (or an owner with no row) is asked GitHub, with the app's JWT,
+/// whether it covers this repository: GitHub answers `404` when it does not,
+/// and the answer is kept for a few minutes per isolate. `None` when no
+/// installation of this app covers the repository, so the personal token is
+/// the one to use.
+///
+/// # Errors
+///
+/// [`Failed`] when the app cannot sign or GitHub or the database refuse.
+pub async fn token_for_repo(
+    db: Arc<dyn Database>,
+    http: &dyn HttpClient,
+    owner: &str,
+    name: &str,
+    now: i64,
+) -> Result<Option<AppToken>, Failed> {
+    if app_row(db.clone()).await?.is_none() {
+        return Ok(None);
+    }
+    let rows = installations(db.clone()).await?;
+    if let Some(row) = pick_installation(&rows, owner).filter(|row| row.selection == "all") {
         let row = row.clone();
         return mint(db, http, &row, now).await.map(Some);
     }
-    let Some(repo) = repo else {
-        return Ok(None);
+    let key = coverage_key(owner, name);
+    let covering = match cached_coverage(&key, now) {
+        Some(found) => Some(found),
+        None => {
+            let found = discover(db.clone(), http, owner, name, now).await?;
+            if let Some(found) = &found {
+                remember_coverage(key, found.clone(), now);
+            }
+            found
+        }
     };
-    let Some(found) = discover(db.clone(), http, owner, repo, now).await? else {
-        return Ok(None);
-    };
-    mint(db, http, &found, now).await.map(Some)
+    match covering {
+        Some(found) => mint(db, http, &found, now).await.map(Some),
+        None => Ok(None),
+    }
 }
 
 /// The installation of one repository, asked of GitHub with the app's JWT.
-/// Recorded when it belongs to this app.
+/// Recorded when it belongs to this app; `None` when GitHub has no
+/// installation for it (`404`).
 async fn discover(
     db: Arc<dyn Database>,
     http: &dyn HttpClient,

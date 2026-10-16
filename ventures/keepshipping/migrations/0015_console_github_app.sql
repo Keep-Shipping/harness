@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS console_github_app (
     client_id TEXT NOT NULL,
     html_url TEXT NOT NULL,
     owner_login TEXT NOT NULL,
+    permissions_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL
 );
 
@@ -27,8 +28,10 @@ CREATE TABLE IF NOT EXISTS console_github_installation (
 );
 
 -- The manifest flow's `state`: random, single use, ten minutes. `expires_at`
--- is unix seconds.
+-- is unix seconds. `subject_hash` is the SHA-256 of the signed-in person's
+-- email: the state only returns to the person who asked for it.
 CREATE TABLE IF NOT EXISTS console_github_app_state (
     state TEXT PRIMARY KEY,
-    expires_at INTEGER NOT NULL
+    expires_at INTEGER NOT NULL,
+    subject_hash TEXT NOT NULL DEFAULT ''
 );

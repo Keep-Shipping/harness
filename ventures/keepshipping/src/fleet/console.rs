@@ -387,8 +387,8 @@ async fn serve_action(req: &mut Request, env: &Env, action: Action) -> worker::R
         Action::GitHub if post => github_save(req, env).await?,
         Action::GitHub => github_form(req, env).await?,
         Action::GitHubDisconnect => github_disconnect(env).await?,
-        Action::GitHubAppNew => github_app_new(req, env).await?,
-        Action::GitHubAppCreated => github_app_created(req, env).await?,
+        Action::GitHubAppNew => github_app_new(req, env, &session.email).await?,
+        Action::GitHubAppCreated => github_app_created(req, env, &session.email).await?,
         Action::GitHubAppInstalled => github_app_installed(req, env).await?,
         Action::RewrapKeys => rewrap_keys(env).await?,
     };
@@ -541,7 +541,17 @@ async fn github_page(
 /// The app's create form: the organisation and the name, checked, then a
 /// `state` stored and a page that hands the browser to GitHub with the
 /// manifest.
-async fn github_app_new(req: &mut Request, env: &Env) -> worker::Result<Response> {
+async fn github_app_new(req: &mut Request, env: &Env, email: &str) -> worker::Result<Response> {
+    if email.trim().is_empty() {
+        return github_page(
+            env,
+            Some(
+                "Your sign-in has no email on it, so the app cannot be tied to you. Sign in again.",
+            ),
+            None,
+        )
+        .await;
+    }
     let body = req.text().await?;
     if body.len() > 4096 {
         return github_page(env, Some("The form is larger than it should be."), None).await;
@@ -565,7 +575,8 @@ async fn github_app_new(req: &mut Request, env: &Env) -> worker::Result<Response
         Err(_) => return github_page(env, Some(secrets::NO_MASTER_KEY_COPY), None).await,
     };
     let now = WorkersClock.now().unix_timestamp();
-    let state = match github_app::issue_state(db, now).await {
+    let subject = github_app::subject_of(email);
+    let state = match github_app::issue_state(db, now, &subject).await {
         Ok(state) => state,
         Err(failed) => return github_page(env, Some(failed.message), None).await,
     };
@@ -577,7 +588,7 @@ async fn github_app_new(req: &mut Request, env: &Env) -> worker::Result<Response
 /// GitHub's redirect after it created the app: the `state` is checked (once,
 /// in time), the code is exchanged and the app recorded. The person is then
 /// sent to install it.
-async fn github_app_created(req: &Request, env: &Env) -> worker::Result<Response> {
+async fn github_app_created(req: &Request, env: &Env, email: &str) -> worker::Result<Response> {
     let back = Some((GITHUB_CONNECT_PATH, "Back to the GitHub connection"));
     let (Some(code), Some(state)) = (query_value(req, "code"), query_value(req, "state")) else {
         return page(
@@ -595,7 +606,8 @@ async fn github_app_created(req: &Request, env: &Env) -> worker::Result<Response
         Ok(db) => db,
         Err(_) => return github_page(env, Some(secrets::NO_MASTER_KEY_COPY), None).await,
     };
-    match github_app::take_state(db.clone(), &state, now).await {
+    let subject = github_app::subject_of(email);
+    match github_app::take_state(db.clone(), &state, now, &subject).await {
         Ok(true) => {}
         Ok(false) => {
             return page(

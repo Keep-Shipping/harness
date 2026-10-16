@@ -407,33 +407,41 @@ struct Tokens {
 }
 
 impl Tokens {
-    /// The client for one record. The console's GitHub App goes first: an
-    /// installation that covers the repository's owner speaks for the record.
-    /// Otherwise a record whose edit has its own repository (onboarding's) uses
-    /// the console's personal token; every other record uses the configured
-    /// token, else the personal token. Without a token it needs, a record
-    /// waits and is retried.
+    /// The personal connection for one record: the configured token, else the
+    /// stored one; an onboarding edit's own repository uses the stored one.
+    fn personal(&self, own_repository: bool) -> Option<github::GitHub> {
+        let token = if own_repository {
+            self.stored.clone()
+        } else {
+            self.configured.clone().or_else(|| self.stored.clone())
+        };
+        token.map(|token| github::GitHub::new(Arc::clone(&self.http), token, self.base.clone()))
+    }
+
+    /// The client for one record and whether it is the app's. The console's
+    /// GitHub App goes first when one of its installations covers the
+    /// repository. Otherwise, or when the app is not connected, the personal
+    /// connection. A record with neither waits and is retried.
     async fn client(
         &self,
         repo: Option<&str>,
         own_repository: bool,
         now: i64,
-    ) -> Result<github::GitHub, github::Failure> {
+    ) -> Result<(github::GitHub, bool), github::Failure> {
         if let Some((owner, name)) = repo.and_then(|repo| repo.split_once('/')) {
-            let app = crate::github::app::token_for_owner(
+            let app = crate::github::app::token_for_repo(
                 Arc::clone(&self.db),
                 &*self.http,
                 owner,
-                Some(name),
+                name,
                 now,
             )
             .await;
             match app {
                 Ok(Some(app)) => {
-                    return Ok(github::GitHub::new(
-                        Arc::clone(&self.http),
-                        app.token,
-                        self.base.clone(),
+                    return Ok((
+                        github::GitHub::new(Arc::clone(&self.http), app.token, self.base.clone()),
+                        true,
                     ));
                 }
                 Ok(None) => {}
@@ -443,20 +451,12 @@ impl Tokens {
                 ),
             }
         }
-        let token = if own_repository {
-            self.stored.clone()
-        } else {
-            self.configured.clone().or_else(|| self.stored.clone())
-        };
-        token.map_or_else(
-            || {
-                Err(github::Failure::retryable(
-                    "no GitHub token is connected for this change yet; connect GitHub on the console"
-                        .to_owned(),
-                ))
-            },
-            |token| Ok(github::GitHub::new(Arc::clone(&self.http), token, self.base.clone())),
-        )
+        self.personal(own_repository).map(|github| (github, false)).ok_or_else(|| {
+            github::Failure::retryable(
+                "no GitHub token is connected for this change yet; connect GitHub on the console"
+                    .to_owned(),
+            )
+        })
     }
 }
 
@@ -500,9 +500,11 @@ async fn drain(
         .await
 }
 
-/// One outbox record's delivery, and what its failure means. A permanent
-/// refusal (or enough retries) marks the edit failed so the page says so;
-/// everything else reschedules with a doubling backoff.
+/// One outbox record's delivery, and what its failure means. A delivery the
+/// app is refused (`403`/`404`) is tried once more with the personal token,
+/// when there is one. A permanent refusal (or enough retries) marks the edit
+/// failed so the page says so; everything else reschedules with a doubling
+/// backoff.
 async fn handle_record(
     tokens: &Tokens,
     db: &dyn Database,
@@ -511,30 +513,55 @@ async fn handle_record(
 ) -> Processed {
     let now = iso(clock.now());
     let unix = clock.now().unix_timestamp();
-    let outcome = match record.topic.as_str() {
-        TOPIC_OPEN_PR => {
-            let repo = payload_field(&record, "repo");
-            match tokens.client(repo.as_deref(), false, unix).await {
-                Ok(github) => open_edit_pr(&github, db, &record, &now).await,
-                Err(failure) => Err(failure),
-            }
-        }
+    let (own, repo) = match record.topic.as_str() {
+        TOPIC_OPEN_PR => (false, payload_field(&record, "repo")),
         TOPIC_DISPATCH => {
-            let own = edit_has_own_repository(db, &record).await;
-            let repo = payload_field(&record, "repo");
-            match tokens.client(repo.as_deref(), own, unix).await {
-                Ok(github) => github.dispatch(&record.payload).await,
-                Err(failure) => Err(failure),
-            }
+            (edit_has_own_repository(db, &record).await, payload_field(&record, "repo"))
         }
-        _ => Ok(()),
+        _ => {
+            return finish(db, clock, &record, Ok(())).await;
+        }
     };
+    let outcome = match tokens.client(repo.as_deref(), own, unix).await {
+        Ok((github, via_app)) => match deliver(db, &record, &github, &now).await {
+            Err(failure) if via_app && failure.refused => match tokens.personal(own) {
+                Some(personal) => deliver(db, &record, &personal, &now).await,
+                None => Err(failure),
+            },
+            other => other,
+        },
+        Err(failure) => Err(failure),
+    };
+    finish(db, clock, &record, outcome).await
+}
+
+/// Sends one record with one connection: the pull request's open, or the
+/// approval's dispatch.
+async fn deliver(
+    db: &dyn Database,
+    record: &OutboxRecord,
+    github: &github::GitHub,
+    now: &str,
+) -> Result<(), github::Failure> {
+    match record.topic.as_str() {
+        TOPIC_OPEN_PR => open_edit_pr(github, db, record, now).await,
+        _ => github.dispatch(&record.payload).await,
+    }
+}
+
+/// What a record's outcome does: done, or retried later, or the edit failed.
+async fn finish(
+    db: &dyn Database,
+    clock: &dyn Clock,
+    record: &OutboxRecord,
+    outcome: Result<(), github::Failure>,
+) -> Processed {
     match outcome {
         Ok(()) => Processed::Done,
         Err(failure) => {
             let give_up = failure.permanent || record.attempts + 1 >= MAX_ATTEMPTS;
             if give_up {
-                if let Some(edit_id) = payload_edit_id(&record) {
+                if let Some(edit_id) = payload_edit_id(record) {
                     fail_edit(db, &edit_id, &failure.reason).await;
                 }
                 Processed::Done

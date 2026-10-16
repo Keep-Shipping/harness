@@ -45,16 +45,8 @@ pub const PERMISSIONS: [(&str, &str, &str); 6] = [
 
 /// The permissions the GitHub App asks for, in words: the names GitHub shows
 /// on its own confirmation page.
-const APP_PERMISSIONS: [&str; 8] = [
-    "Contents",
-    "Pull requests",
-    "Workflows",
-    "Secrets",
-    "Actions variables",
-    "Administration",
-    "Actions",
-    "Metadata",
-];
+const APP_PERMISSIONS: [&str; 7] =
+    ["Contents", "Pull requests", "Workflows", "Secrets", "Administration", "Actions", "Metadata"];
 
 /// Where the connection returns a person to after it is saved: a path on this
 /// console and nowhere else. Anything else (another origin, a protocol-relative
@@ -159,6 +151,7 @@ fn app_card(overview: &Overview, app_error: Option<&str>) -> String {
             CREATE_PATH = CREATE_PATH,
         );
     };
+    let shortfall = missing_warning(&app.missing_permissions());
     let installs = if overview.installations.is_empty() {
         format!(
             "<p class=\"muted\">The app is created but not installed on any account yet.</p>\n\
@@ -184,10 +177,25 @@ fn app_card(overview: &Overview, app_error: Option<&str>) -> String {
          <span class=\"tag live\">recommended</span></h2><p>{status}</p></div>\n\
          <p class=\"muted\">App <a href=\"{page}\" rel=\"noopener noreferrer\">{slug}</a>, \
          created under {owner}.</p>\n\
-         {error}{installs}</section>\n",
+         {error}{shortfall}{installs}</section>\n",
         page = esc(&app.html_url),
         slug = esc(&app.slug),
         owner = esc(&app.owner),
+    )
+}
+
+/// The warning shown when GitHub granted the app less than it needs: each
+/// missing permission named, with what to do. Empty when nothing is missing.
+fn missing_warning(missing: &[String]) -> String {
+    if missing.is_empty() {
+        return String::new();
+    }
+    let names: Vec<String> = missing.iter().map(|name| esc(name)).collect();
+    format!(
+        "<div class=\"callout warn\" role=\"status\"><p><strong>GitHub did not grant the app \
+         everything it needs.</strong> Missing or lower than needed: {}. Open the app's \
+         permissions on GitHub, accept the changes, then reload this page.</p></div>\n",
+        names.join(", ")
     )
 }
 
@@ -332,6 +340,7 @@ mod tests {
             client_id: "Iv1.abc".to_owned(),
             html_url: format!("https://github.com/apps/{slug}"),
             owner: "nick".to_owned(),
+            permissions: serde_json::json!({"contents": "write"}),
         }
     }
 
@@ -457,6 +466,36 @@ mod tests {
         let page = connect_page(&overview, None, State::Disconnected, None, None, NOW);
         assert!(page.contains("<strong>a&quot;b&lt;c</strong>"));
         assert!(!page.contains("a\"b<c"));
+    }
+
+    #[test]
+    fn a_missing_permission_is_named_on_the_page_and_a_full_grant_is_not() {
+        let granted = Overview {
+            app: Some(app::AppRow {
+                permissions: serde_json::json!({
+                    "contents": "write", "pull_requests": "write", "workflows": "write",
+                    "secrets": "write", "administration": "write", "actions": "read",
+                    "metadata": "read"
+                }),
+                ..app("x")
+            }),
+            installations: vec![],
+        };
+        let page = connect_page(&granted, None, State::Disconnected, None, None, NOW);
+        assert!(!page.contains("did not grant"), "nothing missing, no warning");
+
+        let short = Overview {
+            app: Some(app::AppRow {
+                permissions: serde_json::json!({"contents": "read"}),
+                ..app("x")
+            }),
+            installations: vec![],
+        };
+        let page = connect_page(&short, None, State::Disconnected, None, None, NOW);
+        assert!(page.contains("did not grant the app"));
+        assert!(page.contains("contents (write)"), "the missing permission is named");
+        assert!(page.contains("administration (write)"));
+        assert!(!page.contains("actions variables"), "variables are no longer asked for");
     }
 
     #[test]

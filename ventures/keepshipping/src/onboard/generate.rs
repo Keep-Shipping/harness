@@ -18,6 +18,7 @@ use serde_json::Value;
 
 use crate::cloudflare::rollback::{Target, target};
 use crate::fleet::Site;
+use crate::onboard::wizard;
 
 /// The database engine behind a test environment's Hyperdrive config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,7 +113,10 @@ pub fn plan_files(
         add_test_env(&mut files, scoped, test);
     }
     let destinations = !scoped.destinations.is_empty();
-    files.insert(".github/workflows/infra.yml".to_string(), workflow(db, destinations));
+    files.insert(
+        ".github/workflows/infra.yml".to_string(),
+        workflow(db, destinations, &scoped.account_id),
+    );
     files.insert("README.md".to_string(), readme(test.enabled, destinations));
     files
 }
@@ -470,13 +474,22 @@ fn output_pairs(test: &TestEnv) -> Vec<(&'static str, &'static str)> {
 
 // -- the workflow and the README ---------------------------------------------
 
+/// Whether `id` is a Cloudflare account id: 32 hexadecimal characters. The
+/// workflow carries the id as a literal, so nothing else may reach the file.
+#[must_use]
+pub fn is_account_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// The CI workflow: plan on each pull request, post the plan back, and keep the
 /// saved plan as an artifact; apply exactly that saved plan on
 /// `repository_dispatch`. Secrets are named here and their values never appear
-/// in the file. Event values reach the shell only through `env:`, never inline.
-fn workflow(database: Option<DbKind>, destinations: bool) -> String {
-    let mut env = String::from(
-        "      TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}\n      TF_VAR_cloudflare_account_id: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}\n      TF_VAR_state_encryption_passphrase: ${{ secrets.STATE_ENCRYPTION_PASSPHRASE }}\n      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}\n      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}\n",
+/// in the file. The account id and the console's address are not secrets, so
+/// the file carries them as quoted literals in `env:`. Event values reach the
+/// shell only through `env:`, never inline.
+fn workflow(database: Option<DbKind>, destinations: bool, account_id: &str) -> String {
+    let mut env = format!(
+        "      TF_VAR_cloudflare_api_token: ${{{{ secrets.CLOUDFLARE_API_TOKEN }}}}\n      TF_VAR_cloudflare_account_id: \"{account_id}\"\n      TF_VAR_state_encryption_passphrase: ${{{{ secrets.STATE_ENCRYPTION_PASSPHRASE }}}}\n      AWS_ACCESS_KEY_ID: ${{{{ secrets.AWS_ACCESS_KEY_ID }}}}\n      AWS_SECRET_ACCESS_KEY: ${{{{ secrets.AWS_SECRET_ACCESS_KEY }}}}\n",
     );
     if destinations {
         env.push_str(
@@ -494,7 +507,9 @@ fn workflow(database: Option<DbKind>, destinations: bool) -> String {
             let _ = writeln!(env, "      TF_VAR_{name}: ${{{{ secrets.{secret} }}}}");
         }
     }
-    WORKFLOW.replace("__TF_ENV__\n", &env)
+    WORKFLOW
+        .replace("__TF_ENV__\n", &env)
+        .replace("${{ vars.KEEPSHIPPING_CONSOLE_URL }}", &format!("\"{}\"", wizard::CONSOLE_URL))
 }
 
 /// The workflow text. `__TF_ENV__` is replaced by the variables both jobs need.
@@ -635,7 +650,7 @@ fn readme(test: bool, destinations: bool) -> String {
         ""
     };
     let mut out = format!(
-        "# Infrastructure\n\nThis repository describes the Cloudflare setup of the site or sites it was made for, as code.\n\n## What is here\n\n- `imports.tf` and the `modules/` folders describe what already exists on Cloudflare. Nothing here creates it again.\n- `backend.tf` keeps the record of what Terraform manages in Cloudflare R2, encrypted.\n- `IMPORT-REPORT.md` lists what was brought in and what was left alone.\n- `.github/workflows/infra.yml` plans each pull request and applies a change only after it is approved.\n\n## Secrets\n\nSet these in the repository's settings. Their values are never written to a file.\n\n- `CLOUDFLARE_API_TOKEN`: the Cloudflare token the workflow uses.\n- `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`: the R2 keys for the record of changes.\n- `STATE_ENCRYPTION_PASSPHRASE`: encrypts that record.\n- `EDITS_RUNNER_TOKEN`: lets the workflow report each plan back to Keep Shipping.\n{destinations_line}\nVariables: `CLOUDFLARE_ACCOUNT_ID` and `KEEPSHIPPING_CONSOLE_URL`.\n",
+        "# Infrastructure\n\nThis repository describes the Cloudflare setup of the site or sites it was made for, as code.\n\n## What is here\n\n- `imports.tf` and the `modules/` folders describe what already exists on Cloudflare. Nothing here creates it again.\n- `backend.tf` keeps the record of what Terraform manages in Cloudflare R2, encrypted.\n- `IMPORT-REPORT.md` lists what was brought in and what was left alone.\n- `.github/workflows/infra.yml` plans each pull request and applies a change only after it is approved.\n\n## Secrets\n\nSet these in the repository's settings. Their values are never written to a file.\n\n- `CLOUDFLARE_API_TOKEN`: the Cloudflare token the workflow uses.\n- `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`: the R2 keys for the record of changes.\n- `STATE_ENCRYPTION_PASSPHRASE`: encrypts that record.\n- `EDITS_RUNNER_TOKEN`: lets the workflow report each plan back to Keep Shipping.\n{destinations_line}\nThe Cloudflare account id and the console's address are not secrets: the workflow file carries them.\n",
     );
     if test {
         out.push_str(
