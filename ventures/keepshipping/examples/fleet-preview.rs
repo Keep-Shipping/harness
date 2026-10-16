@@ -233,6 +233,7 @@ fn wizard_pages(snapshot: &Fleet, out: &Path) {
         },
         db_given: false,
         destinations: false,
+        db_kind: Some(DbKind::Postgres),
     };
     write(
         "code-opened.html",

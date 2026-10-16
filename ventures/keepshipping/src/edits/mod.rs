@@ -68,10 +68,8 @@ const MAX_BODY: usize = PLAN_BODY_LIMIT + 64 * 1024;
 /// Deliveries before an outbox row's failure marks the edit failed.
 const MAX_ATTEMPTS: i64 = 12;
 
-static MIGRATIONS: [SqlMigration; 2] = [
-    SqlMigration::new("0001", "init", include_str!("migrations/0001_init.sql")),
-    SqlMigration::new("0002", "edits_repo", include_str!("migrations/0002_edits_repo.sql")),
-];
+static MIGRATIONS: [SqlMigration; 1] =
+    [SqlMigration::new("0001", "init", include_str!("migrations/0001_init.sql"))];
 const _: () = cratefield_core::assert_migration_set(&MIGRATIONS);
 
 /// A plan callback refused because the edit already carries an approval:
@@ -397,10 +395,43 @@ fn deliver_soon(ctx: &ModuleContext) {
     }));
 }
 
+/// The GitHub tokens one drain pass may use, and the endpoint they go to.
+struct Tokens {
+    /// `EDITS_GITHUB_TOKEN`, when it is set.
+    configured: Option<String>,
+    /// The console's own GitHub connection, opened from its stored row.
+    stored: Option<String>,
+    http: Arc<dyn HttpClient>,
+    base: String,
+}
+
+impl Tokens {
+    /// The client for one record. A record whose edit has its own repository
+    /// (onboarding's) uses the console's connection; every other record uses
+    /// the configured token, else the console's connection. Without the token
+    /// it needs, a record waits and is retried.
+    fn client(&self, own_repository: bool) -> Result<github::GitHub, github::Failure> {
+        let token = if own_repository {
+            self.stored.clone()
+        } else {
+            self.configured.clone().or_else(|| self.stored.clone())
+        };
+        token.map_or_else(
+            || {
+                Err(github::Failure::retryable(
+                    "no GitHub token is connected for this change yet; connect GitHub on the console"
+                        .to_owned(),
+                ))
+            },
+            |token| Ok(github::GitHub::new(Arc::clone(&self.http), token, self.base.clone())),
+        )
+    }
+}
+
 /// One drain pass over the module's outbox: open pull requests and fire
 /// approval dispatches, with the approvals module's lease and backoff
-/// posture. Needs the GitHub token; without one there is simply nothing to
-/// deliver yet.
+/// posture. With neither `EDITS_GITHUB_TOKEN` nor a connected GitHub account
+/// there is simply nothing to deliver yet.
 async fn drain(
     db: &dyn Database,
     http: Arc<dyn HttpClient>,
@@ -409,26 +440,23 @@ async fn drain(
     budget: &ScheduledBudget,
 ) -> Result<DrainReport, DbError> {
     let cfg = ModuleConfig::new(Edits::NAME, config.as_ref());
-    // The configured token when there is one; otherwise the console's own
-    // GitHub connection, which onboarding's edits are opened and approved with.
-    let token = match cfg.get_opt("GITHUB_TOKEN") {
-        Some(token) => Some(token),
-        None => match config.get("HARNESS_SECRET") {
-            Some(secret) => crate::github::token_from_database(db, &secret).await,
-            None => None,
-        },
+    let configured = cfg.get_opt("GITHUB_TOKEN");
+    let stored = match config.get("HARNESS_SECRET") {
+        Some(secret) => crate::github::token_from_database(db, &secret).await,
+        None => None,
     };
-    let Some(token) = token else {
+    if configured.is_none() && stored.is_none() {
         return Ok(cratefield_core::DrainReport::default());
-    };
-    let github = github::GitHub::new(http, token, cfg.get_str("GITHUB_API_BASE", github::API_BASE));
+    }
+    let tokens =
+        Tokens { configured, stored, http, base: cfg.get_str("GITHUB_API_BASE", github::API_BASE) };
     Outbox::new(OUTBOX_TABLE)
         .drain_within(
             db,
             clock,
             budget,
             DrainOptions { limit: 10, lease: time::Duration::minutes(5), subrequests_per_item: 12 },
-            |record| handle_record(&github, db, clock, record),
+            |record| handle_record(&tokens, db, clock, record),
         )
         .await
 }
@@ -437,15 +465,24 @@ async fn drain(
 /// refusal (or enough retries) marks the edit failed so the page says so;
 /// everything else reschedules with a doubling backoff.
 async fn handle_record(
-    github: &github::GitHub,
+    tokens: &Tokens,
     db: &dyn Database,
     clock: &dyn Clock,
     record: OutboxRecord,
 ) -> Processed {
     let now = iso(clock.now());
     let outcome = match record.topic.as_str() {
-        TOPIC_OPEN_PR => open_edit_pr(github, db, &record, &now).await,
-        TOPIC_DISPATCH => github.dispatch(&record.payload).await,
+        TOPIC_OPEN_PR => match tokens.client(false) {
+            Ok(github) => open_edit_pr(&github, db, &record, &now).await,
+            Err(failure) => Err(failure),
+        },
+        TOPIC_DISPATCH => {
+            let own = edit_has_own_repository(db, &record).await;
+            match tokens.client(own) {
+                Ok(github) => github.dispatch(&record.payload).await,
+                Err(failure) => Err(failure),
+            }
+        }
         _ => Ok(()),
     };
     match outcome {
@@ -463,6 +500,20 @@ async fn handle_record(
             }
         }
     }
+}
+
+/// Whether the edit a record belongs to lives in its own repository (set when
+/// the edit was opened), rather than the configured one.
+async fn edit_has_own_repository(db: &dyn Database, record: &OutboxRecord) -> bool {
+    let Some(edit_id) = payload_edit_id(record) else {
+        return false;
+    };
+    db.query(&Statement::with_values("SELECT repo FROM edits WHERE id = ?", vec![edit_id.into()]))
+        .await
+        .ok()
+        .and_then(|rows| rows.rows.into_iter().next())
+        .and_then(|row| opt_col(&row, "repo"))
+        .is_some()
 }
 
 /// The edit an outbox row belongs to, from either topic's payload.
@@ -525,15 +576,48 @@ async fn open_edit_pr(
     Ok(())
 }
 
-/// Records on the edit why its delivery gave up.
+/// Records on the edit why its delivery gave up. An approved edit keeps its
+/// status (its plan was approved and is what it is) but shows the error, so
+/// the page says why the apply dispatch never went out.
 async fn fail_edit(db: &dyn Database, edit_id: &str, reason: &str) {
     let short: String = reason.chars().take(500).collect();
     let _ = db
         .execute(&Statement::with_values(
-            "UPDATE edits SET status = 'failed', error = ? WHERE id = ? AND status != 'approved'",
+            "UPDATE edits SET error = ?, status = CASE WHEN status = 'approved' THEN status \
+             ELSE 'failed' END WHERE id = ?",
             vec![short.into(), edit_id.into()],
         ))
         .await;
+}
+
+/// The runner token for one repository: lowercase hex of HMAC-SHA256 keyed by
+/// the console's runner key over the repository's name, lowercased. The
+/// infrastructure repository's workflow presents it at the plan callback, so a
+/// token leaked from one repository's secrets does not open another's edits.
+pub(crate) fn runner_token_for(key: &str, repo: &str) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+    use std::fmt::Write as _;
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key.as_bytes())
+        .expect("hmac takes a key of any length");
+    mac.update(repo.to_ascii_lowercase().as_bytes());
+    let mut hex = String::with_capacity(64);
+    for byte in mac.finalize().into_bytes() {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Whether a plan callback may write to an edit: the repository's own runner
+/// token, or, for an edit in the configured repository, the raw runner key
+/// (older workflows post with it).
+fn runner_authorized(key: &str, presented: &str, edit_repo: &str, configured: &str) -> bool {
+    let key = key.trim();
+    let target = if edit_repo.is_empty() { configured } else { edit_repo };
+    let per_repo = runner_token_for(key, target);
+    let in_configured = edit_repo.is_empty() || edit_repo.eq_ignore_ascii_case(configured);
+    constant_time_eq(presented.as_bytes(), per_repo.as_bytes())
+        || (in_configured && constant_time_eq(presented.as_bytes(), key.as_bytes()))
 }
 
 /// The signed-in person, or the page that says why not. `$path` is where
@@ -707,9 +791,6 @@ async fn plan_post(
     let Some(presented) = bearer_token(&headers) else {
         return Problem::new(&SLUGS.unauthenticated).into_response();
     };
-    if !constant_time_eq(presented.as_bytes(), expected.trim().as_bytes()) {
-        return Problem::new(&SLUGS.unauthenticated).into_response();
-    }
     if body.len() > PLAN_BODY_LIMIT {
         return Problem::new(&PLAN_TOO_LARGE).into_response();
     }
@@ -741,11 +822,17 @@ async fn plan_post(
     let Some(db) = ctx.ports.db.clone() else {
         return Problem::not_ready("the database is not wired up").into_response();
     };
+    // The edit is looked up before the token is judged, because the token is
+    // judged against the edit's repository. A missing edit reads as refused, the
+    // same as a wrong token, so the callback cannot tell which ids exist.
     let row = match find_edit(&*db, &id).await {
         Ok(Some(row)) => row,
-        Ok(None) => return Problem::not_found().into_response(),
+        Ok(None) => return Problem::new(&SLUGS.unauthenticated).into_response(),
         Err(error) => return Problem::internal().with_detail(error.to_string()).into_response(),
     };
+    if !runner_authorized(&expected, presented, &col(&row, "repo"), &cfg.get_str("REPO", "")) {
+        return Problem::new(&SLUGS.unauthenticated).into_response();
+    }
     if col(&row, "status") == "approved" {
         return Problem::new(&ALREADY_APPROVED).into_response();
     }
@@ -948,5 +1035,68 @@ mod tests {
                 ("EDITS_BASE_BRANCH", "main"),
             ]))
             .expect("the minimum configuration");
+    }
+
+    /// The column names a CREATE TABLE block declares: the first word of each
+    /// line inside one, skipping constraints.
+    fn table_columns(sql: &str) -> Vec<String> {
+        let mut columns = Vec::new();
+        let mut inside = false;
+        for line in sql.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("CREATE TABLE") {
+                inside = true;
+                continue;
+            }
+            if trimmed.starts_with(')') {
+                inside = false;
+            }
+            let word = trimmed.split_whitespace().next().unwrap_or_default();
+            let constraint = matches!(
+                word.to_ascii_uppercase().as_str(),
+                "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN"
+            );
+            if inside && !word.is_empty() && !constraint {
+                columns.push(word.to_owned());
+            }
+        }
+        columns
+    }
+
+    #[test]
+    fn the_venture_migration_creates_every_column_the_module_migration_does() {
+        let module = include_str!("migrations/0001_init.sql");
+        let venture = include_str!("../../migrations/0013_edits.sql");
+        let wanted = table_columns(module);
+        assert!(wanted.contains(&"repo".to_owned()), "the module declares edits.repo");
+        for column in &wanted {
+            assert!(
+                table_columns(venture).contains(column) || venture.contains(&format!("{column} ")),
+                "migrations/0013_edits.sql is missing column {column}"
+            );
+        }
+        assert!(venture.contains("CREATE TABLE IF NOT EXISTS edits_outbox"));
+    }
+
+    #[test]
+    fn a_runner_token_is_derived_per_repository_and_ignores_case() {
+        let a = runner_token_for("runner-key", "nick/shop-infra");
+        assert_eq!(a.len(), 64);
+        assert_eq!(a, runner_token_for("runner-key", "Nick/Shop-Infra"));
+        assert_ne!(a, runner_token_for("runner-key", "nick/other-infra"));
+        assert_ne!(a, runner_token_for("other-key", "nick/shop-infra"));
+    }
+
+    #[test]
+    fn a_callback_is_judged_against_its_own_repository() {
+        let key = "runner-key";
+        let own = runner_token_for(key, "nick/shop-infra");
+        assert!(runner_authorized(key, &own, "nick/shop-infra", "keepshipping/infra"));
+        let other = runner_token_for(key, "nick/other-infra");
+        assert!(!runner_authorized(key, &other, "nick/shop-infra", "keepshipping/infra"));
+        // The raw key opens only the configured repository's edits.
+        assert!(!runner_authorized(key, key, "nick/shop-infra", "keepshipping/infra"));
+        assert!(runner_authorized(key, key, "", "keepshipping/infra"));
+        assert!(runner_authorized(key, key, "keepshipping/infra", "keepshipping/infra"));
     }
 }

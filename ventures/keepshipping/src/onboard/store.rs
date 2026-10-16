@@ -164,3 +164,18 @@ pub async fn insert_edit(
     .await?;
     Ok(())
 }
+
+/// Whether another site's setup already uses this infrastructure repository.
+/// One repository holds one state per site, named by the site, so two sites
+/// cannot share one.
+pub async fn repo_taken(env: &Env, repo: &str, site_id: &str) -> worker::Result<bool> {
+    let db = env.d1("DB")?;
+    let row = db
+        .prepare(format!(
+            "SELECT site_id FROM {TABLE} WHERE infra_repo = ? AND site_id != ? LIMIT 1"
+        ))
+        .bind(&[JsValue::from_str(repo), JsValue::from_str(site_id)])?
+        .first::<serde_json::Value>(None)
+        .await?;
+    Ok(row.is_some())
+}

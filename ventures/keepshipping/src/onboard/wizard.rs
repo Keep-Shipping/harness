@@ -138,11 +138,12 @@ pub fn parse_repo(text: &str) -> Option<(&str, &str)> {
     (ok(owner) && ok(name) && !name.contains('/')).then_some((owner, name))
 }
 
-/// The infrastructure repository a person is offered: `<app owner>/infra`.
+/// The infrastructure repository a person is offered: `<app owner>/infra-<site
+/// slug>`, one per site, since a repository holds one state per site.
 #[must_use]
-pub fn infra_repo_default(app_repo: &str) -> String {
+pub fn infra_repo_default(app_repo: &str, site_slug: &str) -> String {
     match parse_repo(app_repo) {
-        Some((owner, _)) => format!("{owner}/infra"),
+        Some((owner, _)) => format!("{owner}/infra-{site_slug}"),
         None => String::new(),
     }
 }
@@ -316,8 +317,8 @@ mod tests {
         assert_eq!(parse_repo("a/../b"), None);
         assert_eq!(parse_repo("a/b c"), None);
         assert_eq!(parse_repo("/b"), None);
-        assert_eq!(infra_repo_default("nick/shop"), "nick/infra");
-        assert_eq!(infra_repo_default(""), "");
+        assert_eq!(infra_repo_default("nick/shop", "shop"), "nick/infra-shop");
+        assert_eq!(infra_repo_default("", "shop"), "");
     }
 
     #[test]

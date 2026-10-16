@@ -14,15 +14,20 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use base64::Engine as _;
+use cratefield_core::Clock;
+use cratefield_runtime_cloudflare::WorkersClock;
 use ks_cloudflare::{Account as CfAccount, Attr, Cloudflare, StateBackend};
 use ks_core::ports::secrets::SecretValue;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use time::format_description::well_known::Rfc3339;
+use time::{Duration, OffsetDateTime};
 use worker::Env;
 
 use super::WorkersHttp;
 use super::database::{self, DbAddress};
 use super::detect::{self, BindingKind, Stack};
+use super::generate::DbKind;
 use super::generate::{self, SiteScope, TestEnv};
 use super::page::{self, Review, StatusView, View};
 use super::store::{self, Record};
@@ -42,6 +47,7 @@ const STEP_VARIABLES: &str = "Setting the repository variables";
 const STEP_PULL: &str = "Opening the pull request";
 const STEP_RECORD: &str = "Recording the change";
 const STEP_CHECK: &str = "Checking the earlier pull request";
+const STEP_BRANCH: &str = "Putting the workflow on the default branch";
 
 const NOT_CONNECTED: &str = "GitHub is not connected. Connect it first.";
 const NO_READ_TOKEN: &str = "No Cloudflare read token is connected. Connect one first.";
@@ -78,6 +84,9 @@ pub struct Opened {
     /// Whether the account has email forwarding destinations, whose secret
     /// is set by hand.
     pub destinations: bool,
+    /// The database engine the app needs for its test environment, when it
+    /// needs one. Set even when no address was given yet.
+    pub db_kind: Option<DbKind>,
 }
 
 /// What a wizard request answers with.
@@ -89,16 +98,16 @@ pub enum Reply {
     Redirect(String),
 }
 
-/// A failed step: its name, and what to tell the person, in fixed words.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A failed step: its name, and what to tell the person, in plain words.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Stop {
     step: &'static str,
-    message: &'static str,
+    message: String,
 }
 
 impl Stop {
-    fn new(step: &'static str, message: &'static str) -> Stop {
-        Stop { step, message }
+    fn new(step: &'static str, message: impl Into<String>) -> Stop {
+        Stop { step, message: message.into() }
     }
 }
 
@@ -318,7 +327,7 @@ async fn review(
         Err(stop) => (None, Some(stop.message)),
     };
     let infra_default = if record.infra_repo.is_empty() {
-        wizard::infra_repo_default(&scan.repo)
+        wizard::infra_repo_default(&scan.repo, &wizard::slug(name_of(target)))
     } else {
         record.infra_repo.clone()
     };
@@ -332,7 +341,7 @@ async fn review(
                 stack_lines: if scan.repo.is_empty() { Vec::new() } else { scan.stack.summary() },
                 truncated: scan.truncated,
                 plan_lines: plan_lines.as_deref(),
-                plan_note,
+                plan_note: plan_note.as_deref(),
                 db: test.hyperdrive,
                 infra_default: &infra_default,
                 error: error.or_else(|| non_empty(&record.error)),
@@ -462,6 +471,26 @@ async fn refuse_scan(
     Reply::Redirect(page_path(site))
 }
 
+/// The path of the workflow every infrastructure repository carries on its
+/// default branch: `repository_dispatch` runs only workflows that are there.
+const WORKFLOW_PATH: &str = ".github/workflows/infra.yml";
+/// The state backend file: its presence on a default branch means the
+/// repository already holds a site's state.
+const STATE_FILE: &str = "backend.tf";
+/// How long a running setup holds the site before a second one may start.
+const LOCK: Duration = Duration::minutes(2);
+
+const ALREADY_RUNNING: &str =
+    "A setup for this site is already running. Wait a minute, then reload this page.";
+const APPROVED_CHANGED: &str = "This change is already approved and is being applied, so its \
+     pull request cannot take the new files. Open a new change for them.";
+const DB_READ: &str = "The database could not be read.";
+
+/// Whether a setup started at `updated_at` still holds the site at `now`.
+fn holds(updated_at: &str, now: OffsetDateTime) -> bool {
+    OffsetDateTime::parse(updated_at, &Rfc3339).is_ok_and(|at| now - at < LOCK)
+}
+
 /// The open step: check the form, then run the setup. A problem with the form
 /// is shown on the review; a failure in the setup is stored with its step.
 async fn open(
@@ -477,6 +506,9 @@ async fn open(
         Err(reply) => return reply,
     };
     let now = api::now();
+    if record.status == "opening" && holds(&record.updated_at, WorkersClock.now()) {
+        return refuse_form(env, site, record, ALREADY_RUNNING, &now).await;
+    }
     let scan: Scan = match serde_json::from_str(&record.stack_json) {
         Ok(scan) if !record.stack_json.is_empty() => scan,
         _ => return refuse_form(env, site, record, NO_SCAN, &now).await,
@@ -488,7 +520,7 @@ async fn open(
             env,
             site,
             record,
-            "Enter the infrastructure repository as owner/name, like you/infra.",
+            "Enter the infrastructure repository as owner/name, like you/infra-shop.",
             &now,
         )
         .await;
@@ -504,9 +536,9 @@ async fn open(
         )
         .await;
     }
-    let test = test_env_of(site, target, &scan.stack, test_on);
+    let db_kind = test_env_of(site, target, &scan.stack, test_on).hyperdrive;
     let db_text = field(form, "test_db_url").trim().to_owned();
-    let database = if test_on && test.hyperdrive.is_some() && !db_text.is_empty() {
+    let database = if test_on && db_kind.is_some() && !db_text.is_empty() {
         match database::parse(&db_text) {
             Ok(address) => Some(address),
             Err(error) => {
@@ -517,23 +549,25 @@ async fn open(
         None
     };
 
+    let infra_full = format!("{infra_owner}/{infra_name}");
+    let own_repo = record.infra_repo == infra_full;
     record.status = "opening".to_owned();
     record.error = String::new();
-    record.infra_repo = format!("{infra_owner}/{infra_name}");
+    record.infra_repo = infra_full;
     save(env, site, &record, &now).await;
 
-    let db_given = database.is_some();
     let input = OpenInput {
+        site,
         target,
         scan: &scan,
-        test,
+        test_on,
         email,
         infra: (infra_owner, infra_name),
         token: &token,
         database,
-        db_given,
+        own_repo,
     };
-    match run_open(env, secret, site, &input, &mut record, &now).await {
+    match run_open(env, secret, &input, &mut record, &now).await {
         Ok(()) => {
             record.status = "opened".to_owned();
             record.error = String::new();
@@ -561,35 +595,40 @@ async fn refuse_form(
 
 /// What the open step was given, once the form is checked.
 struct OpenInput<'a> {
+    site: &'a Site,
     target: &'a Target,
     scan: &'a Scan,
-    test: TestEnv,
+    test_on: bool,
     email: &'a str,
     infra: (&'a str, &'a str),
     token: &'a str,
     database: Option<DbAddress>,
-    db_given: bool,
+    /// The site's row already named this repository: a repeat, not a clash.
+    own_repo: bool,
 }
 
 /// The open step's work, in an order that makes a repeat safe.
 ///
-/// The account is read and the pull request opened only while no edit exists
-/// for the site. The secrets and variables are set on every run, so a repeat
-/// fixes whatever failed. The state passphrase is generated only while no
-/// edit exists: no state can be written before an approved plan, so a repeat
-/// before the pull request cannot strand state encrypted under an old value.
-/// Secrets and variables go in before the pull request, so the workflow it
-/// starts finds them all.
+/// The repository must be the site's own: no other site's row names it, and
+/// (unless it is this site's repository already) its default branch holds no
+/// state file. The workflow goes on the default branch before anything else,
+/// since a repository_dispatch can only run a workflow found there. Secrets
+/// and variables are set on every run. The state passphrase is generated only
+/// when the repository has no `STATE_ENCRYPTION_PASSPHRASE` yet, so a repeat
+/// never rotates a key the state may be encrypted under. The plan is read on
+/// every run, and the pull request's files follow it: a new branch when there
+/// is no edit yet, the existing branch brought up to date when there is one.
 async fn run_open(
     env: &Env,
     secret: &str,
-    site: &Site,
     input: &OpenInput<'_>,
     record: &mut Record,
     now: &str,
 ) -> Result<(), Stop> {
+    let site = input.site;
     let account = account_of(input.target);
     let (owner, name) = input.infra;
+    let infra_full = format!("{owner}/{name}");
 
     let token_id = api::verify_account_token(input.token, account)
         .await
@@ -613,42 +652,68 @@ async fn run_open(
             .await
             .map_err(|failed| Stop::new(STEP_REPO, failed.message))?,
     };
-
-    let opened = !record.edit_id.is_empty()
-        && store::edit_exists(env, &record.edit_id)
+    let slug = wizard::slug(name_of(input.target));
+    let shared = Stop::new(
+        STEP_REPO,
+        format!(
+            "That repository already belongs to another site, or already holds its state. Use \
+             {owner}/infra-{slug} instead, or another repository name."
+        ),
+    );
+    if store::repo_taken(env, &infra_full, &site.id)
+        .await
+        .map_err(|_| Stop::new(STEP_REPO, DB_READ))?
+    {
+        return Err(shared);
+    }
+    if !input.own_repo
+        && client
+            .file_at(owner, name, STATE_FILE, &repo.default_branch)
             .await
-            .map_err(|_| Stop::new(STEP_CHECK, "The database could not be read."))?;
-
-    // The plan is read only while the pull request is still to be opened.
-    let mut plan = None;
-    if !opened {
-        if record.edit_id.is_empty() {
-            let mut random = [0u8; 16];
-            getrandom::fill(&mut random).map_err(|_| Stop::new(STEP_PULL, NO_RANDOM))?;
-            record.edit_id = wizard::new_edit_id(random);
-        }
-        let account_read = read_account(env, secret, input.target).await?;
-        let scoped = generate::scope(&account_read, &scope_of(site, &input.scan.stack));
-        let slug = wizard::slug(name_of(input.target));
-        let backend = StateBackend::new(account, wizard::STATE_BUCKET, &slug).map_err(|_| {
-            Stop::new(STEP_NAME, "The site's name cannot be used to name its state.")
-        })?;
-        let files = generate::plan_files(&scoped, &input.test, &backend);
-        let lines = generate::summary(&scoped, &input.test);
-        plan = Some((files, lines, scoped));
+            .map_err(|failed| Stop::new(STEP_REPO, failed.message))?
+            .is_some()
+    {
+        return Err(shared);
     }
 
-    // The facts the status page shows. A repeat keeps the first run's
-    // answers, except that a database address supplied now counts.
-    let previous: Option<Opened> = serde_json::from_str(&record.test_env_json).ok();
-    let destinations = match (&plan, &previous) {
-        (Some((_, _, scoped)), _) => !scoped.destinations.is_empty(),
-        (None, Some(previous)) => previous.destinations,
-        (None, None) => false,
+    // Whether the test database exists: an address given now, or one an
+    // earlier run stored. Without one the test environment waits for it.
+    let mut test = test_env_of(site, input.target, &input.scan.stack, input.test_on);
+    let db_kind = test.hyperdrive;
+    let has_db = match &input.database {
+        Some(_) => true,
+        None => client
+            .actions_secret_exists(owner, name, "TEST_DB_HOST")
+            .await
+            .map_err(|failed| Stop::new(STEP_SECRETS, failed.message))?,
     };
-    let db_given = input.db_given || previous.as_ref().is_some_and(|facts| facts.db_given);
-    let facts = Opened { test_env: input.test.clone(), db_given, destinations };
+    if !has_db {
+        test.hyperdrive = None;
+    }
+
+    if record.edit_id.is_empty() {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).map_err(|_| Stop::new(STEP_PULL, NO_RANDOM))?;
+        record.edit_id = wizard::new_edit_id(random);
+    }
+    let edit =
+        store::edit(env, &record.edit_id).await.map_err(|_| Stop::new(STEP_CHECK, DB_READ))?;
+
+    let account_read = read_account(env, secret, input.target).await?;
+    let scoped = generate::scope(&account_read, &scope_of(site, &input.scan.stack));
+    let backend = StateBackend::new(account, wizard::STATE_BUCKET, &slug)
+        .map_err(|_| Stop::new(STEP_NAME, "The site's name cannot be used to name its state."))?;
+    let files: BTreeMap<String, String> = generate::plan_files(&scoped, &test, &backend);
+    let lines = generate::summary(&scoped, &test);
+
+    let facts = Opened {
+        test_env: test.clone(),
+        db_given: has_db,
+        destinations: !scoped.destinations.is_empty(),
+        db_kind,
+    };
     record.test_env_json = to_json(&facts);
+    record.infra_repo = infra_full.clone();
     save(env, site, record, now).await;
 
     let mut secrets: Vec<(&str, String)> = vec![
@@ -656,16 +721,25 @@ async fn run_open(
         ("AWS_ACCESS_KEY_ID", token_id),
         ("AWS_SECRET_ACCESS_KEY", wizard::r2_secret_access_key(input.token)),
     ];
-    if !opened {
+    if !client
+        .actions_secret_exists(owner, name, "STATE_ENCRYPTION_PASSPHRASE")
+        .await
+        .map_err(|failed| Stop::new(STEP_SECRETS, failed.message))?
+    {
         secrets.push(("STATE_ENCRYPTION_PASSPHRASE", state_passphrase()?));
     }
-    if let Ok(runner) = env.secret("EDITS_RUNNER_TOKEN") {
-        let runner = runner.to_string();
-        if !runner.trim().is_empty() {
-            secrets.push(("EDITS_RUNNER_TOKEN", runner.trim().to_owned()));
+    if let Ok(key) = env.secret("EDITS_RUNNER_TOKEN") {
+        let key = key.to_string();
+        if !key.trim().is_empty() {
+            // Each repository's workflow gets its own runner token, so a leaked
+            // one opens only that repository's edits.
+            let per_repo = crate::edits::runner_token_for(key.trim(), &infra_full);
+            secrets.push(("EDITS_RUNNER_TOKEN", per_repo));
         }
     }
-    if let Some(address) = &input.database {
+    if test.hyperdrive.is_some()
+        && let Some(address) = &input.database
+    {
         secrets.extend(database::secrets(address));
     }
     for (secret_name, value) in &secrets {
@@ -683,18 +757,76 @@ async fn run_open(
             .map_err(|failed| Stop::new(STEP_VARIABLES, failed.message))?;
     }
 
-    if let Some((files, lines, scoped)) = plan {
-        let pull_input = PullInput {
-            site,
-            repo: &repo,
-            edit_id: &record.edit_id,
-            files,
-            lines: &lines,
-            zone: zone_for(&scoped, site),
-            email: input.email,
-            now,
-        };
-        open_pull_request(env, &client, &pull_input).await?;
+    // The workflow on the default branch, the copy the pull request carries too.
+    if let Some(workflow) = files.get(WORKFLOW_PATH) {
+        client
+            .put_if_changed(
+                owner,
+                name,
+                WORKFLOW_PATH,
+                &repo.default_branch,
+                workflow,
+                "Keep the infrastructure workflow current (Keep Shipping).",
+            )
+            .await
+            .map_err(|failed| Stop::new(STEP_BRANCH, failed.message))?;
+    }
+
+    match edit {
+        None => {
+            let pull_input = PullInput {
+                site,
+                repo: &repo,
+                edit_id: &record.edit_id,
+                files,
+                lines: &lines,
+                zone: zone_for(&scoped, site),
+                email: input.email,
+                now,
+            };
+            open_pull_request(env, &client, &pull_input).await?;
+        }
+        Some(edit) => {
+            update_branch(&client, &repo, &record.edit_id, &files, edit.status == "approved")
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Brings the edit's branch up to the planned files, committing only what
+/// changed, so the workflow plans the new files. An approved edit cannot take
+/// new files: when they differ, that is said rather than silently dropped.
+async fn update_branch(
+    client: &Client,
+    repo: &Repo,
+    edit_id: &str,
+    files: &BTreeMap<String, String>,
+    approved: bool,
+) -> Result<(), Stop> {
+    let branch = wizard::edit_branch(edit_id);
+    for (path, content) in files {
+        if approved {
+            let current = client
+                .file_at(&repo.owner, &repo.name, path, &branch)
+                .await
+                .map_err(|failed| Stop::new(STEP_PULL, failed.message))?;
+            if current.as_ref().map(|(_, text)| text.as_str()) != Some(content.as_str()) {
+                return Err(Stop::new(STEP_PULL, APPROVED_CHANGED));
+            }
+        } else {
+            client
+                .put_if_changed(
+                    &repo.owner,
+                    &repo.name,
+                    path,
+                    &branch,
+                    content,
+                    "Update the planned change (Keep Shipping).",
+                )
+                .await
+                .map_err(|failed| Stop::new(STEP_PULL, failed.message))?;
+        }
     }
     Ok(())
 }

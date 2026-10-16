@@ -109,9 +109,15 @@ let the console's own GitHub connection deliver for it:
   manage-as-code wizard (`src/onboard/`) sets it to the site's infrastructure
   repository, and approval dispatches there. An empty column means
   `EDITS_REPO`, as before.
-- With `EDITS_GITHUB_TOKEN` unset, the outbox opens the token the console
-  stored on the GitHub connection page (`console_github_token`, opened with
-  `HARNESS_SECRET`). A configured `EDITS_GITHUB_TOKEN` still wins.
+- An edit with its own repository is dispatched with the console's stored
+  GitHub connection (`console_github_token`, opened with `HARNESS_SECRET`).
+  Other edits use `EDITS_GITHUB_TOKEN`, else the stored connection.
+- The plan callback's bearer is per repository: `HMAC-SHA256(EDITS_RUNNER_TOKEN,
+  lowercase(repo))`, hex. The wizard stores that value as each infrastructure
+  repository's `EDITS_RUNNER_TOKEN` secret. The raw runner token still opens
+  edits in `EDITS_REPO`.
+- A dispatch that fails for good on an approved edit keeps the approval and
+  puts the reason in the edit's `error`.
 
 ## The CI contract
 

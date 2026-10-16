@@ -309,7 +309,7 @@ fn status_card(status: &StatusView<'_>, here: &str, site: &Site) -> String {
             format!("<p>Infrastructure repository: <code>{}</code>.</p>\n", esc(status.infra_repo))
         }
     };
-    let state = status.edit.map_or(
+    let state = esc(&status.edit.map_or(
         "Waiting for the first plan. The workflow reads the code and posts the plan here."
             .to_owned(),
         |edit| match edit.status.as_str() {
@@ -324,7 +324,7 @@ fn status_card(status: &StatusView<'_>, here: &str, site: &Site) -> String {
             }
             other => format!("Status: {other}."),
         },
-    );
+    ));
     let summary: String = status
         .edit
         .map(|edit| {
@@ -336,6 +336,7 @@ fn status_card(status: &StatusView<'_>, here: &str, site: &Site) -> String {
         })
         .unwrap_or_default();
     let todo = to_do(status.facts, status.worker, status.runner_set);
+    let repo_note = status.infra_repo;
     let todo_html = if todo.is_empty() {
         "<p>Nothing else to do.</p>\n".to_owned()
     } else {
@@ -353,13 +354,17 @@ fn status_card(status: &StatusView<'_>, here: &str, site: &Site) -> String {
         )
     };
     format!(
-        "{error}<section class=\"panel\">\n<h2>Setup status</h2>\n{pull}<p>{state}</p>\n{edit_link}</section>\n\
+        "{error}<section class=\"panel\">\n<h2>Setup status</h2>\n{pull}<p>{state}</p>\n{edit_link}\
+         <p class=\"hint\">The infrastructure workflow lives on the default branch of \
+         <code>{repo}</code>: that is where the approval runs it. The pull request carries the \
+         same copy.</p>\n</section>\n\
          <section class=\"panel\">\n<h2>What the change does</h2>\n<ul class=\"findings\">\n{summary}</ul>\n</section>\n\
          <section class=\"panel\">\n<h2>Still to do</h2>\n{todo_html}</section>\n\
          <p><a class=\"btn\" href=\"{here}?again=1\">Run the setup again</a> \
          <span class=\"muted\">{name}</span></p>\n",
         here = esc(here),
         name = esc(&site.name),
+        repo = esc(repo_note),
     )
 }
 
@@ -378,11 +383,13 @@ pub fn to_do(facts: Option<&Opened>, worker: bool, runner_set: bool) -> Vec<Stri
     let Some(facts) = facts else {
         return lines;
     };
-    if facts.test_env.enabled && facts.test_env.hyperdrive.is_some() && !facts.db_given {
+    if facts.test_env.enabled && facts.db_kind.is_some() && !facts.db_given {
         lines.push(
-            "Add the test database address: in the infrastructure repository go to Settings → \
-             Secrets and variables → Actions, and set TEST_DB_HOST, TEST_DB_PORT, \
-             TEST_DB_DATABASE, TEST_DB_USER and TEST_DB_PASSWORD."
+            "Add a test database later: the app needs a database for its test environment and \
+             none was given, so the test environment is planned without it. In the \
+             infrastructure repository go to Settings → Secrets and variables → Actions, set \
+             TEST_DB_HOST, TEST_DB_PORT, TEST_DB_DATABASE, TEST_DB_USER and TEST_DB_PASSWORD, \
+             then run the setup again."
                 .to_owned(),
         );
     }
@@ -473,6 +480,7 @@ mod tests {
             },
             db_given,
             destinations,
+            db_kind: hyper.then_some(DbKind::Postgres),
         }
     }
 

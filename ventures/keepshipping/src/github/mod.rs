@@ -642,6 +642,60 @@ impl Client {
         Err(REFUSED)
     }
 
+    /// A file on `branch` with its blob sha and text, or `None` when the file
+    /// is not there.
+    pub async fn file_at(
+        &self,
+        owner: &str,
+        name: &str,
+        file: &str,
+        branch: &str,
+    ) -> Result<Option<(String, String)>, Failed> {
+        let (status, body) = self.get(&contents_on_url(owner, name, file, branch)).await?;
+        if status == 404 {
+            return Ok(None);
+        }
+        ok(status, "the file")?;
+        Ok(Some((read_blob_sha(&body)?, read_file(&body)?)))
+    }
+
+    /// Makes `file` on `branch` read `content`, committing only when it does
+    /// not already. Returns whether a commit was made.
+    pub async fn put_if_changed(
+        &self,
+        owner: &str,
+        name: &str,
+        file: &str,
+        branch: &str,
+        content: &str,
+        message: &str,
+    ) -> Result<bool, Failed> {
+        let current = self.file_at(owner, name, file, branch).await?;
+        let sha = match &current {
+            Some((_, text)) if text == content => return Ok(false),
+            Some((sha, _)) => Some(sha.as_str()),
+            None => None,
+        };
+        self.put_file(owner, name, file, branch, content, sha, message).await?;
+        Ok(true)
+    }
+
+    /// Whether a repository Actions secret exists. Values are write-only, so
+    /// this is how a setup learns that a secret was stored by an earlier run.
+    pub async fn actions_secret_exists(
+        &self,
+        owner: &str,
+        name: &str,
+        secret: &str,
+    ) -> Result<bool, Failed> {
+        let (status, _) = self.get(&actions_secret_url(owner, name, secret)).await?;
+        if status == 404 {
+            return Ok(false);
+        }
+        ok(status, "the secrets")?;
+        Ok(true)
+    }
+
     /// Creates a repository variable, or updates it when it exists.
     pub async fn put_variable(
         &self,

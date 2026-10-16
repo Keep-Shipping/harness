@@ -544,7 +544,14 @@ fn an_onboarding_edit(kit: &TestHarness, id: &str, repo: &str) {
 async fn plan_and_approve(kit: &TestHarness, id: &str) {
     let plan_body =
         plan_json(&["create"], json!({"name":"www.example.com","content":"192.0.2.10","type":"A"}));
-    let (status, body) = post_plan(kit, id, RUNNER_TOKEN, &plan_body).await;
+    // Each repository's workflow presents its own runner token.
+    let repo = edit_field(kit, id, "repo");
+    let token = if repo.is_empty() {
+        RUNNER_TOKEN.to_owned()
+    } else {
+        keepshipping_waitlist_test_hmac(RUNNER_TOKEN, &repo)
+    };
+    let (status, body) = post_plan(kit, id, &token, &plan_body).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let digest = edit_field(kit, id, "plan_sha256");
     let (status, _, body) =
@@ -553,10 +560,43 @@ async fn plan_and_approve(kit: &TestHarness, id: &str) {
     assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
 }
 
+/// Stores the console's own GitHub token the way the connect page seals it.
+fn store_console_token(kit: &TestHarness) {
+    let sealed = keepshipping_waitlist::cloudflare::seal::seal_for(
+        keepshipping_waitlist::cloudflare::seal::GITHUB_INFO,
+        "harness-secret-test",
+        "gh-console-token",
+    )
+    .expect("the token seals");
+    pollster::block_on(
+        kit.db.execute(&Statement::new(
+            "CREATE TABLE IF NOT EXISTS console_github_token (id INTEGER PRIMARY KEY, \
+         nonce TEXT NOT NULL, ciphertext TEXT NOT NULL, updated_at TEXT NOT NULL)"
+                .to_owned(),
+        )),
+    )
+    .expect("the table is created");
+    pollster::block_on(kit.db.execute(&Statement::with_values(
+        "INSERT OR REPLACE INTO console_github_token (id, nonce, ciphertext, updated_at) \
+         VALUES (1, ?, ?, '2026-10-16T09:00:00Z')",
+        vec![sealed.nonce.into(), sealed.ciphertext.into()],
+    )))
+    .expect("the sealed token is stored");
+}
+
 #[test]
 fn an_onboarding_edit_dispatches_to_its_own_repository() {
     pollster::block_on(async {
-        let (kit, http) = kit(vec![empty(204)], |_| {});
+        let (kit, http) = kit(vec![empty(204)], |ports| {
+            ports.config = Arc::new(MapConfig::from_pairs([
+                ("EDITS_REPO", "keepshipping/infra"),
+                ("EDITS_BASE_BRANCH", "main"),
+                ("EDITS_GITHUB_TOKEN", "gh-token-test"),
+                ("EDITS_RUNNER_TOKEN", RUNNER_TOKEN),
+                ("HARNESS_SECRET", "harness-secret-test"),
+            ]));
+        });
+        store_console_token(&kit);
         let id = "ks0123456789abcdef0123456789abcdef";
         an_onboarding_edit(&kit, id, "nick/shop-infra");
         plan_and_approve(&kit, id).await;
@@ -601,28 +641,7 @@ fn without_an_edits_token_the_console_github_connection_delivers() {
                 ("HARNESS_SECRET", "harness-secret-test"),
             ]));
         });
-        // The token the console stored under its own key, as the connect page
-        // would seal it.
-        let sealed = keepshipping_waitlist::cloudflare::seal::seal_for(
-            keepshipping_waitlist::cloudflare::seal::GITHUB_INFO,
-            "harness-secret-test",
-            "gh-console-token",
-        )
-        .expect("the token seals");
-        pollster::block_on(
-            kit.db.execute(&Statement::new(
-                "CREATE TABLE IF NOT EXISTS console_github_token (id INTEGER PRIMARY KEY, \
-             nonce TEXT NOT NULL, ciphertext TEXT NOT NULL, updated_at TEXT NOT NULL)"
-                    .to_owned(),
-            )),
-        )
-        .expect("the table is created");
-        pollster::block_on(kit.db.execute(&Statement::with_values(
-            "INSERT INTO console_github_token (id, nonce, ciphertext, updated_at) \
-             VALUES (1, ?, ?, '2026-10-16T09:00:00Z')",
-            vec![sealed.nonce.into(), sealed.ciphertext.into()],
-        )))
-        .expect("the sealed token is stored");
+        store_console_token(&kit);
 
         let id = "ks2123456789abcdef0123456789abcdef";
         an_onboarding_edit(&kit, id, "nick/shop-infra");
@@ -635,4 +654,40 @@ fn without_an_edits_token_the_console_github_connection_delivers() {
         assert_eq!(calls.len(), 1, "a stored token lets the dispatch go out: {calls:#?}");
         assert!(calls[0].1.ends_with("/repos/nick/shop-infra/dispatches"));
     });
+}
+
+/// A plan callback presenting `token` for an edit in `repo`.
+async fn callback_with(kit: &TestHarness, id: &str, token: &str) -> StatusCode {
+    let plan_body =
+        plan_json(&["create"], json!({"name":"www.example.com","content":"192.0.2.10","type":"A"}));
+    post_plan(kit, id, token, &plan_body).await.0
+}
+
+#[test]
+fn a_runner_token_for_one_repository_is_refused_for_another() {
+    pollster::block_on(async {
+        let (kit, _http) = kit(vec![], |_| {});
+        let shop = "ks3123456789abcdef0123456789abcdef";
+        an_onboarding_edit(&kit, shop, "nick/shop-infra");
+        let other = "ks4123456789abcdef0123456789abcdef";
+        an_onboarding_edit(&kit, other, "nick/other-infra");
+
+        let shop_token = keepshipping_waitlist_test_hmac(RUNNER_TOKEN, "nick/shop-infra");
+        let other_token = keepshipping_waitlist_test_hmac(RUNNER_TOKEN, "nick/other-infra");
+        // The shop's token opens the shop's edit and nothing of the other repo.
+        assert_eq!(callback_with(&kit, shop, &shop_token).await, StatusCode::OK);
+        assert_eq!(callback_with(&kit, other, &shop_token).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(callback_with(&kit, other, &other_token).await, StatusCode::OK);
+        // The raw runner key does not open an onboarding repository's edit.
+        assert_eq!(callback_with(&kit, shop, RUNNER_TOKEN).await, StatusCode::UNAUTHORIZED);
+    });
+}
+
+/// The per-repository runner token, computed the way the console sends it.
+fn keepshipping_waitlist_test_hmac(key: &str, repo: &str) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key.as_bytes()).expect("a key");
+    mac.update(repo.to_ascii_lowercase().as_bytes());
+    mac.finalize().into_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
 }
