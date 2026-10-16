@@ -268,6 +268,29 @@ form.connect input {
   color: var(--ink);
   margin-bottom: 0.9rem;
 }
+form.connect select {
+  display: block; width: 100%;
+  font: 0.9rem var(--mono);
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--border-strong);
+  background: var(--bg);
+  color: var(--ink);
+  margin-bottom: 0.9rem;
+}
+form.connect .check { display: flex; align-items: center; gap: 0.5rem; margin: 1rem 0 0.4rem; }
+form.connect .check input[type="checkbox"] { display: inline-block; width: auto; margin: 0; }
+form.connect .check label { display: inline; margin: 0; font-weight: 600; color: var(--ink); }
+.panel .hint, form.connect .hint { color: var(--muted); font-size: 0.88rem; margin: 0.25rem 0 0.9rem; }
+ul.perms-list { margin: 0 0 0.9rem; padding-left: 1.1rem; font-size: 0.88rem; }
+ul.perms-list li { margin: 0.2rem 0; }
+ul.findings { margin: 0.5rem 0 1rem; padding-left: 1.1rem; font-size: 0.93rem; }
+ul.findings li { margin: 0.25rem 0; overflow-wrap: anywhere; }
+ol.progress { list-style: none; margin: 0 0 1.25rem; padding: 0; display: flex; flex-wrap: wrap; gap: 0.5rem 1.1rem; font-size: 0.85rem; color: var(--muted); }
+ol.progress li { display: flex; align-items: center; gap: 0.4rem; }
+ol.progress li .n { display: inline-grid; place-items: center; width: 1.5rem; height: 1.5rem; font: 600 0.75rem var(--mono); border: 1px solid var(--border-strong); }
+ol.progress li.done .n { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-soft); }
+ol.progress li[aria-current="step"] { color: var(--ink); font-weight: 600; }
+ol.progress li[aria-current="step"] .n { border-color: var(--accent); color: var(--accent); }
 
 /* Narrow screens: each table row becomes a card; the table semantics stay. */
 @media (max-width: 47.99em) {

@@ -102,6 +102,17 @@ with `return=<where the visitor was>`.
 Secrets are not in `wrangler.toml`: `wrangler secret put EDITS_GITHUB_TOKEN`
 and `wrangler secret put EDITS_RUNNER_TOKEN`.
 
+Two things let an edit belong to a repository other than `EDITS_REPO`, and
+let the console's own GitHub connection deliver for it:
+
+- The `edits.repo` column names the repository an edit was opened in. The
+  manage-as-code wizard (`src/onboard/`) sets it to the site's infrastructure
+  repository, and approval dispatches there. An empty column means
+  `EDITS_REPO`, as before.
+- With `EDITS_GITHUB_TOKEN` unset, the outbox opens the token the console
+  stored on the GitHub connection page (`console_github_token`, opened with
+  `HARNESS_SECRET`). A configured `EDITS_GITHUB_TOKEN` still wins.
+
 ## The CI contract
 
 The infra repository owns one workflow. On `pull_request` (paths under the

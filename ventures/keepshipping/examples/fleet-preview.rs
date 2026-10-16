@@ -69,13 +69,15 @@ fn main() {
         let panel = rollback::panel_html(site, &Panel::Candidates(candidates.clone()), &now);
         write(
             "rollback-site.html",
-            fleet::render_site_with(&snapshot, &site.id, &now, "", &panel).expect("a known id"),
+            fleet::render_site_with(&snapshot, &site.id, &now, "", &panel, None)
+                .expect("a known id"),
         );
         write(
             "rollback-confirm.html",
             rollback::confirm_page(site, &candidates[2], Some(&candidates[0]), &now),
         );
     }
+    wizard_pages(&snapshot, &out);
     let accounts = vec!["Factory0".to_owned(), "Earth.OS".to_owned()];
     write(
         "connect.html",
@@ -91,11 +93,12 @@ fn main() {
         "connect-error.html",
         connect_page(None, &[], None, Some("Cloudflare did not accept that token."), &now),
     );
-    write("github.html", github_page(GitHubState::Disconnected, None, &now));
+    write("github.html", github_page(GitHubState::Disconnected, None, None, &now));
     write(
         "github-connected.html",
         github_page(
             GitHubState::Connected { login: Some("nick"), saved: &snapshot.generated_at },
+            None,
             None,
             &now,
         ),
@@ -110,6 +113,143 @@ fn main() {
         ),
     );
     println!("wrote {}", out.display());
+}
+
+/// Every step of the manage-as-code wizard, rendered with made-up findings
+/// for the first site that can be managed as code: the connect card, the
+/// repository choice, the review (with and without an error) and the status
+/// page of a finished setup.
+fn wizard_pages(snapshot: &Fleet, out: &Path) {
+    use keepshipping_waitlist::github::Repo;
+    use keepshipping_waitlist::onboard::detect::{Framework, Need, Runtime, Stack};
+    use keepshipping_waitlist::onboard::flow::{Opened, Scan};
+    use keepshipping_waitlist::onboard::generate::DbKind;
+    use keepshipping_waitlist::onboard::generate::TestEnv;
+    use keepshipping_waitlist::onboard::page::{Review, StatusView, View, wizard};
+    use keepshipping_waitlist::onboard::store::EditView;
+    use keepshipping_waitlist::onboard::wizard::{Step, preselect};
+    use std::collections::BTreeSet;
+
+    // The wizard needs a site it can manage: a Pages project. The fixture's
+    // first site is re-labelled as one, so every step renders from it.
+    let Some(first) = snapshot.sites.first() else {
+        return;
+    };
+    let site = &fleet::Site {
+        id: "pages:fixture-account:shop-web".to_owned(),
+        name: "shop-web".to_owned(),
+        kind: fleet::Kind::Pages,
+        ..first.clone()
+    };
+    let write = |name: &str, html: String| {
+        let path = out.join(name);
+        fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+        fs::write(&path, html).expect("write");
+    };
+    let here = format!("/console/fleet/{}/code", site.id);
+    write("code-github.html", wizard(site, Some(Step::GitHub), View::Connect { next: &here }));
+
+    let repo = |name: &str, private: bool| Repo {
+        owner: "nick".to_owned(),
+        name: name.to_owned(),
+        default_branch: "main".to_owned(),
+        private,
+    };
+    let repos = vec![repo("blog", false), repo("shop-web", true), repo("shop", true)];
+    let selected =
+        preselect(&site.name, None, &repos).map(|index| format!("nick/{}", repos[index].name));
+    write(
+        "code-repo.html",
+        wizard(
+            site,
+            Some(Step::Repo),
+            View::Repo { repos: &repos, selected: selected.as_deref(), error: None },
+        ),
+    );
+
+    let mut needs = BTreeSet::new();
+    needs.insert(Need::Postgres);
+    needs.insert(Need::ObjectStorage);
+    let stack = Stack {
+        framework: Some(Framework::Next),
+        runtime: Some(Runtime::Pages),
+        needs,
+        env_vars: BTreeSet::from(["DATABASE_URL".to_owned(), "SESSION_SECRET".to_owned()]),
+        ..Stack::default()
+    };
+    let scan = Scan {
+        repo: "nick/shop".to_owned(),
+        branch: "main".to_owned(),
+        truncated: true,
+        stack: stack.clone(),
+    };
+    let plan = vec![
+        "Imports 3 DNS records in example.com".to_owned(),
+        "Imports the Pages site shop".to_owned(),
+        "Imports the address shop.example.com on the Pages site shop".to_owned(),
+        "Creates a test database (D1) called shop-test".to_owned(),
+        "Postgres for the test environment goes through Hyperdrive; the database address is kept as a secret".to_owned(),
+    ];
+    fn review_for<'a>(scan: &'a Scan, plan: &'a [String], error: Option<&'a str>) -> Review<'a> {
+        Review {
+            app_repo: &scan.repo,
+            stack_lines: scan.stack.summary(),
+            truncated: scan.truncated,
+            plan_lines: Some(plan),
+            plan_note: None,
+            db: Some(DbKind::Postgres),
+            infra_default: "nick/infra",
+            error,
+        }
+    }
+    write(
+        "code-review.html",
+        wizard(site, Some(Step::Review), View::Review(review_for(&scan, &plan, None))),
+    );
+    let failed = "Opening the pull request did not finish. GitHub would not do that. Check the \
+         token's permissions against the list on the connection page.";
+    write(
+        "code-failed.html",
+        wizard(site, Some(Step::Review), View::Review(review_for(&scan, &plan, Some(failed)))),
+    );
+
+    let edit = EditView {
+        status: "planned".to_owned(),
+        summary_md: plan.iter().map(|line| format!("- {line}\n")).collect(),
+        pr_url: "https://github.com/nick/infra/pull/7".to_owned(),
+        pr_number: 7,
+        error: String::new(),
+    };
+    let facts = Opened {
+        test_env: TestEnv {
+            enabled: true,
+            name: "shop-test".to_owned(),
+            hostname: Some("test.example.com".to_owned()),
+            d1: false,
+            kv: false,
+            r2: true,
+            hyperdrive: Some(DbKind::Postgres),
+            pages_project: Some("shop".to_owned()),
+        },
+        db_given: false,
+        destinations: false,
+    };
+    write(
+        "code-opened.html",
+        wizard(
+            site,
+            None,
+            View::Status(StatusView {
+                infra_repo: "nick/infra",
+                edit_id: "ks0123456789abcdef0123456789abcdef",
+                edit: Some(&edit),
+                facts: Some(&facts),
+                runner_set: false,
+                worker: false,
+                error: None,
+            }),
+        ),
+    );
 }
 
 /// `generated_at` plus one hour, RFC 3339; the snapshot's own time when it

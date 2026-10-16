@@ -68,8 +68,10 @@ const MAX_BODY: usize = PLAN_BODY_LIMIT + 64 * 1024;
 /// Deliveries before an outbox row's failure marks the edit failed.
 const MAX_ATTEMPTS: i64 = 12;
 
-static MIGRATIONS: [SqlMigration; 1] =
-    [SqlMigration::new("0001", "init", include_str!("migrations/0001_init.sql"))];
+static MIGRATIONS: [SqlMigration; 2] = [
+    SqlMigration::new("0001", "init", include_str!("migrations/0001_init.sql")),
+    SqlMigration::new("0002", "edits_repo", include_str!("migrations/0002_edits_repo.sql")),
+];
 const _: () = cratefield_core::assert_migration_set(&MIGRATIONS);
 
 /// A plan callback refused because the edit already carries an approval:
@@ -407,7 +409,16 @@ async fn drain(
     budget: &ScheduledBudget,
 ) -> Result<DrainReport, DbError> {
     let cfg = ModuleConfig::new(Edits::NAME, config.as_ref());
-    let Some(token) = cfg.get_opt("GITHUB_TOKEN") else {
+    // The configured token when there is one; otherwise the console's own
+    // GitHub connection, which onboarding's edits are opened and approved with.
+    let token = match cfg.get_opt("GITHUB_TOKEN") {
+        Some(token) => Some(token),
+        None => match config.get("HARNESS_SECRET") {
+            Some(secret) => crate::github::token_from_database(db, &secret).await,
+            None => None,
+        },
+    };
+    let Some(token) = token else {
         return Ok(cratefield_core::DrainReport::default());
     };
     let github = github::GitHub::new(http, token, cfg.get_str("GITHUB_API_BASE", github::API_BASE));
@@ -778,13 +789,6 @@ async fn approve(
         );
     };
     let cfg = ModuleConfig::new(Edits::NAME, ctx.config.as_ref());
-    let repo = cfg.get_str("REPO", "");
-    if repo.is_empty() {
-        return html(
-            StatusCode::SERVICE_UNAVAILABLE,
-            page::not_ready("the infrastructure repository is not configured"),
-        );
-    }
     let row = match find_edit(&*db, &id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
@@ -798,6 +802,18 @@ async fn approve(
         }
         Err(error) => return Problem::internal().with_detail(error.to_string()).into_response(),
     };
+    // An edit opened for a specific repository (onboarding) dispatches there;
+    // every other edit dispatches to the configured one.
+    let repo = match col(&row, "repo") {
+        repo if repo.is_empty() => cfg.get_str("REPO", ""),
+        repo => repo,
+    };
+    if repo.is_empty() {
+        return html(
+            StatusCode::SERVICE_UNAVAILABLE,
+            page::not_ready("the infrastructure repository is not configured"),
+        );
+    }
     if col(&row, "status") != "planned" {
         let why = if col(&row, "status") == "approved" {
             "This change is already approved; the workflow is applying it."

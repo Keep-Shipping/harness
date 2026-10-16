@@ -147,7 +147,7 @@ impl Target {
     }
 }
 
-fn seg(value: &str) -> String {
+pub(crate) fn seg(value: &str) -> String {
     utf8_percent_encode(value, SEGMENT).to_string()
 }
 

@@ -19,6 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// The most files one scan reads. The wizard fetches each file over the
@@ -126,7 +127,7 @@ pub fn detect(files: &BTreeMap<String, String>) -> Stack {
 /// What the wizard learned about one app repository. Every field is either
 /// a name, a kind, or a plain-English note. No environment value ever lands
 /// here.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stack {
     /// The framework the app is built with, the most specific one found.
     pub framework: Option<Framework>,
@@ -197,7 +198,7 @@ impl Stack {
 /// A web or language framework the app is built with. The variants are in
 /// precedence order: when two are found, the earlier one is the app's
 /// framework (a Next app with a small Vite tool beside it is a Next app).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Framework {
     /// Next.js.
     Next,
@@ -247,7 +248,7 @@ impl Framework {
 }
 
 /// Where Cloudflare would run the app.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Runtime {
     /// A Worker: code that runs on each request (wrangler `main`).
     Worker,
@@ -269,7 +270,7 @@ impl Runtime {
 
 /// Something the app needs from outside itself that Cloudflare may have to
 /// provide, or that the wizard must report instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Need {
     /// A Postgres database.
     Postgres,
@@ -335,7 +336,7 @@ impl Need {
 }
 
 /// A kind of binding a wrangler config can declare.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum BindingKind {
     /// A D1 (SQLite) database.
     D1,
@@ -380,7 +381,7 @@ impl BindingKind {
 
 /// A binding the wrangler config already declares: its kind and the name the
 /// code uses for it. Ids and other config values are not kept.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Binding {
     /// What kind of resource the binding points at.
     pub kind: BindingKind,

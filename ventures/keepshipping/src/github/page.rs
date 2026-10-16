@@ -32,6 +32,19 @@ pub const PERMISSIONS: [(&str, &str, &str); 6] = [
     ("Metadata", "Read-only", "GitHub requires it for every token"),
 ];
 
+/// Where the connection returns a person to after it is saved: a path on this
+/// console and nowhere else. Anything else (another origin, a protocol-relative
+/// `//host` path, a backslash or a control character) is refused and the page
+/// falls back to its own.
+#[must_use]
+pub fn safe_next(raw: &str) -> Option<&str> {
+    let ok = raw.starts_with("/console/")
+        && !raw.starts_with("//")
+        && !raw.contains('\\')
+        && raw.chars().all(|c| !c.is_control());
+    ok.then_some(raw)
+}
+
 /// What the page shows about the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State<'a> {
@@ -48,10 +61,16 @@ pub enum State<'a> {
 }
 
 /// The GitHub connection page. `error` is a plain-words refusal from the
-/// last paste, shown above the form; `now` is RFC 3339, for the relative
-/// save time.
+/// last paste, shown above the form; `next` is where a successful paste
+/// returns the person (already checked by [`safe_next`]); `now` is RFC 3339,
+/// for the relative save time.
 #[must_use]
-pub fn connect_page(state: State<'_>, error: Option<&str>, now: &str) -> String {
+pub fn connect_page(
+    state: State<'_>,
+    error: Option<&str>,
+    next: Option<&str>,
+    now: &str,
+) -> String {
     let status = match state {
         State::Connected { login, saved } => format!(
             "<section class=\"panel status-card\" aria-labelledby=\"status-title\">\n\
@@ -84,6 +103,9 @@ pub fn connect_page(state: State<'_>, error: Option<&str>, now: &str) -> String 
         State::Connected { .. } => ("Replace the token", "Replace the GitHub token"),
         State::Disconnected => ("Connect GitHub", "Connect GitHub"),
     };
+    let next_field = next
+        .map(|next| format!("<input type=\"hidden\" name=\"next\" value=\"{}\">\n", esc(next)))
+        .unwrap_or_default();
     let body = format!(
         "<main id=\"main\" class=\"wrap narrow\">\n\
          <div class=\"pagehead\"><div>\n<h1>GitHub connection</h1>\n\
@@ -108,6 +130,7 @@ pub fn connect_page(state: State<'_>, error: Option<&str>, now: &str) -> String 
          holds, and stored. It is never shown again.</p>\n\
          {error}\
          <form class=\"connect\" method=\"post\" action=\"{CONNECT_PATH}\" autocomplete=\"off\">\n\
+         {next_field}\
          <label for=\"gh-token\">GitHub token</label>\n\
          <input id=\"gh-token\" name=\"token\" type=\"password\" required autocomplete=\"off\" \
          autocapitalize=\"off\" spellcheck=\"false\">\n\
@@ -124,7 +147,7 @@ mod tests {
 
     #[test]
     fn a_disconnected_page_lists_every_permission_and_offers_a_paste() {
-        let page = connect_page(State::Disconnected, None, "2026-10-16T09:00:00Z");
+        let page = connect_page(State::Disconnected, None, None, "2026-10-16T09:00:00Z");
         assert!(page.contains(&format!("href=\"{TOKEN_PAGE}\"")));
         for (name, _, _) in PERMISSIONS {
             assert!(page.contains(&format!("<strong>{name}</strong>")), "{name} listed");
@@ -141,6 +164,7 @@ mod tests {
         let page = connect_page(
             State::Connected { login: Some("nick<script>"), saved: "2026-10-15T09:00:00Z" },
             None,
+            None,
             "2026-10-16T09:00:00Z",
         );
         assert!(page.contains("Signed in to GitHub as <strong>nick&lt;script&gt;</strong>"));
@@ -153,6 +177,7 @@ mod tests {
         let page = connect_page(
             State::Connected { login: None, saved: "2026-10-15T09:00:00Z" },
             None,
+            None,
             "2026-10-16T09:00:00Z",
         );
         assert!(page.contains("GitHub could not be asked which account this is"));
@@ -160,8 +185,29 @@ mod tests {
 
     #[test]
     fn an_error_is_escaped_and_announced() {
-        let page = connect_page(State::Disconnected, Some("<b>no</b>"), "2026-10-16T09:00:00Z");
+        let page =
+            connect_page(State::Disconnected, Some("<b>no</b>"), None, "2026-10-16T09:00:00Z");
         assert!(page.contains("role=\"alert\""));
         assert!(page.contains("&lt;b&gt;no&lt;/b&gt;"));
+    }
+
+    #[test]
+    fn only_console_paths_are_taken_as_the_way_back() {
+        assert_eq!(safe_next("/console/fleet/a%3Ab/code"), Some("/console/fleet/a%3Ab/code"));
+        assert_eq!(safe_next("https://evil.example/console/x"), None);
+        assert_eq!(safe_next("//evil.example/console/x"), None);
+        assert_eq!(safe_next("/console/\\evil"), None);
+        assert_eq!(safe_next("/console/x\nSet-Cookie: a"), None);
+        assert_eq!(safe_next("/elsewhere"), None);
+        assert_eq!(safe_next(""), None);
+    }
+
+    #[test]
+    fn a_next_path_is_carried_in_a_hidden_field_and_escaped() {
+        let page =
+            connect_page(State::Disconnected, None, Some("/console/x\"y"), "2026-10-16T09:00:00Z");
+        assert!(page.contains("name=\"next\" value=\"/console/x&quot;y\""));
+        let plain = connect_page(State::Disconnected, None, None, "2026-10-16T09:00:00Z");
+        assert!(!plain.contains("name=\"next\""));
     }
 }

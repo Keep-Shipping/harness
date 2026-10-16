@@ -524,3 +524,115 @@ fn the_list_page_shows_every_change_and_its_chip() {
         assert!(body.contains("Make a change"), "{body}");
     });
 }
+
+/// Inserts an edit the way onboarding does: its pull request already open, in
+/// its own infrastructure repository, and no plan yet.
+fn an_onboarding_edit(kit: &TestHarness, id: &str, repo: &str) {
+    pollster::block_on(kit.db.execute(&Statement::with_values(
+        "INSERT INTO edits (id, kind, zone, title, summary_md, file_path, author, status, repo, \
+         pr_number, pr_url, pr_head_sha, created_at, updated_at) \
+         VALUES (?, 'onboard', 'example.com', 'Manage shop as code', '', 'main.tf', 'person_1', \
+         'checking', ?, 9, 'https://github.com/nick/shop-infra/pull/9', ?, \
+         '2026-10-16T09:00:00Z', '2026-10-16T09:00:00Z')",
+        vec![id.into(), repo.into(), "a".repeat(40).into()],
+    )))
+    .expect("the onboarding edit inserts");
+}
+
+/// Plans and approves `id` as a signed-in person would; returns nothing, the
+/// approval is checked by the caller.
+async fn plan_and_approve(kit: &TestHarness, id: &str) {
+    let plan_body =
+        plan_json(&["create"], json!({"name":"www.example.com","content":"192.0.2.10","type":"A"}));
+    let (status, body) = post_plan(kit, id, RUNNER_TOKEN, &plan_body).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let digest = edit_field(kit, id, "plan_sha256");
+    let (status, _, body) =
+        post_form(kit, &format!("/v1/edits/{id}/approve"), "person_1", &format!("saw={digest}"))
+            .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+}
+
+#[test]
+fn an_onboarding_edit_dispatches_to_its_own_repository() {
+    pollster::block_on(async {
+        let (kit, http) = kit(vec![empty(204)], |_| {});
+        let id = "ks0123456789abcdef0123456789abcdef";
+        an_onboarding_edit(&kit, id, "nick/shop-infra");
+        plan_and_approve(&kit, id).await;
+
+        kit.defer.drain().await;
+        let calls = http.captured();
+        assert_eq!(calls.len(), 1, "{calls:#?}");
+        assert!(
+            calls[0].1.ends_with("/repos/nick/shop-infra/dispatches"),
+            "the dispatch goes to the edit's repository: {}",
+            calls[0].1
+        );
+        let dispatch: Value = serde_json::from_str(&calls[0].2).expect("the dispatch body");
+        assert_eq!(dispatch["client_payload"]["edit_id"], json!(id));
+        assert_eq!(dispatch["client_payload"]["pr_number"], json!(9));
+    });
+}
+
+#[test]
+fn an_edit_without_its_own_repository_still_uses_the_configured_one() {
+    pollster::block_on(async {
+        let (kit, http) = kit(vec![empty(204)], |_| {});
+        let id = "ks1123456789abcdef0123456789abcdef";
+        an_onboarding_edit(&kit, id, "");
+        plan_and_approve(&kit, id).await;
+
+        kit.defer.drain().await;
+        let calls = http.captured();
+        assert_eq!(calls.len(), 1, "{calls:#?}");
+        assert!(calls[0].1.ends_with("/repos/keepshipping/infra/dispatches"), "{}", calls[0].1);
+    });
+}
+
+#[test]
+fn without_an_edits_token_the_console_github_connection_delivers() {
+    pollster::block_on(async {
+        let (kit, http) = kit(vec![empty(204)], |ports| {
+            ports.config = Arc::new(MapConfig::from_pairs([
+                ("EDITS_REPO", "keepshipping/infra"),
+                ("EDITS_BASE_BRANCH", "main"),
+                ("EDITS_RUNNER_TOKEN", RUNNER_TOKEN),
+                ("HARNESS_SECRET", "harness-secret-test"),
+            ]));
+        });
+        // The token the console stored under its own key, as the connect page
+        // would seal it.
+        let sealed = keepshipping_waitlist::cloudflare::seal::seal_for(
+            keepshipping_waitlist::cloudflare::seal::GITHUB_INFO,
+            "harness-secret-test",
+            "gh-console-token",
+        )
+        .expect("the token seals");
+        pollster::block_on(
+            kit.db.execute(&Statement::new(
+                "CREATE TABLE IF NOT EXISTS console_github_token (id INTEGER PRIMARY KEY, \
+             nonce TEXT NOT NULL, ciphertext TEXT NOT NULL, updated_at TEXT NOT NULL)"
+                    .to_owned(),
+            )),
+        )
+        .expect("the table is created");
+        pollster::block_on(kit.db.execute(&Statement::with_values(
+            "INSERT INTO console_github_token (id, nonce, ciphertext, updated_at) \
+             VALUES (1, ?, ?, '2026-10-16T09:00:00Z')",
+            vec![sealed.nonce.into(), sealed.ciphertext.into()],
+        )))
+        .expect("the sealed token is stored");
+
+        let id = "ks2123456789abcdef0123456789abcdef";
+        an_onboarding_edit(&kit, id, "nick/shop-infra");
+        plan_and_approve(&kit, id).await;
+
+        // Nothing is sent before the drain; the drain opens the stored token
+        // and delivers the dispatch with it.
+        kit.defer.drain().await;
+        let calls = http.captured();
+        assert_eq!(calls.len(), 1, "a stored token lets the dispatch go out: {calls:#?}");
+        assert!(calls[0].1.ends_with("/repos/nick/shop-infra/dispatches"));
+    });
+}

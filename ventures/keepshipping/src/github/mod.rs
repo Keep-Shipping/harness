@@ -12,7 +12,7 @@
 pub mod page;
 
 use base64::Engine as _;
-use cratefield_core::Clock;
+use cratefield_core::{Clock, Database, Statement};
 use cratefield_runtime_cloudflare::WorkersClock;
 use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
@@ -29,6 +29,8 @@ const API_VERSION: &str = "2022-11-28";
 const USER_AGENT: &str = "keepshipping-console";
 /// The D1 table holding the sealed token: one row, `id = 1`.
 const TABLE: &str = "console_github_token";
+/// The row read by [`token_from_database`].
+const STORED_QUERY: &str = "SELECT nonce, ciphertext FROM console_github_token WHERE id = 1";
 
 /// A failure the connection and wizard pages can show: an HTTP status to
 /// answer with, and what to tell the person, in plain words.
@@ -91,6 +93,33 @@ pub struct ActionsKey {
     pub key_id: String,
     /// The key itself, base64 of 32 bytes.
     pub key: String,
+}
+
+/// A pull request to open: the branch it comes from, the branch it targets,
+/// its text, and the files each committed on the branch.
+#[derive(Debug, Clone, Copy)]
+pub struct NewPull<'a> {
+    /// The branch the pull request merges into.
+    pub base: &'a str,
+    /// The branch the commits go on; created off `base`.
+    pub branch: &'a str,
+    /// The pull request's title, also the first line of each commit.
+    pub title: &'a str,
+    /// The pull request's body, Markdown.
+    pub body: &'a str,
+    /// Each file's path and full text.
+    pub files: &'a [(String, String)],
+}
+
+/// A pull request the console opened, or found already open for its branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pull {
+    /// The pull request's number in its repository.
+    pub number: u64,
+    /// The page on GitHub a person opens to read it.
+    pub url: String,
+    /// The commit the branch's head is at.
+    pub head_sha: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +202,49 @@ pub fn actions_key_url(owner: &str, name: &str) -> String {
 #[must_use]
 pub fn actions_secret_url(owner: &str, name: &str, secret: &str) -> String {
     format!("{}/actions/secrets/{}", repo_url(owner, name), segment(secret))
+}
+
+/// `GET /repos/{owner}/{name}/git/ref/heads/{branch}`: a branch's head.
+#[must_use]
+pub fn branch_ref_url(owner: &str, name: &str, branch: &str) -> String {
+    format!("{}/git/ref/heads/{}", repo_url(owner, name), path(branch))
+}
+
+/// `POST /repos/{owner}/{name}/git/refs`: creates a branch.
+#[must_use]
+pub fn refs_url(owner: &str, name: &str) -> String {
+    format!("{}/git/refs", repo_url(owner, name))
+}
+
+/// `GET` or `PUT /repos/{owner}/{name}/contents/{path}` on one branch.
+#[must_use]
+pub fn contents_on_url(owner: &str, name: &str, file: &str, branch: &str) -> String {
+    format!("{}?ref={}", contents_url(owner, name, file), segment(branch))
+}
+
+/// `POST /repos/{owner}/{name}/pulls`.
+#[must_use]
+pub fn pulls_url(owner: &str, name: &str) -> String {
+    format!("{}/pulls", repo_url(owner, name))
+}
+
+/// `GET /repos/{owner}/{name}/pulls` for the open pull request from `branch`
+/// (the head is `owner:branch`).
+#[must_use]
+pub fn open_pulls_url(owner: &str, name: &str, branch: &str) -> String {
+    format!("{}?head={}&state=open", pulls_url(owner, name), segment(&format!("{owner}:{branch}")))
+}
+
+/// `POST /repos/{owner}/{name}/actions/variables`.
+#[must_use]
+pub fn variables_url(owner: &str, name: &str) -> String {
+    format!("{}/actions/variables", repo_url(owner, name))
+}
+
+/// `PATCH /repos/{owner}/{name}/actions/variables/{variable}`.
+#[must_use]
+pub fn variable_url(owner: &str, name: &str, variable: &str) -> String {
+    format!("{}/{}", variables_url(owner, name), segment(variable))
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +355,57 @@ pub fn read_file(body: &str) -> Result<String, Failed> {
 pub fn read_actions_key(body: &str) -> Result<ActionsKey, Failed> {
     shape(serde_json::from_str::<KeyBody>(body))
         .map(|parsed| ActionsKey { key_id: parsed.key_id, key: parsed.key })
+}
+
+#[derive(Deserialize)]
+struct ShaBody {
+    sha: String,
+}
+
+#[derive(Deserialize)]
+struct RefBody {
+    object: ShaBody,
+}
+
+#[derive(Deserialize)]
+struct PullBody {
+    number: u64,
+    html_url: String,
+    head: PullHead,
+}
+
+#[derive(Deserialize)]
+struct PullHead {
+    sha: String,
+}
+
+/// A branch's head commit (`GET .../git/ref/heads/...`).
+pub fn read_ref_sha(body: &str) -> Result<String, Failed> {
+    shape(serde_json::from_str::<RefBody>(body)).map(|parsed| parsed.object.sha)
+}
+
+/// A file's blob sha (`GET .../contents/...`): what an overwrite must name.
+pub fn read_blob_sha(body: &str) -> Result<String, Failed> {
+    shape(serde_json::from_str::<ShaBody>(body)).map(|parsed| parsed.sha)
+}
+
+/// One pull request (`POST .../pulls`).
+pub fn read_pull(body: &str) -> Result<Pull, Failed> {
+    shape(serde_json::from_str::<PullBody>(body)).map(|parsed| Pull {
+        number: parsed.number,
+        url: parsed.html_url,
+        head_sha: parsed.head.sha,
+    })
+}
+
+/// The first pull request of a listing, if any.
+pub fn read_first_pull(body: &str) -> Result<Option<Pull>, Failed> {
+    let listed: Vec<PullBody> = shape(serde_json::from_str(body))?;
+    Ok(listed.into_iter().next().map(|parsed| Pull {
+        number: parsed.number,
+        url: parsed.html_url,
+        head_sha: parsed.head.sha,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -411,6 +534,159 @@ impl Client {
         }
     }
 
+    /// A branch's head commit.
+    pub async fn branch_head(
+        &self,
+        owner: &str,
+        name: &str,
+        branch: &str,
+    ) -> Result<String, Failed> {
+        let (status, body) = self.get(&branch_ref_url(owner, name, branch)).await?;
+        ok(status, "the branch")?;
+        read_ref_sha(&body)
+    }
+
+    /// Creates `branch` at `sha`. A branch that already exists (`422`) counts
+    /// as made: a setup that is run again replays this step.
+    pub async fn create_branch(
+        &self,
+        owner: &str,
+        name: &str,
+        branch: &str,
+        sha: &str,
+    ) -> Result<(), Failed> {
+        let payload = serde_json::json!({ "ref": format!("refs/heads/{branch}"), "sha": sha });
+        let (status, _) =
+            self.send(Method::Post, &refs_url(owner, name), Some(payload.to_string())).await?;
+        if status == 201 || status == 422 {
+            return Ok(());
+        }
+        tracing::warn!(status, "console: github refused to create a branch");
+        Err(REFUSED)
+    }
+
+    /// The blob sha of a file on `branch`, or `None` when the file is not
+    /// there. An overwrite must name it.
+    pub async fn file_sha(
+        &self,
+        owner: &str,
+        name: &str,
+        file: &str,
+        branch: &str,
+    ) -> Result<Option<String>, Failed> {
+        let (status, body) = self.get(&contents_on_url(owner, name, file, branch)).await?;
+        if status == 404 {
+            return Ok(None);
+        }
+        ok(status, "the file")?;
+        read_blob_sha(&body).map(Some)
+    }
+
+    /// Commits one file on `branch`, creating or overwriting it. `sha` is the
+    /// file's current blob sha, when it exists.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_file(
+        &self,
+        owner: &str,
+        name: &str,
+        file: &str,
+        branch: &str,
+        content: &str,
+        sha: Option<&str>,
+        message: &str,
+    ) -> Result<(), Failed> {
+        let mut payload = serde_json::json!({
+            "message": message,
+            "content": base64::engine::general_purpose::STANDARD.encode(content.as_bytes()),
+            "branch": branch,
+        });
+        if let Some(sha) = sha {
+            payload["sha"] = serde_json::Value::from(sha);
+        }
+        let (status, _) = self
+            .send(Method::Put, &contents_url(owner, name, file), Some(payload.to_string()))
+            .await?;
+        if (200..300).contains(&status) {
+            return Ok(());
+        }
+        tracing::warn!(status, "console: github refused to commit a file");
+        Err(REFUSED)
+    }
+
+    /// Opens a pull request from `head` into `base`. A pull request the head
+    /// already has (`422`) is adopted, so a repeated setup finds it.
+    pub async fn open_pull(
+        &self,
+        owner: &str,
+        name: &str,
+        head: &str,
+        base: &str,
+        title: &str,
+        body_text: &str,
+    ) -> Result<Pull, Failed> {
+        let payload =
+            serde_json::json!({ "title": title, "body": body_text, "head": head, "base": base });
+        let (status, body) =
+            self.send(Method::Post, &pulls_url(owner, name), Some(payload.to_string())).await?;
+        if status == 201 || status == 200 {
+            return read_pull(&body);
+        }
+        if status == 422 {
+            let (listed_status, listed) = self.get(&open_pulls_url(owner, name, head)).await?;
+            ok(listed_status, "the pull request")?;
+            if let Some(pull) = read_first_pull(&listed)? {
+                return Ok(pull);
+            }
+        }
+        tracing::warn!(status, "console: github refused to open a pull request");
+        Err(REFUSED)
+    }
+
+    /// Creates a repository variable, or updates it when it exists.
+    pub async fn put_variable(
+        &self,
+        owner: &str,
+        name: &str,
+        variable: &str,
+        value: &str,
+    ) -> Result<(), Failed> {
+        let payload = serde_json::json!({ "name": variable, "value": value }).to_string();
+        let (status, _) =
+            self.send(Method::Post, &variables_url(owner, name), Some(payload.clone())).await?;
+        if (200..300).contains(&status) {
+            return Ok(());
+        }
+        if status == 409 {
+            let (status, _) = self
+                .send(Method::Patch, &variable_url(owner, name, variable), Some(payload))
+                .await?;
+            if (200..300).contains(&status) {
+                return Ok(());
+            }
+        }
+        tracing::warn!(status, "console: github refused to store a variable");
+        Err(REFUSED)
+    }
+
+    /// Puts `pr.files` on a new branch off `pr.base`, one commit per file, and
+    /// opens the pull request. Every step tolerates a repeat, so a setup that
+    /// failed half-way can be run again.
+    pub async fn commit_pull_request(
+        &self,
+        owner: &str,
+        name: &str,
+        pr: &NewPull<'_>,
+    ) -> Result<Pull, Failed> {
+        let head = self.branch_head(owner, name, pr.base).await?;
+        self.create_branch(owner, name, pr.branch, &head).await?;
+        let message = format!("{}\n\nAdded by Keep Shipping; see the pull request.", pr.title);
+        for (file, content) in pr.files {
+            let sha = self.file_sha(owner, name, file, pr.branch).await?;
+            self.put_file(owner, name, file, pr.branch, content, sha.as_deref(), &message).await?;
+        }
+        self.open_pull(owner, name, pr.branch, pr.base, pr.title, pr.body).await
+    }
+
     async fn get(&self, url: &str) -> Result<(u16, String), Failed> {
         self.send(Method::Get, url, None).await
     }
@@ -502,6 +778,24 @@ async fn load(env: &Env, secret: &str) -> Result<Option<(String, String)>, Faile
         Err(error) => {
             tracing::warn!(?error, "console: stored github token does not open");
             Ok(None)
+        }
+    }
+}
+
+/// The stored token, opened from inside the edits module. That module holds
+/// the database port and the venture's config but not the Worker `Env`, so it
+/// reads the same row and opens it with the same key. `None` when nothing is
+/// stored or it does not open.
+pub async fn token_from_database(db: &dyn Database, secret: &str) -> Option<String> {
+    let rows = db.query(&Statement::with_values(STORED_QUERY, Vec::new())).await.ok()?;
+    let row = rows.rows.into_iter().next()?;
+    let sealed =
+        Sealed { nonce: row.get::<String>("nonce")?, ciphertext: row.get::<String>("ciphertext")? };
+    match seal::open_for(GITHUB_INFO, secret, &sealed) {
+        Ok(token) => Some(token),
+        Err(error) => {
+            tracing::warn!(?error, "console: stored github token does not open");
+            None
         }
     }
 }
@@ -685,5 +979,50 @@ mod tests {
         assert_eq!(seal_secret("not base64!", "x"), Err(SHAPE));
         let short = base64::engine::general_purpose::STANDARD.encode([1u8; 16]);
         assert_eq!(seal_secret(&short, "x"), Err(SHAPE));
+    }
+
+    #[test]
+    fn the_branch_pull_request_and_variable_urls_are_built_from_encoded_parts() {
+        assert_eq!(
+            branch_ref_url("o", "r", "main"),
+            "https://api.github.com/repos/o/r/git/ref/heads/main"
+        );
+        assert_eq!(refs_url("o", "r"), "https://api.github.com/repos/o/r/git/refs");
+        assert_eq!(
+            contents_on_url("o", "r", "modules/test-env/main.tf", "ks-edit/ks1"),
+            "https://api.github.com/repos/o/r/contents/modules/test-env/main.tf?ref=ks-edit%2Fks1"
+        );
+        assert_eq!(pulls_url("o", "r"), "https://api.github.com/repos/o/r/pulls");
+        assert_eq!(
+            open_pulls_url("nick", "infra", "ks-edit/ks1"),
+            "https://api.github.com/repos/nick/infra/pulls?head=nick%3Aks-edit%2Fks1&state=open"
+        );
+        assert_eq!(variables_url("o", "r"), "https://api.github.com/repos/o/r/actions/variables");
+        assert_eq!(
+            variable_url("o", "r", "KEEPSHIPPING_CONSOLE_URL"),
+            "https://api.github.com/repos/o/r/actions/variables/KEEPSHIPPING_CONSOLE_URL"
+        );
+    }
+
+    #[test]
+    fn a_pull_request_and_its_listing_are_read() {
+        let body = r#"{"number":7,"html_url":"https://github.com/o/r/pull/7",
+            "head":{"sha":"abc"},"state":"open"}"#;
+        assert_eq!(
+            read_pull(body),
+            Ok(Pull {
+                number: 7,
+                url: "https://github.com/o/r/pull/7".into(),
+                head_sha: "abc".into(),
+            })
+        );
+        assert_eq!(read_first_pull("[]"), Ok(None));
+        assert_eq!(
+            read_first_pull(&format!("[{body}]")).map(|pull| pull.map(|p| p.number)),
+            Ok(Some(7))
+        );
+        assert_eq!(read_ref_sha(r#"{"object":{"sha":"deadbeef"}}"#), Ok("deadbeef".into()));
+        assert_eq!(read_blob_sha(r#"{"sha":"blob1","path":"x"}"#), Ok("blob1".into()));
+        assert_eq!(read_ref_sha("{}"), Err(SHAPE));
     }
 }

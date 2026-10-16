@@ -1031,7 +1031,7 @@ mod tests {
         assert!(!index.contains(">Baseline<"), "no Terraform columns without Terraform");
         let site = fleet.sites.iter().find(|site| site.name == "tickets-api").expect("worker");
         let page = render_site(&fleet, &site.id, "2026-10-16T10:00:00Z").expect("site page");
-        assert!(page.contains("Not managed by Terraform yet"));
+        assert!(page.contains("Not managed as code yet"));
         assert!(!page.contains(" in Factory-Zero"));
     }
 

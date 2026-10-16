@@ -13,13 +13,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use ks_cloudflare::{ACCOUNT_MODULE, Account, Attr, Resource, StateBackend, add_backend, generate};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cloudflare::rollback::{Target, target};
 use crate::fleet::Site;
 
 /// The database engine behind a test environment's Hyperdrive config.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DbKind {
     /// PostgreSQL, reached through Hyperdrive.
     Postgres,
@@ -72,7 +73,7 @@ impl SiteScope {
 }
 
 /// The test environment a site gets next to its imported code.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestEnv {
     /// Whether any of it is created at all. When false nothing below is written.
     pub enabled: bool,

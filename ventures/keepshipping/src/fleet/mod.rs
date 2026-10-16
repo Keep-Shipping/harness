@@ -258,6 +258,9 @@ pub enum Route {
     Site(String),
     /// `/console/fleet/<id>/rollback`: GET confirms, POST rolls back.
     Rollback(String),
+    /// `/console/fleet/<id>/code`: GET shows the manage-as-code wizard's step,
+    /// POST runs one of its steps.
+    Code(String),
 }
 
 /// `/console/fleet` and `/console/fleet/<id>`, trailing-slash tolerant.
@@ -272,12 +275,22 @@ pub fn route(path: &str) -> Option<Route> {
         Some(id) if !id.is_empty() && !id.contains('/') => {
             Some(Route::Site(percent_decode_str(id).decode_utf8_lossy().into_owned()))
         }
-        Some(rest) => match rest.strip_suffix("/rollback") {
-            Some(id) if !id.is_empty() && !id.contains('/') => {
-                Some(Route::Rollback(percent_decode_str(id).decode_utf8_lossy().into_owned()))
+        Some(rest) => {
+            let decoded = |id: &str| percent_decode_str(id).decode_utf8_lossy().into_owned();
+            if let Some(id) = rest.strip_suffix("/rollback")
+                && !id.is_empty()
+                && !id.contains('/')
+            {
+                return Some(Route::Rollback(decoded(id)));
             }
-            _ => None,
-        },
+            if let Some(id) = rest.strip_suffix("/code")
+                && !id.is_empty()
+                && !id.contains('/')
+            {
+                return Some(Route::Code(decoded(id)));
+            }
+            None
+        }
     }
 }
 
@@ -797,11 +810,6 @@ fn health(site: &Site) -> String {
     format!("<span class=\"status {class}\" title=\"{}\">{words}</span>", esc(&title))
 }
 
-/// Said on a site's page instead of empty Terraform fields.
-const TERRAFORM_NOTE: &str = "<p class=\"callout info\"><strong>Not managed by Terraform yet.</strong> \
-     Baseline scores, code drift and links to the code come from Terraform, so they appear once \
-     it is connected.</p>\n";
-
 /// The refresh button: a POST to the same-origin gate.
 pub(crate) const REFRESH_FORM: &str = "<form class=\"refresh\" method=\"post\" \
      action=\"/console/fleet/refresh\"><button class=\"btn primary\" type=\"submit\">Refresh now</button></form>";
@@ -899,12 +907,14 @@ fn group_name(site: &Site) -> &str {
 /// routing never guesses.
 #[must_use]
 pub fn render_site(snapshot: &Fleet, id: &str, now: &str) -> Option<String> {
-    render_site_with(snapshot, id, now, "", "")
+    render_site_with(snapshot, id, now, "", "", None)
 }
 
 /// [`render_site`] with `top` (a notice, such as a finished rollback) above
-/// the status tiles and `panel` (the rollback panel) under the deploys; both
-/// already HTML.
+/// the status tiles, `panel` (the rollback panel) under the deploys, both
+/// already HTML, and the site's manage-as-code wizard state (`None` when it
+/// was never started). Shown in place of the Terraform details when the site
+/// is not under code.
 #[must_use]
 pub fn render_site_with(
     snapshot: &Fleet,
@@ -912,6 +922,7 @@ pub fn render_site_with(
     now: &str,
     top: &str,
     panel: &str,
+    onboarding: Option<&crate::onboard::store::Record>,
 ) -> Option<String> {
     let site = snapshot.sites.iter().find(|candidate| candidate.id == id)?;
     let terraform = snapshot.terraform.as_ref();
@@ -969,7 +980,7 @@ pub fn render_site_with(
             repo = esc(&terraform.repo),
             resources = resources_list(site, Some(terraform)),
         ),
-        None => TERRAFORM_NOTE.to_owned(),
+        None => crate::onboard::page::callout(&site_path_segment(&site.id), onboarding),
     };
     let tags =
         format!("<span class=\"tag\">{}</span>{}", site.kind.words(), environment_badge(site));
@@ -1786,5 +1797,22 @@ mod tests {
             panic!("the encoded id routes to its site");
         };
         assert_eq!(id, "pages:acct:kaje:feature/x");
+    }
+
+    #[test]
+    fn the_onboarding_wizard_routes_by_its_site_and_nothing_deeper() {
+        assert_eq!(
+            route("/console/fleet/pages:acct:kaje/code"),
+            Some(Route::Code("pages:acct:kaje".into()))
+        );
+        // A preview's id carries an encoded slash; it is one segment on the wire.
+        assert_eq!(
+            route("/console/fleet/pages%3Aacct%3Akaje%3Afeature%2Fx/code/"),
+            Some(Route::Code("pages:acct:kaje:feature/x".into()))
+        );
+        assert_eq!(route("/console/fleet//code"), None, "an empty site id is not a site");
+        assert_eq!(route("/console/fleet/x/code/extra"), None);
+        assert_eq!(route("/console/fleet/x/codex"), None);
+        assert_eq!(route("/console/fleet/x/rollback"), Some(Route::Rollback("x".into())));
     }
 }
