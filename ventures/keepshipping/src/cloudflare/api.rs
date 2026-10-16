@@ -17,7 +17,7 @@ use time::format_description::well_known::Rfc3339;
 use worker::wasm_bindgen::JsValue;
 use worker::{Env, Fetch, Headers, Method, Request, RequestInit};
 
-use super::rollback::{self, Candidate, PagesProjectLive, Panel, Target, WorkerVersions};
+use super::rollback::{self, Candidate, PagesProjectLive, Panel, Target};
 use super::seal::{self, Sealed};
 use super::{
     Account, AccountError, CertificatePack, Envelope, Inventory, PagesDeployment, PagesProject,
@@ -485,13 +485,16 @@ pub async fn refresh(env: &Env, secret: &str) -> Result<Fleet, Failed> {
     write_snapshot(env, &token).await
 }
 
-/// Forgets the token and the snapshot it produced.
+/// Forgets both tokens and the snapshot the read token produced.
 pub async fn disconnect(env: &Env) -> Result<(), Failed> {
     let db = env.d1("DB").map_err(|_| STORE)?;
-    db.prepare("DELETE FROM console_cloudflare_token WHERE id = 1")
-        .run()
-        .await
-        .map_err(|_| STORE)?;
+    // The deploy token goes too: disconnecting cuts all Cloudflare access.
+    for slot in [Slot::Read, Slot::Deploy] {
+        db.prepare(format!("DELETE FROM {} WHERE id = 1", slot.table()))
+            .run()
+            .await
+            .map_err(|_| STORE)?;
+    }
     let kv = env.kv("FLEET").map_err(|_| WRITE)?;
     kv.delete(KV_KEY).await.map_err(|_| WRITE)?;
     Ok(())
@@ -560,8 +563,9 @@ const NOT_A_CANDIDATE: Failed = Failed {
 };
 const ROLLBACK_REFUSED: Failed = Failed {
     status: 502,
-    message: "Cloudflare refused the rollback. Check the deploy token has Pages Edit and \
-              Workers Scripts Edit on this account.",
+    message: "Cloudflare refused the rollback. Either the deploy token lacks Pages Edit or \
+              Workers Scripts Edit on this account, or Cloudflare cannot deploy that version \
+              any more.",
 };
 
 /// The live deployment and the earlier ones a site can go back to, read now
@@ -570,7 +574,7 @@ async fn candidates(token: &str, target: &Target) -> Result<Vec<Candidate>, Fail
     match target {
         Target::Pages { .. } => {
             let live: Envelope<PagesProjectLive> =
-                get(token, &format!("{API}{}", target.live_path())).await?;
+                get(token, &format!("{API}{}", target.live_path().unwrap_or_default())).await?;
             let live = live.result.and_then(|project| project.canonical_deployment);
             let deployments: Envelope<Vec<rollback::PagesDeployment>> =
                 get(token, &format!("{API}{}", target.versions_path())).await?;
@@ -580,18 +584,10 @@ async fn candidates(token: &str, target: &Target) -> Result<Vec<Candidate>, Fail
             ))
         }
         Target::Worker { .. } => {
-            let live: Envelope<super::WorkerDeployments> =
-                get(token, &format!("{API}{}", target.live_path())).await?;
-            let live = live
-                .result
-                .and_then(|listed| listed.deployments.into_iter().next())
-                .and_then(|deployment| deployment.versions.into_iter().next())
-                .map(|version| version.version_id);
-            let versions: Envelope<WorkerVersions> =
+            let history: Envelope<super::WorkerDeployments> =
                 get(token, &format!("{API}{}", target.versions_path())).await?;
             Ok(rollback::worker_candidates(
-                versions.result.unwrap_or(WorkerVersions::List(Vec::new())),
-                live.as_deref(),
+                history.result.map(|listed| listed.deployments).unwrap_or_default(),
             ))
         }
     }

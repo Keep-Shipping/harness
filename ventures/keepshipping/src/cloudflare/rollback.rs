@@ -88,7 +88,9 @@ pub fn target(site: &Site) -> Option<Target> {
 }
 
 impl Target {
-    /// The API path (after `/client/v4`) listing what can be rolled back to.
+    /// The API path (after `/client/v4`) listing what can be rolled back to:
+    /// a Pages project's production deployments, or a Worker's deployment
+    /// history (its last ten, newest and live first).
     #[must_use]
     pub fn versions_path(&self) -> String {
         match self {
@@ -98,25 +100,21 @@ impl Target {
                 seg(project)
             ),
             Target::Worker { account, script } => {
-                format!("/accounts/{}/workers/scripts/{}/versions", seg(account), seg(script))
+                format!("/accounts/{}/workers/scripts/{}/deployments", seg(account), seg(script))
             }
         }
     }
 
-    /// The API path that says which deployment is live now: the Pages
-    /// project (its `canonical_deployment`), or the Worker's newest
-    /// deployment.
+    /// The API path that says which Pages deployment is live now (the
+    /// project, its `canonical_deployment`). `None` for a Worker: the first
+    /// entry of its history is the live one.
     #[must_use]
-    pub fn live_path(&self) -> String {
+    pub fn live_path(&self) -> Option<String> {
         match self {
             Target::Pages { account, project } => {
-                format!("/accounts/{}/pages/projects/{}", seg(account), seg(project))
+                Some(format!("/accounts/{}/pages/projects/{}", seg(account), seg(project)))
             }
-            Target::Worker { account, script } => format!(
-                "/accounts/{}/workers/scripts/{}/deployments?per_page=1",
-                seg(account),
-                seg(script)
-            ),
+            Target::Worker { .. } => None,
         }
     }
 
@@ -205,42 +203,6 @@ pub struct IdOnly {
     pub id: String,
 }
 
-/// `GET …/workers/scripts/{script}/versions`: `{"items": [...]}`, newest
-/// first; read as a bare list too, in case the envelope is flat.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum WorkerVersions {
-    Items { items: Vec<WorkerVersionItem> },
-    List(Vec<WorkerVersionItem>),
-}
-
-impl WorkerVersions {
-    fn into_items(self) -> Vec<WorkerVersionItem> {
-        match self {
-            WorkerVersions::Items { items } | WorkerVersions::List(items) => items,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct WorkerVersionItem {
-    pub id: String,
-    #[serde(default)]
-    pub number: Option<u64>,
-    #[serde(default)]
-    pub metadata: Option<WorkerVersionMetadata>,
-    #[serde(default)]
-    pub annotations: Option<super::WorkerAnnotations>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct WorkerVersionMetadata {
-    #[serde(default)]
-    pub created_on: Option<String>,
-    #[serde(default)]
-    pub source: Option<String>,
-}
-
 /// The successful production deployments, newest first, at most
 /// [`CANDIDATES`] plus the live one, with the live one marked. A deployment
 /// that failed or is still building cannot be rolled back to.
@@ -272,29 +234,35 @@ pub fn pages_candidates(deployments: Vec<PagesDeployment>, live: Option<&str>) -
     out
 }
 
-/// The Worker's versions, newest first, at most [`CANDIDATES`] plus the live
-/// one, with the live one marked.
+/// The versions a Worker actually served, from its deployment history
+/// (newest first; the first deployment is live). Only versions that were
+/// once deployed are offered, never one that was uploaded and not deployed
+/// (a preview or pull-request build), so a rollback cannot put an
+/// unreviewed version live. Each version appears once, at its newest
+/// deployment.
 #[must_use]
-pub fn worker_candidates(versions: WorkerVersions, live: Option<&str>) -> Vec<Candidate> {
-    let mut out: Vec<Candidate> = versions
-        .into_items()
-        .into_iter()
-        .map(|version| {
-            let metadata = version
-                .metadata
-                .unwrap_or(WorkerVersionMetadata { created_on: None, source: None });
-            Candidate {
-                live: live == Some(version.id.as_str()),
-                id: version.id,
-                at: metadata.created_on.unwrap_or_default(),
-                commit: None,
-                branch: None,
-                message: version.annotations.and_then(|annotations| annotations.message),
-                source: metadata.source,
-                number: version.number,
-            }
-        })
-        .collect();
+pub fn worker_candidates(deployments: Vec<super::WorkerDeployment>) -> Vec<Candidate> {
+    let mut out: Vec<Candidate> = Vec::new();
+    for (index, deployment) in deployments.into_iter().enumerate() {
+        // A split deployment's first version is the one it is named by.
+        let Some(version) = deployment.versions.into_iter().next() else {
+            continue;
+        };
+        if out.iter().any(|seen| seen.id == version.version_id) {
+            continue;
+        }
+        let annotations = deployment.annotations.unwrap_or_default();
+        out.push(Candidate {
+            live: index == 0,
+            id: version.version_id,
+            at: deployment.created_on,
+            commit: None,
+            branch: None,
+            message: annotations.message,
+            source: annotations.triggered_by,
+            number: None,
+        });
+    }
     keep(&mut out);
     out
 }
@@ -527,22 +495,24 @@ mod tests {
     }
 
     #[test]
-    fn worker_versions_read_either_shape_and_keep_ten_plus_the_live_one() {
-        let items: Vec<serde_json::Value> = (0..15)
-            .map(|n| {
-                serde_json::json!({ "id": format!("v{n}"), "number": 100 - n,
-                "metadata": { "created_on": "2026-10-15T10:00:00Z", "source": "wrangler" } })
-            })
-            .collect();
-        let wrapped: WorkerVersions =
-            serde_json::from_value(serde_json::json!({ "items": items.clone() })).unwrap();
-        let flat: WorkerVersions = serde_json::from_value(serde_json::json!(items)).unwrap();
-        for versions in [wrapped, flat] {
-            let candidates = worker_candidates(versions, Some("v12"));
-            assert_eq!(candidates.len(), CANDIDATES + 1);
-            assert!(candidates.iter().any(|c| c.id == "v12" && c.live));
-            assert!(candidates.iter().all(|c| c.id != "v13"));
-        }
+    fn worker_candidates_are_versions_that_were_deployed_once_each() {
+        let deployments: Vec<crate::cloudflare::WorkerDeployment> =
+            serde_json::from_value(serde_json::json!([
+                { "created_on": "2026-10-15T10:00:00Z", "versions": [{ "version_id": "v3" }],
+                  "annotations": { "workers/message": "ship", "workers/triggered_by": "deployment" } },
+                { "created_on": "2026-10-14T10:00:00Z", "versions": [{ "version_id": "v2" }] },
+                { "created_on": "2026-10-13T10:00:00Z", "versions": [{ "version_id": "v3" }] },
+                { "created_on": "2026-10-12T10:00:00Z", "versions": [] },
+                { "created_on": "2026-10-11T10:00:00Z", "versions": [{ "version_id": "v1" }] }
+            ]))
+            .unwrap();
+        let candidates = worker_candidates(deployments);
+        let ids: Vec<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["v3", "v2", "v1"]);
+        assert!(candidates[0].live && !candidates[1].live);
+        assert_eq!(candidates[0].message.as_deref(), Some("ship"));
+        assert!(allowed(&candidates, "v3").is_none(), "live");
+        assert!(allowed(&candidates, "v9").is_none(), "an uploaded, never-deployed version");
     }
 
     #[test]
