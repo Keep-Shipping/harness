@@ -320,9 +320,16 @@ impl Cloudflare {
             .map_err(|error| Error::Http { message: format!("{path}: {error}") })?;
         // A body is worth reading whatever the status: a 403 says why in
         // `errors[].message`, and that message is the whole error.
+        // The path names the endpoint that refused, which is what a 403 needs
+        // to be actionable ("which permission is missing"). Its query string is
+        // dropped; the ids in the path are not secret.
         if response.status != 200 {
             let body = parse(&response.body).unwrap_or(Value::Null);
-            return Err(Error::Status { status: response.status, message: messages(&body) });
+            let endpoint = path.split('?').next().unwrap_or(path);
+            return Err(Error::Status {
+                status: response.status,
+                message: format!("{endpoint}: {}", messages(&body)),
+            });
         }
         // A 200 that is not the envelope is an error, never an empty read: an
         // account silently read as empty would sail through the empty-plan

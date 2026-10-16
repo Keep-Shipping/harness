@@ -260,7 +260,12 @@ async fn read_account(env: &Env, secret: Option<&str>, target: &Target) -> Resul
         .ok_or(Stop::new(STEP_READ, NO_READ_TOKEN))?;
     let reader =
         Cloudflare::new(Arc::new(WorkersHttp::cloudflare()), SecretValue::new(token.into_bytes()));
-    reader.read(account_of(target)).await.map_err(|_| Stop::new(STEP_READ, READ_FAILED))
+    // The port's error names the endpoint and Cloudflare's own message; it
+    // never holds the token, so it is safe to show.
+    reader
+        .read(account_of(target))
+        .await
+        .map_err(|failed| Stop::new(STEP_READ, format!("{READ_FAILED} {failed}")))
 }
 
 /// The first step: a repository choice, preselected from the Pages source or

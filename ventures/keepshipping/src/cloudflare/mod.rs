@@ -32,23 +32,35 @@ pub const TOKEN_NAME: &str = "Keep Shipping console (read-only)";
 /// `ssl_and_certificates`, `workers_scripts`, `page` for Pages, and
 /// `account_settings`), listed in the docs at
 /// <https://developers.cloudflare.com/fundamentals/api/how-to/account-owned-token-template/>.
-pub const PERMISSIONS: [(&str, &str); 6] = [
+pub const PERMISSIONS: [(&str, &str); 12] = [
     ("zone", "read"),
     ("dns", "read"),
     ("ssl_and_certificates", "read"),
     ("workers_scripts", "read"),
     ("page", "read"),
     ("account_settings", "read"),
+    ("zone_settings", "read"),
+    ("d1", "read"),
+    ("workers_r2", "read"),
+    ("workers_kv_storage", "read"),
+    ("workers_routes", "read"),
+    ("email_routing_rules", "read"),
 ];
 
 /// The plain-words names of [`PERMISSIONS`], in the same order, for the page.
-pub const PERMISSION_WORDS: [&str; 6] = [
+pub const PERMISSION_WORDS: [&str; 12] = [
     "Zone Read",
     "DNS Read",
     "SSL and Certificates Read",
     "Workers Scripts Read",
     "Pages Read",
     "Account Settings Read",
+    "Zone Settings Read",
+    "D1 Read",
+    "Workers R2 Storage Read",
+    "Workers KV Storage Read",
+    "Workers Routes Read",
+    "Email Routing Rules Read",
 ];
 
 /// The token name's encoding: everything but letters, digits and `-_.~`
