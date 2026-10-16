@@ -5,7 +5,7 @@
 //! deploys, unknown ids route nowhere, hostile snapshot strings stay
 //! escaped, and the auth helpers the worker glue calls behave.
 
-use keepshipping_waitlist::fleet::{self, Route};
+use keepshipping_waitlist::fleet::{self, Filter, Route};
 
 const FIXTURE: &str = include_str!("fixtures/fleet.json");
 
@@ -16,8 +16,12 @@ fn fixture() -> fleet::Fleet {
 /// The fixture's own `generated_at`: "checked … just now".
 const NOW: &str = "2026-10-09T06:00:00Z";
 
+/// Every view of the index, one after another: apps, domains, attention.
 fn index() -> String {
-    fleet::render_index(&fixture(), NOW)
+    ["apps", "domains", "attention"]
+        .iter()
+        .map(|view| fleet::render_index(&fixture(), NOW, &Filter::from_query(Some(view), None)))
+        .collect()
 }
 
 #[test]
@@ -41,16 +45,15 @@ fn the_index_lists_every_site_with_its_last_deploy_and_terraform_link() {
     // older one, and the time in plain words. A site never deployed says
     // so rather than leaving an empty cell.
     assert!(html.contains(
-        "<time datetime=\"2026-10-08T17:42:00Z\" title=\"8 Oct 2026, 17:42 UTC · ada\">12 hours ago</time>"
+        "<time datetime=\"2026-10-08T17:42:00Z\" title=\"8 Oct 2026, 17:42 UTC · b7e4a9c · ada\">12 hours ago</time>"
     ));
-    assert!(html.contains("<code>b7e4a9c</code>"));
     assert!(!html.contains("5a3c1e9"), "older deploy must not be the shown one");
     assert!(html.contains("Never deployed"));
     // The summary line and the count of sites needing attention: one
     // expiring certificate, one failing one, one site changed outside code.
     assert!(html.contains("5 sites in Factory Zero"));
-    assert!(html.contains("<span class=\"n\">3</span> Need attention"));
-    assert!(html.contains("3 sites need attention"));
+    assert!(html.contains("<span>Needs attention</span><span class=\"count\">3</span>"));
+    assert!(html.contains("3 sites need attention."));
     assert!(html.contains(
         "checked <time datetime=\"2026-10-09T06:00:00Z\">9 Oct 2026, 06:00 UTC</time> · just now"
     ));
@@ -76,9 +79,9 @@ fn the_index_lists_every_site_with_its_last_deploy_and_terraform_link() {
             expects(&detail, &resource.defined_at.path, resource.defined_at.line, rev);
         }
     }
-    // Only zones get the Change link to the edit-as-code page.
-    assert!(html.contains("/v1/edits/new?kind=dns&amp;zone=keepshipping.run"));
-    assert!(!html.contains("zone=keepshipping-site"));
+    // No link to the edit-as-code page until it can serve: it is the
+    // harness's, and refuses every request on this Worker today.
+    assert!(!html.contains("/v1/edits/"));
 }
 
 #[test]
@@ -156,7 +159,7 @@ fn hostile_snapshot_strings_stay_escaped() {
         }]
     }))
     .expect("the hostile snapshot is still valid JSON against the contract");
-    let html = fleet::render_index(&hostile, NOW);
+    let html = fleet::render_index(&hostile, NOW, &Filter::from_query(Some("domains"), None));
     assert!(!html.contains("<script>"), "no raw script tag: {html}");
     assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     // The entity the attacker planted is shown as text ("&amp;quot;"), the
