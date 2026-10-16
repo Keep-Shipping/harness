@@ -225,7 +225,9 @@ fn app_card(overview: &Overview, app_error: Option<&str>) -> String {
         let rows: String = overview.installations.iter().map(installation_row).collect();
         format!(
             "<ul class=\"rows installs\">\n{rows}</ul>\n\
-             <p><a class=\"btn\" href=\"{href}\">Add another account ↗</a></p>\n",
+             <p><a class=\"btn\" href=\"{href}\">Add another account ↗</a></p>\n\
+             <p class=\"hint\">To install on another organisation, the app must be public: on \
+             GitHub open the app's Advanced settings and choose Make public.</p>\n",
             href = esc(&app::install_url(&app.slug)),
         )
     };
@@ -473,6 +475,7 @@ mod tests {
             )
         );
         assert!(page.contains("Add another account"));
+        assert!(page.contains("choose Make public."), "the public-app hint is shown");
     }
 
     #[test]

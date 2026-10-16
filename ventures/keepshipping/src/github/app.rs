@@ -243,7 +243,13 @@ pub struct Overview {
 
 /// The manifest GitHub's form takes: what the app is called, where its
 /// webhook and its return legs point, and the permissions and events it asks
-/// for. `public` is false: only the creating account may install it.
+/// for. `public` is true so the app can be installed on any account, including
+/// the organisations the operator runs (a private app is installable only on
+/// the account that created it). That is safe because only this console holds
+/// the app's private key, so only this console can act through the app; the
+/// webhook therefore never adds an installation it did not hear about from the
+/// signed-in setup callback. Apps created before this change may still be
+/// private; their owner can make them public in GitHub's advanced settings.
 #[must_use]
 pub fn manifest(name: &str) -> serde_json::Value {
     let permissions: serde_json::Map<String, serde_json::Value> = PERMISSIONS
@@ -257,7 +263,7 @@ pub fn manifest(name: &str) -> serde_json::Value {
         "redirect_url": format!("{CONSOLE_URL}{CREATED_PATH}"),
         "setup_url": format!("{CONSOLE_URL}{INSTALLED_PATH}"),
         "setup_on_update": true,
-        "public": false,
+        "public": true,
         "default_permissions": permissions,
         "default_events": ["pull_request", "workflow_run"],
     })
@@ -741,7 +747,35 @@ fn installation_of(row: &cratefield_core::Row) -> Result<Installation, Failed> {
     read().ok_or(SHAPE)
 }
 
-/// Stores or refreshes one installation.
+/// Refreshes an installation the console already records. An unknown id
+/// matches no row and is left alone: the webhook never adds installations.
+///
+/// # Errors
+///
+/// [`Failed`] when the database refuses the write.
+pub async fn refresh_installation(
+    db: Arc<dyn Database>,
+    installation: &Installation,
+    now: &str,
+) -> Result<(), Failed> {
+    db.execute(&Statement::with_values(
+        "UPDATE console_github_installation SET account_login = ?, account_type = ?, \
+         repository_selection = ?, updated_at = ? WHERE installation_id = ?",
+        vec![
+            installation.account.clone().into(),
+            installation.account_type.clone().into(),
+            installation.selection.clone().into(),
+            now.into(),
+            installation.id.into(),
+        ],
+    ))
+    .await
+    .map_err(|_| DATABASE)?;
+    Ok(())
+}
+
+/// Stores or refreshes one installation. Used by the signed-in setup
+/// callback, the only path that records a new installation.
 ///
 /// # Errors
 ///
@@ -1158,8 +1192,8 @@ pub async fn token_for_repo(
 }
 
 /// The installation of one repository, asked of GitHub with the app's JWT.
-/// Recorded when it belongs to this app; `None` when GitHub has no
-/// installation for it (`404`).
+/// Returned for use when it belongs to this app, and never stored; `None`
+/// when GitHub has no installation for it (`404`).
 async fn discover(
     db: Arc<dyn Database>,
     http: &dyn HttpClient,
@@ -1176,12 +1210,20 @@ async fn discover(
         return Ok(None);
     }
     ok(status, "the repository's installation")?;
-    let (app_id, installation) = read_installation(&body)?;
-    if app_id != app.app_id {
-        return Ok(None);
-    }
-    save_installation(db, &installation, &stamp(now)).await?;
-    Ok(Some(installation))
+    covering_installation(&body, app.app_id)
+}
+
+/// The installation a repository lookup answered with, when it belongs to
+/// `app_id`. Pure and never stored: a coverage answer is used for one token
+/// and then forgotten, so a stranger's installation of the public app cannot
+/// add a row through the fallback.
+///
+/// # Errors
+///
+/// [`Failed`] when the answer does not parse.
+pub fn covering_installation(body: &str, app_id: i64) -> Result<Option<Installation>, Failed> {
+    let (found_app, installation) = read_installation(body)?;
+    Ok((found_app == app_id).then_some(installation))
 }
 
 /// The installation's token: cached while fresh, else minted with the app's

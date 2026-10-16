@@ -7,10 +7,13 @@
 //! any check is answered and nothing else. The payload is never logged; only
 //! the event's name and the status are.
 //!
-//! What the console acts on is installations: created, deleted, suspended,
-//! resumed, and a repository selection that changed. Pull requests and
-//! workflow runs are not acted on yet; their handling (updating onboarding
-//! status from the workflow's result) is still to come.
+//! What the console acts on is installations: deleted, suspended, resumed,
+//! and a repository selection that changed. The app is public, so anyone can
+//! install it: a `created` delivery never adds a row. New installations are
+//! recorded only by the signed-in setup callback, which verifies them with the
+//! app's own key; the webhook only updates or removes rows already recorded.
+//! Pull requests and workflow runs are not acted on yet; their handling
+//! (updating onboarding status from the workflow's result) is still to come.
 
 use std::sync::Arc;
 
@@ -58,8 +61,9 @@ fn decode_hex(text: &str) -> Option<Vec<u8>> {
 pub enum Effect {
     /// Nothing to record (a ping, or an event not acted on yet).
     Nothing,
-    /// Record the installation, or refresh it.
-    Save(Installation),
+    /// Refresh an installation the console already records. An id it does not
+    /// record is ignored, so a delivery can never add an installation.
+    Refresh(Installation),
     /// Forget the installation with this id.
     Remove(i64),
     /// Record a new repository selection for this installation.
@@ -90,7 +94,8 @@ struct DeliveryAccount {
 
 /// The effect of one verified delivery, by its event name and body.
 ///
-/// `installation` events create, suspend, resume and delete installations;
+/// `installation` events suspend, resume and delete installations, and
+/// refresh the ones already recorded (a `created` for an unknown id is ignored);
 /// `installation_repositories` changes what an installation can see. `ping`
 /// and every other event (`pull_request`, `workflow_run`, to come) change
 /// nothing here.
@@ -103,7 +108,7 @@ pub fn effect_of(event: &str, body: &[u8]) -> Option<Effect> {
             let installation = delivery.installation?;
             Some(match delivery.action.as_str() {
                 "created" | "unsuspend" | "new_permissions_accepted" => {
-                    Effect::Save(Installation {
+                    Effect::Refresh(Installation {
                         id: installation.id,
                         account: installation.account.login,
                         account_type: installation.account.kind,
@@ -167,6 +172,26 @@ pub fn judge(
     })
 }
 
+/// Records one judged effect. Only rows already present are changed:
+/// [`Effect::Refresh`] and [`Effect::Selection`] update by id and do nothing
+/// for an unknown one.
+///
+/// # Errors
+///
+/// [`super::Failed`] when the database refuses the write.
+pub async fn apply(
+    db: Arc<dyn Database>,
+    effect: Effect,
+    stamp: &str,
+) -> Result<(), super::Failed> {
+    match effect {
+        Effect::Nothing => Ok(()),
+        Effect::Refresh(installation) => app::refresh_installation(db, &installation, stamp).await,
+        Effect::Remove(id) => app::remove_installation(db, id).await,
+        Effect::Selection(id, selection) => app::set_selection(db, id, &selection).await,
+    }
+}
+
 /// Answers one delivery and returns its HTTP status: [`judge`], then the
 /// effect is recorded. `204` when applied or ignored; `503` when the database
 /// refuses the write.
@@ -187,13 +212,7 @@ pub async fn handle(
         Err(status) => return status,
     };
     let stamp = app::stamp(now);
-    let applied = match effect {
-        Effect::Nothing => Ok(()),
-        Effect::Save(installation) => app::save_installation(db, &installation, &stamp).await,
-        Effect::Remove(id) => app::remove_installation(db, id).await,
-        Effect::Selection(id, selection) => app::set_selection(db, id, &selection).await,
-    };
-    match applied {
+    match apply(db, effect, &stamp).await {
         Ok(()) => 204,
         Err(failed) => {
             tracing::warn!(message = failed.message, "console: a webhook could not be recorded");
