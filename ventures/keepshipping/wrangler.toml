@@ -78,7 +78,8 @@ migrations_dir = "migrations"
 # The console fleet view (issue #169): the snapshot (key `fleet.json`) that
 # /console/fleet renders. The console's Cloudflare connect page (/console/
 # connect/cloudflare) and its hourly cron write it. Optional var
-# `CF_ACCOUNT_ID` picks the account when the token sees more than one.
+# `CF_ACCOUNT_ID` narrows it to one account; unset, every account the token
+# sees is read.
 [[kv_namespaces]]
 binding = "FLEET"
 # Namespace `keepshipping-console-fleet` on Factory0.

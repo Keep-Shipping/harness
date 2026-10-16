@@ -20,7 +20,8 @@ use worker::{Env, Fetch, Headers, Method, Request, RequestInit};
 use super::seal::{self, Sealed};
 use super::{
     Account, AccountError, CertificatePack, Envelope, Inventory, PagesProject, Verify,
-    WorkerDomain, WorkerScript, Zone, ZoneRecord, fleet_from, pick_account, token_is_active,
+    WorkerDomain, WorkerScript, Zone, ZoneRecord, fleet_from, merge, pick_accounts,
+    token_is_active,
 };
 use crate::fleet::Fleet;
 
@@ -249,14 +250,7 @@ async fn certificates(token: &str, zone_id: &str) -> Option<Vec<CertificatePack>
 
 /// Reads the account: its zones (with certificate status), Pages projects,
 /// Workers scripts and their custom domains.
-async fn collect(token: &str, wanted: Option<&str>) -> Result<Inventory, Failed> {
-    let accounts: Vec<Account> = list(token, "/accounts").await?;
-    let account = pick_account(&accounts, wanted)
-        .map_err(|error| match error {
-            AccountError::NoAccounts => NO_ACCOUNTS,
-            AccountError::NotVisible => NOT_VISIBLE,
-        })?
-        .clone();
+async fn collect(token: &str, account: Account) -> Inventory {
     let mut gaps = Vec::new();
     let zones: Vec<Zone> = or_gap(
         list(token, &format!("/zones?account.id={}", account.id)).await,
@@ -283,7 +277,7 @@ async fn collect(token: &str, wanted: Option<&str>) -> Result<Inventory, Failed>
         "Workers custom domains (Workers Scripts: Read)",
         &mut gaps,
     );
-    Ok(Inventory { account, zones: records, pages, scripts, worker_domains, gaps })
+    Inventory { account, zones: records, pages, scripts, worker_domains, gaps }
 }
 
 /// The `CF_ACCOUNT_ID` var, trimmed, blank meaning unset.
@@ -297,9 +291,18 @@ fn wanted_account(env: &Env) -> Option<String> {
 /// Collects with `token` and writes the snapshot to KV. The previous
 /// snapshot stays until a new one is complete.
 async fn write_snapshot(env: &Env, token: &str) -> Result<Fleet, Failed> {
-    let inventory = collect(token, wanted_account(env).as_deref()).await?;
+    let accounts: Vec<Account> = list(token, "/accounts").await?;
+    let picked =
+        pick_accounts(&accounts, wanted_account(env).as_deref()).map_err(|error| match error {
+            AccountError::NoAccounts => NO_ACCOUNTS,
+            AccountError::NotVisible => NOT_VISIBLE,
+        })?;
     let now = WorkersClock.now().format(&Rfc3339).map_err(|_| WRITE)?;
-    let fleet = fleet_from(&inventory, &now);
+    let mut fleets = Vec::with_capacity(picked.len());
+    for account in picked {
+        fleets.push(fleet_from(&collect(token, account.clone()).await, &now));
+    }
+    let fleet = merge(fleets, &now);
     let json = serde_json::to_string(&fleet).map_err(|_| WRITE)?;
     env.kv("FLEET")
         .map_err(|_| WRITE)?
