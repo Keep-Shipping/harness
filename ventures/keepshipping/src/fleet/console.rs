@@ -340,7 +340,13 @@ async fn connect_form(env: &Env) -> worker::Result<Response> {
         return page(503, &notice_page("Console not configured", SEALER_COPY, None));
     };
     match api::connected_at(env, &secret).await {
-        Ok(connected) => page(200, &connect_page(connected.as_deref(), None)),
+        Ok(connected) => {
+            let accounts = match connected {
+                Some(_) => api::visible_accounts(env, &secret).await,
+                None => Vec::new(),
+            };
+            page(200, &connect_page(connected.as_deref(), &accounts, None, &api::now()))
+        }
         Err(failed) => page(
             failed.status,
             &notice_page("Could not check the connection", failed.message, None),
@@ -610,10 +616,13 @@ mod tests {
 
     #[test]
     fn the_empty_state_points_at_connect_or_offers_refresh() {
-        let disconnected = empty_snapshot_page(false);
+        // The nav bar links the connect page on every page; the body is
+        // what differs.
+        let main = |page: String| page.split("<main").nth(1).unwrap_or_default().to_owned();
+        let disconnected = main(empty_snapshot_page(false));
         assert!(disconnected.contains("href=\"/console/connect/cloudflare\""));
         assert!(!disconnected.contains("action=\"/console/fleet/refresh\""));
-        let connected = empty_snapshot_page(true);
+        let connected = main(empty_snapshot_page(true));
         assert!(connected.contains("action=\"/console/fleet/refresh\""));
         assert!(!connected.contains("href=\"/console/connect/cloudflare\""));
     }
