@@ -61,6 +61,19 @@ pub fn safe_next(raw: &str) -> Option<&str> {
     ok.then_some(raw)
 }
 
+/// A one-line notice shown at the top of the connection page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Notice<'a> {
+    /// Nothing to say.
+    None,
+    /// The app was removed from the console. `advanced` is GitHub's settings
+    /// page for the app, when the link was checked.
+    Removed {
+        /// The app's advanced settings page on GitHub.
+        advanced: Option<&'a str>,
+    },
+}
+
 /// What the page shows about the personal token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State<'a> {
@@ -90,10 +103,25 @@ pub fn connect_page(
     next: Option<&str>,
     now: &str,
 ) -> String {
+    connect_page_noticed(overview, app_error, token, token_error, next, Notice::None, now)
+}
+
+/// [`connect_page`], with a notice above its content.
+#[must_use]
+pub fn connect_page_noticed(
+    overview: &Overview,
+    app_error: Option<&str>,
+    token: State<'_>,
+    token_error: Option<&str>,
+    next: Option<&str>,
+    notice: Notice<'_>,
+    now: &str,
+) -> String {
     let app_card = app_card(overview, app_error);
     let token_open = overview.app.is_none() || matches!(token, State::Connected { .. });
     let body = format!(
         "<main id=\"main\" class=\"wrap\">\n\
+         {notice}\
          <div class=\"pagehead\"><div>\n<h1>GitHub connection</h1>\n\
          <p class=\"sub\">The infrastructure code for each site lives in a GitHub repository. \
          Connecting lets the console read your app repositories and open the pull requests \
@@ -116,10 +144,45 @@ pub fn connect_page(
          {token_card}\
          </details>\n\
          </main>\n",
+        notice = notice_html(notice),
         open = if token_open { " open" } else { "" },
         token_card = token_card(token, token_error, next, now),
     );
     signed_in_layout("GitHub connection", Tab::GitHub, &body)
+}
+
+/// The notice's markup. The GitHub link is escaped like every other value.
+fn notice_html(notice: Notice<'_>) -> String {
+    match notice {
+        Notice::None => String::new(),
+        Notice::Removed { advanced } => {
+            let link = advanced
+                .map(|url| {
+                    format!(
+                        " <a href=\"{}\" rel=\"noopener noreferrer\">Open the app on GitHub ↗</a>",
+                        esc(url)
+                    )
+                })
+                .unwrap_or_default();
+            format!(
+                "<p class=\"callout ok\" role=\"status\">The app was removed from the console. \
+                 Delete it on GitHub too, so its name is free again.{link}</p>\n"
+            )
+        }
+    }
+}
+
+/// The remove button, shown in both app states (created, and installed): a
+/// secondary form with one line of warning.
+fn remove_form() -> String {
+    format!(
+        "<form class=\"remove-app\" method=\"post\" action=\"{REMOVE}\">\n\
+         <p class=\"hint\">Use this if the app was created under the wrong account. Sites \
+         already set up keep working only if they use a personal token.</p>\n\
+         <button class=\"btn\" type=\"submit\">Remove this app from the console</button>\n\
+         </form>\n",
+        REMOVE = app::REMOVE_PATH,
+    )
 }
 
 /// The app's card: the create form, the "Install" step, or the installations.
@@ -177,10 +240,11 @@ fn app_card(overview: &Overview, app_error: Option<&str>) -> String {
          <span class=\"tag live\">recommended</span></h2><p>{status}</p></div>\n\
          <p class=\"muted\">App <a href=\"{page}\" rel=\"noopener noreferrer\">{slug}</a>, \
          created under {owner}.</p>\n\
-         {error}{shortfall}{installs}</section>\n",
+         {error}{shortfall}{installs}{remove}</section>\n",
         page = esc(&app.html_url),
         slug = esc(&app.slug),
         owner = esc(&app.owner),
+        remove = remove_form(),
     )
 }
 
@@ -554,6 +618,73 @@ mod tests {
         assert!(page.contains("name=\"next\" value=\"/console/x&quot;y\""));
         let plain = connect_page(&Overview::default(), None, State::Disconnected, None, None, NOW);
         assert!(!plain.contains("name=\"next\""));
+    }
+
+    #[test]
+    fn the_remove_button_is_offered_when_created_and_when_installed() {
+        let created = Overview { app: Some(app("kp")), installations: vec![] };
+        let installed = Overview {
+            app: Some(app("kp")),
+            installations: vec![install(7, "nick", "User", "all")],
+        };
+        for overview in [created, installed] {
+            let page = connect_page(&overview, None, State::Disconnected, None, None, NOW);
+            assert!(page.contains("action=\"/console/connect/github/app/remove\""));
+            assert!(page.contains("method=\"post\""));
+            assert!(page.contains("Remove this app from the console"));
+            assert!(page.contains(
+                "Use this if the app was created under the wrong account. Sites already set up \
+                 keep working only if they use a personal token."
+            ));
+        }
+        // No app, nothing to remove.
+        let page = connect_page(&Overview::default(), None, State::Disconnected, None, None, NOW);
+        assert!(!page.contains("app/remove"));
+    }
+
+    #[test]
+    fn the_removal_notice_links_github_and_escapes_the_link() {
+        let overview = Overview::default();
+        let link = "https://github.com/settings/apps/kp/advanced";
+        let page = connect_page_noticed(
+            &overview,
+            None,
+            State::Disconnected,
+            None,
+            None,
+            Notice::Removed { advanced: Some(link) },
+            NOW,
+        );
+        assert!(page.contains(
+            "The app was removed from the console. Delete it on GitHub too, so its name is free again."
+        ));
+        assert!(page.contains(&format!("href=\"{link}\"")));
+
+        let hostile = connect_page_noticed(
+            &overview,
+            None,
+            State::Disconnected,
+            None,
+            None,
+            Notice::Removed { advanced: Some("https://github.com/x\"><script>") },
+            NOW,
+        );
+        assert!(!hostile.contains("<script>"));
+        assert!(hostile.contains("&quot;&gt;&lt;script&gt;"));
+
+        let bare = connect_page_noticed(
+            &overview,
+            None,
+            State::Disconnected,
+            None,
+            None,
+            Notice::Removed { advanced: None },
+            NOW,
+        );
+        assert!(bare.contains("so its name is free again.</p>"), "no link, the line still shows");
+        assert!(!bare.contains("Open the app on GitHub"));
+        let quiet = connect_page(&overview, None, State::Disconnected, None, None, NOW);
+        assert!(!quiet.contains("was removed from the console"));
     }
 
     #[test]
