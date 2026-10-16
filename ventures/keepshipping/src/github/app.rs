@@ -536,6 +536,51 @@ pub fn advanced_url(html_url: &str) -> Option<String> {
     }
 }
 
+/// The advanced settings link for an app from its slug and owner. GitHub's own
+/// `html_url` for an app is its public page (`https://github.com/apps/<slug>`),
+/// which has no delete button, so the link is built from the owner instead:
+/// an organisation's apps live under `/organizations/<org>/settings/apps`, a
+/// personal account's under `/settings/apps`. `None` unless both are plain.
+#[must_use]
+pub fn advanced_url_for(slug: &str, owner: &str, owner_is_org: bool) -> Option<String> {
+    if !plain(slug, APP_SLUG_MAX) || !plain(owner, ORG_MAX) {
+        return None;
+    }
+    let page = if owner_is_org {
+        format!("https://github.com/organizations/{owner}/settings/apps/{slug}")
+    } else {
+        format!("https://github.com/settings/apps/{slug}")
+    };
+    advanced_url(&page)
+}
+
+/// Whether `login` is an organisation, from GitHub's public users endpoint
+/// (`type` is `Organization` or `User`). `None` when GitHub cannot say.
+pub async fn owner_is_org(login: &str) -> Option<bool> {
+    if !plain(login, ORG_MAX) {
+        return None;
+    }
+    let headers = worker::Headers::new();
+    headers.set("accept", "application/vnd.github+json").ok()?;
+    headers.set("x-github-api-version", "2022-11-28").ok()?;
+    headers.set("user-agent", "keepshipping-console").ok()?;
+    let mut init = worker::RequestInit::new();
+    init.with_method(worker::Method::Get).with_headers(headers);
+    let req =
+        worker::Request::new_with_init(&format!("https://api.github.com/users/{login}"), &init)
+            .ok()?;
+    let mut res = worker::Fetch::Request(req).send().await.ok()?;
+    if res.status_code() != 200 {
+        return None;
+    }
+    let body: serde_json::Value = res.json().await.ok()?;
+    match body.get("type").and_then(serde_json::Value::as_str) {
+        Some("Organization") => Some(true),
+        Some("User") => Some(false),
+        _ => None,
+    }
+}
+
 /// The advanced link a redirect carries back, checked: it must be exactly what
 /// [`advanced_url`] builds from the app's page address. Anything else is `None`.
 #[must_use]

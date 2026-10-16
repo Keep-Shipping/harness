@@ -640,7 +640,11 @@ async fn github_app_remove(env: &Env) -> worker::Result<Response> {
     };
     // The page address is read before the row goes, for the link.
     let advanced = match github_app::app_row(db.clone()).await {
-        Ok(app) => app.and_then(|app| github_app::advanced_url(&app.html_url)),
+        Ok(Some(app)) => match github_app::owner_is_org(&app.owner).await {
+            Some(is_org) => github_app::advanced_url_for(&app.slug, &app.owner, is_org),
+            None => None,
+        },
+        Ok(None) => None,
         Err(failed) => {
             return page(
                 failed.status,
