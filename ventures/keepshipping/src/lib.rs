@@ -365,6 +365,12 @@ fn origin_refused() -> worker::Result<Response> {
     .map(|response| response.with_status(403))
 }
 
+/// `/` and `/console` on a read: the paths a person types, which have no
+/// page and would otherwise be the harness's empty 404.
+fn is_console_entry(method: &str, path: &str) -> bool {
+    matches!(method, "GET" | "HEAD") && matches!(path, "/" | "/console" | "/console/")
+}
+
 /// Every HTTP request lands here. Writes are checked against the site
 /// origins before anything else runs; everything else — including browser
 /// preflights, which are `OPTIONS` — goes to the harness. A header that
@@ -384,6 +390,13 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> worker::Result<Respo
         &SITE_ORIGINS,
     ) {
         return origin_refused();
+    }
+    // A bare host or `/console` has no page of its own: send it to the
+    // console's start page, which signs the visitor in first.
+    if is_console_entry(req.method().as_ref(), req.path().as_str()) {
+        let headers = worker::Headers::new();
+        headers.set("location", signin::DEFAULT_NEXT)?;
+        return Ok(Response::empty()?.with_status(302).with_headers(headers));
     }
     // The console fleet view (issue #169); `None` falls through.
     if let Some(response) = fleet::handle(&req, &env).await {
@@ -407,7 +420,19 @@ pub async fn scheduled(event: worker::ScheduledEvent, env: Env, ctx: worker::Sch
 
 #[cfg(test)]
 mod tests {
-    use super::{MailProvider, mail_provider};
+    use super::{MailProvider, is_console_entry, mail_provider};
+
+    #[test]
+    fn the_bare_host_and_console_redirect_on_reads_only() {
+        for path in ["/", "/console", "/console/"] {
+            assert!(is_console_entry("GET", path), "{path}");
+            assert!(is_console_entry("HEAD", path), "{path}");
+            assert!(!is_console_entry("POST", path), "{path}");
+        }
+        for path in ["/console/fleet", "/console/login", "/__health", "/v1/edits"] {
+            assert!(!is_console_entry("GET", path), "{path}");
+        }
+    }
 
     #[test]
     fn a_set_owlpost_key_selects_owlpost() {
