@@ -186,7 +186,9 @@ fn notice_html(notice: Notice<'_>) -> String {
                 "<section class=\"panel\" aria-labelledby=\"found-title\">\n\
                  <h2 id=\"found-title\">Installations not listed yet</h2>\n\
                  <p class=\"muted\">GitHub has these installations of the app that this console \
-                 does not list. Add the ones that are yours.</p>\n\
+                 does not list. Add only the ones that are yours: the app is public, so an \
+                 account you do not know can appear here, and adding it lets the console act in \
+                 its repositories.</p>\n\
                  <ul class=\"rows installs\">\n{rows}</ul>\n</section>\n"
             )
         }
