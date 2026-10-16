@@ -276,8 +276,8 @@ pub fn route(path: &str) -> Option<Route> {
 
 /// The whole fleet: a summary, what needs attention, then one section per
 /// venture with its apps (Pages sites and Workers, each environment under
-/// its production row) and its domains. The order is fixed by
-/// [`sort_key`], so the same snapshot always renders the same page; `now`
+/// its production row) and its domains. The order is fixed (venture,
+/// group, production first), so the same snapshot always renders the same page; `now`
 /// (RFC 3339) is what the relative times are measured from.
 #[must_use]
 pub fn render_index(snapshot: &Fleet, now: &str) -> String {
