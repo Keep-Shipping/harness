@@ -52,6 +52,9 @@ pub const INSTALLED_PATH: &str = "/console/connect/github/app/installed";
 pub const CREATE_PATH: &str = "/console/connect/github/app/new";
 /// The webhook's path, as the manifest's `hook_attributes` name it.
 pub const WEBHOOK_PATH: &str = "/console/github/webhook";
+/// Where the connection page's remove button posts: the app is forgotten by
+/// the console (not on GitHub).
+pub const REMOVE_PATH: &str = "/console/connect/github/app/remove";
 
 /// The secrets-store name of the app's private key (PEM).
 pub const PRIVATE_KEY: &str = "github-app/private-key";
@@ -59,6 +62,8 @@ pub const PRIVATE_KEY: &str = "github-app/private-key";
 pub const WEBHOOK_SECRET: &str = "github-app/webhook-secret";
 /// The secrets-store name of the app's OAuth client secret.
 pub const CLIENT_SECRET: &str = "github-app/client-secret";
+/// Every secret the app keeps, all of which a removal forgets.
+pub const SECRET_NAMES: [&str; 3] = [PRIVATE_KEY, WEBHOOK_SECRET, CLIENT_SECRET];
 
 /// How long a manifest `state` is good for, in seconds.
 const STATE_TTL_SECS: i64 = 600;
@@ -511,6 +516,92 @@ pub fn install_url(slug: &str) -> String {
     format!("https://github.com/apps/{}/installations/new", segment(slug))
 }
 
+/// GitHub's settings page for an app's advanced options, where it is deleted.
+/// Built only from the app's stored page address, and only when that address
+/// is one of GitHub's two app-page forms with a plain slug (and organisation):
+/// anything else is `None`, so no other host or path can reach the page.
+#[must_use]
+pub fn advanced_url(html_url: &str) -> Option<String> {
+    let parts: Vec<&str> = html_url.strip_prefix("https://github.com/")?.split('/').collect();
+    match parts.as_slice() {
+        ["settings", "apps", slug] if plain(slug, APP_SLUG_MAX) => {
+            Some(format!("https://github.com/settings/apps/{slug}/advanced"))
+        }
+        ["organizations", org, "settings", "apps", slug]
+            if plain(org, ORG_MAX) && plain(slug, APP_SLUG_MAX) =>
+        {
+            Some(format!("https://github.com/organizations/{org}/settings/apps/{slug}/advanced"))
+        }
+        _ => None,
+    }
+}
+
+/// The advanced settings link for an app from its slug and owner. GitHub's own
+/// `html_url` for an app is its public page (`https://github.com/apps/<slug>`),
+/// which has no delete button, so the link is built from the owner instead:
+/// an organisation's apps live under `/organizations/<org>/settings/apps`, a
+/// personal account's under `/settings/apps`. `None` unless both are plain.
+#[must_use]
+pub fn advanced_url_for(slug: &str, owner: &str, owner_is_org: bool) -> Option<String> {
+    if !plain(slug, APP_SLUG_MAX) || !plain(owner, ORG_MAX) {
+        return None;
+    }
+    let page = if owner_is_org {
+        format!("https://github.com/organizations/{owner}/settings/apps/{slug}")
+    } else {
+        format!("https://github.com/settings/apps/{slug}")
+    };
+    advanced_url(&page)
+}
+
+/// Whether `login` is an organisation, from GitHub's public users endpoint
+/// (`type` is `Organization` or `User`). `None` when GitHub cannot say.
+pub async fn owner_is_org(login: &str) -> Option<bool> {
+    if !plain(login, ORG_MAX) {
+        return None;
+    }
+    let headers = worker::Headers::new();
+    headers.set("accept", "application/vnd.github+json").ok()?;
+    headers.set("x-github-api-version", "2022-11-28").ok()?;
+    headers.set("user-agent", "keepshipping-console").ok()?;
+    let mut init = worker::RequestInit::new();
+    init.with_method(worker::Method::Get).with_headers(headers);
+    let req =
+        worker::Request::new_with_init(&format!("https://api.github.com/users/{login}"), &init)
+            .ok()?;
+    let mut res = worker::Fetch::Request(req).send().await.ok()?;
+    if res.status_code() != 200 {
+        return None;
+    }
+    let body: serde_json::Value = res.json().await.ok()?;
+    match body.get("type").and_then(serde_json::Value::as_str) {
+        Some("Organization") => Some(true),
+        Some("User") => Some(false),
+        _ => None,
+    }
+}
+
+/// The advanced link a redirect carries back, checked: it must be exactly what
+/// [`advanced_url`] builds from the app's page address. Anything else is `None`.
+#[must_use]
+pub fn checked_advanced_url(raw: &str) -> Option<String> {
+    let page = raw.strip_suffix("/advanced")?;
+    advanced_url(page).filter(|built| built == raw)
+}
+
+/// The longest app slug GitHub is taken to allow here.
+const APP_SLUG_MAX: usize = 64;
+/// The longest organisation login (GitHub's limit).
+const ORG_MAX: usize = 39;
+
+/// Whether a slug or login is non-empty, short enough, and made only of the
+/// letters, digits and hyphens GitHub uses.
+fn plain(text: &str, max: usize) -> bool {
+    !text.is_empty()
+        && text.len() <= max
+        && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
 /// Whether a code from GitHub's redirect is one this console will send: the
 /// characters GitHub uses, and a sane length.
 #[must_use]
@@ -760,6 +851,23 @@ pub async fn finish_app(db: Arc<dyn Database>, app: &AppRow) -> Result<(), Faile
     Ok(())
 }
 
+/// Forgets the app in the console's database: every installation row, then
+/// the app row, which includes a claim left behind by a create that never
+/// finished. The app's secrets are forgotten separately, by the caller.
+///
+/// # Errors
+///
+/// [`Failed`] when the database refuses a write.
+pub async fn remove_app(db: Arc<dyn Database>) -> Result<(), Failed> {
+    db.execute(&Statement::new("DELETE FROM console_github_installation"))
+        .await
+        .map_err(|_| DATABASE)?;
+    db.execute(&Statement::new("DELETE FROM console_github_app WHERE id = 1"))
+        .await
+        .map_err(|_| DATABASE)?;
+    Ok(())
+}
+
 /// Gives a claim back, when the create did not finish. Touches nothing that
 /// is a finished app.
 ///
@@ -949,6 +1057,17 @@ fn cached_token(id: i64, now: i64) -> Option<String> {
 fn remember_token(id: i64, token: &str, expires: i64) {
     if let Ok(mut cache) = TOKENS.get_or_init(Default::default).lock() {
         cache.insert(id, (token.to_owned(), expires));
+    }
+}
+
+/// Drops the installation tokens and coverage answers this isolate holds, so
+/// nothing minted for a removed app is used again here.
+pub fn forget_cached() {
+    if let Some(Ok(mut tokens)) = TOKENS.get().map(Mutex::lock) {
+        tokens.clear();
+    }
+    if let Some(Ok(mut coverage)) = COVERAGE.get().map(Mutex::lock) {
+        coverage.clear();
     }
 }
 

@@ -444,3 +444,105 @@ fn a_grant_short_of_a_required_permission_is_named_and_a_full_grant_is_not() {
     );
     assert_eq!(missing_permissions(&serde_json::Value::Null).len(), 7);
 }
+
+#[test]
+fn the_advanced_link_is_built_only_from_a_checked_app_page() {
+    assert_eq!(
+        advanced_url("https://github.com/settings/apps/kp-console").as_deref(),
+        Some("https://github.com/settings/apps/kp-console/advanced")
+    );
+    assert_eq!(
+        advanced_url("https://github.com/organizations/keep-shipping/settings/apps/kp-console")
+            .as_deref(),
+        Some("https://github.com/organizations/keep-shipping/settings/apps/kp-console/advanced")
+    );
+    // Other hosts, schemes, paths and characters never reach the page.
+    for hostile in [
+        "http://github.com/settings/apps/kp",
+        "https://evil.example/settings/apps/kp",
+        "https://github.com.evil.example/settings/apps/kp",
+        "https://github.com/apps/kp",
+        "https://github.com/settings/apps/kp/advanced",
+        "https://github.com/settings/apps/",
+        "https://github.com/settings/apps/kp?x=1",
+        "https://github.com/settings/apps/kp#frag",
+        "https://github.com/settings/apps/k%20p",
+        "https://github.com/settings/apps/kp\"><script>",
+        "https://github.com/organizations//settings/apps/kp",
+        "https://github.com/organizations/a.b/settings/apps/kp",
+        "https://github.com/organizations/keep-shipping/settings/apps/",
+        "//github.com/settings/apps/kp",
+        "",
+    ] {
+        assert_eq!(advanced_url(hostile), None, "{hostile} is refused");
+    }
+    let long = "a".repeat(APP_SLUG_MAX + 1);
+    assert_eq!(advanced_url(&format!("https://github.com/settings/apps/{long}")), None);
+}
+
+#[test]
+fn a_redirected_advanced_link_is_accepted_only_when_it_is_the_built_one() {
+    let built = advanced_url("https://github.com/settings/apps/kp").expect("built");
+    assert_eq!(checked_advanced_url(&built).as_deref(), Some(built.as_str()));
+    assert_eq!(checked_advanced_url("https://github.com/settings/apps/kp/advanced/x"), None);
+    assert_eq!(checked_advanced_url("https://evil.example/settings/apps/kp/advanced"), None);
+    assert_eq!(checked_advanced_url("https://github.com/settings/apps/kp"), None);
+    assert_eq!(checked_advanced_url(""), None);
+}
+
+#[test]
+fn removing_the_app_forgets_its_installations_and_its_row_and_a_claim_too() {
+    let db = database();
+    let installation = Installation {
+        id: 7,
+        account: "keep-shipping".to_owned(),
+        account_type: "Organization".to_owned(),
+        selection: "all".to_owned(),
+    };
+    block(save_installation(Arc::clone(&db), &installation, "2026-10-16T09:00:00Z")).expect("save");
+    block(finish_app(Arc::clone(&db), &app_row_for_tests())).expect("finish");
+    block(remove_app(Arc::clone(&db))).expect("remove");
+    assert!(block(installations(Arc::clone(&db))).expect("list").is_empty());
+    assert!(block(app_row(Arc::clone(&db))).expect("row").is_none());
+    // The row is gone, so a fresh claim is taken (a placeholder would refuse it).
+    assert!(block(claim_app(Arc::clone(&db), NOW)).expect("claim"));
+
+    // A placeholder claim, left by a create that never finished, goes too.
+    block(remove_app(Arc::clone(&db))).expect("remove the claim");
+    assert!(block(claim_app(db, NOW)).expect("claim"), "the claim is gone");
+}
+
+fn app_row_for_tests() -> AppRow {
+    AppRow {
+        app_id: 42,
+        slug: "kp-console".to_owned(),
+        client_id: "Iv1.abc".to_owned(),
+        html_url: "https://github.com/organizations/keep-shipping/settings/apps/kp-console"
+            .to_owned(),
+        owner: "keep-shipping".to_owned(),
+        permissions: serde_json::json!({"contents": "write"}),
+    }
+}
+
+#[test]
+fn the_delete_link_is_built_from_the_slug_and_owner_not_the_public_page() {
+    assert_eq!(
+        advanced_url_for("keep-shipping-console", "Keep-Shipping", true).as_deref(),
+        Some(
+            "https://github.com/organizations/Keep-Shipping/settings/apps/keep-shipping-console/advanced"
+        )
+    );
+    assert_eq!(
+        advanced_url_for("keep-shipping-console", "ParallelEntrepreneur", false).as_deref(),
+        Some("https://github.com/settings/apps/keep-shipping-console/advanced")
+    );
+    assert_eq!(advanced_url("https://github.com/apps/keep-shipping-console"), None);
+    assert_eq!(advanced_url_for("bad/slug", "owner", false), None);
+    assert_eq!(advanced_url_for("slug", "own?er", true), None);
+    for built in [
+        advanced_url_for("a-1", "Org", true).unwrap(),
+        advanced_url_for("a-1", "me", false).unwrap(),
+    ] {
+        assert_eq!(checked_advanced_url(&built).as_deref(), Some(built.as_str()));
+    }
+}

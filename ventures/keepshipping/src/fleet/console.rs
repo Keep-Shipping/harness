@@ -30,7 +30,8 @@ use crate::cloudflare::rollback;
 use crate::github::app as github_app;
 use crate::github::page::{
     CONNECT_PATH as GITHUB_CONNECT_PATH, DISCONNECT_PATH as GITHUB_DISCONNECT_PATH,
-    State as GitHubState, connect_page as github_connect_page, handoff_page, safe_next,
+    Notice as GitHubNotice, State as GitHubState, connect_page_noticed as github_connect_noticed,
+    handoff_page, safe_next,
 };
 use crate::github::{self, webhook};
 use crate::onboard::flow::{self, Reply as WizardReply};
@@ -85,6 +86,8 @@ enum Action {
     GitHubAppCreated,
     /// `GET`: the app was installed; the installation is verified here.
     GitHubAppInstalled,
+    /// `POST` forgets the app and its secrets in the console (not on GitHub).
+    GitHubAppRemove,
     /// `POST` re-wraps the stored data keys under the current master key.
     RewrapKeys,
 }
@@ -101,6 +104,7 @@ fn action_for(path: &str) -> Option<Action> {
         github_app::CREATE_PATH => Some(Action::GitHubAppNew),
         github_app::CREATED_PATH => Some(Action::GitHubAppCreated),
         github_app::INSTALLED_PATH => Some(Action::GitHubAppInstalled),
+        github_app::REMOVE_PATH => Some(Action::GitHubAppRemove),
         KEYS_REWRAP_PATH => Some(Action::RewrapKeys),
         _ => None,
     }
@@ -335,34 +339,32 @@ async fn serve(req: &mut Request, env: &Env, route: Route) -> worker::Result<Res
     with_cookies(fleet_page(req, env, route, &session.email).await?, &session.set_cookies)
 }
 
+/// Whether an action answers a request, given whether it is a `POST` and
+/// whether it is a `GET` or `HEAD`. Every other action is `POST` only.
+fn method_allowed(action: Action, post: bool, read_only: bool) -> bool {
+    match action {
+        Action::Connect | Action::GitHub => post || read_only,
+        Action::GitHubAppCreated | Action::GitHubAppInstalled => read_only,
+        _ => post,
+    }
+}
+
+/// The `Allow` header for an action's refusal: the methods it answers.
+fn allowed_methods(action: Action) -> &'static str {
+    match action {
+        Action::Connect | Action::GitHub => "GET, HEAD, POST",
+        Action::GitHubAppCreated | Action::GitHubAppInstalled => "GET, HEAD",
+        _ => "POST",
+    }
+}
+
 /// The connect page (GET), the paste (POST), disconnect and refresh (POST).
 /// Every one is behind [`authorize`]; the methods are checked first.
 async fn serve_action(req: &mut Request, env: &Env, action: Action) -> worker::Result<Response> {
     let post = matches!(req.method(), Method::Post);
     let read_only = matches!(req.method(), Method::Get | Method::Head);
-    let allowed = match action {
-        Action::Connect | Action::GitHub => post || read_only,
-        Action::GitHubAppCreated | Action::GitHubAppInstalled => read_only,
-        Action::Disconnect
-        | Action::Refresh
-        | Action::ConnectDeploy
-        | Action::DisconnectDeploy
-        | Action::GitHubDisconnect
-        | Action::GitHubAppNew
-        | Action::RewrapKeys => post,
-    };
-    if !allowed {
-        let allow = match action {
-            Action::Connect | Action::GitHub => "GET, HEAD, POST",
-            Action::GitHubAppCreated | Action::GitHubAppInstalled => "GET, HEAD",
-            Action::Disconnect
-            | Action::Refresh
-            | Action::ConnectDeploy
-            | Action::DisconnectDeploy
-            | Action::GitHubDisconnect
-            | Action::GitHubAppNew
-            | Action::RewrapKeys => "POST",
-        };
+    if !method_allowed(action, post, read_only) {
+        let allow = allowed_methods(action);
         return page_with(
             405,
             &notice_page(
@@ -390,6 +392,7 @@ async fn serve_action(req: &mut Request, env: &Env, action: Action) -> worker::R
         Action::GitHubAppNew => github_app_new(req, env, &session.email).await?,
         Action::GitHubAppCreated => github_app_created(req, env, &session.email).await?,
         Action::GitHubAppInstalled => github_app_installed(req, env).await?,
+        Action::GitHubAppRemove => github_app_remove(env).await?,
         Action::RewrapKeys => rewrap_keys(env).await?,
     };
     with_cookies(response, &session.set_cookies)
@@ -481,7 +484,16 @@ async fn connect_save(req: &mut Request, env: &Env, deploy: bool) -> worker::Res
 /// returns the person.
 async fn github_form(req: &Request, env: &Env) -> worker::Result<Response> {
     let next = query_value(req, "next");
-    github_page(env, None, next.as_deref().and_then(safe_next)).await
+    // The removal's notice: the link is taken only when it passes the check.
+    let removed = query_value(req, "notice").as_deref() == Some("removed");
+    let advanced =
+        query_value(req, "advanced").and_then(|raw| github_app::checked_advanced_url(&raw));
+    let notice = if removed {
+        GitHubNotice::Removed { advanced: advanced.as_deref() }
+    } else {
+        GitHubNotice::None
+    };
+    github_page_noticed(env, None, next.as_deref().and_then(safe_next), notice).await
 }
 
 /// The GitHub connection page, rendered from what is stored. `app_error` is a
@@ -490,6 +502,16 @@ async fn github_page(
     env: &Env,
     app_error: Option<&str>,
     next: Option<&str>,
+) -> worker::Result<Response> {
+    github_page_noticed(env, app_error, next, GitHubNotice::None).await
+}
+
+/// [`github_page`], with the notice a redirect carried.
+async fn github_page_noticed(
+    env: &Env,
+    app_error: Option<&str>,
+    next: Option<&str>,
+    notice: GitHubNotice<'_>,
 ) -> worker::Result<Response> {
     let db = match secrets::d1(env) {
         Ok(db) => db,
@@ -535,7 +557,10 @@ async fn github_page(
         }
         None => GitHubState::Disconnected,
     };
-    page(200, &github_connect_page(&overview, app_error, token_state, None, next, &api::now()))
+    page(
+        200,
+        &github_connect_noticed(&overview, app_error, token_state, None, next, notice, &api::now()),
+    )
 }
 
 /// The app's create form: the organisation and the name, checked, then a
@@ -583,6 +608,60 @@ async fn github_app_new(req: &mut Request, env: &Env, email: &str) -> worker::Re
     let manifest = github_app::manifest(&name).to_string();
     let target = github_app::create_target(org.as_deref(), &state);
     page(200, &handoff_page(&name, org.as_deref(), &manifest, &target))
+}
+
+/// The redirect after a removal: the connection page with the notice, and
+/// GitHub's settings link for the app when it was checked.
+fn removed_location(advanced: Option<&str>) -> String {
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("notice", "removed");
+    if let Some(url) = advanced {
+        query.append_pair("advanced", url);
+    }
+    format!("{GITHUB_CONNECT_PATH}?{}", query.finish())
+}
+
+/// Removes the GitHub App from the console: its three secrets are forgotten
+/// first, then the installations and the app row, then this isolate's cached
+/// tokens. The app itself stays on GitHub, which the notice says. A failure
+/// part-way is safe to retry: each step is a plain delete. Behind the same
+/// authorisation and origin checks as the other writes here.
+async fn github_app_remove(env: &Env) -> worker::Result<Response> {
+    let back = Some((GITHUB_CONNECT_PATH, "Back to the GitHub connection"));
+    let failed_copy = "The app could not be removed right now. Try again in a moment.";
+    let db = match secrets::d1(env) {
+        Ok(db) => db,
+        Err(_) => {
+            return page(
+                503,
+                &notice_page("Could not remove the app", secrets::NO_MASTER_KEY_COPY, back),
+            );
+        }
+    };
+    // The page address is read before the row goes, for the link.
+    let advanced = match github_app::app_row(db.clone()).await {
+        Ok(Some(app)) => match github_app::owner_is_org(&app.owner).await {
+            Some(is_org) => github_app::advanced_url_for(&app.slug, &app.owner, is_org),
+            None => None,
+        },
+        Ok(None) => None,
+        Err(failed) => {
+            return page(
+                failed.status,
+                &notice_page("Could not remove the app", failed.message, back),
+            );
+        }
+    };
+    for name in github_app::SECRET_NAMES {
+        if secrets::forget(env, name, &secrets::unsealed()).await.is_err() {
+            return page(503, &notice_page("Could not remove the app", failed_copy, back));
+        }
+    }
+    if github_app::remove_app(db).await.is_err() {
+        return page(503, &notice_page("Could not remove the app", failed_copy, back));
+    }
+    github_app::forget_cached();
+    redirect(303, &removed_location(advanced.as_deref()))
 }
 
 /// GitHub's redirect after it created the app: the `state` is checked (once,
@@ -1094,7 +1173,9 @@ const READ_COPY: &str = "The fleet could not be read right now. Try again shortl
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, action_for, rewrap_copy};
+    use super::{
+        Action, action_for, allowed_methods, method_allowed, removed_location, rewrap_copy,
+    };
     use crate::fleet::{Route, empty_snapshot_page, route};
 
     #[test]
@@ -1147,8 +1228,45 @@ mod tests {
             Some(Action::GitHubAppInstalled)
         ));
         assert!(action_for("/console/connect/github/app/new/extra").is_none());
+        assert!(matches!(
+            action_for("/console/connect/github/app/remove"),
+            Some(Action::GitHubAppRemove)
+        ));
+        assert!(matches!(
+            action_for("/console/connect/github/app/remove/"),
+            Some(Action::GitHubAppRemove)
+        ));
+        assert!(action_for("/console/connect/github/app/remove/extra").is_none());
         // The webhook is not an action: it is answered before the session gate.
         assert!(action_for("/console/github/webhook").is_none());
+    }
+
+    #[test]
+    fn the_app_remove_answers_post_only() {
+        // A GET (or HEAD) is refused with the Allow header naming POST.
+        assert!(method_allowed(Action::GitHubAppRemove, true, false));
+        assert!(!method_allowed(Action::GitHubAppRemove, false, true));
+        assert_eq!(allowed_methods(Action::GitHubAppRemove), "POST");
+        // Like the GitHub disconnect beside it.
+        assert!(method_allowed(Action::GitHubDisconnect, true, false));
+        assert!(!method_allowed(Action::GitHubDisconnect, false, true));
+        // The connection page still takes GET, HEAD and POST.
+        assert!(method_allowed(Action::GitHub, true, false));
+        assert!(method_allowed(Action::GitHub, false, true));
+        assert_eq!(allowed_methods(Action::GitHub), "GET, HEAD, POST");
+        assert!(!method_allowed(Action::GitHubAppInstalled, true, false));
+    }
+
+    #[test]
+    fn the_removal_redirect_names_the_notice_and_only_a_checked_link() {
+        assert_eq!(removed_location(None), "/console/connect/github?notice=removed");
+        let link =
+            "https://github.com/organizations/keep-shipping/settings/apps/kp-console/advanced";
+        let located = removed_location(Some(link));
+        assert!(located.starts_with("/console/connect/github?notice=removed&advanced="));
+        // The link is query-encoded: no raw `:` or `/` survives in the value.
+        assert!(!located.contains("https://"), "the link is encoded in the query");
+        assert!(located.contains("%3A%2F%2Fgithub.com"));
     }
 
     #[test]
