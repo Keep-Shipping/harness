@@ -29,8 +29,9 @@ use crate::cloudflare::rollback::{self, Panel};
 use crate::github;
 use crate::github::page::{
     CONNECT_PATH as GITHUB_CONNECT_PATH, DISCONNECT_PATH as GITHUB_DISCONNECT_PATH,
-    State as GitHubState, connect_page as github_connect_page,
+    State as GitHubState, connect_page as github_connect_page, safe_next,
 };
+use crate::onboard::flow::{self, Reply as WizardReply};
 use crate::signin::{self, CALLBACK_PATH, Client, LOGIN_PATH, LOGOUT_PATH, Reply};
 
 /// `same-origin`, not `no-referrer`: under `no-referrer` Chrome sends
@@ -238,6 +239,8 @@ fn reply(answer: &Reply) -> worker::Result<Response> {
 /// Who is asking, and the cookies to set on the way out.
 struct Session {
     set_cookies: Vec<String>,
+    /// The signed-in person's email, as the token says it (empty when none).
+    email: String,
 }
 
 /// The one gate every signed-in console page and write goes through: the
@@ -289,12 +292,15 @@ async fn authorize(req: &Request, env: &Env) -> Result<Session, worker::Result<R
     if !signin::allowed(&claims, &allowlist) {
         return Err(page(403, &notice_page("Not allowed", FORBIDDEN_COPY, None)));
     }
-    Ok(Session { set_cookies })
+    Ok(Session { set_cookies, email: claims.email.clone().unwrap_or_default() })
 }
 
 async fn serve(req: &mut Request, env: &Env, route: Route) -> worker::Result<Response> {
-    let rollback_post = matches!(route, Route::Rollback(_)) && matches!(req.method(), Method::Post);
-    if !rollback_post && !matches!(req.method(), Method::Get | Method::Head) {
+    // The rollback confirmation and the onboarding wizard take POSTs; every
+    // other console page is read-only.
+    let form_post = matches!(route, Route::Rollback(_) | Route::Code(_))
+        && matches!(req.method(), Method::Post);
+    if !form_post && !matches!(req.method(), Method::Get | Method::Head) {
         return page_with(
             405,
             &notice_page(
@@ -309,7 +315,7 @@ async fn serve(req: &mut Request, env: &Env, route: Route) -> worker::Result<Res
         Ok(session) => session,
         Err(answer) => return answer,
     };
-    with_cookies(fleet_page(req, env, route).await?, &session.set_cookies)
+    with_cookies(fleet_page(req, env, route, &session.email).await?, &session.set_cookies)
 }
 
 /// The connect page (GET), the paste (POST), disconnect and refresh (POST).
@@ -356,7 +362,7 @@ async fn serve_action(req: &mut Request, env: &Env, action: Action) -> worker::R
         Action::ConnectDeploy => connect_save(req, env, true).await?,
         Action::DisconnectDeploy => disconnect_deploy(env).await?,
         Action::GitHub if post => github_save(req, env).await?,
-        Action::GitHub => github_form(env).await?,
+        Action::GitHub => github_form(req, env).await?,
         Action::GitHubDisconnect => github_disconnect(env).await?,
     };
     with_cookies(response, &session.set_cookies)
@@ -449,7 +455,10 @@ async fn connect_save(req: &mut Request, env: &Env, deploy: bool) -> worker::Res
 }
 
 /// The GitHub connection page: who it is connected as, when GitHub can say.
-async fn github_form(env: &Env) -> worker::Result<Response> {
+/// A `next` query names where a successful paste returns the person.
+async fn github_form(req: &Request, env: &Env) -> worker::Result<Response> {
+    let next = query_value(req, "next");
+    let next = next.as_deref().and_then(safe_next);
     let Some(secret) = read(env, "HARNESS_SECRET") else {
         return page(503, &notice_page("Console not configured", SEALER_COPY, None));
     };
@@ -471,10 +480,11 @@ async fn github_form(env: &Env) -> worker::Result<Response> {
             github_connect_page(
                 GitHubState::Connected { login: login.as_deref(), saved: &saved },
                 None,
+                next,
                 &api::now(),
             )
         }
-        None => github_connect_page(GitHubState::Disconnected, None, &api::now()),
+        None => github_connect_page(GitHubState::Disconnected, None, next, &api::now()),
     };
     page(200, &html)
 }
@@ -497,10 +507,21 @@ async fn github_save(req: &mut Request, env: &Env) -> worker::Result<Response> {
             ),
         );
     }
-    let token = form_urlencoded::parse(body.as_bytes())
+    let fields: Vec<(String, String)> = form_urlencoded::parse(body.as_bytes())
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+    let token = fields
+        .iter()
         .find(|(name, _)| name == "token")
         .map(|(_, value)| value.trim().to_owned())
         .unwrap_or_default();
+    // Where to go next, when the paste came from a page that asked (the
+    // wizard): same-origin console paths only.
+    let next = fields
+        .iter()
+        .find(|(name, _)| name == "next")
+        .and_then(|(_, value)| safe_next(value))
+        .unwrap_or(GITHUB_CONNECT_PATH);
     if token.is_empty() {
         return page(
             400,
@@ -512,7 +533,7 @@ async fn github_save(req: &mut Request, env: &Env) -> worker::Result<Response> {
         );
     }
     match github::connect(env, &secret, &token).await {
-        Ok(_) => redirect(303, GITHUB_CONNECT_PATH),
+        Ok(_) => redirect(303, next),
         Err(failed) => page(
             failed.status,
             &notice_page(
@@ -619,8 +640,14 @@ fn with_cookies(mut response: Response, cookies: &[String]) -> worker::Result<Re
     Ok(response)
 }
 
-/// The fleet itself, for a caller already let in.
-async fn fleet_page(req: &mut Request, env: &Env, route: Route) -> worker::Result<Response> {
+/// The fleet itself, for a caller already let in. `email` is the signed-in
+/// person, recorded as the author of any change the wizard opens.
+async fn fleet_page(
+    req: &mut Request,
+    env: &Env,
+    route: Route,
+    email: &str,
+) -> worker::Result<Response> {
     // What: the snapshot the nightly check writes. A missing key is the
     // honest empty state, not an error; a read that fails is a broken
     // console rather than an empty fleet; a snapshot that does not parse
@@ -674,9 +701,32 @@ async fn fleet_page(req: &mut Request, env: &Env, route: Route) -> worker::Resul
             let rolled = query_value(req, "rolled_back").is_some();
             let top = if rolled { ROLLED_BACK } else { "" };
             let panel = rollback::panel_html(site, &panel, &now);
-            match render_site_with(&snapshot, &id, &now, top, &panel) {
+            let onboarding = flow::site_record(env, &id).await;
+            match render_site_with(&snapshot, &id, &now, top, &panel, onboarding.as_ref()) {
                 Some(html) => page(200, &html),
                 None => no_such_site(),
+            }
+        }
+        Route::Code(id) => {
+            let Some(site) = snapshot.sites.iter().find(|site| site.id == id).cloned() else {
+                return no_such_site();
+            };
+            let Some(secret) = read(env, "HARNESS_SECRET") else {
+                return page(503, &notice_page("Console not configured", SEALER_COPY, None));
+            };
+            let reply = if matches!(req.method(), Method::Post) {
+                let body = req.text().await?;
+                let form: Vec<(String, String)> = form_urlencoded::parse(body.as_bytes())
+                    .map(|(name, value)| (name.into_owned(), value.into_owned()))
+                    .collect();
+                flow::post(env, &secret, &site, email, &form).await
+            } else {
+                let again = query_value(req, "again").is_some();
+                flow::view(env, &secret, &site, again).await
+            };
+            match reply {
+                WizardReply::Html(status, html) => page(status, &html),
+                WizardReply::Redirect(location) => redirect(303, &location),
             }
         }
         Route::Rollback(id) => {

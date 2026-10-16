@@ -116,7 +116,7 @@ pub async fn visible_accounts(env: &Env, secret: &str) -> Vec<String> {
 }
 
 /// The token as stored, opened; `None` when there is none or it does not open.
-async fn load_token(env: &Env, secret: &str) -> Result<Option<String>, Failed> {
+pub(crate) async fn load_token(env: &Env, secret: &str) -> Result<Option<String>, Failed> {
     let Some(row) = stored(env).await? else {
         return Ok(None);
     };
@@ -204,7 +204,7 @@ async fn send(token: &str, url: &str) -> Result<(u16, String), Failed> {
 }
 
 /// [`send`] with a method and an optional JSON body.
-async fn send_with(
+pub(crate) async fn send_with(
     token: &str,
     method: Method,
     url: &str,
@@ -231,7 +231,10 @@ async fn send_with(
 
 /// One read, decoded from the v4 envelope. Only a 200 that says
 /// `success: true` counts; the status alone is logged, never the body.
-async fn get<T: DeserializeOwned>(token: &str, url: &str) -> Result<Envelope<T>, Failed> {
+pub(crate) async fn get<T: DeserializeOwned>(
+    token: &str,
+    url: &str,
+) -> Result<Envelope<T>, Failed> {
     let (status, body) = send(token, url).await?;
     if status != 200 {
         tracing::warn!(status, path = %path_of(url), "console: cloudflare refused a read");
@@ -540,6 +543,91 @@ pub async fn connect_deploy(env: &Env, secret: &str, token: &str) -> Result<(), 
     let sealed = seal::seal_for(Slot::Deploy.info(), secret, token).map_err(|_| STORE)?;
     let now = WorkersClock.now().format(&Rfc3339).map_err(|_| STORE)?;
     store_in(env, Slot::Deploy, &sealed, &now).await
+}
+
+/// What a write the onboarding makes can be refused with.
+const CHANGE_REFUSED: Failed = Failed {
+    status: 502,
+    message: "Cloudflare refused that change. Check the token has the permission this step \
+              needs, from the list on the setup page.",
+};
+
+#[derive(Deserialize)]
+struct TokenVerify {
+    id: String,
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct PagesProjectSource {
+    source: Option<PagesSource>,
+}
+
+#[derive(Deserialize)]
+struct PagesSource {
+    config: Option<PagesSourceConfig>,
+}
+
+#[derive(Deserialize)]
+struct PagesSourceConfig {
+    owner: Option<String>,
+    repo_name: Option<String>,
+}
+
+/// The GitHub repository a Pages project builds from, as `(owner, name)`, read
+/// with the read token. `None` for a project that is not built from GitHub,
+/// or when the read fails: the caller then guesses from names instead.
+pub(crate) async fn pages_source(
+    token: &str,
+    account_id: &str,
+    project: &str,
+) -> Option<(String, String)> {
+    let url = format!(
+        "{API}/accounts/{}/pages/projects/{}",
+        super::rollback::seg(account_id),
+        super::rollback::seg(project)
+    );
+    let envelope: Envelope<PagesProjectSource> = get(token, &url).await.ok()?;
+    let config = envelope.result?.source?.config?;
+    Some((config.owner?, config.repo_name?))
+}
+
+/// Checks the infrastructure token: the account's own verify endpoint first,
+/// then the user's, since either can be the one a token answers to. Returns
+/// the token's id (the R2 access key id) when it is active.
+pub(crate) async fn verify_account_token(token: &str, account_id: &str) -> Result<String, Failed> {
+    let urls = [
+        format!("{API}/accounts/{}/tokens/verify", super::rollback::seg(account_id)),
+        format!("{API}/user/tokens/verify"),
+    ];
+    for url in urls {
+        let (status, body) = send(token, &url).await?;
+        if status != 200 {
+            continue;
+        }
+        let verified: Envelope<TokenVerify> = serde_json::from_str(&body).map_err(|_| SHAPE)?;
+        return match verified.result {
+            Some(result) if verified.success && result.status == "active" => Ok(result.id),
+            _ => Err(NOT_ACCEPTED),
+        };
+    }
+    Err(NOT_ACCEPTED)
+}
+
+/// Creates an R2 bucket with the infrastructure token. A bucket that already
+/// exists is fine: the setup is run again on purpose.
+pub(crate) async fn create_bucket(token: &str, account_id: &str, name: &str) -> Result<(), Failed> {
+    let body = serde_json::json!({ "name": name }).to_string();
+    let url = format!("{API}/accounts/{}/r2/buckets", super::rollback::seg(account_id));
+    let (status, answer) = send_with(token, Method::Post, &url, Some(&body)).await?;
+    if (200..300).contains(&status) {
+        return Ok(());
+    }
+    if status == 409 || answer.to_ascii_lowercase().contains("already exists") {
+        return Ok(());
+    }
+    tracing::warn!(status, "console: cloudflare refused to create a bucket");
+    Err(CHANGE_REFUSED)
 }
 
 /// Forgets the deploy token; the fleet and its read-only token stay.

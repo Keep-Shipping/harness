@@ -524,3 +524,170 @@ fn the_list_page_shows_every_change_and_its_chip() {
         assert!(body.contains("Make a change"), "{body}");
     });
 }
+
+/// Inserts an edit the way onboarding does: its pull request already open, in
+/// its own infrastructure repository, and no plan yet.
+fn an_onboarding_edit(kit: &TestHarness, id: &str, repo: &str) {
+    pollster::block_on(kit.db.execute(&Statement::with_values(
+        "INSERT INTO edits (id, kind, zone, title, summary_md, file_path, author, status, repo, \
+         pr_number, pr_url, pr_head_sha, created_at, updated_at) \
+         VALUES (?, 'onboard', 'example.com', 'Manage shop as code', '', 'main.tf', 'person_1', \
+         'checking', ?, 9, 'https://github.com/nick/shop-infra/pull/9', ?, \
+         '2026-10-16T09:00:00Z', '2026-10-16T09:00:00Z')",
+        vec![id.into(), repo.into(), "a".repeat(40).into()],
+    )))
+    .expect("the onboarding edit inserts");
+}
+
+/// Plans and approves `id` as a signed-in person would; returns nothing, the
+/// approval is checked by the caller.
+async fn plan_and_approve(kit: &TestHarness, id: &str) {
+    let plan_body =
+        plan_json(&["create"], json!({"name":"www.example.com","content":"192.0.2.10","type":"A"}));
+    // Each repository's workflow presents its own runner token.
+    let repo = edit_field(kit, id, "repo");
+    let token = if repo.is_empty() {
+        RUNNER_TOKEN.to_owned()
+    } else {
+        keepshipping_waitlist_test_hmac(RUNNER_TOKEN, &repo)
+    };
+    let (status, body) = post_plan(kit, id, &token, &plan_body).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let digest = edit_field(kit, id, "plan_sha256");
+    let (status, _, body) =
+        post_form(kit, &format!("/v1/edits/{id}/approve"), "person_1", &format!("saw={digest}"))
+            .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+}
+
+/// Stores the console's own GitHub token the way the connect page seals it.
+fn store_console_token(kit: &TestHarness) {
+    let sealed = keepshipping_waitlist::cloudflare::seal::seal_for(
+        keepshipping_waitlist::cloudflare::seal::GITHUB_INFO,
+        "harness-secret-test",
+        "gh-console-token",
+    )
+    .expect("the token seals");
+    pollster::block_on(
+        kit.db.execute(&Statement::new(
+            "CREATE TABLE IF NOT EXISTS console_github_token (id INTEGER PRIMARY KEY, \
+         nonce TEXT NOT NULL, ciphertext TEXT NOT NULL, updated_at TEXT NOT NULL)"
+                .to_owned(),
+        )),
+    )
+    .expect("the table is created");
+    pollster::block_on(kit.db.execute(&Statement::with_values(
+        "INSERT OR REPLACE INTO console_github_token (id, nonce, ciphertext, updated_at) \
+         VALUES (1, ?, ?, '2026-10-16T09:00:00Z')",
+        vec![sealed.nonce.into(), sealed.ciphertext.into()],
+    )))
+    .expect("the sealed token is stored");
+}
+
+#[test]
+fn an_onboarding_edit_dispatches_to_its_own_repository() {
+    pollster::block_on(async {
+        let (kit, http) = kit(vec![empty(204)], |ports| {
+            ports.config = Arc::new(MapConfig::from_pairs([
+                ("EDITS_REPO", "keepshipping/infra"),
+                ("EDITS_BASE_BRANCH", "main"),
+                ("EDITS_GITHUB_TOKEN", "gh-token-test"),
+                ("EDITS_RUNNER_TOKEN", RUNNER_TOKEN),
+                ("HARNESS_SECRET", "harness-secret-test"),
+            ]));
+        });
+        store_console_token(&kit);
+        let id = "ks0123456789abcdef0123456789abcdef";
+        an_onboarding_edit(&kit, id, "nick/shop-infra");
+        plan_and_approve(&kit, id).await;
+
+        kit.defer.drain().await;
+        let calls = http.captured();
+        assert_eq!(calls.len(), 1, "{calls:#?}");
+        assert!(
+            calls[0].1.ends_with("/repos/nick/shop-infra/dispatches"),
+            "the dispatch goes to the edit's repository: {}",
+            calls[0].1
+        );
+        let dispatch: Value = serde_json::from_str(&calls[0].2).expect("the dispatch body");
+        assert_eq!(dispatch["client_payload"]["edit_id"], json!(id));
+        assert_eq!(dispatch["client_payload"]["pr_number"], json!(9));
+    });
+}
+
+#[test]
+fn an_edit_without_its_own_repository_still_uses_the_configured_one() {
+    pollster::block_on(async {
+        let (kit, http) = kit(vec![empty(204)], |_| {});
+        let id = "ks1123456789abcdef0123456789abcdef";
+        an_onboarding_edit(&kit, id, "");
+        plan_and_approve(&kit, id).await;
+
+        kit.defer.drain().await;
+        let calls = http.captured();
+        assert_eq!(calls.len(), 1, "{calls:#?}");
+        assert!(calls[0].1.ends_with("/repos/keepshipping/infra/dispatches"), "{}", calls[0].1);
+    });
+}
+
+#[test]
+fn without_an_edits_token_the_console_github_connection_delivers() {
+    pollster::block_on(async {
+        let (kit, http) = kit(vec![empty(204)], |ports| {
+            ports.config = Arc::new(MapConfig::from_pairs([
+                ("EDITS_REPO", "keepshipping/infra"),
+                ("EDITS_BASE_BRANCH", "main"),
+                ("EDITS_RUNNER_TOKEN", RUNNER_TOKEN),
+                ("HARNESS_SECRET", "harness-secret-test"),
+            ]));
+        });
+        store_console_token(&kit);
+
+        let id = "ks2123456789abcdef0123456789abcdef";
+        an_onboarding_edit(&kit, id, "nick/shop-infra");
+        plan_and_approve(&kit, id).await;
+
+        // Nothing is sent before the drain; the drain opens the stored token
+        // and delivers the dispatch with it.
+        kit.defer.drain().await;
+        let calls = http.captured();
+        assert_eq!(calls.len(), 1, "a stored token lets the dispatch go out: {calls:#?}");
+        assert!(calls[0].1.ends_with("/repos/nick/shop-infra/dispatches"));
+    });
+}
+
+/// A plan callback presenting `token` for an edit in `repo`.
+async fn callback_with(kit: &TestHarness, id: &str, token: &str) -> StatusCode {
+    let plan_body =
+        plan_json(&["create"], json!({"name":"www.example.com","content":"192.0.2.10","type":"A"}));
+    post_plan(kit, id, token, &plan_body).await.0
+}
+
+#[test]
+fn a_runner_token_for_one_repository_is_refused_for_another() {
+    pollster::block_on(async {
+        let (kit, _http) = kit(vec![], |_| {});
+        let shop = "ks3123456789abcdef0123456789abcdef";
+        an_onboarding_edit(&kit, shop, "nick/shop-infra");
+        let other = "ks4123456789abcdef0123456789abcdef";
+        an_onboarding_edit(&kit, other, "nick/other-infra");
+
+        let shop_token = keepshipping_waitlist_test_hmac(RUNNER_TOKEN, "nick/shop-infra");
+        let other_token = keepshipping_waitlist_test_hmac(RUNNER_TOKEN, "nick/other-infra");
+        // The shop's token opens the shop's edit and nothing of the other repo.
+        assert_eq!(callback_with(&kit, shop, &shop_token).await, StatusCode::OK);
+        assert_eq!(callback_with(&kit, other, &shop_token).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(callback_with(&kit, other, &other_token).await, StatusCode::OK);
+        // The raw runner key does not open an onboarding repository's edit.
+        assert_eq!(callback_with(&kit, shop, RUNNER_TOKEN).await, StatusCode::UNAUTHORIZED);
+    });
+}
+
+/// The per-repository runner token, computed the way the console sends it.
+fn keepshipping_waitlist_test_hmac(key: &str, repo: &str) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key.as_bytes()).expect("a key");
+    mac.update(repo.to_ascii_lowercase().as_bytes());
+    mac.finalize().into_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
+}

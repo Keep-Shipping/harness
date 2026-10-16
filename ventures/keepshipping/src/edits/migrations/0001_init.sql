@@ -3,7 +3,8 @@
 -- cratefield-core's portable DDL, under this module's table name — so opening
 -- the pull request and firing the approval dispatch survive a crash between
 -- the click and GitHub. Kept inside src/edits/ because the tables belong to
--- this module, not to the venture's shared schema directory.
+-- this module, not to the venture's shared schema directory. The venture's
+-- production migration is migrations/0013_edits.sql; keep the two in step.
 
 CREATE TABLE IF NOT EXISTS edits (
     id TEXT PRIMARY KEY,
@@ -14,6 +15,7 @@ CREATE TABLE IF NOT EXISTS edits (
     file_path TEXT NOT NULL DEFAULT '',
     author TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'opening',
+    repo TEXT NOT NULL DEFAULT '',
     pr_number INTEGER,
     pr_url TEXT NOT NULL DEFAULT '',
     pr_head_sha TEXT NOT NULL DEFAULT '',
