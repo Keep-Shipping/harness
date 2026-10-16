@@ -616,10 +616,13 @@ mod tests {
 
     #[test]
     fn the_empty_state_points_at_connect_or_offers_refresh() {
-        let disconnected = empty_snapshot_page(false);
+        // The nav bar links the connect page on every page; the body is
+        // what differs.
+        let main = |page: String| page.split("<main").nth(1).unwrap_or_default().to_owned();
+        let disconnected = main(empty_snapshot_page(false));
         assert!(disconnected.contains("href=\"/console/connect/cloudflare\""));
         assert!(!disconnected.contains("action=\"/console/fleet/refresh\""));
-        let connected = empty_snapshot_page(true);
+        let connected = main(empty_snapshot_page(true));
         assert!(connected.contains("action=\"/console/fleet/refresh\""));
         assert!(!connected.contains("href=\"/console/connect/cloudflare\""));
     }
