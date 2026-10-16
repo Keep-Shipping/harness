@@ -55,6 +55,12 @@ pub const WEBHOOK_PATH: &str = "/console/github/webhook";
 /// Where the connection page's remove button posts: the app is forgotten by
 /// the console (not on GitHub).
 pub const REMOVE_PATH: &str = "/console/connect/github/app/remove";
+/// Where the connection page's check button posts: GitHub is asked for every
+/// installation of the app, and the ones the console does not list are shown.
+pub const CHECK_PATH: &str = "/console/connect/github/app/check";
+/// Where an installation shown by the check is added: a hidden
+/// `installation_id`, verified with GitHub before it is recorded.
+pub const ADOPT_PATH: &str = "/console/connect/github/app/adopt";
 
 /// The secrets-store name of the app's private key (PEM).
 pub const PRIVATE_KEY: &str = "github-app/private-key";
@@ -64,6 +70,11 @@ pub const WEBHOOK_SECRET: &str = "github-app/webhook-secret";
 pub const CLIENT_SECRET: &str = "github-app/client-secret";
 /// Every secret the app keeps, all of which a removal forgets.
 pub const SECRET_NAMES: [&str; 3] = [PRIVATE_KEY, WEBHOOK_SECRET, CLIENT_SECRET];
+
+/// How many pages of the app's installations the check reads, at 100 each.
+const LIST_PAGES_MAX: u32 = 10;
+/// The page size the check asks GitHub for (its largest).
+const LIST_PER_PAGE: usize = 100;
 
 /// How long a manifest `state` is good for, in seconds.
 const STATE_TTL_SECS: i64 = 600;
@@ -451,12 +462,27 @@ struct AccountBody {
 /// `SHAPE` when a field is missing.
 pub fn read_installation(body: &str) -> Result<(i64, Installation), Failed> {
     let parsed: InstallationBody = serde_json::from_str(body).map_err(|_| SHAPE)?;
+    Ok(installation_of_body(parsed))
+}
+
+/// The app's installations as `GET /app/installations` lists them: a JSON
+/// array, each with the app it belongs to. Pure.
+///
+/// # Errors
+///
+/// `SHAPE` when the array or a field is missing.
+pub fn read_installation_list(body: &str) -> Result<Vec<(i64, Installation)>, Failed> {
+    let parsed: Vec<InstallationBody> = serde_json::from_str(body).map_err(|_| SHAPE)?;
+    Ok(parsed.into_iter().map(installation_of_body).collect())
+}
+
+fn installation_of_body(parsed: InstallationBody) -> (i64, Installation) {
     let selection = if parsed.repository_selection.is_empty() {
         "selected".to_owned()
     } else {
         parsed.repository_selection
     };
-    Ok((
+    (
         parsed.app_id,
         Installation {
             id: parsed.id,
@@ -464,7 +490,34 @@ pub fn read_installation(body: &str) -> Result<(i64, Installation), Failed> {
             account_type: parsed.account.kind,
             selection,
         },
-    ))
+    )
+}
+
+/// The installations of `app_id` that are not in `recorded`, in GitHub's
+/// order. An installation of another app is never offered. Pure.
+#[must_use]
+pub fn unrecorded(
+    listed: Vec<(i64, Installation)>,
+    app_id: i64,
+    recorded: &[Installation],
+) -> Vec<Installation> {
+    listed
+        .into_iter()
+        .filter(|(listed_app, row)| {
+            *listed_app == app_id && !recorded.iter().any(|known| known.id == row.id)
+        })
+        .map(|(_, row)| row)
+        .collect()
+}
+
+/// The installation id a form posts: digits only, so no sign, space or
+/// separator reaches GitHub. `None` otherwise. Pure.
+#[must_use]
+pub fn installation_id_of(raw: &str) -> Option<i64> {
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok()
 }
 
 #[derive(Deserialize)]
@@ -486,6 +539,38 @@ pub fn read_token(body: &str, now: i64) -> Result<(String, i64), Failed> {
         .map(OffsetDateTime::unix_timestamp)
         .unwrap_or(now + FALLBACK_TOKEN_SECS);
     Ok((parsed.token, expires))
+}
+
+/// The installations of this app that the console does not record yet, asked
+/// of GitHub with the app's JWT, at most `LIST_PAGES_MAX` pages. Only the
+/// listing is read here: nothing is recorded until the person adopts one.
+///
+/// # Errors
+///
+/// [`Failed`] when the app does not exist, the key cannot sign, or GitHub or
+/// the database refuse.
+pub async fn unrecorded_installations(
+    db: Arc<dyn Database>,
+    http: &dyn HttpClient,
+    now: i64,
+) -> Result<Vec<Installation>, Failed> {
+    let app = app_row(db.clone()).await?.ok_or(NOT_CREATED)?;
+    let key = private_key(db.clone()).await?;
+    let jwt = app_jwt(&key, &app.client_id, now)?;
+    let mut listed = Vec::new();
+    for page in 1..=LIST_PAGES_MAX {
+        let url = format!("{API}/app/installations?per_page={LIST_PER_PAGE}&page={page}");
+        let (status, body) = call(http, "GET", &url, Some(&jwt), None).await?;
+        ok(status, "the installation list")?;
+        let rows = read_installation_list(&body)?;
+        let count = rows.len();
+        listed.extend(rows);
+        if count < LIST_PER_PAGE {
+            break;
+        }
+    }
+    let recorded = installations(db).await?;
+    Ok(unrecorded(listed, app.app_id, &recorded))
 }
 
 /// The installation for an owner: the first whose account login matches,

@@ -572,3 +572,53 @@ fn only_a_recorded_installation_is_acted_through() {
     assert_eq!(recorded_only(one(9), &[one(7), one(8)]), None, "a stranger's installation");
     assert_eq!(recorded_only(one(7), &[]), None);
 }
+
+#[test]
+fn the_check_lists_only_the_installations_the_console_does_not_record() {
+    // GitHub's `GET /app/installations` answer: three installations of this
+    // app (42), of which the console already records id 7.
+    let body = r#"[
+        {"id": 7, "app_id": 42, "account": {"login": "nick", "type": "User"},
+         "repository_selection": "all"},
+        {"id": 9, "app_id": 42, "account": {"login": "keep-shipping", "type": "Organization"},
+         "repository_selection": "selected"},
+        {"id": 11, "app_id": 42, "account": {"login": "Keep-Shipping-Ops", "type": "Organization"},
+         "repository_selection": "all"}
+    ]"#;
+    let listed = read_installation_list(body).expect("the fixture parses");
+    assert_eq!(listed.len(), 3);
+    let recorded = [Installation {
+        id: 7,
+        account: "nick".to_owned(),
+        account_type: "User".to_owned(),
+        selection: "all".to_owned(),
+    }];
+    let new = unrecorded(listed, 42, &recorded);
+    let ids: Vec<i64> = new.iter().map(|row| row.id).collect();
+    assert_eq!(ids, vec![9, 11], "two shown, the recorded one hidden, in GitHub's order");
+    assert_eq!(new[0].account, "keep-shipping");
+    assert_eq!(new[0].account_type, "Organization");
+    assert_eq!(new[0].selection, "selected");
+}
+
+#[test]
+fn an_installation_of_another_app_is_never_offered_by_the_check() {
+    let body = r#"[{"id": 5, "app_id": 1, "account": {"login": "stranger", "type": "User"},
+                    "repository_selection": "all"}]"#;
+    let listed = read_installation_list(body).expect("parses");
+    assert!(unrecorded(listed, 42, &[]).is_empty());
+}
+
+#[test]
+fn an_installation_list_that_does_not_parse_is_refused() {
+    assert!(read_installation_list(r#"{"installations": []}"#).is_err());
+    assert!(read_installation_list("[]").expect("an empty list").is_empty());
+}
+
+#[test]
+fn an_adopted_installation_id_is_digits_only() {
+    assert_eq!(installation_id_of("12345"), Some(12345));
+    for refused in ["", "abc", "12a", "-4", "+4", " 4", "4 ", "1.5", "9999999999999999999999"] {
+        assert_eq!(installation_id_of(refused), None, "{refused:?} is refused");
+    }
+}
