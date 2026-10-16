@@ -14,6 +14,10 @@ use sha2::Sha256;
 /// HKDF info and AEAD associated data: the key's purpose and version.
 pub const INFO: &[u8] = b"ks-console/cloudflare-token/v1";
 
+/// [`INFO`] for the optional deploy token (rollbacks): its own key, so a
+/// read token's ciphertext never opens as a deploy token or the reverse.
+pub const DEPLOY_INFO: &[u8] = b"ks-console/cloudflare-deploy-token/v1";
+
 /// The GCM nonce length: 96 bits.
 pub const NONCE_LEN: usize = 12;
 
@@ -37,21 +41,26 @@ pub enum SealError {
     Open,
 }
 
-fn cipher(secret: &str) -> Result<Aes256Gcm, SealError> {
+fn cipher(secret: &str, info: &[u8]) -> Result<Aes256Gcm, SealError> {
     if secret.is_empty() {
         return Err(SealError::Key);
     }
     let hkdf = Hkdf::<Sha256>::new(None, secret.as_bytes());
     let mut key = [0u8; 32];
-    hkdf.expand(INFO, &mut key).map_err(|_| SealError::Key)?;
+    hkdf.expand(info, &mut key).map_err(|_| SealError::Key)?;
     Aes256Gcm::new_from_slice(&key).map_err(|_| SealError::Key)
 }
 
 /// Seals `plaintext` under `secret` with a fresh random nonce.
 pub fn seal(secret: &str, plaintext: &str) -> Result<Sealed, SealError> {
+    seal_for(INFO, secret, plaintext)
+}
+
+/// [`seal`] under another purpose's key ([`DEPLOY_INFO`]).
+pub fn seal_for(info: &[u8], secret: &str, plaintext: &str) -> Result<Sealed, SealError> {
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::fill(&mut nonce).map_err(|_| SealError::Random)?;
-    seal_with_nonce(secret, plaintext, &nonce)
+    seal_with_nonce_for(info, secret, plaintext, &nonce)
 }
 
 /// [`seal`] with the nonce supplied: the randomness is the caller's, so
@@ -61,10 +70,19 @@ pub fn seal_with_nonce(
     plaintext: &str,
     nonce: &[u8; NONCE_LEN],
 ) -> Result<Sealed, SealError> {
-    let cipher = cipher(secret)?;
+    seal_with_nonce_for(INFO, secret, plaintext, nonce)
+}
+
+fn seal_with_nonce_for(
+    info: &[u8],
+    secret: &str,
+    plaintext: &str,
+    nonce: &[u8; NONCE_LEN],
+) -> Result<Sealed, SealError> {
+    let cipher = cipher(secret, info)?;
     let nonce = Nonce::try_from(&nonce[..]).map_err(|_| SealError::Malformed)?;
     let ciphertext = cipher
-        .encrypt(&nonce, Payload { msg: plaintext.as_bytes(), aad: INFO })
+        .encrypt(&nonce, Payload { msg: plaintext.as_bytes(), aad: info })
         .map_err(|_| SealError::Open)?;
     let engine = base64::engine::general_purpose::STANDARD;
     Ok(Sealed { nonce: engine.encode(nonce), ciphertext: engine.encode(ciphertext) })
@@ -73,16 +91,21 @@ pub fn seal_with_nonce(
 /// Opens a stored token. Any failure is an error; nothing is ever returned
 /// partially decrypted.
 pub fn open(secret: &str, sealed: &Sealed) -> Result<String, SealError> {
+    open_for(INFO, secret, sealed)
+}
+
+/// [`open`] under another purpose's key ([`DEPLOY_INFO`]).
+pub fn open_for(info: &[u8], secret: &str, sealed: &Sealed) -> Result<String, SealError> {
     let engine = base64::engine::general_purpose::STANDARD;
     let nonce = engine.decode(&sealed.nonce).map_err(|_| SealError::Malformed)?;
     if nonce.len() != NONCE_LEN {
         return Err(SealError::Malformed);
     }
     let ciphertext = engine.decode(&sealed.ciphertext).map_err(|_| SealError::Malformed)?;
-    let cipher = cipher(secret)?;
+    let cipher = cipher(secret, info)?;
     let nonce = Nonce::try_from(&nonce[..]).map_err(|_| SealError::Malformed)?;
     let plaintext = cipher
-        .decrypt(&nonce, Payload { msg: &ciphertext, aad: INFO })
+        .decrypt(&nonce, Payload { msg: &ciphertext, aad: info })
         .map_err(|_| SealError::Open)?;
     String::from_utf8(plaintext).map_err(|_| SealError::Malformed)
 }
@@ -176,5 +199,14 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_read_token_never_opens_as_a_deploy_token_or_the_reverse() {
+        let read = seal_with_nonce(SECRET, TOKEN, &NONCE).unwrap();
+        assert_eq!(open_for(DEPLOY_INFO, SECRET, &read), Err(SealError::Open));
+        let deploy = seal_for(DEPLOY_INFO, SECRET, TOKEN).unwrap();
+        assert_eq!(open(SECRET, &deploy), Err(SealError::Open));
+        assert_eq!(open_for(DEPLOY_INFO, SECRET, &deploy).as_deref(), Ok(TOKEN));
     }
 }

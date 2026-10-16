@@ -19,10 +19,13 @@ use worker::{Env, Headers, Method, Request, Response};
 
 use super::{
     Fleet, Route, bearer_token, cookie_value, empty_snapshot_page, notice_page, render_index,
-    render_site, route,
+    render_site_with, route,
 };
 use crate::cloudflare::api::{self, NOT_CONNECTED};
-use crate::cloudflare::page::{CONNECT_PATH, DISCONNECT_PATH, connect_page};
+use crate::cloudflare::page::{
+    CONNECT_PATH, DEPLOY_CONNECT_PATH, DEPLOY_DISCONNECT_PATH, DISCONNECT_PATH, connect_page,
+};
+use crate::cloudflare::rollback::{self, Panel};
 use crate::signin::{self, CALLBACK_PATH, Client, LOGIN_PATH, LOGOUT_PATH, Reply};
 
 /// `same-origin`, not `no-referrer`: under `no-referrer` Chrome sends
@@ -56,6 +59,9 @@ enum Action {
     Connect,
     Disconnect,
     Refresh,
+    /// `POST` stores a pasted deploy token (rollbacks).
+    ConnectDeploy,
+    DisconnectDeploy,
 }
 
 fn action_for(path: &str) -> Option<Action> {
@@ -63,6 +69,8 @@ fn action_for(path: &str) -> Option<Action> {
         CONNECT_PATH => Some(Action::Connect),
         DISCONNECT_PATH => Some(Action::Disconnect),
         REFRESH_PATH => Some(Action::Refresh),
+        DEPLOY_CONNECT_PATH => Some(Action::ConnectDeploy),
+        DEPLOY_DISCONNECT_PATH => Some(Action::DisconnectDeploy),
         _ => None,
     }
 }
@@ -274,8 +282,9 @@ async fn authorize(req: &Request, env: &Env) -> Result<Session, worker::Result<R
     Ok(Session { set_cookies })
 }
 
-async fn serve(req: &Request, env: &Env, route: Route) -> worker::Result<Response> {
-    if !matches!(req.method(), Method::Get | Method::Head) {
+async fn serve(req: &mut Request, env: &Env, route: Route) -> worker::Result<Response> {
+    let rollback_post = matches!(route, Route::Rollback(_)) && matches!(req.method(), Method::Post);
+    if !rollback_post && !matches!(req.method(), Method::Get | Method::Head) {
         return page_with(
             405,
             &notice_page(
@@ -290,7 +299,7 @@ async fn serve(req: &Request, env: &Env, route: Route) -> worker::Result<Respons
         Ok(session) => session,
         Err(answer) => return answer,
     };
-    with_cookies(fleet_page(env, route).await?, &session.set_cookies)
+    with_cookies(fleet_page(req, env, route).await?, &session.set_cookies)
 }
 
 /// The connect page (GET), the paste (POST), disconnect and refresh (POST).
@@ -300,12 +309,17 @@ async fn serve_action(req: &mut Request, env: &Env, action: Action) -> worker::R
     let read_only = matches!(req.method(), Method::Get | Method::Head);
     let allowed = match action {
         Action::Connect => post || read_only,
-        Action::Disconnect | Action::Refresh => post,
+        Action::Disconnect | Action::Refresh | Action::ConnectDeploy | Action::DisconnectDeploy => {
+            post
+        }
     };
     if !allowed {
         let allow = match action {
             Action::Connect => "GET, HEAD, POST",
-            Action::Disconnect | Action::Refresh => "POST",
+            Action::Disconnect
+            | Action::Refresh
+            | Action::ConnectDeploy
+            | Action::DisconnectDeploy => "POST",
         };
         return page_with(
             405,
@@ -322,10 +336,12 @@ async fn serve_action(req: &mut Request, env: &Env, action: Action) -> worker::R
         Err(answer) => return answer,
     };
     let response = match action {
-        Action::Connect if post => connect_save(req, env).await?,
+        Action::Connect if post => connect_save(req, env, false).await?,
         Action::Connect => connect_form(env).await?,
         Action::Disconnect => disconnect(env).await?,
         Action::Refresh => refresh(env).await?,
+        Action::ConnectDeploy => connect_save(req, env, true).await?,
+        Action::DisconnectDeploy => disconnect_deploy(env).await?,
     };
     with_cookies(response, &session.set_cookies)
 }
@@ -345,7 +361,17 @@ async fn connect_form(env: &Env) -> worker::Result<Response> {
                 Some(_) => api::visible_accounts(env, &secret).await,
                 None => Vec::new(),
             };
-            page(200, &connect_page(connected.as_deref(), &accounts, None, &api::now()))
+            let deploy = api::deploy_connected_at(env, &secret).await.ok().flatten();
+            page(
+                200,
+                &connect_page(
+                    connected.as_deref(),
+                    &accounts,
+                    deploy.as_deref(),
+                    None,
+                    &api::now(),
+                ),
+            )
         }
         Err(failed) => page(
             failed.status,
@@ -357,7 +383,8 @@ async fn connect_form(env: &Env) -> worker::Result<Response> {
 /// The paste: the token is read from the form body, sent to Cloudflare to
 /// verify, sealed and stored. Nothing in the answer carries it; a refusal is
 /// shown in words and the form is not kept.
-async fn connect_save(req: &mut Request, env: &Env) -> worker::Result<Response> {
+/// `deploy` picks the deploy token (rollbacks) over the read-only one.
+async fn connect_save(req: &mut Request, env: &Env, deploy: bool) -> worker::Result<Response> {
     let Some(secret) = read(env, "HARNESS_SECRET") else {
         return page(503, &notice_page("Console not configured", SEALER_COPY, None));
     };
@@ -386,7 +413,13 @@ async fn connect_save(req: &mut Request, env: &Env) -> worker::Result<Response> 
             ),
         );
     }
-    match api::connect(env, &secret, &token).await {
+    let saved = if deploy {
+        api::connect_deploy(env, &secret, &token).await
+    } else {
+        api::connect(env, &secret, &token).await
+    };
+    match saved {
+        Ok(()) if deploy => redirect(303, CONNECT_PATH),
         Ok(()) => redirect(303, "/console/fleet"),
         Err(failed) => page(
             failed.status,
@@ -406,6 +439,20 @@ async fn disconnect(env: &Env) -> worker::Result<Response> {
             failed.status,
             &notice_page(
                 "Could not disconnect",
+                failed.message,
+                Some((CONNECT_PATH, "Back to the connect page")),
+            ),
+        ),
+    }
+}
+
+async fn disconnect_deploy(env: &Env) -> worker::Result<Response> {
+    match api::disconnect_deploy(env).await {
+        Ok(()) => redirect(303, CONNECT_PATH),
+        Err(failed) => page(
+            failed.status,
+            &notice_page(
+                "Could not remove the deploy token",
                 failed.message,
                 Some((CONNECT_PATH, "Back to the connect page")),
             ),
@@ -467,7 +514,7 @@ fn with_cookies(mut response: Response, cookies: &[String]) -> worker::Result<Re
 }
 
 /// The fleet itself, for a caller already let in.
-async fn fleet_page(env: &Env, route: Route) -> worker::Result<Response> {
+async fn fleet_page(req: &mut Request, env: &Env, route: Route) -> worker::Result<Response> {
     // What: the snapshot the nightly check writes. A missing key is the
     // honest empty state, not an error; a read that fails is a broken
     // console rather than an empty fleet; a snapshot that does not parse
@@ -503,18 +550,78 @@ async fn fleet_page(env: &Env, route: Route) -> worker::Result<Response> {
     };
     match route {
         Route::Index => page(200, &render_index(&snapshot, &api::now())),
-        Route::Site(id) => match render_site(&snapshot, &id, &api::now()) {
-            Some(html) => page(200, &html),
-            None => page(
-                404,
-                &notice_page(
-                    "No such site",
-                    "The snapshot has no site with that id.",
-                    Some(("/console/fleet", "All sites")),
-                ),
-            ),
-        },
+        Route::Site(id) => {
+            let Some(site) = snapshot.sites.iter().find(|site| site.id == id) else {
+                return no_such_site();
+            };
+            let now = api::now();
+            let panel = match read(env, "HARNESS_SECRET") {
+                Some(secret) => api::rollback_panel(env, &secret, site).await,
+                None => Panel::NotSupported,
+            };
+            let rolled = query_value(req, "rolled_back").is_some();
+            let top = if rolled { ROLLED_BACK } else { "" };
+            let panel = rollback::panel_html(site, &panel, &now);
+            match render_site_with(&snapshot, &id, &now, top, &panel) {
+                Some(html) => page(200, &html),
+                None => no_such_site(),
+            }
+        }
+        Route::Rollback(id) => {
+            let Some(site) = snapshot.sites.iter().find(|site| site.id == id).cloned() else {
+                return no_such_site();
+            };
+            let Some(secret) = read(env, "HARNESS_SECRET") else {
+                return page(503, &notice_page("Console not configured", SEALER_COPY, None));
+            };
+            let site_path = format!("/console/fleet/{}", super::site_path_segment(&site.id));
+            let back = Some((site_path.as_str(), "Back to the site"));
+            if matches!(req.method(), Method::Post) {
+                let body = req.text().await?;
+                let to = form_urlencoded::parse(body.as_bytes())
+                    .find(|(name, _)| name == "to")
+                    .map(|(_, value)| value.into_owned())
+                    .unwrap_or_default();
+                return match api::roll_back(env, &secret, &site, &to).await {
+                    Ok(()) => redirect(303, &format!("{site_path}?rolled_back=1")),
+                    Err(failed) => {
+                        page(failed.status, &notice_page("Not rolled back", failed.message, back))
+                    }
+                };
+            }
+            let to = query_value(req, "to").unwrap_or_default();
+            match api::rollback_choice(env, &secret, &site, &to).await {
+                Ok((chosen, live)) => {
+                    page(200, &rollback::confirm_page(&site, &chosen, live.as_ref(), &api::now()))
+                }
+                Err(failed) => {
+                    page(failed.status, &notice_page("Cannot roll back", failed.message, back))
+                }
+            }
+        }
     }
+}
+
+/// Shown above a site's tiles after a rollback.
+const ROLLED_BACK: &str = "<p class=\"callout info\" role=\"status\"><strong>Rolled back.</strong> \
+     Cloudflare is serving the deployment you chose. The list of sites catches up on its next \
+     refresh.</p>\n";
+
+fn no_such_site() -> worker::Result<Response> {
+    page(
+        404,
+        &notice_page(
+            "No such site",
+            "The snapshot has no site with that id.",
+            Some(("/console/fleet", "All sites")),
+        ),
+    )
+}
+
+/// One query parameter of the request URL.
+fn query_value(req: &Request, name: &str) -> Option<String> {
+    let url = req.url().ok()?;
+    url.query_pairs().find(|(key, _)| key == name).map(|(_, value)| value.into_owned())
 }
 
 /// The token verifier, one per isolate: it caches the issuer's key set, so

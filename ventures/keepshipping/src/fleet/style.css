@@ -216,6 +216,21 @@ ul.rows, ol.rows { list-style: none; margin: 0; padding: 0; }
 .deploys .what { white-space: normal; font-size: 0.9rem; color: var(--text); margin: 0; }
 .deploys .tag.live { margin-left: 0; }
 
+/* Rollbacks: the versions list on a site's page and the confirmation. */
+.stack { display: grid; gap: 1rem; min-width: 0; }
+.versions li { display: grid; grid-template-columns: 15rem minmax(0, 1fr) auto; gap: 0.25rem 1rem; align-items: center; }
+.versions .when { color: var(--muted); font-size: 0.85rem; }
+.versions .when time { color: var(--ink); }
+.versions .what { white-space: normal; font-size: 0.9rem; color: var(--text); margin: 0; }
+.versions form { margin: 0; }
+.versions .btn { padding: 0.35rem 0.7rem; font-size: 0.82rem; }
+dl.facts { display: grid; grid-template-columns: 7rem minmax(0, 1fr); gap: 0.75rem 1rem; margin: 0 0 1.25rem; }
+dl.facts dt { color: var(--muted); font: 500 0.75rem/1.9 var(--mono); text-transform: uppercase; letter-spacing: 0.05em; }
+dl.facts dd { margin: 0; overflow-wrap: anywhere; }
+.btn.danger-fill { background: var(--bad); border-color: var(--bad); color: var(--surface); }
+h2 .tag { margin-left: 0.4rem; vertical-align: 0.15em; }
+.status-head p { margin: 0; }
+
 /* Empty state and every error: one centred card. */
 .notice { background: var(--surface); border: 1px solid var(--border); margin: 10vh auto 0; max-width: 32rem; padding: 2rem; }
 .notice h1 { font-size: 1.6rem; margin-bottom: 0.75rem; }
@@ -254,7 +269,7 @@ form.connect input {
   .tabs a { padding: 0.6rem 0.75rem 0.7rem 0; margin-right: 0.75rem; }
   .stats { grid-template-columns: repeat(2, 1fr); }
   .columns { grid-template-columns: minmax(0, 1fr); }
-  .deploys li { grid-template-columns: minmax(0, 1fr); }
+  .deploys li, .versions li { grid-template-columns: minmax(0, 1fr); }
   table, tbody, tr, th, td, caption { display: block; }
   table { background: none; border: 0; }
   thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }

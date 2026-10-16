@@ -17,13 +17,14 @@ use time::format_description::well_known::Rfc3339;
 use worker::wasm_bindgen::JsValue;
 use worker::{Env, Fetch, Headers, Method, Request, RequestInit};
 
+use super::rollback::{self, Candidate, PagesProjectLive, Panel, Target};
 use super::seal::{self, Sealed};
 use super::{
     Account, AccountError, CertificatePack, Envelope, Inventory, PagesDeployment, PagesProject,
     Verify, WorkerDeployments, WorkerDomain, WorkerScript, Zone, ZoneRecord, fleet_from, merge,
     pick_accounts, token_is_active,
 };
-use crate::fleet::Fleet;
+use crate::fleet::{Fleet, Site};
 
 /// The KV key the snapshot lives under (binding `FLEET`).
 pub const KV_KEY: &str = "fleet.json";
@@ -129,9 +130,37 @@ async fn load_token(env: &Env, secret: &str) -> Result<Option<String>, Failed> {
     }
 }
 
+/// Which stored token: the read-only one the fleet is built with, or the
+/// optional deploy token rollbacks use. Each has its own table and key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Read,
+    Deploy,
+}
+
+impl Slot {
+    fn table(self) -> &'static str {
+        match self {
+            Slot::Read => "console_cloudflare_token",
+            Slot::Deploy => "console_cloudflare_deploy_token",
+        }
+    }
+
+    fn info(self) -> &'static [u8] {
+        match self {
+            Slot::Read => seal::INFO,
+            Slot::Deploy => seal::DEPLOY_INFO,
+        }
+    }
+}
+
 async fn stored(env: &Env) -> Result<Option<StoredRow>, Failed> {
+    stored_in(env, Slot::Read).await
+}
+
+async fn stored_in(env: &Env, slot: Slot) -> Result<Option<StoredRow>, Failed> {
     let db = env.d1("DB").map_err(|_| STORE)?;
-    db.prepare("SELECT nonce, ciphertext, updated_at FROM console_cloudflare_token WHERE id = 1")
+    db.prepare(format!("SELECT nonce, ciphertext, updated_at FROM {} WHERE id = 1", slot.table()))
         .first::<StoredRow>(None)
         .await
         .map_err(|error| {
@@ -141,18 +170,23 @@ async fn stored(env: &Env) -> Result<Option<StoredRow>, Failed> {
 }
 
 async fn store(env: &Env, sealed: &Sealed, now: &str) -> Result<(), Failed> {
+    store_in(env, Slot::Read, sealed, now).await
+}
+
+async fn store_in(env: &Env, slot: Slot, sealed: &Sealed, now: &str) -> Result<(), Failed> {
     let db = env.d1("DB").map_err(|_| STORE)?;
     let values = [
         JsValue::from_str(&sealed.nonce),
         JsValue::from_str(&sealed.ciphertext),
         JsValue::from_str(now),
     ];
-    db.prepare(
-        "INSERT INTO console_cloudflare_token (id, nonce, ciphertext, updated_at) \
+    db.prepare(format!(
+        "INSERT INTO {} (id, nonce, ciphertext, updated_at) \
          VALUES (1, ?, ?, ?) \
          ON CONFLICT(id) DO UPDATE SET nonce = excluded.nonce, \
          ciphertext = excluded.ciphertext, updated_at = excluded.updated_at",
-    )
+        slot.table()
+    ))
     .bind(&values)
     .map_err(|_| STORE)?
     .run()
@@ -166,11 +200,25 @@ async fn store(env: &Env, sealed: &Sealed, now: &str) -> Result<(), Failed> {
 
 /// One send: the status and body, with the token only in the header.
 async fn send(token: &str, url: &str) -> Result<(u16, String), Failed> {
+    send_with(token, Method::Get, url, None).await
+}
+
+/// [`send`] with a method and an optional JSON body.
+async fn send_with(
+    token: &str,
+    method: Method,
+    url: &str,
+    body: Option<&str>,
+) -> Result<(u16, String), Failed> {
     let headers = Headers::new();
     headers.set("authorization", &format!("Bearer {token}")).map_err(|_| NETWORK)?;
     headers.set("accept", "application/json").map_err(|_| NETWORK)?;
     let mut init = RequestInit::new();
-    init.with_method(Method::Get).with_headers(headers);
+    init.with_method(method).with_headers(headers);
+    if let Some(body) = body {
+        init.headers.set("content-type", "application/json").map_err(|_| NETWORK)?;
+        init.with_body(Some(JsValue::from_str(body)));
+    }
     let request = Request::new_with_init(url, &init).map_err(|_| NETWORK)?;
     let mut response = Fetch::Request(request).send().await.map_err(|error| {
         tracing::warn!(%error, "console: cloudflare request did not complete");
@@ -437,14 +485,162 @@ pub async fn refresh(env: &Env, secret: &str) -> Result<Fleet, Failed> {
     write_snapshot(env, &token).await
 }
 
-/// Forgets the token and the snapshot it produced.
+/// Forgets both tokens and the snapshot the read token produced.
 pub async fn disconnect(env: &Env) -> Result<(), Failed> {
     let db = env.d1("DB").map_err(|_| STORE)?;
-    db.prepare("DELETE FROM console_cloudflare_token WHERE id = 1")
+    // The deploy token goes too: disconnecting cuts all Cloudflare access.
+    for slot in [Slot::Read, Slot::Deploy] {
+        db.prepare(format!("DELETE FROM {} WHERE id = 1", slot.table()))
+            .run()
+            .await
+            .map_err(|_| STORE)?;
+    }
+    let kv = env.kv("FLEET").map_err(|_| WRITE)?;
+    kv.delete(KV_KEY).await.map_err(|_| WRITE)?;
+    Ok(())
+}
+
+/// When the deploy token was saved, when one is stored and opens.
+pub async fn deploy_connected_at(env: &Env, secret: &str) -> Result<Option<String>, Failed> {
+    Ok(stored_in(env, Slot::Deploy).await?.and_then(|row| {
+        let sealed = Sealed { nonce: row.nonce, ciphertext: row.ciphertext };
+        seal::open_for(Slot::Deploy.info(), secret, &sealed).ok().map(|_| row.updated_at)
+    }))
+}
+
+async fn load_deploy_token(env: &Env, secret: &str) -> Result<Option<String>, Failed> {
+    let Some(row) = stored_in(env, Slot::Deploy).await? else {
+        return Ok(None);
+    };
+    let sealed = Sealed { nonce: row.nonce, ciphertext: row.ciphertext };
+    match seal::open_for(Slot::Deploy.info(), secret, &sealed) {
+        Ok(token) => Ok(Some(token)),
+        Err(error) => {
+            tracing::warn!(?error, "console: stored deploy token does not open");
+            Ok(None)
+        }
+    }
+}
+
+/// The deploy token's paste: verified active and able to list an account,
+/// then sealed under its own key and stored. No snapshot is taken: the
+/// fleet is read with the read-only token.
+pub async fn connect_deploy(env: &Env, secret: &str, token: &str) -> Result<(), Failed> {
+    let (status, body) = send(token, &format!("{API}/user/tokens/verify")).await?;
+    if status != 200 {
+        return Err(NOT_ACCEPTED);
+    }
+    let verified: Envelope<Verify> = serde_json::from_str(&body).map_err(|_| SHAPE)?;
+    if !verified.success || !verified.result.as_ref().is_some_and(token_is_active) {
+        return Err(NOT_ACCEPTED);
+    }
+    if list::<Account>(token, "/accounts").await?.is_empty() {
+        return Err(NO_ACCOUNTS);
+    }
+    let sealed = seal::seal_for(Slot::Deploy.info(), secret, token).map_err(|_| STORE)?;
+    let now = WorkersClock.now().format(&Rfc3339).map_err(|_| STORE)?;
+    store_in(env, Slot::Deploy, &sealed, &now).await
+}
+
+/// Forgets the deploy token; the fleet and its read-only token stay.
+pub async fn disconnect_deploy(env: &Env) -> Result<(), Failed> {
+    let db = env.d1("DB").map_err(|_| STORE)?;
+    db.prepare("DELETE FROM console_cloudflare_deploy_token WHERE id = 1")
         .run()
         .await
         .map_err(|_| STORE)?;
-    let kv = env.kv("FLEET").map_err(|_| WRITE)?;
-    kv.delete(KV_KEY).await.map_err(|_| WRITE)?;
+    Ok(())
+}
+
+const NO_DEPLOY_TOKEN: Failed = Failed {
+    status: 409,
+    message: "No deploy token is connected. Add one on the Cloudflare connection page first.",
+};
+const NOT_A_CANDIDATE: Failed = Failed {
+    status: 409,
+    message: "That deployment is not one this site can roll back to now: it may already be \
+              live, or no longer listed. Pick one from the list again.",
+};
+const ROLLBACK_REFUSED: Failed = Failed {
+    status: 502,
+    message: "Cloudflare refused the rollback. Either the deploy token lacks Pages Edit or \
+              Workers Scripts Edit on this account, or Cloudflare cannot deploy that version \
+              any more.",
+};
+
+/// The live deployment and the earlier ones a site can go back to, read now
+/// with the deploy token (which can also read what it can write).
+async fn candidates(token: &str, target: &Target) -> Result<Vec<Candidate>, Failed> {
+    match target {
+        Target::Pages { .. } => {
+            let live: Envelope<PagesProjectLive> =
+                get(token, &format!("{API}{}", target.live_path().unwrap_or_default())).await?;
+            let live = live.result.and_then(|project| project.canonical_deployment);
+            let deployments: Envelope<Vec<rollback::PagesDeployment>> =
+                get(token, &format!("{API}{}", target.versions_path())).await?;
+            Ok(rollback::pages_candidates(
+                deployments.result.unwrap_or_default(),
+                live.as_ref().map(|live| live.id.as_str()),
+            ))
+        }
+        Target::Worker { .. } => {
+            let history: Envelope<super::WorkerDeployments> =
+                get(token, &format!("{API}{}", target.versions_path())).await?;
+            Ok(rollback::worker_candidates(
+                history.result.map(|listed| listed.deployments).unwrap_or_default(),
+            ))
+        }
+    }
+}
+
+/// The site page's rollback panel, read live.
+pub async fn rollback_panel(env: &Env, secret: &str, site: &Site) -> Panel {
+    let Some(target) = rollback::target(site) else {
+        return Panel::NotSupported;
+    };
+    let token = match load_deploy_token(env, secret).await {
+        Ok(Some(token)) => token,
+        Ok(None) => return Panel::NoDeployToken,
+        Err(failed) => return Panel::Unavailable(failed.message),
+    };
+    match candidates(&token, &target).await {
+        Ok(candidates) => Panel::Candidates(candidates),
+        Err(failed) => Panel::Unavailable(failed.message),
+    }
+}
+
+/// The confirmation page's facts: the candidate `to`, and the live one.
+pub async fn rollback_choice(
+    env: &Env,
+    secret: &str,
+    site: &Site,
+    to: &str,
+) -> Result<(Candidate, Option<Candidate>), Failed> {
+    let target = rollback::target(site).ok_or(NOT_A_CANDIDATE)?;
+    let token = load_deploy_token(env, secret).await?.ok_or(NO_DEPLOY_TOKEN)?;
+    let listed = candidates(&token, &target).await?;
+    let chosen = rollback::allowed(&listed, to).cloned().ok_or(NOT_A_CANDIDATE)?;
+    let live = listed.into_iter().find(|candidate| candidate.live);
+    Ok((chosen, live))
+}
+
+/// Rolls `site` back to `to`: checked against a fresh listing (listed, not
+/// live), then the one documented call. Logged with ids only.
+pub async fn roll_back(env: &Env, secret: &str, site: &Site, to: &str) -> Result<(), Failed> {
+    let target = rollback::target(site).ok_or(NOT_A_CANDIDATE)?;
+    let token = load_deploy_token(env, secret).await?.ok_or(NO_DEPLOY_TOKEN)?;
+    let listed = candidates(&token, &target).await?;
+    let chosen = rollback::allowed(&listed, to).ok_or(NOT_A_CANDIDATE)?;
+    let (path, body) = target.rollback_request(&chosen.id);
+    let (status, answer) =
+        send_with(&token, Method::Post, &format!("{API}{path}"), body.as_deref()).await?;
+    let ok = (200..300).contains(&status)
+        && serde_json::from_str::<Envelope<serde_json::Value>>(&answer)
+            .is_ok_and(|envelope| envelope.success);
+    if !ok {
+        tracing::warn!(status, site = %site.id, "console: cloudflare refused a rollback");
+        return Err(ROLLBACK_REFUSED);
+    }
+    tracing::info!(site = %site.id, to = %chosen.id, "console: rolled back");
     Ok(())
 }

@@ -3,13 +3,18 @@
 //! paste form. Nothing here echoes a token; the form posts back to the
 //! worker, which seals it and redirects.
 
-use super::{PERMISSION_WORDS, PERMISSIONS, template_url};
+use super::rollback::{DEPLOY_PERMISSION_WORDS, DEPLOY_PERMISSIONS, DEPLOY_TOKEN_NAME};
+use super::{PERMISSION_WORDS, PERMISSIONS, template_url, template_url_for};
 use crate::fleet::{Tab, esc, signed_in_layout, time_html};
 
 /// Where the paste form posts.
 pub const CONNECT_PATH: &str = "/console/connect/cloudflare";
 /// Where disconnect posts.
 pub const DISCONNECT_PATH: &str = "/console/connect/cloudflare/disconnect";
+/// Where the deploy token's paste form posts.
+pub const DEPLOY_CONNECT_PATH: &str = "/console/connect/cloudflare/deploy";
+/// Where removing the deploy token posts.
+pub const DEPLOY_DISCONNECT_PATH: &str = "/console/connect/cloudflare/deploy/disconnect";
 
 /// The connect page. `connected_at` is the RFC 3339 time the stored token was
 /// saved (when one is stored and readable), shown relative to `now`, also
@@ -20,6 +25,7 @@ pub const DISCONNECT_PATH: &str = "/console/connect/cloudflare/disconnect";
 pub fn connect_page(
     connected_at: Option<&str>,
     accounts: &[String],
+    deploy_connected_at: Option<&str>,
     error: Option<&str>,
     now: &str,
 ) -> String {
@@ -66,7 +72,8 @@ pub fn connect_page(
          <div class=\"pagehead\"><div>\n<h1>Cloudflare connection</h1>\n\
          <p class=\"sub\">The console reads your Cloudflare accounts to list their domains, Pages \
          sites and Workers, when each was last deployed, and whether HTTPS and DNS are healthy. \
-         Every permission it asks for is read-only, so it can change nothing.</p>\n</div></div>\n\
+         This token is read-only: it can change nothing. Rollbacks use a separate, optional \
+         token, below.</p>\n</div></div>\n\
          {status}\
          <ol class=\"steps\">\n\
          <li class=\"panel\">\n<h2>Create a read-only token</h2>\n\
@@ -86,7 +93,9 @@ pub fn connect_page(
          autocapitalize=\"off\" spellcheck=\"false\">\n\
          <button class=\"btn primary\" type=\"submit\">{submit}</button>\n\
          </form>\n</li>\n</ol>\n\
+         {rollbacks}\
          </main>\n",
+        rollbacks = rollbacks_section(deploy_connected_at, now),
         href = esc(&template_url()),
         count = PERMISSIONS.len(),
         submit = if connected_at.is_some() {
@@ -98,21 +107,70 @@ pub fn connect_page(
     signed_in_layout("Cloudflare connection", Tab::Cloudflare, &body)
 }
 
+/// The optional deploy token, for rollbacks: what it allows, its state, and
+/// its own create link and paste form.
+fn rollbacks_section(connected_at: Option<&str>, now: &str) -> String {
+    let permissions = DEPLOY_PERMISSIONS
+        .iter()
+        .zip(DEPLOY_PERMISSION_WORDS)
+        .map(|((key, kind), words)| format!("<li>{words} <code>{key}:{kind}</code></li>"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let state = match connected_at {
+        Some(when) => format!(
+            "<div class=\"status-head\"><p><span class=\"status ok\">Rollbacks on</span> \
+             <span class=\"muted\">· deploy token saved {when}</span></p>\
+             <form class=\"disconnect\" method=\"post\" action=\"{DEPLOY_DISCONNECT_PATH}\">\
+             <button class=\"btn danger\" type=\"submit\">Remove the deploy token</button></form></div>\n",
+            when = time_html(when, now),
+        ),
+        None => "<p><span class=\"status unknown\">Rollbacks off</span></p>\n".to_owned(),
+    };
+    format!(
+        "<section class=\"panel\" id=\"rollbacks\" aria-labelledby=\"rollbacks-title\">\n\
+         <h2 id=\"rollbacks-title\">Rollbacks <span class=\"tag\">optional</span></h2>\n\
+         {state}\
+         <p>To roll a Pages site or Worker back to an earlier deployment from its page, add a \
+         second token that can deploy. It is kept apart from the read-only one, used only when \
+         you confirm a rollback, and can be removed here at any time.</p>\n\
+         <p><a class=\"btn\" target=\"_blank\" rel=\"noopener noreferrer\" href=\"{href}\">\
+         Create a deploy token on Cloudflare ↗</a></p>\n\
+         <details class=\"perms\"><summary>The {count} permissions it asks for</summary>\n\
+         <ul>\n{permissions}\n</ul>\n</details>\n\
+         <form class=\"connect\" method=\"post\" action=\"{DEPLOY_CONNECT_PATH}\" autocomplete=\"off\">\n\
+         <label for=\"cf-deploy-token\">Cloudflare deploy token</label>\n\
+         <input id=\"cf-deploy-token\" name=\"token\" type=\"password\" required autocomplete=\"off\" \
+         autocapitalize=\"off\" spellcheck=\"false\">\n\
+         <button class=\"btn\" type=\"submit\">{submit}</button>\n\
+         </form>\n</section>\n",
+        href = esc(&template_url_for(&DEPLOY_PERMISSIONS, DEPLOY_TOKEN_NAME)),
+        count = DEPLOY_PERMISSIONS.len(),
+        submit =
+            if connected_at.is_some() { "Replace the deploy token" } else { "Turn on rollbacks" },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn the_page_links_the_template_and_lists_every_permission_read_only() {
-        let page = connect_page(None, &[], None, "2026-10-16T09:00:00Z");
+        let page = connect_page(None, &[], None, None, "2026-10-16T09:00:00Z");
         assert!(page.contains("permissionGroupKeys=%5B%7B%22key%22%3A%22zone%22"));
         for (key, _) in PERMISSIONS {
             assert!(page.contains(&format!("<code>{key}</code>")), "{key} listed");
         }
-        assert!(!page.contains("type=\"edit\""), "no write permission is asked for");
+        // The read token's link asks for no write; only the separate deploy
+        // token's link does.
+        let read_link = template_url();
+        assert!(!read_link.contains("%22edit%22"), "the read token asks for no write");
+        assert!(page.contains("action=\"/console/connect/cloudflare/deploy\""));
+        assert!(page.contains("Rollbacks off"));
         assert!(page.contains("type=\"password\""));
         assert!(page.contains("method=\"post\" action=\"/console/connect/cloudflare\""));
-        assert!(!page.contains("Disconnect"), "no disconnect without a token");
+        assert!(!page.contains("Disconnect Cloudflare"), "no disconnect without a token");
+        assert!(!page.contains("Remove the deploy token"));
     }
 
     #[test]
@@ -120,6 +178,7 @@ mod tests {
         let page = connect_page(
             Some("2026-10-15T09:00:00.123456Z"),
             &["Factory0".to_owned()],
+            None,
             None,
             "2026-10-16T09:00:00Z",
         );
@@ -132,7 +191,7 @@ mod tests {
 
     #[test]
     fn an_error_is_escaped_and_announced() {
-        let page = connect_page(None, &[], Some("<b>nope</b>"), "2026-10-16T09:00:00Z");
+        let page = connect_page(None, &[], None, Some("<b>nope</b>"), "2026-10-16T09:00:00Z");
         assert!(page.contains("role=\"alert\""));
         assert!(page.contains("&lt;b&gt;nope&lt;/b&gt;"));
     }
