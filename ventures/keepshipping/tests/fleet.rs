@@ -119,6 +119,20 @@ fn route_parses_the_console_paths_only() {
         fleet::route("/console/fleet/b7e4a9c%2Brun"),
         Some(Route::Site("b7e4a9c+run".to_owned()))
     );
+    // A site's rollback page, its id decoded like the site's own.
+    assert_eq!(
+        fleet::route("/console/fleet/pages:a:kaje/rollback"),
+        Some(Route::Rollback("pages:a:kaje".to_owned()))
+    );
+    assert_eq!(
+        fleet::route("/console/fleet/pages:a:kaje:feature%2Fx/rollback/"),
+        Some(Route::Rollback("pages:a:kaje:feature/x".to_owned()))
+    );
+    for path in
+        ["/console/fleet//rollback", "/console/fleet/a/b/rollback", "/console/fleet/a/rollbackx"]
+    {
+        assert_eq!(fleet::route(path), None, "{path}");
+    }
     // Not the console's: near-misses, deeper paths and other prefixes all
     // fall through to the harness.
     for path in ["/console/fleetfoo", "/console/fleets", "/console/fleet/a/b", "/", "/console"] {

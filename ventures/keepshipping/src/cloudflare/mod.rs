@@ -13,6 +13,7 @@
 
 pub mod api;
 pub mod page;
+pub mod rollback;
 pub mod seal;
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
@@ -60,7 +61,14 @@ const NAME: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.')
 /// user-token form.
 #[must_use]
 pub fn template_url() -> String {
-    let groups: Vec<serde_json::Value> = PERMISSIONS
+    template_url_for(&PERMISSIONS, TOKEN_NAME)
+}
+
+/// [`template_url`] for another set of permission groups and token name
+/// (the deploy token's, [`rollback::DEPLOY_PERMISSIONS`]).
+#[must_use]
+pub fn template_url_for(permissions: &[(&str, &str)], name: &str) -> String {
+    let groups: Vec<serde_json::Value> = permissions
         .iter()
         .map(|(key, kind)| serde_json::json!({ "key": key, "type": kind }))
         .collect();
@@ -68,7 +76,7 @@ pub fn template_url() -> String {
     format!(
         "https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys={keys}&accountId=*&zoneId=all&name={name}",
         keys = utf8_percent_encode(&json, NON_ALPHANUMERIC),
-        name = utf8_percent_encode(TOKEN_NAME, NAME),
+        name = utf8_percent_encode(name, NAME),
     )
 }
 

@@ -14,6 +14,7 @@
 //! named below open directly.
 
 use keepshipping_waitlist::cloudflare::page::connect_page;
+use keepshipping_waitlist::cloudflare::rollback::{self, Candidate, Panel};
 use keepshipping_waitlist::fleet::{self, Fleet};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use std::fs;
@@ -43,11 +44,45 @@ fn main() {
             fleet::render_site(&snapshot, &site.id, &now).expect("a known id"),
         );
     }
+    // A rollback panel and its confirmation page on the first Pages
+    // production site, with made-up versions (the real ones are read live).
+    if let Some(site) = snapshot.sites.iter().find(|site| rollback::target(site).is_some()) {
+        let candidates: Vec<Candidate> = (0..4)
+            .map(|n| Candidate {
+                id: format!("{n}3f9a1c2b4d5e6f70"),
+                at: snapshot.generated_at.clone(),
+                commit: Some(format!("{n}a1f9c2e7b3d")),
+                branch: Some("main".to_owned()),
+                message: Some(format!("Release {}", 20 - n)),
+                source: Some("github:push".to_owned()),
+                number: None,
+                live: n == 0,
+            })
+            .collect();
+        let panel = rollback::panel_html(site, &Panel::Candidates(candidates.clone()), &now);
+        write(
+            "rollback-site.html",
+            fleet::render_site_with(&snapshot, &site.id, &now, "", &panel).expect("a known id"),
+        );
+        write(
+            "rollback-confirm.html",
+            rollback::confirm_page(site, &candidates[2], Some(&candidates[0]), &now),
+        );
+    }
     let accounts = vec!["Factory0".to_owned(), "Earth.OS".to_owned()];
-    write("connect.html", connect_page(Some(&snapshot.generated_at), &accounts, None, &now));
+    write(
+        "connect.html",
+        connect_page(
+            Some(&snapshot.generated_at),
+            &accounts,
+            Some(&snapshot.generated_at),
+            None,
+            &now,
+        ),
+    );
     write(
         "connect-error.html",
-        connect_page(None, &[], Some("Cloudflare did not accept that token."), &now),
+        connect_page(None, &[], None, Some("Cloudflare did not accept that token."), &now),
     );
     write("empty.html", fleet::empty_snapshot_page(true));
     write(

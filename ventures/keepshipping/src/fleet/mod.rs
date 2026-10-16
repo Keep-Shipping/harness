@@ -256,6 +256,8 @@ pub struct Resource {
 pub enum Route {
     Index,
     Site(String),
+    /// `/console/fleet/<id>/rollback`: GET confirms, POST rolls back.
+    Rollback(String),
 }
 
 /// `/console/fleet` and `/console/fleet/<id>`, trailing-slash tolerant.
@@ -270,7 +272,12 @@ pub fn route(path: &str) -> Option<Route> {
         Some(id) if !id.is_empty() && !id.contains('/') => {
             Some(Route::Site(percent_decode_str(id).decode_utf8_lossy().into_owned()))
         }
-        Some(_) => None,
+        Some(rest) => match rest.strip_suffix("/rollback") {
+            Some(id) if !id.is_empty() && !id.contains('/') => {
+                Some(Route::Rollback(percent_decode_str(id).decode_utf8_lossy().into_owned()))
+            }
+            _ => None,
+        },
     }
 }
 
@@ -621,6 +628,11 @@ fn environment_badge(site: &Site) -> String {
     }
 }
 
+/// A site id as one `/console/fleet/<id>` path segment.
+pub(crate) fn site_path_segment(id: &str) -> String {
+    utf8_percent_encode(id, ID).to_string()
+}
+
 /// The index's order: venture (sites with none last), then the group (a
 /// Worker's base name, so its staging and test rows sit next to it),
 /// production or a lone site before the other environments, then
@@ -654,6 +666,20 @@ fn group_name(site: &Site) -> &str {
 /// routing never guesses.
 #[must_use]
 pub fn render_site(snapshot: &Fleet, id: &str, now: &str) -> Option<String> {
+    render_site_with(snapshot, id, now, "", "")
+}
+
+/// [`render_site`] with `top` (a notice, such as a finished rollback) above
+/// the status tiles and `panel` (the rollback panel) under the deploys; both
+/// already HTML.
+#[must_use]
+pub fn render_site_with(
+    snapshot: &Fleet,
+    id: &str,
+    now: &str,
+    top: &str,
+    panel: &str,
+) -> Option<String> {
     let site = snapshot.sites.iter().find(|candidate| candidate.id == id)?;
     let terraform = snapshot.terraform.as_ref();
     let failing = site
@@ -727,9 +753,10 @@ pub fn render_site(snapshot: &Fleet, id: &str, now: &str) -> Option<String> {
          <div class=\"pagehead\">\n<div>\n<h1>{name}</h1>\n\
          <p class=\"sub\">{tags} <span>in {account} · checked {when}</span></p>\n</div>\n\
          <div class=\"actions\">{actions}</div>\n</div>\n\
-         <ul class=\"tiles\">\n{tiles}</ul>\n\
-         <div class=\"columns\">\n\
+         {top}<ul class=\"tiles\">\n{tiles}</ul>\n\
+         <div class=\"columns\">\n<div class=\"stack\">\n\
          <section class=\"panel\">\n<h2>Deploys</h2>\n<ol class=\"rows deploys\">\n{deploys}</ol>\n</section>\n\
+         {panel}</div>\n\
          <section class=\"panel\">\n<h2>Domains</h2>\n<ul class=\"rows\">\n{domains}</ul>\n</section>\n\
          </div>\n{code}</main>\n",
         venture = venture_name(site.venture.trim()),
