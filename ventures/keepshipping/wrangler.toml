@@ -75,8 +75,10 @@ database_name = "keepshipping-console"
 database_id = "b8f67c1f-9958-48f2-811b-1cc5b884c8d5"
 migrations_dir = "migrations"
 
-# The console fleet view (issue #169): the nightly check writes the fleet
-# snapshot here (key `fleet.json`), which /console/fleet renders.
+# The console fleet view (issue #169): the snapshot (key `fleet.json`) that
+# /console/fleet renders. The console's Cloudflare connect page (/console/
+# connect/cloudflare) and its hourly cron write it. Optional var
+# `CF_ACCOUNT_ID` picks the account when the token sees more than one.
 [[kv_namespaces]]
 binding = "FLEET"
 # Namespace `keepshipping-console-fleet` on Factory0.

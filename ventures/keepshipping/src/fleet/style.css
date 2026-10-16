@@ -141,3 +141,33 @@ ul.failing { margin: 0.3rem 0 0; padding-left: 1.1rem; }
   }
   tbody th { font-size: 1rem; }
 }
+/* The connect page and the refresh button: plain buttons and a token field. */
+.actions { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; margin: 1rem 0; }
+.button, .actions button, form.refresh button, form.connect button, form.disconnect button {
+  display: inline-block;
+  font: inherit;
+  padding: 0.5rem 0.9rem;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: inherit;
+  text-decoration: none;
+  cursor: pointer;
+}
+.button:focus-visible, .actions button:focus-visible, form.refresh button:focus-visible,
+form.connect button:focus-visible, form.disconnect button:focus-visible,
+form.connect input:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+form.connect label { display: block; margin: 1.2rem 0 0.4rem; }
+form.connect input {
+  font: inherit;
+  font-family: "DM Mono", ui-monospace, monospace;
+  width: 100%;
+  max-width: 36rem;
+  padding: 0.5rem;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: inherit;
+}
+ol.steps { padding-left: 1.2rem; }
+ol.steps li { margin: 0.6rem 0; }
+.error { color: var(--bad, #b00020); }

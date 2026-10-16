@@ -57,6 +57,7 @@ mod setup;
 
 pub mod signin;
 
+pub mod cloudflare;
 pub mod fleet;
 
 pub use billing::{Billing, DISPUTE_POLL_CRON, Plan, entitlements};
@@ -377,7 +378,7 @@ fn is_console_entry(method: &str, path: &str) -> bool {
 /// cannot even be read counts as absent, and so is refused on writes:
 /// fail closed, never error open.
 #[event(fetch)]
-pub async fn fetch(req: Request, env: Env, ctx: Context) -> worker::Result<Response> {
+pub async fn fetch(mut req: Request, env: Env, ctx: Context) -> worker::Result<Response> {
     let origin = req.headers().get("origin").ok().flatten();
     // The host the request itself was addressed to: a same-origin form post
     // carries it as `Origin`, and that is as good as the site allowlist.
@@ -399,23 +400,27 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> worker::Result<Respo
         return Ok(Response::empty()?.with_status(302).with_headers(headers));
     }
     // The console fleet view (issue #169); `None` falls through.
-    if let Some(response) = fleet::handle(&req, &env).await {
+    if let Some(response) = fleet::handle(&mut req, &env).await {
         return response;
     }
     let (harness, runtime) = &*instance(&env);
     serve(harness, runtime, req, env, ctx).await
 }
 
-/// Cron entry: the modules' sweeps. The hourly trigger wired in
-/// `wrangler.toml` (`0 * * * *`) is the billing module's dispute poll
-/// (`DISPUTE_POLL_CRON` — Polar sends no dispute webhooks); the waitlist
-/// module's pending-entry retention runs on the same dispatch.
+/// Cron entry: the modules' sweeps, then the console's fleet snapshot. The
+/// hourly trigger wired in `wrangler.toml` (`0 * * * *`) is the billing
+/// module's dispute poll (`DISPUTE_POLL_CRON` — Polar sends no dispute
+/// webhooks); the waitlist module's pending-entry retention runs on the same
+/// dispatch.
 #[event(scheduled)]
 pub async fn scheduled(event: worker::ScheduledEvent, env: Env, ctx: worker::ScheduleContext) {
     // Handler errors inside `serve_scheduled` are logged, never a failed
     // cron — the module's sweeps are idempotent by construction.
     let (harness, runtime) = &*instance(&env);
-    serve_scheduled(harness, runtime, event, env, ctx).await;
+    serve_scheduled(harness, runtime, event, env.clone(), ctx).await;
+    // The fleet snapshot (issue #169) refreshes alongside the sweeps, after
+    // them, and never fails the cron: errors are logged inside.
+    fleet::scheduled_refresh(&env).await;
 }
 
 #[cfg(test)]

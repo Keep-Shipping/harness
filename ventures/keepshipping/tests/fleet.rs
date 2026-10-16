@@ -57,8 +57,10 @@ fn the_index_lists_every_site_with_its_last_deploy_and_terraform_link() {
     }
     for site in &snapshot.sites {
         let detail = fleet::render_site(&snapshot, &site.id).expect("known id");
-        for page in [&html, detail.as_str()] {
-            expects(page, &site.defined_at.path, site.defined_at.line, rev);
+        if let Some(at) = &site.defined_at {
+            for page in [&html, detail.as_str()] {
+                expects(page, &at.path, at.line, rev);
+            }
         }
         for resource in &site.resources {
             expects(&detail, &resource.defined_at.path, resource.defined_at.line, rev);

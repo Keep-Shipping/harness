@@ -18,19 +18,62 @@ use cratefield_runtime_cloudflare::{FetchClient, WorkersClock};
 use worker::{Env, Headers, Method, Request, Response};
 
 use super::{
-    Fleet, Route, bearer_token, cookie_value, notice_page, render_index, render_site, route,
+    Fleet, Route, bearer_token, cookie_value, empty_snapshot_page, notice_page, render_index,
+    render_site, route,
 };
+use crate::cloudflare::api::{self, NOT_CONNECTED};
+use crate::cloudflare::page::{CONNECT_PATH, DISCONNECT_PATH, connect_page};
 use crate::signin::{self, CALLBACK_PATH, Client, LOGIN_PATH, LOGOUT_PATH, Reply};
 
+/// The fleet snapshot's refresh button (a POST, same gate as the fleet).
+pub const REFRESH_PATH: &str = "/console/fleet/refresh";
+
 /// Answers console paths, or `None` when the path is not the console's and
-/// the request should fall through to the harness.
-pub async fn handle(req: &Request, env: &Env) -> Option<worker::Result<Response>> {
+/// the request should fall through to the harness. `lib.rs` has already
+/// refused cross-site writes (`write_origin_rejected`) before this runs.
+pub async fn handle(req: &mut Request, env: &Env) -> Option<worker::Result<Response>> {
     let path = req.path();
     if let Some(step) = sign_in_step(&path) {
         return Some(serve_sign_in(req, env, step).await);
     }
+    if let Some(action) = action_for(&path) {
+        return Some(serve_action(req, env, action).await);
+    }
     let route = route(&path)?;
     Some(serve(req, env, route).await)
+}
+
+/// The Cloudflare connect page and the snapshot's write routes.
+#[derive(Clone, Copy)]
+enum Action {
+    /// `GET` shows the page, `POST` stores a pasted token.
+    Connect,
+    Disconnect,
+    Refresh,
+}
+
+fn action_for(path: &str) -> Option<Action> {
+    match path.trim_end_matches('/') {
+        CONNECT_PATH => Some(Action::Connect),
+        DISCONNECT_PATH => Some(Action::Disconnect),
+        REFRESH_PATH => Some(Action::Refresh),
+        _ => None,
+    }
+}
+
+/// The hourly cron's snapshot refresh (issue #169). Runs after the venture's
+/// own sweeps and never panics: a missing token is quiet, a failure is a
+/// logged warning, and the previous snapshot stays in place.
+pub async fn scheduled_refresh(env: &Env) {
+    let Some(secret) = read(env, "HARNESS_SECRET") else {
+        tracing::warn!("console: no HARNESS_SECRET, fleet snapshot not refreshed");
+        return;
+    };
+    match api::refresh(env, &secret).await {
+        Ok(_) => tracing::info!("console: fleet snapshot refreshed"),
+        Err(failed) if failed == NOT_CONNECTED => {}
+        Err(failed) => tracing::warn!(message = failed.message, "console: fleet refresh failed"),
+    }
 }
 
 /// The three sign-in routes, matched exactly (trailing slash tolerant).
@@ -53,7 +96,7 @@ fn sign_in_step(path: &str) -> Option<Step> {
 /// A config value as trimmed text, blank counting as absent — the same rule
 /// the secrets are read by. Vars and secrets both qualify: the issuer and
 /// client id are public, the allowlist may be sensitive.
-fn read(env: &Env, name: &str) -> Option<String> {
+pub(crate) fn read(env: &Env, name: &str) -> Option<String> {
     env.var(name)
         .ok()
         .map(|value| value.to_string())
@@ -168,23 +211,21 @@ fn reply(answer: &Reply) -> worker::Result<Response> {
     with_cookies(response, &answer.set_cookies)
 }
 
-async fn serve(req: &Request, env: &Env, route: Route) -> worker::Result<Response> {
-    if !matches!(req.method(), Method::Get | Method::Head) {
-        return page_with(
-            405,
-            &notice_page(
-                "Method not allowed",
-                "The console is read-only: it answers GET and HEAD only.",
-                None,
-            ),
-            &[("allow", "GET, HEAD")],
-        );
-    }
+/// Who is asking, and the cookies to set on the way out.
+struct Session {
+    set_cookies: Vec<String>,
+}
 
+/// The one gate every signed-in console page and write goes through: the
+/// configuration (503 when unset), who (a bearer token, else the console
+/// cookie, renewed from the refresh cookie when lapsed: 401 otherwise), and
+/// whether that person is on the allowlist (403). The `Err` is the finished
+/// answer to send instead.
+async fn authorize(req: &Request, env: &Env) -> Result<Session, worker::Result<Response>> {
     let (Some(issuer), Some(client_id), Some(allowlist)) =
         (read(env, "AUTH_ISSUER"), read(env, "AUTH_CLIENT_ID"), read(env, "CONSOLE_EMAILS"))
     else {
-        return page(503, &notice_page("Console not configured", CONFIGURED_COPY, None));
+        return Err(page(503, &notice_page("Console not configured", CONFIGURED_COPY, None)));
     };
 
     // Who: a bearer token in the header, else the console cookie; a
@@ -213,17 +254,174 @@ async fn serve(req: &Request, env: &Env, route: Route) -> worker::Result<Respons
             match renew(env, &issuer, &client_id, cookie_header.as_deref(), &verifier).await {
                 signin::Refresh::Renewed { claims, set_cookies } => (claims, set_cookies),
                 signin::Refresh::SignedOut { set_cookies } => {
-                    return with_cookies(unauthorized(&here)?, &set_cookies);
+                    return Err(unauthorized(&here)
+                        .and_then(|response| with_cookies(response, &set_cookies)));
                 }
-                signin::Refresh::Unavailable => return unauthorized(&here),
+                signin::Refresh::Unavailable => return Err(unauthorized(&here)),
             }
         }
-        None => return unauthorized(&here),
+        None => return Err(unauthorized(&here)),
     };
     if !signin::allowed(&claims, &allowlist) {
-        return page(403, &notice_page("Not allowed", FORBIDDEN_COPY, None));
+        return Err(page(403, &notice_page("Not allowed", FORBIDDEN_COPY, None)));
     }
-    with_cookies(fleet_page(env, route).await?, &set_cookies)
+    Ok(Session { set_cookies })
+}
+
+async fn serve(req: &Request, env: &Env, route: Route) -> worker::Result<Response> {
+    if !matches!(req.method(), Method::Get | Method::Head) {
+        return page_with(
+            405,
+            &notice_page(
+                "Method not allowed",
+                "The console is read-only: it answers GET and HEAD only.",
+                None,
+            ),
+            &[("allow", "GET, HEAD")],
+        );
+    }
+    let session = match authorize(req, env).await {
+        Ok(session) => session,
+        Err(answer) => return answer,
+    };
+    with_cookies(fleet_page(env, route).await?, &session.set_cookies)
+}
+
+/// The connect page (GET), the paste (POST), disconnect and refresh (POST).
+/// Every one is behind [`authorize`]; the methods are checked first.
+async fn serve_action(req: &mut Request, env: &Env, action: Action) -> worker::Result<Response> {
+    let post = matches!(req.method(), Method::Post);
+    let read_only = matches!(req.method(), Method::Get | Method::Head);
+    let allowed = match action {
+        Action::Connect => post || read_only,
+        Action::Disconnect | Action::Refresh => post,
+    };
+    if !allowed {
+        let allow = match action {
+            Action::Connect => "GET, HEAD, POST",
+            Action::Disconnect | Action::Refresh => "POST",
+        };
+        return page_with(
+            405,
+            &notice_page(
+                "Method not allowed",
+                "This page answers the methods its form uses.",
+                None,
+            ),
+            &[("allow", allow)],
+        );
+    }
+    let session = match authorize(req, env).await {
+        Ok(session) => session,
+        Err(answer) => return answer,
+    };
+    let response = match action {
+        Action::Connect if post => connect_save(req, env).await?,
+        Action::Connect => connect_form(env).await?,
+        Action::Disconnect => disconnect(env).await?,
+        Action::Refresh => refresh(env).await?,
+    };
+    with_cookies(response, &session.set_cookies)
+}
+
+/// Mirrors the secret's absence: the Cloudflare token is sealed with it, so
+/// nothing can be stored without it.
+const SEALER_COPY: &str = "This deployment has no HARNESS_SECRET, which seals the stored Cloudflare \
+     token, so nothing can be connected. Set it (see the README) and deploy again.";
+
+async fn connect_form(env: &Env) -> worker::Result<Response> {
+    let Some(secret) = read(env, "HARNESS_SECRET") else {
+        return page(503, &notice_page("Console not configured", SEALER_COPY, None));
+    };
+    match api::connected_at(env, &secret).await {
+        Ok(connected) => page(200, &connect_page(connected.as_deref(), None)),
+        Err(failed) => page(
+            failed.status,
+            &notice_page("Could not check the connection", failed.message, None),
+        ),
+    }
+}
+
+/// The paste: the token is read from the form body, sent to Cloudflare to
+/// verify, sealed and stored. Nothing in the answer carries it; a refusal is
+/// shown in words and the form is not kept.
+async fn connect_save(req: &mut Request, env: &Env) -> worker::Result<Response> {
+    let Some(secret) = read(env, "HARNESS_SECRET") else {
+        return page(503, &notice_page("Console not configured", SEALER_COPY, None));
+    };
+    let body = req.text().await?;
+    if body.len() > 4096 {
+        return page(
+            413,
+            &notice_page(
+                "Token not saved",
+                "The form is larger than a token can be.",
+                Some((CONNECT_PATH, "Back to the connect page")),
+            ),
+        );
+    }
+    let token = form_urlencoded::parse(body.as_bytes())
+        .find(|(name, _)| name == "token")
+        .map(|(_, value)| value.trim().to_owned())
+        .unwrap_or_default();
+    if token.is_empty() {
+        return page(
+            400,
+            &notice_page(
+                "Token not saved",
+                "Paste the token into the box first.",
+                Some((CONNECT_PATH, "Back to the connect page")),
+            ),
+        );
+    }
+    match api::connect(env, &secret, &token).await {
+        Ok(()) => redirect(303, "/console/fleet"),
+        Err(failed) => page(
+            failed.status,
+            &notice_page(
+                "Token not saved",
+                failed.message,
+                Some((CONNECT_PATH, "Back to the connect page")),
+            ),
+        ),
+    }
+}
+
+async fn disconnect(env: &Env) -> worker::Result<Response> {
+    match api::disconnect(env).await {
+        Ok(()) => redirect(303, CONNECT_PATH),
+        Err(failed) => page(
+            failed.status,
+            &notice_page(
+                "Could not disconnect",
+                failed.message,
+                Some((CONNECT_PATH, "Back to the connect page")),
+            ),
+        ),
+    }
+}
+
+async fn refresh(env: &Env) -> worker::Result<Response> {
+    let Some(secret) = read(env, "HARNESS_SECRET") else {
+        return page(503, &notice_page("Console not configured", SEALER_COPY, None));
+    };
+    match api::refresh(env, &secret).await {
+        Ok(_) => redirect(303, "/console/fleet"),
+        Err(failed) if failed == NOT_CONNECTED => redirect(303, CONNECT_PATH),
+        Err(failed) => page(
+            failed.status,
+            &notice_page("Refresh failed", failed.message, Some(("/console/fleet", "All sites"))),
+        ),
+    }
+}
+
+/// A 303 to `location`, with the console's no-store and no-referrer headers.
+fn redirect(status: u16, location: &str) -> worker::Result<Response> {
+    let headers = Headers::new();
+    headers.set("location", location)?;
+    headers.set("cache-control", "private, no-store")?;
+    headers.set("referrer-policy", "no-referrer")?;
+    Ok(Response::empty()?.with_status(status).with_headers(headers))
 }
 
 /// A server-side refresh from the `ks_console_refresh` cookie, or signed
@@ -272,15 +470,12 @@ async fn fleet_page(env: &Env, route: Route) -> worker::Result<Response> {
     let raw = match kv.get("fleet.json").text().await {
         Ok(Some(raw)) => raw,
         Ok(None) => {
-            return page(
-                200,
-                &notice_page(
-                    "No fleet snapshot yet",
-                    "This view appears after the nightly check writes its first snapshot. \
-                     Until then there is nothing to show.",
-                    None,
-                ),
-            );
+            // Connected: offer a refresh. Not connected: point at the connect page.
+            let connected = match read(env, "HARNESS_SECRET") {
+                Some(secret) => api::connected_at(env, &secret).await.ok().flatten().is_some(),
+                None => false,
+            };
+            return page(200, &empty_snapshot_page(connected));
         }
         Err(error) => {
             tracing::warn!(%error, "console: fleet.json could not be read");
@@ -378,3 +573,42 @@ const BROKEN_COPY: &str = "The fleet snapshot in storage is not the shape this p
      snapshot.";
 const READ_COPY: &str = "The fleet could not be read right now. Try again shortly; if it \
      persists, the worker that serves this view cannot reach its storage.";
+
+#[cfg(test)]
+mod tests {
+    use super::{Action, action_for};
+    use crate::fleet::{Route, empty_snapshot_page, route};
+
+    #[test]
+    fn the_write_routes_are_matched_exactly_trailing_slash_tolerant() {
+        assert!(matches!(action_for("/console/connect/cloudflare"), Some(Action::Connect)));
+        assert!(matches!(action_for("/console/connect/cloudflare/"), Some(Action::Connect)));
+        assert!(matches!(
+            action_for("/console/connect/cloudflare/disconnect"),
+            Some(Action::Disconnect)
+        ));
+        assert!(matches!(action_for("/console/fleet/refresh"), Some(Action::Refresh)));
+        // Look-alikes fall through to the harness or the fleet routes.
+        assert!(action_for("/console/connect/cloudflarex").is_none());
+        assert!(action_for("/console/connect/cloudflare/x/disconnect").is_none());
+        assert!(action_for("/console/fleet/refresh/extra").is_none());
+    }
+
+    #[test]
+    fn refresh_is_claimed_before_the_fleet_route_can_read_it_as_a_site() {
+        // `route` would call this a site named "refresh"; `handle` checks
+        // `action_for` first, so the POST never reaches the site lookup.
+        assert_eq!(route("/console/fleet/refresh"), Some(Route::Site("refresh".into())));
+        assert!(matches!(action_for("/console/fleet/refresh"), Some(Action::Refresh)));
+    }
+
+    #[test]
+    fn the_empty_state_points_at_connect_or_offers_refresh() {
+        let disconnected = empty_snapshot_page(false);
+        assert!(disconnected.contains("href=\"/console/connect/cloudflare\""));
+        assert!(!disconnected.contains("action=\"/console/fleet/refresh\""));
+        let connected = empty_snapshot_page(true);
+        assert!(connected.contains("action=\"/console/fleet/refresh\""));
+        assert!(!connected.contains("href=\"/console/connect/cloudflare\""));
+    }
+}
