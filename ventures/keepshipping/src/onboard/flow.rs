@@ -119,7 +119,7 @@ pub fn page_path(site: &Site) -> String {
 
 /// `GET /console/fleet/<id>/code`: the step the site is on. `again` shows the
 /// review of a finished setup, to run it again.
-pub async fn view(env: &Env, secret: &str, site: &Site, again: bool) -> Reply {
+pub async fn view(env: &Env, secret: Option<&str>, site: &Site, again: bool) -> Reply {
     let here = page_path(site);
     let Some(target) = rollback::target(site) else {
         return Reply::Html(200, page::notice("Not available", UNAVAILABLE));
@@ -153,7 +153,7 @@ pub async fn view(env: &Env, secret: &str, site: &Site, again: bool) -> Reply {
 /// `POST /console/fleet/<id>/code`: runs the step named by the `step` field.
 pub async fn post(
     env: &Env,
-    secret: &str,
+    secret: Option<&str>,
     site: &Site,
     email: &str,
     form: &[(String, String)],
@@ -254,7 +254,7 @@ fn scope_of(site: &Site, stack: &Stack) -> SiteScope {
 }
 
 /// The account, read with the stored read token.
-async fn read_account(env: &Env, secret: &str, target: &Target) -> Result<CfAccount, Stop> {
+async fn read_account(env: &Env, secret: Option<&str>, target: &Target) -> Result<CfAccount, Stop> {
     let token = api::load_token(env, secret)
         .await
         .map_err(|failed| Stop::new(STEP_READ, failed.message))?
@@ -268,7 +268,7 @@ async fn read_account(env: &Env, secret: &str, target: &Target) -> Result<CfAcco
 /// the closest name.
 async fn repo_step(
     env: &Env,
-    secret: &str,
+    secret: Option<&str>,
     site: &Site,
     target: &Target,
     client: &Client,
@@ -311,7 +311,7 @@ async fn repo_step(
 /// fields for the two secrets.
 async fn review(
     env: &Env,
-    secret: &str,
+    secret: Option<&str>,
     site: &Site,
     target: &Target,
     record: &Record,
@@ -379,7 +379,7 @@ async fn status(env: &Env, site: &Site, record: &Record) -> Reply {
 
 /// Scans the app repository (or records "Cloudflare only") and moves the
 /// wizard on to the review. A failure is stored as the row's error.
-async fn scan(env: &Env, secret: &str, site: &Site, form: &[(String, String)]) -> Reply {
+async fn scan(env: &Env, secret: Option<&str>, site: &Site, form: &[(String, String)]) -> Reply {
     let mut record = match load(env, &site.id).await {
         Ok(record) => record,
         Err(reply) => return reply,
@@ -495,7 +495,7 @@ fn holds(updated_at: &str, now: OffsetDateTime) -> bool {
 /// is shown on the review; a failure in the setup is stored with its step.
 async fn open(
     env: &Env,
-    secret: &str,
+    secret: Option<&str>,
     site: &Site,
     target: &Target,
     email: &str,
@@ -620,7 +620,7 @@ struct OpenInput<'a> {
 /// is no edit yet, the existing branch brought up to date when there is one.
 async fn run_open(
     env: &Env,
-    secret: &str,
+    secret: Option<&str>,
     input: &OpenInput<'_>,
     record: &mut Record,
     now: &str,

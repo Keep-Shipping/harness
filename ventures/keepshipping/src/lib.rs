@@ -55,6 +55,7 @@ mod billing;
 mod edits;
 mod gsc;
 mod origin;
+mod secrets;
 mod setup;
 
 pub mod signin;
@@ -405,6 +406,12 @@ fn is_console_entry(method: &str, path: &str) -> bool {
 /// fail closed, never error open.
 #[event(fetch)]
 pub async fn fetch(mut req: Request, env: Env, ctx: Context) -> worker::Result<Response> {
+    // Edits deliveries (started by an approval) and the console read stored
+    // tokens with the master key, which a request loads here, where `Env` is.
+    let path = req.path();
+    if path.starts_with("/v1/edits") || path.starts_with("/console") {
+        secrets::prime(&env).await;
+    }
     let origin = req.headers().get("origin").ok().flatten();
     // The host the request itself was addressed to: a same-origin form post
     // carries it as `Origin`, and that is as good as the site allowlist.
@@ -442,6 +449,9 @@ pub async fn fetch(mut req: Request, env: Env, ctx: Context) -> worker::Result<R
 pub async fn scheduled(event: worker::ScheduledEvent, env: Env, ctx: worker::ScheduleContext) {
     // Handler errors inside `serve_scheduled` are logged, never a failed
     // cron — the module's sweeps are idempotent by construction.
+    // The edits deliveries run inside the sweeps below and read the stored
+    // GitHub token with the master key, loaded here where `Env` is.
+    secrets::prime(&env).await;
     let (harness, runtime) = &*instance(&env);
     serve_scheduled(harness, runtime, event, env.clone(), ctx).await;
     // The fleet snapshot (issue #169) refreshes alongside the sweeps, after

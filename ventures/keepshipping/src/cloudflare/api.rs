@@ -1,13 +1,15 @@
 //! The Workers side of the Cloudflare collector: the HTTP reads (`worker::Fetch`),
-//! the D1 row that holds the sealed token, and the KV snapshot. Every
-//! decision worth testing is in the parent module; what is here is the
-//! wiring. A missing token, a broken row or an unreadable account is a
+//! the token in the secrets vault (`src/secrets.rs`), and the KV snapshot.
+//! Every decision worth testing is in the parent module; what is here is the
+//! wiring. A missing token, a master key that is not configured, or an
+//! unreadable account is a
 //! plain-words [`Failed`] and nothing is written. A refused zone, Pages or
 //! Workers listing is a named gap on the page instead, so one missing
 //! permission does not hide everything the token can read.
 //!
 //! The token is only ever in memory here, in a request header, or in the
-//! sealed D1 row. It is never logged, never put in a URL and never returned.
+//! vault's encrypted row. It is never logged, never put in a URL and never
+//! returned.
 
 use cratefield_core::Clock;
 use cratefield_runtime_cloudflare::WorkersClock;
@@ -18,13 +20,14 @@ use worker::wasm_bindgen::JsValue;
 use worker::{Env, Fetch, Headers, Method, Request, RequestInit};
 
 use super::rollback::{self, Candidate, PagesProjectLive, Panel, Target};
-use super::seal::{self, Sealed};
+use super::seal;
 use super::{
     Account, AccountError, CertificatePack, Envelope, Inventory, PagesDeployment, PagesProject,
     Verify, WorkerDeployments, WorkerDomain, WorkerScript, Zone, ZoneRecord, fleet_from, merge,
     pick_accounts, token_is_active,
 };
 use crate::fleet::{Fleet, Site};
+use crate::secrets::{self, Legacy, Stored, Vault};
 
 /// The KV key the snapshot lives under (binding `FLEET`).
 pub const KV_KEY: &str = "fleet.json";
@@ -73,40 +76,27 @@ const SHAPE: Failed = Failed {
     message: "Cloudflare answered in a shape this console does not read. Try again later.",
 };
 const STORE: Failed = Failed { status: 503, message: "The token could not be saved. Try again." };
+const NO_MASTER_KEY: Failed = Failed { status: 503, message: secrets::NO_MASTER_KEY_COPY };
 const WRITE: Failed =
     Failed { status: 503, message: "The fleet snapshot could not be written. Try again." };
 pub const NOT_CONNECTED: Failed =
     Failed { status: 409, message: "No Cloudflare token is connected. Connect one first." };
 
-/// The stored row, as D1 returns it.
-#[derive(Deserialize)]
-struct StoredRow {
-    nonce: String,
-    ciphertext: String,
-    updated_at: String,
-}
-
-/// What the connect page shows: when the readable token was saved, or
-/// `None` when nothing is stored or it no longer opens (a rotated
-/// `HARNESS_SECRET`), which reads the same to the person: connect again.
-pub async fn connected_at(env: &Env, secret: &str) -> Result<Option<String>, Failed> {
-    Ok(stored(env).await?.and_then(|row| {
-        let sealed = Sealed { nonce: row.nonce, ciphertext: row.ciphertext };
-        match seal::open(secret, &sealed) {
-            Ok(_) => Some(row.updated_at),
-            Err(error) => {
-                tracing::warn!(?error, "console: stored Cloudflare token does not open");
-                None
-            }
-        }
-    }))
+/// What the connect page shows: when the readable token was saved, or `None`
+/// when nothing is connected or the stored one no longer opens (a rotated
+/// master key), which reads the same to the person: connect again.
+pub async fn connected_at(
+    env: &Env,
+    legacy_secret: Option<&str>,
+) -> Result<Option<String>, Failed> {
+    Ok(load(env, Slot::Read, legacy_secret).await?.map(|stored| stored.saved_at().to_owned()))
 }
 
 /// The names of the accounts the stored token can list, for the connect
 /// page. Empty when there is no token or the listing fails: the page then
 /// simply does not say.
-pub async fn visible_accounts(env: &Env, secret: &str) -> Vec<String> {
-    let Ok(Some(token)) = load_token(env, secret).await else {
+pub async fn visible_accounts(env: &Env, legacy_secret: Option<&str>) -> Vec<String> {
+    let Ok(Some(token)) = load_token(env, legacy_secret).await else {
         return Vec::new();
     };
     list::<Account>(&token, "/accounts")
@@ -115,23 +105,17 @@ pub async fn visible_accounts(env: &Env, secret: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The token as stored, opened; `None` when there is none or it does not open.
-pub(crate) async fn load_token(env: &Env, secret: &str) -> Result<Option<String>, Failed> {
-    let Some(row) = stored(env).await? else {
-        return Ok(None);
-    };
-    let sealed = Sealed { nonce: row.nonce, ciphertext: row.ciphertext };
-    match seal::open(secret, &sealed) {
-        Ok(token) => Ok(Some(token)),
-        Err(error) => {
-            tracing::warn!(?error, "console: stored Cloudflare token does not open");
-            Ok(None)
-        }
-    }
+/// The read token as text, when one is stored and opens.
+pub(crate) async fn load_token(
+    env: &Env,
+    legacy_secret: Option<&str>,
+) -> Result<Option<String>, Failed> {
+    Ok(load(env, Slot::Read, legacy_secret).await?.map(Stored::into_token))
 }
 
 /// Which stored token: the read-only one the fleet is built with, or the
-/// optional deploy token rollbacks use. Each has its own table and key.
+/// optional deploy token rollbacks use. Each has its own name in the vault
+/// and its own legacy row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Slot {
     Read,
@@ -139,66 +123,53 @@ enum Slot {
 }
 
 impl Slot {
-    fn table(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
-            Slot::Read => "console_cloudflare_token",
-            Slot::Deploy => "console_cloudflare_deploy_token",
+            Slot::Read => secrets::CLOUDFLARE_READ,
+            Slot::Deploy => secrets::CLOUDFLARE_DEPLOY,
         }
     }
 
-    fn info(self) -> &'static [u8] {
+    /// The old sealed row this token may still be in, and the secret that
+    /// opens it when the deployment still has one.
+    fn legacy(self, secret: Option<&str>) -> Legacy<'_> {
         match self {
-            Slot::Read => seal::INFO,
-            Slot::Deploy => seal::DEPLOY_INFO,
+            Slot::Read => Legacy { table: "console_cloudflare_token", info: seal::INFO, secret },
+            Slot::Deploy => {
+                Legacy { table: "console_cloudflare_deploy_token", info: seal::DEPLOY_INFO, secret }
+            }
         }
     }
 }
 
-async fn stored(env: &Env) -> Result<Option<StoredRow>, Failed> {
-    stored_in(env, Slot::Read).await
+fn vault_failed(error: secrets::Error) -> Failed {
+    match error {
+        secrets::Error::NoMasterKey => NO_MASTER_KEY,
+        secrets::Error::Storage => STORE,
+    }
 }
 
-async fn stored_in(env: &Env, slot: Slot) -> Result<Option<StoredRow>, Failed> {
-    let db = env.d1("DB").map_err(|_| STORE)?;
-    db.prepare(format!("SELECT nonce, ciphertext, updated_at FROM {} WHERE id = 1", slot.table()))
-        .first::<StoredRow>(None)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "console: reading the stored token failed");
-            STORE
-        })
+/// The token in `slot`, opened, with its save time. `None` when none is
+/// connected.
+async fn load(
+    env: &Env,
+    slot: Slot,
+    legacy_secret: Option<&str>,
+) -> Result<Option<Stored>, Failed> {
+    secrets::read(env, slot.name(), &slot.legacy(legacy_secret)).await.map_err(vault_failed)
 }
 
-async fn store(env: &Env, sealed: &Sealed, now: &str) -> Result<(), Failed> {
-    store_in(env, Slot::Read, sealed, now).await
+/// Saves `token` in `slot`, replacing what was there.
+async fn save(env: &Env, slot: Slot, token: &str) -> Result<(), Failed> {
+    let vault = Vault::open(env).await.map_err(vault_failed)?;
+    vault.write(slot.name(), token, &slot.legacy(None)).await.map_err(vault_failed)
 }
 
-async fn store_in(env: &Env, slot: Slot, sealed: &Sealed, now: &str) -> Result<(), Failed> {
-    let db = env.d1("DB").map_err(|_| STORE)?;
-    let values = [
-        JsValue::from_str(&sealed.nonce),
-        JsValue::from_str(&sealed.ciphertext),
-        JsValue::from_str(now),
-    ];
-    db.prepare(format!(
-        "INSERT INTO {} (id, nonce, ciphertext, updated_at) \
-         VALUES (1, ?, ?, ?) \
-         ON CONFLICT(id) DO UPDATE SET nonce = excluded.nonce, \
-         ciphertext = excluded.ciphertext, updated_at = excluded.updated_at",
-        slot.table()
-    ))
-    .bind(&values)
-    .map_err(|_| STORE)?
-    .run()
-    .await
-    .map(|_| ())
-    .map_err(|error| {
-        tracing::warn!(%error, "console: writing the stored token failed");
-        STORE
-    })
+/// Forgets `slot`'s token and any legacy row for it.
+async fn forget(env: &Env, slot: Slot) -> Result<(), Failed> {
+    secrets::forget(env, slot.name(), &slot.legacy(None)).await.map_err(vault_failed)
 }
 
-/// One send: the status and body, with the token only in the header.
 async fn send(token: &str, url: &str) -> Result<(u16, String), Failed> {
     send_with(token, Method::Get, url, None).await
 }
@@ -453,11 +424,10 @@ async fn write_snapshot(env: &Env, token: &str) -> Result<Fleet, Failed> {
     Ok(fleet)
 }
 
-/// The paste: verify the token, check it can list an account, seal and
-/// store it, then take the first snapshot. The snapshot's failure is logged
-/// and does not undo a token that was accepted; the fleet page offers a
-/// refresh.
-pub async fn connect(env: &Env, secret: &str, token: &str) -> Result<(), Failed> {
+/// The paste: verify the token, check it can list an account, store it, then
+/// take the first snapshot. The snapshot's failure is logged and does not
+/// undo a token that was accepted; the fleet page offers a refresh.
+pub async fn connect(env: &Env, token: &str) -> Result<(), Failed> {
     // Any answer other than a 200 with an active status is "not accepted":
     // the person's fix is the same (paste it again, or make a new one).
     let (status, body) = send(token, &format!("{API}/user/tokens/verify")).await?;
@@ -472,9 +442,7 @@ pub async fn connect(env: &Env, secret: &str, token: &str) -> Result<(), Failed>
     if accounts.is_empty() {
         return Err(NO_ACCOUNTS);
     }
-    let sealed = seal::seal(secret, token).map_err(|_| STORE)?;
-    let now = WorkersClock.now().format(&Rfc3339).map_err(|_| STORE)?;
-    store(env, &sealed, &now).await?;
+    save(env, Slot::Read, token).await?;
     if let Err(failed) = write_snapshot(env, token).await {
         tracing::warn!(message = failed.message, "console: first snapshot after connect failed");
     }
@@ -483,20 +451,16 @@ pub async fn connect(env: &Env, secret: &str, token: &str) -> Result<(), Failed>
 
 /// Rebuilds the snapshot from the stored token. Used by the refresh button
 /// and the hourly cron.
-pub async fn refresh(env: &Env, secret: &str) -> Result<Fleet, Failed> {
-    let token = load_token(env, secret).await?.ok_or(NOT_CONNECTED)?;
+pub async fn refresh(env: &Env, legacy_secret: Option<&str>) -> Result<Fleet, Failed> {
+    let token = load_token(env, legacy_secret).await?.ok_or(NOT_CONNECTED)?;
     write_snapshot(env, &token).await
 }
 
 /// Forgets both tokens and the snapshot the read token produced.
 pub async fn disconnect(env: &Env) -> Result<(), Failed> {
-    let db = env.d1("DB").map_err(|_| STORE)?;
     // The deploy token goes too: disconnecting cuts all Cloudflare access.
     for slot in [Slot::Read, Slot::Deploy] {
-        db.prepare(format!("DELETE FROM {} WHERE id = 1", slot.table()))
-            .run()
-            .await
-            .map_err(|_| STORE)?;
+        forget(env, slot).await?;
     }
     let kv = env.kv("FLEET").map_err(|_| WRITE)?;
     kv.delete(KV_KEY).await.map_err(|_| WRITE)?;
@@ -504,31 +468,24 @@ pub async fn disconnect(env: &Env) -> Result<(), Failed> {
 }
 
 /// When the deploy token was saved, when one is stored and opens.
-pub async fn deploy_connected_at(env: &Env, secret: &str) -> Result<Option<String>, Failed> {
-    Ok(stored_in(env, Slot::Deploy).await?.and_then(|row| {
-        let sealed = Sealed { nonce: row.nonce, ciphertext: row.ciphertext };
-        seal::open_for(Slot::Deploy.info(), secret, &sealed).ok().map(|_| row.updated_at)
-    }))
+pub async fn deploy_connected_at(
+    env: &Env,
+    legacy_secret: Option<&str>,
+) -> Result<Option<String>, Failed> {
+    Ok(load(env, Slot::Deploy, legacy_secret).await?.map(|stored| stored.saved_at().to_owned()))
 }
 
-async fn load_deploy_token(env: &Env, secret: &str) -> Result<Option<String>, Failed> {
-    let Some(row) = stored_in(env, Slot::Deploy).await? else {
-        return Ok(None);
-    };
-    let sealed = Sealed { nonce: row.nonce, ciphertext: row.ciphertext };
-    match seal::open_for(Slot::Deploy.info(), secret, &sealed) {
-        Ok(token) => Ok(Some(token)),
-        Err(error) => {
-            tracing::warn!(?error, "console: stored deploy token does not open");
-            Ok(None)
-        }
-    }
+async fn load_deploy_token(
+    env: &Env,
+    legacy_secret: Option<&str>,
+) -> Result<Option<String>, Failed> {
+    Ok(load(env, Slot::Deploy, legacy_secret).await?.map(Stored::into_token))
 }
 
 /// The deploy token's paste: verified active and able to list an account,
-/// then sealed under its own key and stored. No snapshot is taken: the
-/// fleet is read with the read-only token.
-pub async fn connect_deploy(env: &Env, secret: &str, token: &str) -> Result<(), Failed> {
+/// then stored under its own name. No snapshot is taken: the fleet is read
+/// with the read-only token.
+pub async fn connect_deploy(env: &Env, token: &str) -> Result<(), Failed> {
     let (status, body) = send(token, &format!("{API}/user/tokens/verify")).await?;
     if status != 200 {
         return Err(NOT_ACCEPTED);
@@ -540,9 +497,7 @@ pub async fn connect_deploy(env: &Env, secret: &str, token: &str) -> Result<(), 
     if list::<Account>(token, "/accounts").await?.is_empty() {
         return Err(NO_ACCOUNTS);
     }
-    let sealed = seal::seal_for(Slot::Deploy.info(), secret, token).map_err(|_| STORE)?;
-    let now = WorkersClock.now().format(&Rfc3339).map_err(|_| STORE)?;
-    store_in(env, Slot::Deploy, &sealed, &now).await
+    save(env, Slot::Deploy, token).await
 }
 
 /// What a write the onboarding makes can be refused with.
@@ -632,12 +587,7 @@ pub(crate) async fn create_bucket(token: &str, account_id: &str, name: &str) -> 
 
 /// Forgets the deploy token; the fleet and its read-only token stay.
 pub async fn disconnect_deploy(env: &Env) -> Result<(), Failed> {
-    let db = env.d1("DB").map_err(|_| STORE)?;
-    db.prepare("DELETE FROM console_cloudflare_deploy_token WHERE id = 1")
-        .run()
-        .await
-        .map_err(|_| STORE)?;
-    Ok(())
+    forget(env, Slot::Deploy).await
 }
 
 const NO_DEPLOY_TOKEN: Failed = Failed {
@@ -682,11 +632,11 @@ async fn candidates(token: &str, target: &Target) -> Result<Vec<Candidate>, Fail
 }
 
 /// The site page's rollback panel, read live.
-pub async fn rollback_panel(env: &Env, secret: &str, site: &Site) -> Panel {
+pub async fn rollback_panel(env: &Env, legacy_secret: Option<&str>, site: &Site) -> Panel {
     let Some(target) = rollback::target(site) else {
         return Panel::NotSupported;
     };
-    let token = match load_deploy_token(env, secret).await {
+    let token = match load_deploy_token(env, legacy_secret).await {
         Ok(Some(token)) => token,
         Ok(None) => return Panel::NoDeployToken,
         Err(failed) => return Panel::Unavailable(failed.message),
@@ -700,12 +650,12 @@ pub async fn rollback_panel(env: &Env, secret: &str, site: &Site) -> Panel {
 /// The confirmation page's facts: the candidate `to`, and the live one.
 pub async fn rollback_choice(
     env: &Env,
-    secret: &str,
+    legacy_secret: Option<&str>,
     site: &Site,
     to: &str,
 ) -> Result<(Candidate, Option<Candidate>), Failed> {
     let target = rollback::target(site).ok_or(NOT_A_CANDIDATE)?;
-    let token = load_deploy_token(env, secret).await?.ok_or(NO_DEPLOY_TOKEN)?;
+    let token = load_deploy_token(env, legacy_secret).await?.ok_or(NO_DEPLOY_TOKEN)?;
     let listed = candidates(&token, &target).await?;
     let chosen = rollback::allowed(&listed, to).cloned().ok_or(NOT_A_CANDIDATE)?;
     let live = listed.into_iter().find(|candidate| candidate.live);
@@ -714,9 +664,14 @@ pub async fn rollback_choice(
 
 /// Rolls `site` back to `to`: checked against a fresh listing (listed, not
 /// live), then the one documented call. Logged with ids only.
-pub async fn roll_back(env: &Env, secret: &str, site: &Site, to: &str) -> Result<(), Failed> {
+pub async fn roll_back(
+    env: &Env,
+    legacy_secret: Option<&str>,
+    site: &Site,
+    to: &str,
+) -> Result<(), Failed> {
     let target = rollback::target(site).ok_or(NOT_A_CANDIDATE)?;
-    let token = load_deploy_token(env, secret).await?.ok_or(NO_DEPLOY_TOKEN)?;
+    let token = load_deploy_token(env, legacy_secret).await?.ok_or(NO_DEPLOY_TOKEN)?;
     let listed = candidates(&token, &target).await?;
     let chosen = rollback::allowed(&listed, to).ok_or(NOT_A_CANDIDATE)?;
     let (path, body) = target.rollback_request(&chosen.id);

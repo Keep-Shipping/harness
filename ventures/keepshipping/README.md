@@ -115,6 +115,51 @@ wrangler secret put EDITS_RUNNER_TOKEN   # the CI plan callback's Bearer (#170)
 wrangler deploy
 ```
 
+### The master key for stored tokens (one-time)
+
+The Cloudflare and GitHub tokens the console keeps are encrypted with a data
+key per store, and that data key is wrapped under a master key (KEK). The
+master key lives in a Cloudflare Secrets Store: generate it straight into the
+store, so it is never printed or written to a file. `<STORE_ID>` is the store's
+id, from `wrangler secrets-store store list --remote` (or create one with
+`wrangler secrets-store store create <name> --remote`):
+
+```sh
+# Version 1 of the master key: 32 random bytes, piped in and never shown.
+openssl rand -base64 32 | npx wrangler secrets-store secret create <STORE_ID> --name KS_CONSOLE_KEK_V1 --scopes workers --remote
+# The version new wraps use. The value is the decimal version number.
+printf 1 | npx wrangler secrets-store secret create <STORE_ID> --name KS_CONSOLE_KEK_CURRENT --scopes workers --remote
+```
+
+`--remote` is required: without it the command writes to a local development
+store, not the one the Worker reads. `wrangler.toml` already binds both
+secrets from Factory0's default store (`d9a352fe…`, secret names prefixed
+`KS_CONSOLE_` because the store is shared by every Worker on the account), so
+create them before deploying. Until the key exists, tokens saved before the
+store existed are still read (read-only) and new tokens are refused with a
+plain "set the master key" page.
+
+**Which source is read.** The console uses one source per deployment. If
+`wrangler.toml` declares any `HARNESS_KEK_*` Secrets Store binding, every
+version is read from the store, and a version the store does not hold is
+absent. Only a deployment with no such binding reads plain Worker secrets of
+the same names (`wrangler secret put HARNESS_KEK_V1`, and so on). The two are
+never mixed.
+
+**Rotation.** (1) Create `HARNESS_KEK_V2` in the store with the command above
+(`secret create --name HARNESS_KEK_V2`, or `secret update` to change it in
+place). (2) Add a `[[secrets_store_secrets]]` block for `HARNESS_KEK_V2` to
+`wrangler.toml`, with the same `store_id`. This must be done before the deploy:
+without the block the Worker cannot read version 2. (3) Set
+`HARNESS_KEK_CURRENT` to `2` in the store, and deploy. New data keys wrap under
+version 2 from then on. (4) Open the Cloudflare connection page and press
+**Re-encrypt with the current key**. That re-wraps every stored data key under
+version 2 and reports how many it moved. The tokens themselves do not change.
+(5) Only after that, remove `HARNESS_KEK_V1` from the store and its block from
+`wrangler.toml`. Until step 4 runs, version 1 must stay. Removing a version
+that a stored key still needs makes those tokens error on read, and the
+console says it could not read them.
+
 The Search Console secret is a Google service-account key file's JSON,
 pasted whole — its `private_key` signs the JWT that fetches the status.
 Share the property once in Search Console ("Settings → Users", the
@@ -183,15 +228,17 @@ below are set it answers `503`.
   permission reference): `zone`, `dns`, `ssl_and_certificates`,
   `workers_scripts`, `page` (Pages), `account_settings`, all `read`.
 - **Storage** — the paste is checked (`/user/tokens/verify` must say
-  `active`, and `/accounts` must list at least one account), then sealed and
-  written to the console's D1 table `console_cloudflare_token` (migration
-  `0009`). Sealing is AES-256-GCM with a fresh 96-bit nonce per write; the
-  key is HKDF-SHA256 over `HARNESS_SECRET` with info
-  `ks-console/cloudflare-token/v1`. The token is never logged, echoed, or put
-  in a URL. Rotating `HARNESS_SECRET` makes the stored token unreadable: the
-  connect page then asks for it again.
-- **Disconnect** — `POST /console/connect/cloudflare/disconnect` deletes the
-  row and the `fleet.json` snapshot.
+  `active`, and `/accounts` must list at least one account), then stored in
+  the console's secrets vault under `cloudflare/read-token` (`cratefield-secrets`
+  over the master key above; the encrypted row sits in D1, migration `0014`).
+  The token is never logged, echoed, or put in a URL. A token sealed by the
+  earlier scheme under `HARNESS_SECRET` (table `console_cloudflare_token`,
+  migration `0009`) moves into the vault the first time it is read while
+  `HARNESS_SECRET` is still set; that code path is legacy and is to be removed
+  after one release.
+- **Disconnect** — `POST /console/connect/cloudflare/disconnect` forgets the
+  token (a soft delete in the vault: the encrypted value stays in D1,
+  unreadable) and deletes the `fleet.json` snapshot.
 - **Collector** — with a token stored, the collector lists every account
   the token can see (`CF_ACCOUNT_ID`, an optional var, narrows it to one), and
   for each, grouped by account on the page, its zones (with a certificate-pack

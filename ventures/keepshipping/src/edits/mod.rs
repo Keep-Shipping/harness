@@ -202,7 +202,7 @@ impl Module for Edits {
                 return Ok(());
             };
             let clock = clock_of(ctx);
-            drain(&*db, http, Arc::clone(&ctx.config), &*clock, &ctx.scheduled)
+            drain(Arc::clone(&db), http, Arc::clone(&ctx.config), &*clock, &ctx.scheduled)
                 .await
                 .map(|_| ())
                 .map_err(|error| Box::new(error) as AnyError)
@@ -389,7 +389,7 @@ fn deliver_soon(ctx: &ModuleContext) {
     let config = Arc::clone(&ctx.config);
     defer.wait_until(Box::pin(async move {
         let budget = ScheduledBudget::unbounded();
-        if let Err(error) = drain(&*db, http, config, &*clock, &budget).await {
+        if let Err(error) = drain(db, http, config, &*clock, &budget).await {
             tracing::warn!(%error, "edits: the immediate delivery failed; the cron will retry");
         }
     }));
@@ -433,7 +433,7 @@ impl Tokens {
 /// posture. With neither `EDITS_GITHUB_TOKEN` nor a connected GitHub account
 /// there is simply nothing to deliver yet.
 async fn drain(
-    db: &dyn Database,
+    db: Arc<dyn Database>,
     http: Arc<dyn HttpClient>,
     config: Arc<dyn Config>,
     clock: &dyn Clock,
@@ -441,10 +441,9 @@ async fn drain(
 ) -> Result<DrainReport, DbError> {
     let cfg = ModuleConfig::new(Edits::NAME, config.as_ref());
     let configured = cfg.get_opt("GITHUB_TOKEN");
-    let stored = match config.get("HARNESS_SECRET") {
-        Some(secret) => crate::github::token_from_database(db, &secret).await,
-        None => None,
-    };
+    let legacy_secret = config.get("HARNESS_SECRET");
+    let stored = crate::github::stored_token(Arc::clone(&db), legacy_secret.as_deref()).await;
+    let db: &dyn Database = db.as_ref();
     if configured.is_none() && stored.is_none() {
         return Ok(cratefield_core::DrainReport::default());
     }

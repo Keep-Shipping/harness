@@ -1,25 +1,26 @@
-//! The console's GitHub connection: a fine-grained token the console seals
-//! in D1 (the same scheme as the Cloudflare read token, under its own key),
-//! and the GitHub REST calls the setup wizard makes with it.
+//! The console's GitHub connection: a fine-grained token the console keeps
+//! in its secrets vault (`src/secrets.rs`, envelope-encrypted), and the
+//! GitHub REST calls the setup wizard makes with it.
 //!
 //! The pure parts — URL building, reading GitHub's JSON, sealing a secret
 //! for GitHub's Actions endpoint — are plain functions, tested natively
 //! below. What is left is the Workers wiring: `worker::Fetch` for the calls
-//! and the D1 row for the token. The token is only ever in memory, in a
-//! request header, or in the sealed row. It is never logged, never put in a
-//! URL and never returned.
+//! and the vault for the token. The token is only ever in memory, in a
+//! request header, or in the vault. It is never logged, never put in a URL
+//! and never returned.
 
 pub mod page;
 
+use std::sync::Arc;
+
 use base64::Engine as _;
-use cratefield_core::{Clock, Database, Statement};
-use cratefield_runtime_cloudflare::WorkersClock;
+use cratefield_core::Database;
 use serde::Deserialize;
-use time::format_description::well_known::Rfc3339;
 use worker::wasm_bindgen::JsValue;
 use worker::{Env, Fetch, Headers, Method, Request, RequestInit};
 
-use crate::cloudflare::seal::{self, GITHUB_INFO, Sealed};
+use crate::cloudflare::seal::GITHUB_INFO;
+use crate::secrets::{self, Legacy, Stored, Vault};
 
 /// The public REST root.
 pub const API: &str = "https://api.github.com";
@@ -27,10 +28,9 @@ pub const API: &str = "https://api.github.com";
 /// cannot change what the console reads.
 const API_VERSION: &str = "2022-11-28";
 const USER_AGENT: &str = "keepshipping-console";
-/// The D1 table holding the sealed token: one row, `id = 1`.
-const TABLE: &str = "console_github_token";
-/// The row read by [`token_from_database`].
-const STORED_QUERY: &str = "SELECT nonce, ciphertext FROM console_github_token WHERE id = 1";
+/// The old D1 table the token was sealed in before the vault (`id = 1`).
+/// Read only to move the row across; see `src/secrets.rs`.
+const LEGACY_TABLE: &str = "console_github_token";
 
 /// A failure the connection and wizard pages can show: an HTTP status to
 /// answer with, and what to tell the person, in plain words.
@@ -59,6 +59,7 @@ const SHAPE: Failed = Failed {
     message: "GitHub answered in a shape this console does not read. Try again later.",
 };
 const STORE: Failed = Failed { status: 503, message: "The token could not be saved. Try again." };
+const NO_MASTER_KEY: Failed = Failed { status: 503, message: secrets::NO_MASTER_KEY_COPY };
 const REPO_REFUSED: Failed = Failed {
     status: 502,
     message: "GitHub would not create that repository. The name may already be taken, or the \
@@ -791,108 +792,73 @@ fn ok(status: u16, what: &str) -> Result<(), Failed> {
 // The stored token.
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct StoredRow {
-    nonce: String,
-    ciphertext: String,
-    updated_at: String,
+/// The GitHub token's name in the vault.
+const NAME: &str = secrets::GITHUB;
+
+fn legacy(secret: Option<&str>) -> Legacy<'_> {
+    Legacy { table: LEGACY_TABLE, info: GITHUB_INFO, secret }
 }
 
-async fn stored(env: &Env) -> Result<Option<StoredRow>, Failed> {
-    let db = env.d1("DB").map_err(|_| STORE)?;
-    db.prepare(format!("SELECT nonce, ciphertext, updated_at FROM {TABLE} WHERE id = 1"))
-        .first::<StoredRow>(None)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "console: reading the stored github token failed");
-            STORE
-        })
-}
-
-/// When the GitHub token was saved, when one is stored and opens. A token
-/// that no longer opens (a rotated `HARNESS_SECRET`) reads as not connected.
-pub async fn connected_at(env: &Env, secret: &str) -> Result<Option<String>, Failed> {
-    Ok(load(env, secret).await?.map(|(_, updated_at)| updated_at))
-}
-
-/// A client for the stored token, when one is stored and opens.
-pub async fn client(env: &Env, secret: &str) -> Result<Option<Client>, Failed> {
-    Ok(load(env, secret).await?.map(|(token, _)| Client::new(token)))
+fn vault_failed(error: secrets::Error) -> Failed {
+    match error {
+        secrets::Error::NoMasterKey => NO_MASTER_KEY,
+        secrets::Error::Storage => STORE,
+    }
 }
 
 /// The stored token and its save time, opened; `None` when there is none or
 /// it does not open.
-async fn load(env: &Env, secret: &str) -> Result<Option<(String, String)>, Failed> {
-    let Some(row) = stored(env).await? else {
-        return Ok(None);
-    };
-    let sealed = Sealed { nonce: row.nonce, ciphertext: row.ciphertext };
-    match seal::open_for(GITHUB_INFO, secret, &sealed) {
-        Ok(token) => Ok(Some((token, row.updated_at))),
-        Err(error) => {
-            tracing::warn!(?error, "console: stored github token does not open");
-            Ok(None)
-        }
-    }
+async fn load(env: &Env, legacy_secret: Option<&str>) -> Result<Option<Stored>, Failed> {
+    secrets::read(env, NAME, &legacy(legacy_secret)).await.map_err(vault_failed)
 }
 
-/// The stored token, opened from inside the edits module. That module holds
-/// the database port and the venture's config but not the Worker `Env`, so it
-/// reads the same row and opens it with the same key. `None` when nothing is
-/// stored or it does not open.
-pub async fn token_from_database(db: &dyn Database, secret: &str) -> Option<String> {
-    let rows = db.query(&Statement::with_values(STORED_QUERY, Vec::new())).await.ok()?;
-    let row = rows.rows.into_iter().next()?;
-    let sealed =
-        Sealed { nonce: row.get::<String>("nonce")?, ciphertext: row.get::<String>("ciphertext")? };
-    match seal::open_for(GITHUB_INFO, secret, &sealed) {
-        Ok(token) => Some(token),
+/// The stored token, read from inside the edits module. That module holds the
+/// database port and the config but not the Worker `Env`, so it reads the
+/// vault with the master key this isolate already loaded (see
+/// `secrets::read_cached`). Without one, the legacy row is read in place,
+/// read-only, so deliveries keep working until the key exists. `None` when
+/// nothing is stored or it does not open.
+pub async fn stored_token(db: Arc<dyn Database>, legacy_secret: Option<&str>) -> Option<String> {
+    match secrets::read_cached(db, secrets::GITHUB, &legacy(legacy_secret)).await {
+        Ok(stored) => stored.map(Stored::into_token),
         Err(error) => {
-            tracing::warn!(?error, "console: stored github token does not open");
+            tracing::warn!(?error, "console: the stored github token could not be read");
             None
         }
     }
 }
 
-/// The paste: the token is checked with GitHub (`GET /user`), sealed under
-/// its own key and stored. Returns the account it speaks for, so the page
-/// can say who is connected. A network failure is said as one; any other
-/// refusal of the token reads as "not accepted".
-pub async fn connect(env: &Env, secret: &str, token: &str) -> Result<String, Failed> {
+/// When the GitHub token was saved, when one is stored and opens. A token
+/// that no longer opens (a rotated master key) reads as not connected.
+pub async fn connected_at(
+    env: &Env,
+    legacy_secret: Option<&str>,
+) -> Result<Option<String>, Failed> {
+    Ok(load(env, legacy_secret).await?.map(|stored| stored.saved_at().to_owned()))
+}
+
+/// A client for the stored token, when one is stored and opens.
+pub async fn client(env: &Env, legacy_secret: Option<&str>) -> Result<Option<Client>, Failed> {
+    Ok(load(env, legacy_secret).await?.map(|stored| Client::new(stored.into_token())))
+}
+
+/// The paste: the token is checked with GitHub (`GET /user`), stored in the
+/// vault and the legacy row (if any) dropped. Returns the account it speaks
+/// for, so the page can say who is connected. A network failure is said as
+/// one; any other refusal of the token reads as "not accepted".
+pub async fn connect(env: &Env, token: &str) -> Result<String, Failed> {
     let login = Client::new(token.to_owned())
         .whoami()
         .await
         .map_err(|failed| if failed == NETWORK { NETWORK } else { NOT_ACCEPTED })?;
-    let sealed = seal::seal_for(GITHUB_INFO, secret, token).map_err(|_| STORE)?;
-    let now = WorkersClock.now().format(&Rfc3339).map_err(|_| STORE)?;
-    let db = env.d1("DB").map_err(|_| STORE)?;
-    let values = [
-        JsValue::from_str(&sealed.nonce),
-        JsValue::from_str(&sealed.ciphertext),
-        JsValue::from_str(&now),
-    ];
-    db.prepare(format!(
-        "INSERT INTO {TABLE} (id, nonce, ciphertext, updated_at) \
-         VALUES (1, ?, ?, ?) \
-         ON CONFLICT(id) DO UPDATE SET nonce = excluded.nonce, \
-         ciphertext = excluded.ciphertext, updated_at = excluded.updated_at"
-    ))
-    .bind(&values)
-    .map_err(|_| STORE)?
-    .run()
-    .await
-    .map_err(|error| {
-        tracing::warn!(%error, "console: writing the stored github token failed");
-        STORE
-    })?;
+    let vault = Vault::open(env).await.map_err(vault_failed)?;
+    vault.write(NAME, token, &legacy(None)).await.map_err(vault_failed)?;
     Ok(login)
 }
 
 /// Forgets the GitHub token. Nothing else is touched.
 pub async fn disconnect(env: &Env) -> Result<(), Failed> {
-    let db = env.d1("DB").map_err(|_| STORE)?;
-    db.prepare(format!("DELETE FROM {TABLE} WHERE id = 1")).run().await.map_err(|_| STORE)?;
-    Ok(())
+    secrets::forget(env, NAME, &legacy(None)).await.map_err(vault_failed)
 }
 
 #[cfg(test)]
