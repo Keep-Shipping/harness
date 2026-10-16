@@ -570,6 +570,26 @@ mod tests {
     }
 
     #[test]
+    fn the_read_failure_reason_reaches_the_review_escaped() {
+        let note = "Cloudflare did not give the account's details. Check the read token's \
+             permissions on the Cloudflare connection page. Cloudflare answered 403: \
+             /accounts/a1/d1/database: <b>Authentication error</b>";
+        let review = Review {
+            app_repo: "",
+            stack_lines: Vec::new(),
+            truncated: false,
+            plan_lines: None,
+            plan_note: Some(note),
+            db: None,
+            infra_default: "",
+            error: None,
+        };
+        let page = review_card(&review, "/console/fleet/x/code");
+        assert!(page.contains("/accounts/a1/d1/database: &lt;b&gt;Authentication error&lt;/b&gt;"));
+        assert!(!page.contains("<b>Authentication error"));
+    }
+
+    #[test]
     fn the_to_do_list_names_what_is_left_in_plain_words() {
         let lines = to_do(Some(&facts(true, true, false, true)), true, false);
         assert!(lines.iter().any(|line| line.contains("EDITS_RUNNER_TOKEN")));

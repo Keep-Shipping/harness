@@ -377,7 +377,7 @@ fn an_entitlement_refusal_degrades_to_a_note_not_a_failure() {
     let report = &files["IMPORT-REPORT.md"];
     assert!(
         report.contains(
-            "- Not readable with this token: `zone factoryzero.dev: bot management (403: Authentication error)`"
+            "- Not readable with this token: `zone factoryzero.dev: bot management (403: /zones/zone1/bot_management: Authentication error)`"
         ),
         "{report}"
     );
