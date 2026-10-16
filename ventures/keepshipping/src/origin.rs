@@ -12,6 +12,10 @@
 //! write costs a few string comparisons, not a D1 round trip or a Turnstile
 //! siteverify call.
 
+/// The one path GitHub posts to without an `Origin`: the GitHub App's webhook
+/// (`src/github/webhook.rs`), checked by its signature instead.
+const GITHUB_WEBHOOK_PATH: &str = "/console/github/webhook";
+
 /// The origins this site is served from: the apex over TLS, its `www`
 /// alias, and the worker's own API host — which serves the standard setup
 /// console (issue #273), whose HTML forms POST back to the host they were
@@ -49,6 +53,12 @@ pub fn write_origin_rejected(
     if let ["v1", "edits", id, "plan"] = path.trim_matches('/').split('/').collect::<Vec<_>>()[..]
         && !id.is_empty()
     {
+        return false;
+    }
+    // GitHub's webhook sends no `Origin`. It is authenticated by the HMAC of
+    // its body (`src/github/webhook.rs`), which a browser cannot forge, so
+    // this one exact path is exempt, as the plan callback is.
+    if path.trim_end_matches('/') == GITHUB_WEBHOOK_PATH {
         return false;
     }
     let Some(origin) = origin.map(str::trim).filter(|origin| !origin.is_empty()) else {
@@ -163,6 +173,40 @@ mod tests {
                 "{method}"
             );
         }
+    }
+
+    #[test]
+    fn the_github_webhook_needs_no_origin_and_nothing_else_does() {
+        const HOOK: &str = "/console/github/webhook";
+        assert!(!write_origin_rejected("POST", None, HOOK, SERVING, &SITE_ORIGINS));
+        assert!(!write_origin_rejected(
+            "POST",
+            None,
+            "/console/github/webhook/",
+            SERVING,
+            &SITE_ORIGINS
+        ));
+        assert!(write_origin_rejected(
+            "POST",
+            None,
+            "/console/github/webhook/x",
+            SERVING,
+            &SITE_ORIGINS
+        ));
+        assert!(!write_origin_rejected(
+            "GET",
+            None,
+            "/console/connect/github/app/new",
+            SERVING,
+            &SITE_ORIGINS
+        ));
+        assert!(write_origin_rejected(
+            "POST",
+            None,
+            "/console/connect/github/app/new",
+            SERVING,
+            &SITE_ORIGINS
+        ));
     }
 
     #[test]

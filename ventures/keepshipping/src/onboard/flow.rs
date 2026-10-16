@@ -43,7 +43,6 @@ const STEP_REPO: &str = "Finding the infrastructure repository";
 const STEP_READ: &str = "Reading the Cloudflare account";
 const STEP_NAME: &str = "Naming the state";
 const STEP_SECRETS: &str = "Storing the setup secrets";
-const STEP_VARIABLES: &str = "Setting the repository variables";
 const STEP_PULL: &str = "Opening the pull request";
 const STEP_RECORD: &str = "Recording the change";
 const STEP_CHECK: &str = "Checking the earlier pull request";
@@ -128,8 +127,8 @@ pub async fn view(env: &Env, secret: Option<&str>, site: &Site, again: bool) -> 
         Ok(record) => record,
         Err(reply) => return reply,
     };
-    let client = match github::client(env, secret).await {
-        Ok(Some(client)) => client,
+    match github::client_for(env, None, secret).await {
+        Ok(Some(_)) => {}
         Ok(None) => {
             return Reply::Html(
                 200,
@@ -142,10 +141,10 @@ pub async fn view(env: &Env, secret: Option<&str>, site: &Site, again: bool) -> 
                 page::notice("Could not check GitHub", failed.message),
             );
         }
-    };
+    }
     match record.status.as_str() {
         "opened" if !again => status(env, site, &record).await,
-        "" | "draft" => repo_step(env, secret, site, &target, &client, &record).await,
+        "" | "draft" => repo_step(env, secret, site, &target, &record).await,
         _ => review(env, secret, site, &target, &record, None).await,
     }
 }
@@ -271,10 +270,9 @@ async fn repo_step(
     secret: Option<&str>,
     site: &Site,
     target: &Target,
-    client: &Client,
     record: &Record,
 ) -> Reply {
-    let repos = match client.list_repos().await {
+    let repos = match github::list_repos(env, secret).await {
         Ok(repos) => repos,
         Err(failed) => {
             return Reply::Html(
@@ -398,11 +396,10 @@ async fn scan(env: &Env, secret: Option<&str>, site: &Site, form: &[(String, Str
     let Some((owner, name)) = wizard::parse_repo(choice) else {
         return refuse_scan(env, site, record, "Choose a repository from the list.", &now).await;
     };
-    let client = match github::client(env, secret).await {
-        Ok(Some(client)) => client,
-        _ => return refuse_scan(env, site, record, NOT_CONNECTED, &now).await,
-    };
-    let repos = match client.list_repos().await {
+    if !matches!(github::client_for(env, None, secret).await, Ok(Some(_))) {
+        return refuse_scan(env, site, record, NOT_CONNECTED, &now).await;
+    }
+    let repos = match github::list_repos(env, secret).await {
         Ok(repos) => repos,
         Err(failed) => return refuse_scan(env, site, record, failed.message, &now).await,
     };
@@ -418,6 +415,10 @@ async fn scan(env: &Env, secret: Option<&str>, site: &Site, form: &[(String, Str
         )
         .await;
     };
+    let client = match github::client_for(env, Some((owner, name)), secret).await {
+        Ok(Some(client)) => client,
+        _ => return refuse_scan(env, site, record, NOT_CONNECTED, &now).await,
+    };
     match read_scan(&client, &repo).await {
         Ok(scan) => {
             record.app_repo = scan.repo.clone();
@@ -427,6 +428,36 @@ async fn scan(env: &Env, secret: Option<&str>, site: &Site, form: &[(String, Str
         }
         Err(message) => refuse_scan(env, site, record, message, &now).await,
     }
+}
+
+/// The client that works on the infrastructure repository, and the repository
+/// itself. An existing repository is reached through a connection that covers
+/// it. One that does not exist yet is created through the owner's connection
+/// (the app's installation on that account, else the personal token).
+async fn repo_client(
+    env: &Env,
+    secret: Option<&str>,
+    owner: &str,
+    name: &str,
+) -> Result<(Client, Repo), Stop> {
+    let existing = github::client_for(env, Some((owner, name)), secret)
+        .await
+        .map_err(|failed| Stop::new(STEP_REPO, failed.message))?;
+    if let Some(client) = existing
+        && let Some(repo) =
+            client.repo(owner, name).await.map_err(|failed| Stop::new(STEP_REPO, failed.message))?
+    {
+        return Ok((client, repo));
+    }
+    let creator = github::client_for_owner(env, owner, secret)
+        .await
+        .map_err(|failed| Stop::new(STEP_REPO, failed.message))?
+        .ok_or(Stop::new(STEP_REPO, NOT_CONNECTED))?;
+    let repo = creator
+        .create_repo(owner, name)
+        .await
+        .map_err(|failed| Stop::new(STEP_REPO, failed.message))?;
+    Ok((creator, repo))
 }
 
 /// Lists the repository's files, reads the ones [`detect::pick`] chooses and
@@ -613,7 +644,7 @@ struct OpenInput<'a> {
 /// (unless it is this site's repository already) its default branch holds no
 /// state file. The workflow goes on the default branch before anything else,
 /// since a repository_dispatch can only run a workflow found there. Secrets
-/// and variables are set on every run. The state passphrase is generated only
+/// are set on every run. The state passphrase is generated only
 /// when the repository has no `STATE_ENCRYPTION_PASSPHRASE` yet, so a repeat
 /// never rotates a key the state may be encrypted under. The plan is read on
 /// every run, and the pull request's files follow it: a new branch when there
@@ -637,21 +668,7 @@ async fn run_open(
         .await
         .map_err(|failed| Stop::new(STEP_BUCKET, failed.message))?;
 
-    let client = github::client(env, secret)
-        .await
-        .map_err(|failed| Stop::new(STEP_REPO, failed.message))?
-        .ok_or(Stop::new(STEP_REPO, NOT_CONNECTED))?;
-    let repo = match client
-        .repo(owner, name)
-        .await
-        .map_err(|failed| Stop::new(STEP_REPO, failed.message))?
-    {
-        Some(repo) => repo,
-        None => client
-            .create_repo(owner, name)
-            .await
-            .map_err(|failed| Stop::new(STEP_REPO, failed.message))?,
-    };
+    let (client, repo) = repo_client(env, secret, owner, name).await?;
     let slug = wizard::slug(name_of(input.target));
     let shared = Stop::new(
         STEP_REPO,
@@ -701,6 +718,12 @@ async fn run_open(
 
     let account_read = read_account(env, secret, input.target).await?;
     let scoped = generate::scope(&account_read, &scope_of(site, &input.scan.stack));
+    if !generate::is_account_id(&scoped.account_id) {
+        return Err(Stop::new(
+            STEP_READ,
+            "Cloudflare did not give the account's id in the form this setup can use.",
+        ));
+    }
     let backend = StateBackend::new(account, wizard::STATE_BUCKET, &slug)
         .map_err(|_| Stop::new(STEP_NAME, "The site's name cannot be used to name its state."))?;
     let files: BTreeMap<String, String> = generate::plan_files(&scoped, &test, &backend);
@@ -747,14 +770,6 @@ async fn run_open(
             .set_actions_secret(owner, name, secret_name, value)
             .await
             .map_err(|failed| Stop::new(STEP_SECRETS, failed.message))?;
-    }
-    for (variable, value) in
-        [("CLOUDFLARE_ACCOUNT_ID", account), ("KEEPSHIPPING_CONSOLE_URL", wizard::CONSOLE_URL)]
-    {
-        client
-            .put_variable(owner, name, variable, value)
-            .await
-            .map_err(|failed| Stop::new(STEP_VARIABLES, failed.message))?;
     }
 
     // The workflow on the default branch, the copy the pull request carries too.

@@ -104,12 +104,13 @@ pub fn connect_page(
         .unwrap_or_default();
     let key = key_card(key_version);
     let body = format!(
-        "<main id=\"main\" class=\"wrap narrow\">\n\
+        "<main id=\"main\" class=\"wrap\">\n\
          <div class=\"pagehead\"><div>\n<h1>Cloudflare connection</h1>\n\
          <p class=\"sub\">The console reads your Cloudflare accounts to list their domains, Pages \
          sites and Workers, when each was last deployed, and whether HTTPS and DNS are healthy. \
          This token is read-only: it can change nothing. Rollbacks use a separate, optional \
          token, below.</p>\n</div></div>\n\
+         <div class=\"split\">\n<div class=\"prose\">\n\
          {status}{key}\
          <ol class=\"steps\">\n\
          <li class=\"panel\">\n<h2>Create a read-only token</h2>\n\
@@ -118,7 +119,8 @@ pub fn connect_page(
          <p><a class=\"btn primary\" target=\"_blank\" rel=\"noopener noreferrer\" href=\"{href}\">\
          Create the token on Cloudflare ↗</a></p>\n\
          <details class=\"perms\"><summary>The {count} permissions it asks for</summary>\n\
-         <ul>\n{permissions}\n</ul>\n</details>\n</li>\n\
+         <ul>\n{permissions}\n</ul>\n</details>\n</li>\n</ol>\n</div>\n<div>\n\
+         <ol class=\"steps\" style=\"counter-reset: step 1\">\n\
          <li class=\"panel\">\n<h2>Paste it here</h2>\n\
          <p>It is checked with Cloudflare, sealed with a key only this console holds, and stored. \
          It is never shown again.</p>\n\
@@ -128,7 +130,7 @@ pub fn connect_page(
          <input id=\"cf-token\" name=\"token\" type=\"password\" required autocomplete=\"off\" \
          autocapitalize=\"off\" spellcheck=\"false\">\n\
          <button class=\"btn primary\" type=\"submit\">{submit}</button>\n\
-         </form>\n</li>\n</ol>\n\
+         </form>\n</li>\n</ol>\n</div>\n</div>\n\
          {rollbacks}\
          </main>\n",
         rollbacks = rollbacks_section(deploy_connected_at, now),

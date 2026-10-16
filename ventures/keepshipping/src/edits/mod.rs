@@ -401,30 +401,62 @@ struct Tokens {
     configured: Option<String>,
     /// The console's own GitHub connection, opened from its stored row.
     stored: Option<String>,
+    db: Arc<dyn Database>,
     http: Arc<dyn HttpClient>,
     base: String,
 }
 
 impl Tokens {
-    /// The client for one record. A record whose edit has its own repository
-    /// (onboarding's) uses the console's connection; every other record uses
-    /// the configured token, else the console's connection. Without the token
-    /// it needs, a record waits and is retried.
-    fn client(&self, own_repository: bool) -> Result<github::GitHub, github::Failure> {
+    /// The personal connection for one record: the configured token, else the
+    /// stored one; an onboarding edit's own repository uses the stored one.
+    fn personal(&self, own_repository: bool) -> Option<github::GitHub> {
         let token = if own_repository {
             self.stored.clone()
         } else {
             self.configured.clone().or_else(|| self.stored.clone())
         };
-        token.map_or_else(
-            || {
-                Err(github::Failure::retryable(
-                    "no GitHub token is connected for this change yet; connect GitHub on the console"
-                        .to_owned(),
-                ))
-            },
-            |token| Ok(github::GitHub::new(Arc::clone(&self.http), token, self.base.clone())),
-        )
+        token.map(|token| github::GitHub::new(Arc::clone(&self.http), token, self.base.clone()))
+    }
+
+    /// The client for one record and whether it is the app's. The console's
+    /// GitHub App goes first when one of its installations covers the
+    /// repository. Otherwise, or when the app is not connected, the personal
+    /// connection. A record with neither waits and is retried.
+    async fn client(
+        &self,
+        repo: Option<&str>,
+        own_repository: bool,
+        now: i64,
+    ) -> Result<(github::GitHub, bool), github::Failure> {
+        if let Some((owner, name)) = repo.and_then(|repo| repo.split_once('/')) {
+            let app = crate::github::app::token_for_repo(
+                Arc::clone(&self.db),
+                &*self.http,
+                owner,
+                name,
+                now,
+            )
+            .await;
+            match app {
+                Ok(Some(app)) => {
+                    return Ok((
+                        github::GitHub::new(Arc::clone(&self.http), app.token, self.base.clone()),
+                        true,
+                    ));
+                }
+                Ok(None) => {}
+                Err(failed) => tracing::warn!(
+                    message = failed.message,
+                    "edits: the github app could not be used; trying the stored token"
+                ),
+            }
+        }
+        self.personal(own_repository).map(|github| (github, false)).ok_or_else(|| {
+            github::Failure::retryable(
+                "no GitHub token is connected for this change yet; connect GitHub on the console"
+                    .to_owned(),
+            )
+        })
     }
 }
 
@@ -443,12 +475,20 @@ async fn drain(
     let configured = cfg.get_opt("GITHUB_TOKEN");
     let legacy_secret = config.get("HARNESS_SECRET");
     let stored = crate::github::stored_token(Arc::clone(&db), legacy_secret.as_deref()).await;
-    let db: &dyn Database = db.as_ref();
-    if configured.is_none() && stored.is_none() {
+    // The app is a connection too: with it installed there is delivery to do
+    // even when no token is configured or stored.
+    let app = crate::github::app::app_row(Arc::clone(&db)).await.ok().flatten().is_some();
+    if configured.is_none() && stored.is_none() && !app {
         return Ok(cratefield_core::DrainReport::default());
     }
-    let tokens =
-        Tokens { configured, stored, http, base: cfg.get_str("GITHUB_API_BASE", github::API_BASE) };
+    let tokens = Tokens {
+        configured,
+        stored,
+        db: Arc::clone(&db),
+        http,
+        base: cfg.get_str("GITHUB_API_BASE", github::API_BASE),
+    };
+    let db: &dyn Database = db.as_ref();
     Outbox::new(OUTBOX_TABLE)
         .drain_within(
             db,
@@ -460,9 +500,11 @@ async fn drain(
         .await
 }
 
-/// One outbox record's delivery, and what its failure means. A permanent
-/// refusal (or enough retries) marks the edit failed so the page says so;
-/// everything else reschedules with a doubling backoff.
+/// One outbox record's delivery, and what its failure means. A delivery the
+/// app is refused (`403`/`404`) is tried once more with the personal token,
+/// when there is one. A permanent refusal (or enough retries) marks the edit
+/// failed so the page says so; everything else reschedules with a doubling
+/// backoff.
 async fn handle_record(
     tokens: &Tokens,
     db: &dyn Database,
@@ -470,26 +512,56 @@ async fn handle_record(
     record: OutboxRecord,
 ) -> Processed {
     let now = iso(clock.now());
-    let outcome = match record.topic.as_str() {
-        TOPIC_OPEN_PR => match tokens.client(false) {
-            Ok(github) => open_edit_pr(&github, db, &record, &now).await,
-            Err(failure) => Err(failure),
-        },
+    let unix = clock.now().unix_timestamp();
+    let (own, repo) = match record.topic.as_str() {
+        TOPIC_OPEN_PR => (false, payload_field(&record, "repo")),
         TOPIC_DISPATCH => {
-            let own = edit_has_own_repository(db, &record).await;
-            match tokens.client(own) {
-                Ok(github) => github.dispatch(&record.payload).await,
-                Err(failure) => Err(failure),
-            }
+            (edit_has_own_repository(db, &record).await, payload_field(&record, "repo"))
         }
-        _ => Ok(()),
+        _ => {
+            return finish(db, clock, &record, Ok(())).await;
+        }
     };
+    let outcome = match tokens.client(repo.as_deref(), own, unix).await {
+        Ok((github, via_app)) => match deliver(db, &record, &github, &now).await {
+            Err(failure) if via_app && failure.refused => match tokens.personal(own) {
+                Some(personal) => deliver(db, &record, &personal, &now).await,
+                None => Err(failure),
+            },
+            other => other,
+        },
+        Err(failure) => Err(failure),
+    };
+    finish(db, clock, &record, outcome).await
+}
+
+/// Sends one record with one connection: the pull request's open, or the
+/// approval's dispatch.
+async fn deliver(
+    db: &dyn Database,
+    record: &OutboxRecord,
+    github: &github::GitHub,
+    now: &str,
+) -> Result<(), github::Failure> {
+    match record.topic.as_str() {
+        TOPIC_OPEN_PR => open_edit_pr(github, db, record, now).await,
+        _ => github.dispatch(&record.payload).await,
+    }
+}
+
+/// What a record's outcome does: done, or retried later, or the edit failed.
+async fn finish(
+    db: &dyn Database,
+    clock: &dyn Clock,
+    record: &OutboxRecord,
+    outcome: Result<(), github::Failure>,
+) -> Processed {
     match outcome {
         Ok(()) => Processed::Done,
         Err(failure) => {
             let give_up = failure.permanent || record.attempts + 1 >= MAX_ATTEMPTS;
             if give_up {
-                if let Some(edit_id) = payload_edit_id(&record) {
+                if let Some(edit_id) = payload_edit_id(record) {
                     fail_edit(db, &edit_id, &failure.reason).await;
                 }
                 Processed::Done
@@ -513,6 +585,13 @@ async fn edit_has_own_repository(db: &dyn Database, record: &OutboxRecord) -> bo
         .and_then(|rows| rows.rows.into_iter().next())
         .and_then(|row| opt_col(&row, "repo"))
         .is_some()
+}
+
+/// A top-level text field of an outbox row's payload (the repository an open
+/// or a dispatch names), when there is one.
+fn payload_field(record: &OutboxRecord, name: &str) -> Option<String> {
+    let payload: Value = serde_json::from_str(&record.payload).ok()?;
+    payload.get(name).and_then(Value::as_str).map(str::to_owned)
 }
 
 /// The edit an outbox row belongs to, from either topic's payload.

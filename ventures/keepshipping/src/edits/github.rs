@@ -26,14 +26,17 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) struct Failure {
     pub reason: String,
     pub permanent: bool,
+    /// GitHub refused the call as `403` or `404`: the token cannot see or
+    /// change this, which another connection might.
+    pub refused: bool,
 }
 
 impl Failure {
     pub(crate) fn permanent(reason: impl Into<String>) -> Failure {
-        Failure { reason: reason.into(), permanent: true }
+        Failure { reason: reason.into(), permanent: true, refused: false }
     }
     pub(crate) fn retryable(reason: impl Into<String>) -> Failure {
-        Failure { reason: reason.into(), permanent: false }
+        Failure { reason: reason.into(), permanent: false, refused: false }
     }
 
     /// Classifies a transport error or a response status: 4xx (less 408 and
@@ -42,10 +45,11 @@ impl Failure {
         let snippet: String = body.chars().take(300).collect();
         let reason = format!("{kind} answered {status}: {snippet}");
         let code = status.as_u16();
+        let refused = code == 403 || code == 404;
         if status.is_server_error() || code == 408 || code == 429 {
             Failure::retryable(reason)
         } else {
-            Failure::permanent(reason)
+            Failure { refused, ..Failure::permanent(reason) }
         }
     }
 }
