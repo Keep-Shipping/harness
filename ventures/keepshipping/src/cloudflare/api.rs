@@ -1,9 +1,10 @@
 //! The Workers side of the Cloudflare collector: the HTTP reads (`worker::Fetch`),
 //! the D1 row that holds the sealed token, and the KV snapshot. Every
 //! decision worth testing is in the parent module; what is here is the
-//! wiring, and it fails closed: a refused read, a missing token or a broken
-//! row is a plain-words [`Failed`], never a partial snapshot written over
-//! the last good one.
+//! wiring. A missing token, a broken row or an unreadable account is a
+//! plain-words [`Failed`] and nothing is written. A refused zone, Pages or
+//! Workers listing is a named gap on the page instead, so one missing
+//! permission does not hide everything the token can read.
 //!
 //! The token is only ever in memory here, in a request header, or in the
 //! sealed D1 row. It is never logged, never put in a URL and never returned.
@@ -205,6 +206,33 @@ async fn list<T: DeserializeOwned>(token: &str, path: &str) -> Result<Vec<T>, Fa
     Ok(items)
 }
 
+/// A listing read once, with no `page`/`per_page`: the account-level Pages
+/// and Workers listings reject paging parameters they do not take, and
+/// return everything in one answer.
+async fn list_all<T: DeserializeOwned>(token: &str, path: &str) -> Result<Vec<T>, Failed> {
+    let envelope: Envelope<Vec<T>> = get(token, &format!("{API}{path}")).await?;
+    Ok(envelope.result.unwrap_or_default())
+}
+
+/// A listing the snapshot can do without: a failure becomes a named gap
+/// on the page instead of failing the whole snapshot.
+fn or_gap<T>(read: Result<Vec<T>, Failed>, what: &str, gaps: &mut Vec<String>) -> Vec<T> {
+    read.unwrap_or_else(|failed| {
+        gaps.push(format!("{what} ({})", gap_reason(failed)));
+        Vec::new()
+    })
+}
+
+fn gap_reason(failed: Failed) -> &'static str {
+    if failed == REFUSED {
+        "Cloudflare refused it: check the token has that read permission"
+    } else if failed == SHAPE {
+        "Cloudflare answered in a shape this console does not read"
+    } else {
+        "Cloudflare could not be reached"
+    }
+}
+
 /// A zone's certificate packs. A failed lookup is logged and reads as
 /// unknown on the page; it does not fail the whole snapshot.
 async fn certificates(token: &str, zone_id: &str) -> Option<Vec<CertificatePack>> {
@@ -229,19 +257,33 @@ async fn collect(token: &str, wanted: Option<&str>) -> Result<Inventory, Failed>
             AccountError::NotVisible => NOT_VISIBLE,
         })?
         .clone();
-    let zones: Vec<Zone> = list(token, &format!("/zones?account.id={}", account.id)).await?;
+    let mut gaps = Vec::new();
+    let zones: Vec<Zone> = or_gap(
+        list(token, &format!("/zones?account.id={}", account.id)).await,
+        "Zones (Zone: Read)",
+        &mut gaps,
+    );
     let mut records = Vec::with_capacity(zones.len());
     for zone in zones {
         let certificates = certificates(token, &zone.id).await;
         records.push(ZoneRecord { zone, certificates });
     }
-    let pages: Vec<PagesProject> =
-        list(token, &format!("/accounts/{}/pages/projects", account.id)).await?;
-    let scripts: Vec<WorkerScript> =
-        list(token, &format!("/accounts/{}/workers/scripts", account.id)).await?;
-    let worker_domains: Vec<WorkerDomain> =
-        list(token, &format!("/accounts/{}/workers/domains", account.id)).await?;
-    Ok(Inventory { account, zones: records, pages, scripts, worker_domains })
+    let pages: Vec<PagesProject> = or_gap(
+        list_all(token, &format!("/accounts/{}/pages/projects", account.id)).await,
+        "Pages projects (Cloudflare Pages: Read)",
+        &mut gaps,
+    );
+    let scripts: Vec<WorkerScript> = or_gap(
+        list_all(token, &format!("/accounts/{}/workers/scripts", account.id)).await,
+        "Workers (Workers Scripts: Read)",
+        &mut gaps,
+    );
+    let worker_domains: Vec<WorkerDomain> = or_gap(
+        list_all(token, &format!("/accounts/{}/workers/domains", account.id)).await,
+        "Workers custom domains (Workers Scripts: Read)",
+        &mut gaps,
+    );
+    Ok(Inventory { account, zones: records, pages, scripts, worker_domains, gaps })
 }
 
 /// The `CF_ACCOUNT_ID` var, trimmed, blank meaning unset.

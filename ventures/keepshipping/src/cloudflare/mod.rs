@@ -174,6 +174,8 @@ pub struct Inventory {
     pub pages: Vec<PagesProject>,
     pub scripts: Vec<WorkerScript>,
     pub worker_domains: Vec<WorkerDomain>,
+    /// Listings that could not be read, in plain words.
+    pub gaps: Vec<String>,
 }
 
 /// Why no account was chosen.
@@ -309,6 +311,7 @@ pub fn fleet_from(inventory: &Inventory, generated_at: &str) -> Fleet {
         generated_at: generated_at.to_owned(),
         terraform: None,
         sites,
+        gaps: inventory.gaps.clone(),
     }
 }
 
@@ -380,7 +383,21 @@ mod tests {
             pages: pages.result.expect("pages"),
             scripts: scripts.result.expect("scripts"),
             worker_domains: domains.result.expect("domains"),
+            gaps: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_gap_in_the_inventory_reaches_the_page() {
+        let mut inventory = inventory();
+        inventory.gaps = vec!["Pages projects (Cloudflare Pages: Read)".to_owned()];
+        let fleet = fleet_from(&inventory, "2026-10-16T00:00:00Z");
+        assert_eq!(fleet.gaps, inventory.gaps);
+        let html = crate::fleet::render_index(&fleet);
+        assert!(html.contains("Not read this time:"), "{html}");
+        assert!(html.contains("Pages projects (Cloudflare Pages: Read)"), "{html}");
+        let none = fleet_from(&super::Inventory { gaps: Vec::new(), ..inventory }, "t");
+        assert!(!crate::fleet::render_index(&none).contains("Not read this time"));
     }
 
     #[test]
