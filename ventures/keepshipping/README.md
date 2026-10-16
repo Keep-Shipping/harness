@@ -169,25 +169,59 @@ cd ventures/keepshipping && worker-build --release
 
 ## Console fleet view
 
-`/console/fleet` (issue #169) renders one screen of every zone, Pages site
-and Worker the account's Terraform manages, plus a detail page per site.
-It is read-only and fail-closed: it answers `GET`/`HEAD` only, and until
-all three config values below are set it answers `503`.
+`/console/fleet` (issue #169) renders one screen of the account's zones,
+Pages sites and Workers, plus a detail page per site. It is read-only and
+fail-closed: it answers `GET`/`HEAD` only, and until all three config values
+below are set it answers `503`.
 
-- **Snapshot contract** — a pipeline (the nightly check) writes a JSON
-  snapshot to KV binding `FLEET`, key `fleet.json`: `{account,
-  generated_at, terraform: {repo, ref}, sites: [{id, name, kind:
-  zone|pages|worker, venture, domains, defined_at: {path, line}, deploys,
-  tls, dns, baseline, drift, resources}]}` with `deploys` newest first.
-  Optional fields (`deploys`, `tls`, `dns`, `baseline`, `drift`,
-  `resources`) render as "Not checked yet" / "Never deployed" until the
-  pipeline fills them in. The shape is the `Fleet` struct in `src/fleet/`.
+- **Connect Cloudflare** — `GET /console/connect/cloudflare` explains the
+  read-only token, links Cloudflare's pre-filled token page, and takes the
+  pasted token (`POST` to the same path). The page's template link is
+  `https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=…&accountId=*&zoneId=all&name=Keep%20Shipping%20console%20%28read-only%29`
+  with these groups (`src/cloudflare/mod.rs`, `PERMISSIONS`; keys from
+  Cloudflare's [API token templates](https://developers.cloudflare.com/fundamentals/api/how-to/account-owned-token-template/)
+  permission reference): `zone`, `dns`, `ssl_and_certificates`,
+  `workers_scripts`, `page` (Pages), `account_settings`, all `read`.
+- **Storage** — the paste is checked (`/user/tokens/verify` must say
+  `active`, and `/accounts` must list at least one account), then sealed and
+  written to the console's D1 table `console_cloudflare_token` (migration
+  `0009`). Sealing is AES-256-GCM with a fresh 96-bit nonce per write; the
+  key is HKDF-SHA256 over `HARNESS_SECRET` with info
+  `ks-console/cloudflare-token/v1`. The token is never logged, echoed, or put
+  in a URL. Rotating `HARNESS_SECRET` makes the stored token unreadable: the
+  connect page then asks for it again.
+- **Disconnect** — `POST /console/connect/cloudflare/disconnect` deletes the
+  row and the `fleet.json` snapshot.
+- **Collector** — with a token stored, the collector lists the account
+  (`CF_ACCOUNT_ID`, an optional var, picks one; otherwise the first listed),
+  its zones (with a certificate-pack check for HTTPS), its Pages projects
+  (domains and latest deployment), its Workers scripts and their custom
+  domains, and writes the snapshot to KV `FLEET` / `fleet.json`. It runs on
+  the hourly cron after the billing and waitlist sweeps, and from the
+  "Refresh now" button on the fleet and empty-state pages. Failures are
+  logged and the previous snapshot stays.
+- **What the API cannot give** — Terraform definitions, DNS health, baseline
+  scores and drift are not in the Cloudflare API. A collected snapshot has
+  no `terraform`, and its pages say "Not managed by Terraform yet". A
+  Worker's "deploy" row is its script etag (a content hash), not a commit.
+  Certificate status is "Secure" only when an active pack is found; anything
+  else reads as "Not checked yet".
+- **Snapshot contract** — a JSON snapshot in KV binding `FLEET`, key
+  `fleet.json`: `{account, generated_at, terraform?: {repo, ref}, sites:
+  [{id, name, kind: zone|pages|worker, venture, domains, defined_at?: {path,
+  line}, deploys, tls, dns, baseline, drift, resources}]}`, `deploys` newest
+  first. A pipeline that writes Terraform can still fill those fields; the
+  `Fleet` struct in `src/fleet/` is the shape.
 - **Auth** — `AUTH_ISSUER` + `AUTH_CLIENT_ID` build a token verifier
   (`cratefield-auth-client`); the token comes from `Authorization: Bearer`
   or the `ks_console` cookie, must have a verified `email` on the
   `CONSOLE_EMAILS` allowlist (comma-separated, case-insensitive), or the
-  page answers `401`/`403`. The 401 page's "Sign in" goes to the console's
-  own sign-in, below.
+  page answers `401`/`403`. The connect page, the paste, disconnect and
+  refresh all sit behind that same gate. Writes also pass the worker's
+  same-origin check. The 401 page's "Sign in" goes to the console's own
+  sign-in, below.
+- **Operator steps** — apply migration `0009` to the console database, and
+  nothing else: the token is pasted in the browser, not set as a secret.
 
 ## Sign-in
 

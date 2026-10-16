@@ -10,10 +10,10 @@
 
 mod console;
 
-pub use console::handle;
+pub use console::{handle, scheduled_refresh};
 
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The compiled stylesheet, inlined into each page's one `<style>` block.
 const STYLE: &str = include_str!("style.css");
@@ -42,16 +42,19 @@ const PATH: &AsciiSet = &CONTROLS
 const QUERY: &AsciiSet = &PATH.add(b'=').add(b'+').add(b';').add(b'\'');
 
 /// The fleet snapshot: one account, the Terraform defining it, every site.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fleet {
     pub account: String,
     pub generated_at: String,
-    pub terraform: Terraform,
+    /// Absent when the snapshot has no Terraform behind it (the Cloudflare
+    /// collector writes none yet); pages then say so instead of linking.
+    #[serde(default)]
+    pub terraform: Option<Terraform>,
     pub sites: Vec<Site>,
 }
 
 /// The Terraform repository the sites are defined in.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Terraform {
     pub repo: String,
     /// The commit the snapshot was taken at (`ref` in the JSON).
@@ -60,7 +63,7 @@ pub struct Terraform {
 }
 
 /// What a site is; `Kind::words` renders it in plain words.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Zone,
@@ -82,15 +85,19 @@ impl Kind {
 /// [`Site::dns`], [`Site::baseline`], [`Site::drift`], [`Site::resources`])
 /// render as "Not checked yet" / "Never deployed" until the pipeline fills
 /// them in; `deploys` is newest first.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Site {
     pub id: String,
     pub name: String,
     pub kind: Kind,
+    /// Empty when the site has no venture (shown as an em dash).
+    #[serde(default)]
     pub venture: String,
     #[serde(default)]
     pub domains: Vec<String>,
-    pub defined_at: Location,
+    /// Absent without Terraform (see [`Fleet::terraform`]).
+    #[serde(default)]
+    pub defined_at: Option<Location>,
     #[serde(default)]
     pub deploys: Vec<Deploy>,
     #[serde(default)]
@@ -106,12 +113,12 @@ pub struct Site {
 }
 
 /// TLS certificate state.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tls {
     pub status: TlsStatus,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TlsStatus {
     Ok,
@@ -120,13 +127,13 @@ pub enum TlsStatus {
     Unknown,
 }
 /// DNS state, with a plain-words note when there is a problem.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dns {
     pub status: DnsStatus,
     pub note: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DnsStatus {
     Ok,
@@ -134,7 +141,7 @@ pub enum DnsStatus {
     Unknown,
 }
 /// Whether the deployed site matches the Terraform it is defined in.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Drift {
     InSync,
@@ -142,27 +149,27 @@ pub enum Drift {
     Unknown,
 }
 /// The site's baseline score, with failing checks in plain words.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Baseline {
     pub score: u16,
     #[serde(default)]
     pub failing: Vec<String>,
 }
 /// One deploy of the site.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Deploy {
     pub commit: String,
     pub at: String,
     pub by: String,
 }
 /// Where in the Terraform a thing is defined.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Location {
     pub path: String,
     pub line: u32,
 }
 /// One Terraform resource behind a site.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resource {
     pub kind: String,
     pub name: String,
@@ -206,11 +213,23 @@ pub fn render_index(snapshot: &Fleet) -> String {
         attention,
         if attention == 1 { "needs" } else { "need" },
     );
-    let rows =
-        sites.iter().map(|site| site_row(site, &snapshot.terraform)).collect::<Vec<_>>().join("\n");
+    let rows = sites
+        .iter()
+        .map(|site| site_row(site, snapshot.terraform.as_ref()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let terraform = match &snapshot.terraform {
+        Some(terraform) => format!(
+            "Terraform {repo} at <code>{rev}</code>",
+            repo = esc(&terraform.repo),
+            rev = esc(short(&terraform.revision)),
+        ),
+        None => "Not managed by Terraform yet".to_owned(),
+    };
     let body = format!(
         "<main id=\"main\">\n<h1>{account} fleet</h1>\n\
-         <p class=\"meta\">{count} · checked {when} · Terraform {repo} at <code>{rev}</code></p>\n\
+         <p class=\"meta\">{count} · checked {when} · {terraform}</p>\n\
+         <p>{REFRESH_FORM}</p>\n\
          <table>\n\
          <caption class=\"offscreen\">Every site with its last deploy, HTTPS, DNS, baseline and \
          code state</caption>\n\
@@ -222,16 +241,40 @@ pub fn render_index(snapshot: &Fleet) -> String {
         account = esc(&snapshot.account),
         count = count,
         when = esc(&fmt_time(&snapshot.generated_at)),
-        repo = esc(&snapshot.terraform.repo),
-        rev = esc(short(&snapshot.terraform.revision)),
+        terraform = terraform,
+        REFRESH_FORM = REFRESH_FORM,
     );
     signed_in_layout(&format!("{account} fleet", account = snapshot.account), &body)
+}
+
+/// The snapshot's refresh button: a POST to the same-origin gate.
+pub(crate) const REFRESH_FORM: &str = "<form class=\"refresh\" method=\"post\" \
+     action=\"/console/fleet/refresh\"><button type=\"submit\">Refresh now</button></form>";
+
+/// The page for a console with no snapshot yet: connected, it offers the
+/// refresh; not connected, it points at the connect page.
+#[must_use]
+pub(crate) fn empty_snapshot_page(connected: bool) -> String {
+    let body = if connected {
+        format!(
+            "<main id=\"main\">\n<div class=\"notice\">\n<h1>No fleet snapshot yet</h1>\n\
+             <p>Your Cloudflare token is connected, but no snapshot has been written yet. \
+             Refresh to read the account now.</p>\n{REFRESH_FORM}\n</div>\n</main>\n"
+        )
+    } else {
+        "<main id=\"main\">\n<div class=\"notice\">\n<h1>No fleet snapshot yet</h1>\n\
+         <p>The fleet view is built from a read-only Cloudflare token. Connect one to see your \
+         domains, Pages sites and Workers.</p>\n\
+         <p><a href=\"/console/connect/cloudflare\">Connect Cloudflare</a></p>\n</div>\n</main>\n"
+            .to_owned()
+    };
+    signed_in_layout("No fleet snapshot yet", &body)
 }
 
 /// One row. `th scope="row"` makes the site name the row's heading for
 /// screen readers; each cell carries a `data-label` so the narrow card
 /// layout can name it without JS.
-fn site_row(site: &Site, terraform: &Terraform) -> String {
+fn site_row(site: &Site, terraform: Option<&Terraform>) -> String {
     let change = if site.kind == Kind::Zone {
         format!(
             " <a class=\"change\" href=\"/v1/edits/new?kind=dns&amp;zone={zone}\">Change</a>",
@@ -257,15 +300,23 @@ fn site_row(site: &Site, terraform: &Terraform) -> String {
         name = esc(&site.name),
         kind = site.kind.words(),
         change = change,
-        venture = esc(&site.venture),
+        venture = venture_text(site),
         domains = domains_text(site),
         deploy = deploy_text(site),
         tls = tls_span(site),
         dns = dns_span(site),
         baseline = baseline_text(site),
         drift = drift_span(site),
-        defined = defined_link(terraform, &site.defined_at),
+        defined = defined_link(terraform, site.defined_at.as_ref()),
     )
+}
+
+/// The venture column; an empty venture is an em dash, like an empty domain list.
+fn venture_text(site: &Site) -> String {
+    if site.venture.trim().is_empty() {
+        return "<span class=\"unknown\">—</span>".to_owned();
+    }
+    esc(&site.venture)
 }
 
 /// One site: status summary, resources, deploy history, and the exact
@@ -274,7 +325,7 @@ fn site_row(site: &Site, terraform: &Terraform) -> String {
 #[must_use]
 pub fn render_site(snapshot: &Fleet, id: &str) -> Option<String> {
     let site = snapshot.sites.iter().find(|candidate| candidate.id == id)?;
-    let terraform = &snapshot.terraform;
+    let terraform = snapshot.terraform.as_ref();
     let failing = site
         .baseline
         .as_ref()
@@ -308,21 +359,22 @@ pub fn render_site(snapshot: &Fleet, id: &str) -> Option<String> {
          <dt>Code</dt><dd>{drift}</dd>\n\
          </dl>\n\
          <h2>Defined in</h2>\n\
-         <p>{defined} in {repo}</p>\n\
+         <p>{defined}{repo}</p>\n\
          <h2>Resources</h2>\n<ul class=\"plain\">\n{resources}</ul>\n\
          <h2>Deploys</h2>\n<ul class=\"plain\">\n{deploys}</ul>\n\
          </main>\n",
         name = esc(&site.name),
         kind = site.kind.words(),
-        venture = esc(&site.venture),
+        venture = venture_text(site),
         account = esc(&snapshot.account),
         tls = tls_span(site),
         dns = dns,
         baseline = baseline_text(site),
         failing = failing,
         drift = drift_span(site),
-        defined = defined_link(terraform, &site.defined_at),
-        repo = esc(&terraform.repo),
+        defined = defined_link(terraform, site.defined_at.as_ref()),
+        repo =
+            terraform.map(|terraform| format!(" in {}", esc(&terraform.repo))).unwrap_or_default(),
         resources = resources_list(site, terraform),
         deploys = deploys_list(site),
     );
@@ -331,7 +383,7 @@ pub fn render_site(snapshot: &Fleet, id: &str) -> Option<String> {
 
 /// The one small-page layout (empty state and every error): title, plain
 /// message, optional link.
-fn notice_page(title: &str, message: &str, link: Option<(&str, &str)>) -> String {
+pub(crate) fn notice_page(title: &str, message: &str, link: Option<(&str, &str)>) -> String {
     let link = link
         .map(|(href, text)| {
             format!("<p><a href=\"{href}\">{text}</a></p>", href = esc(href), text = esc(text))
@@ -351,7 +403,7 @@ fn notice_page(title: &str, message: &str, link: Option<(&str, &str)>) -> String
 /// [`layout`] for a signed-in page: the bar carries the sign-out button, a
 /// form posting to `/console/logout` (a POST, so a link elsewhere cannot
 /// sign anyone out; the worker's origin guard checks it is same-origin).
-fn signed_in_layout(title: &str, body: &str) -> String {
+pub(crate) fn signed_in_layout(title: &str, body: &str) -> String {
     layout_with(title, body, SIGN_OUT)
 }
 
@@ -454,7 +506,7 @@ fn deploys_list(site: &Site) -> String {
         .join("\n")
 }
 
-fn resources_list(site: &Site, terraform: &Terraform) -> String {
+fn resources_list(site: &Site, terraform: Option<&Terraform>) -> String {
     if site.resources.is_empty() {
         return "<li class=\"unknown\">None recorded</li>".to_owned();
     }
@@ -465,7 +517,7 @@ fn resources_list(site: &Site, terraform: &Terraform) -> String {
                 "<li>{kind} <strong>{name}</strong> — {defined}</li>",
                 kind = esc(&plain_kind(&resource.kind)),
                 name = esc(&resource.name),
-                defined = defined_link(terraform, &resource.defined_at),
+                defined = defined_link(terraform, Some(&resource.defined_at)),
             )
         })
         .collect::<Vec<_>>()
@@ -535,9 +587,13 @@ fn blob_url(terraform: &Terraform, at: &Location) -> Option<String> {
     ))
 }
 
-/// The "Defined in" link: the exact file and line on GitHub, or plain
-/// text when [`blob_url`] would not make a safe address of the snapshot.
-fn defined_link(terraform: &Terraform, at: &Location) -> String {
+/// The "Defined in" link: the exact file and line on GitHub, plain text when
+/// [`blob_url`] would not make a safe address of the snapshot, and a
+/// "not managed" note when there is no Terraform to link to.
+fn defined_link(terraform: Option<&Terraform>, at: Option<&Location>) -> String {
+    let (Some(terraform), Some(at)) = (terraform, at) else {
+        return "<span class=\"unknown\">Not managed by Terraform yet</span>".to_owned();
+    };
     match blob_url(terraform, at) {
         Some(url) => format!(
             "<a href=\"{href}\" title=\"{path}\">{file}</a>",
@@ -591,7 +647,7 @@ fn short(commit: &str) -> &str {
 
 /// Escapes a value for text content and attribute values; every snapshot
 /// string passes through here before it reaches the page.
-fn esc(value: &str) -> String {
+pub(crate) fn esc(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
