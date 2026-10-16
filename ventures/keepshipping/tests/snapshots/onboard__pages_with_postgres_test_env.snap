@@ -1,0 +1,545 @@
+---
+source: ventures/keepshipping/tests/onboard.rs
+expression: render(&files)
+---
+=== .github/workflows/infra.yml ===
+# Written by Keep Shipping. Pull requests are planned and the plan is posted
+# back to the console; approval sends a repository_dispatch and this workflow
+# applies exactly the plan that was checked. Regenerated when the setup is
+# re-run, so change the setup rather than this file.
+name: infra
+
+on:
+  pull_request:
+    paths:
+      - "**.tf"
+      - ".github/workflows/infra.yml"
+  repository_dispatch:
+    types: [keepshipping-edit-approved]
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_VAR_cloudflare_account_id: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_state_encryption_passphrase: ${{ secrets.STATE_ENCRYPTION_PASSPHRASE }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      TF_VAR_email_routing_destinations: ${{ secrets.EMAIL_ROUTING_DESTINATIONS }}
+      TF_VAR_test_db_host: ${{ secrets.TEST_DB_HOST }}
+      TF_VAR_test_db_port: ${{ secrets.TEST_DB_PORT }}
+      TF_VAR_test_db_database: ${{ secrets.TEST_DB_DATABASE }}
+      TF_VAR_test_db_user: ${{ secrets.TEST_DB_USER }}
+      TF_VAR_test_db_password: ${{ secrets.TEST_DB_PASSWORD }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # TODO pin sha: no full commit SHA for opentofu/setup-opentofu is recorded in this repository yet.
+      - uses: opentofu/setup-opentofu@v1
+      - name: Initialise
+        run: tofu init -input=false
+      - name: Plan
+        run: tofu plan -input=false -lock-timeout=5m -out=tfplan
+      - name: Render the plan as JSON
+        run: tofu show -json tfplan > plan.json
+      - name: Post the plan to Keep Shipping
+        if: startsWith(github.head_ref, 'ks-edit/')
+        env:
+          CONSOLE_URL: ${{ vars.KEEPSHIPPING_CONSOLE_URL }}
+          RUNNER_TOKEN: ${{ secrets.EDITS_RUNNER_TOKEN }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          edit_id="${HEAD_REF#ks-edit/}"
+          plan_sha="$(sha256sum tfplan | cut -d' ' -f1)"
+          jq -n --arg head "$HEAD_SHA" --arg sha "$plan_sha" --slurpfile plan plan.json \
+            '{head_sha: $head, plan_file_sha256: $sha, plan: $plan[0]}' > body.json
+          curl --fail-with-body --silent --show-error -X POST \
+            -H "Authorization: Bearer ${RUNNER_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data-binary @body.json \
+            "${CONSOLE_URL}/v1/edits/${edit_id}/plan"
+
+  apply:
+    if: github.event_name == 'repository_dispatch'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: infra-apply
+      cancel-in-progress: false
+    env:
+      TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_VAR_cloudflare_account_id: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_state_encryption_passphrase: ${{ secrets.STATE_ENCRYPTION_PASSPHRASE }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      TF_VAR_email_routing_destinations: ${{ secrets.EMAIL_ROUTING_DESTINATIONS }}
+      TF_VAR_test_db_host: ${{ secrets.TEST_DB_HOST }}
+      TF_VAR_test_db_port: ${{ secrets.TEST_DB_PORT }}
+      TF_VAR_test_db_database: ${{ secrets.TEST_DB_DATABASE }}
+      TF_VAR_test_db_user: ${{ secrets.TEST_DB_USER }}
+      TF_VAR_test_db_password: ${{ secrets.TEST_DB_PASSWORD }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.client_payload.head_sha }}
+          persist-credentials: false
+      # TODO pin sha: see the plan job.
+      - uses: opentofu/setup-opentofu@v1
+      - name: Initialise
+        run: tofu init -input=false
+      - name: Plan again
+        run: tofu plan -input=false -lock-timeout=5m -out=tfplan
+      - name: Check this is the approved plan
+        env:
+          APPROVED: ${{ github.event.client_payload.plan_file_sha256 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APPROVED" ]; then
+            echo "The approval carries no plan digest; refusing to apply." >&2
+            exit 1
+          fi
+          actual="$(sha256sum tfplan | cut -d' ' -f1)"
+          if [ "$actual" != "$APPROVED" ]; then
+            echo "The plan changed since it was approved; refusing to apply." >&2
+            exit 1
+          fi
+      - name: Apply the approved plan
+        run: tofu apply -input=false tfplan
+=== IMPORT-REPORT.md ===
+# Cloudflare import report
+
+Account `acct123`, 9 resources.
+
+## Imported
+
+| resource | count |
+| --- | --- |
+| `cloudflare_d1_database` | 1 |
+| `cloudflare_dns_record` | 2 |
+| `cloudflare_email_routing_rule` | 1 |
+| `cloudflare_pages_domain` | 1 |
+| `cloudflare_pages_project` | 1 |
+| `cloudflare_workers_kv_namespace` | 1 |
+| `cloudflare_zone` | 1 |
+| `cloudflare_zone_setting` | 1 |
+
+## Secrets to supply
+
+Email routing destinations are not in these files. Supply them through the Secrets port as `TF_VAR_email_routing_destinations`, a JSON object mapping each key below to the address that rule forwards to:
+
+- `kaje_sales`
+
+=== README.md ===
+# Infrastructure
+
+This repository describes the Cloudflare setup of the site or sites it was made for, as code.
+
+## What is here
+
+- `imports.tf` and the `modules/` folders describe what already exists on Cloudflare. Nothing here creates it again.
+- `backend.tf` keeps the record of what Terraform manages in Cloudflare R2, encrypted.
+- `IMPORT-REPORT.md` lists what was brought in and what was left alone.
+- `.github/workflows/infra.yml` plans each pull request and applies a change only after it is approved.
+
+## Secrets
+
+Set these in the repository's settings. Their values are never written to a file.
+
+- `CLOUDFLARE_API_TOKEN`: the Cloudflare token the workflow uses.
+- `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`: the R2 keys for the record of changes.
+- `STATE_ENCRYPTION_PASSPHRASE`: encrypts that record.
+- `EDITS_RUNNER_TOKEN`: lets the workflow report each plan back to Keep Shipping.
+- `EMAIL_ROUTING_DESTINATIONS`: the email forwarding addresses, as one JSON object keyed by rule.
+
+Variables: `CLOUDFLARE_ACCOUNT_ID` and `KEEPSHIPPING_CONSOLE_URL`.
+
+## Test environment
+
+The test environment has its own folder, `modules/test-env/`. If it uses a database, its address, port, name, user and password are secrets named `TEST_DB_HOST`, `TEST_DB_PORT`, `TEST_DB_DATABASE`, `TEST_DB_USER` and `TEST_DB_PASSWORD`.
+=== backend.tf ===
+terraform {
+  backend "s3" {
+    key = "acct123/kaje/terraform.tfstate"
+    region = "auto"
+    endpoints = {
+      s3 = "https://acct123.r2.cloudflarestorage.com"
+    }
+    use_lockfile = true
+    skip_credentials_validation = true
+    skip_region_validation = true
+    skip_requesting_account_id = true
+    skip_metadata_api_check = true
+    skip_s3_checksum = true
+    use_path_style = true
+  }
+  encryption {
+    key_provider "pbkdf2" "state" {
+      passphrase = var.state_encryption_passphrase
+    }
+    method "aes_gcm" "state" {
+      keys = key_provider.pbkdf2.state
+    }
+    state {
+      method = method.aes_gcm.state
+      enforced = true
+    }
+    plan {
+      method = method.aes_gcm.state
+      enforced = true
+    }
+  }
+}
+
+variable "state_encryption_passphrase" {
+  description = "Passphrase for the OpenTofu state encryption, supplied through the Secrets port as TF_VAR_state_encryption_passphrase."
+  type        = string
+  sensitive   = true
+}
+=== imports.tf ===
+import {
+  to = module.account.cloudflare_d1_database.kaje_db
+  id = "account/kaje_db"
+}
+import {
+  to = module.account.cloudflare_pages_domain.kaje_example_com
+  id = "account/kaje_example_com"
+}
+import {
+  to = module.account.cloudflare_pages_project.kaje
+  id = "account/kaje"
+}
+import {
+  to = module.account.cloudflare_workers_kv_namespace.kaje_cache
+  id = "account/kaje_cache"
+}
+import {
+  to = module.example_com.cloudflare_dns_record.kaje
+  id = "example_com/kaje"
+}
+import {
+  to = module.example_com.cloudflare_dns_record.www
+  id = "example_com/www"
+}
+import {
+  to = module.example_com.cloudflare_email_routing_rule.sales
+  id = "example_com/sales"
+}
+import {
+  to = module.example_com.cloudflare_zone.example_com
+  id = "example_com/example_com"
+}
+import {
+  to = module.example_com.cloudflare_zone_setting.ssl
+  id = "example_com/ssl"
+}
+=== main.tf ===
+terraform {
+  required_providers {
+    cloudflare = {
+      source = "cloudflare/cloudflare"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "cloudflare" {
+  api_token = var.cloudflare_api_token
+}
+
+module "account" {
+  source = "./modules/account"
+
+  cloudflare_account_id = var.cloudflare_account_id
+}
+
+module "example_com" {
+  source = "./modules/example_com"
+
+  cloudflare_account_id = var.cloudflare_account_id
+  email_routing_destinations = var.email_routing_destinations
+}
+
+module "test_env" {
+  source = "./modules/test-env"
+
+  cloudflare_account_id = var.cloudflare_account_id
+  test_db_host = var.test_db_host
+  test_db_port = var.test_db_port
+  test_db_database = var.test_db_database
+  test_db_user = var.test_db_user
+  test_db_password = var.test_db_password
+}
+=== modules/account/main.tf ===
+terraform {
+  required_providers {
+    cloudflare = {
+      source = "cloudflare/cloudflare"
+      version = "~> 5.0"
+    }
+  }
+}
+
+resource "cloudflare_d1_database" "kaje_db" {
+  name = "kaje-db"
+}
+
+resource "cloudflare_pages_domain" "kaje_example_com" {
+  name = "kaje.example.com"
+  project_name = "kaje"
+}
+
+resource "cloudflare_pages_project" "kaje" {
+  name = "kaje"
+  production_branch = "main"
+}
+
+resource "cloudflare_workers_kv_namespace" "kaje_cache" {
+  title = "kaje-cache"
+}
+
+=== modules/account/variables.tf ===
+variable "cloudflare_account_id" {
+  description = "The Cloudflare account these objects live in."
+  type        = string
+}
+=== modules/example_com/main.tf ===
+terraform {
+  required_providers {
+    cloudflare = {
+      source = "cloudflare/cloudflare"
+      version = "~> 5.0"
+    }
+  }
+}
+
+resource "cloudflare_dns_record" "kaje" {
+  content = "edge.example.net"
+  name = "kaje.example.com"
+  type = "CNAME"
+}
+
+resource "cloudflare_dns_record" "www" {
+  content = "edge.example.net"
+  name = "www.example.com"
+  type = "CNAME"
+}
+
+resource "cloudflare_email_routing_rule" "sales" {
+  actions = [
+    {
+      type = "forward"
+      value = [var.email_routing_destinations["kaje_sales"]]
+    }
+  ]
+}
+
+resource "cloudflare_zone" "example_com" {
+  account = { id = var.cloudflare_account_id }
+  name = "example.com"
+  type = "full"
+}
+
+resource "cloudflare_zone_setting" "ssl" {
+  setting_id = "ssl"
+  value = "strict"
+}
+
+=== modules/example_com/variables.tf ===
+variable "cloudflare_account_id" {
+  description = "The Cloudflare account these objects live in."
+  type        = string
+}
+
+variable "email_routing_destinations" {
+  description = "Email routing forward destinations, keyed by the rule they belong to."
+  type        = map(string)
+  sensitive   = true
+}
+=== modules/test-env/main.tf ===
+terraform {
+  required_providers {
+    cloudflare = {
+      source  = "cloudflare/cloudflare"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# The test environment. Names here are chosen by Keep Shipping; the database
+# details are sensitive variables, never literal values.
+
+resource "cloudflare_d1_database" "test" {
+  account_id = var.cloudflare_account_id
+  name       = "kaje-test"
+}
+
+resource "cloudflare_workers_kv_namespace" "test" {
+  account_id = var.cloudflare_account_id
+  title      = "kaje-test"
+}
+
+resource "cloudflare_r2_bucket" "test" {
+  account_id = var.cloudflare_account_id
+  name       = "kaje-test"
+}
+
+resource "cloudflare_hyperdrive_config" "test" {
+  account_id = var.cloudflare_account_id
+  name       = "kaje-test"
+  origin = {
+    scheme   = "postgresql"
+    host     = var.test_db_host
+    port     = var.test_db_port
+    database = var.test_db_database
+    user     = var.test_db_user
+    password = var.test_db_password
+  }
+}
+
+data "cloudflare_zone" "test" {
+  filter = { name = "example.com" }
+}
+
+resource "cloudflare_pages_domain" "test" {
+  account_id   = var.cloudflare_account_id
+  project_name = "kaje"
+  name         = "test.kaje.example.com"
+}
+
+resource "cloudflare_dns_record" "test" {
+  zone_id = data.cloudflare_zone.test.id
+  name    = "test.kaje.example.com"
+  type    = "CNAME"
+  content = "test.kaje.pages.dev"
+  ttl     = 1
+  proxied = true
+}
+=== modules/test-env/outputs.tf ===
+output "d1_database_id" {
+  value = cloudflare_d1_database.test.id
+}
+
+output "kv_namespace_id" {
+  value = cloudflare_workers_kv_namespace.test.id
+}
+
+output "r2_bucket_name" {
+  value = cloudflare_r2_bucket.test.name
+}
+
+output "hyperdrive_config_id" {
+  value = cloudflare_hyperdrive_config.test.id
+}
+
+output "pages_domain_name" {
+  value = cloudflare_pages_domain.test.name
+}
+=== modules/test-env/variables.tf ===
+variable "cloudflare_account_id" {
+  description = "The Cloudflare account the test environment lives in."
+  type        = string
+}
+
+variable "test_db_host" {
+  description = "Address of the test database, supplied as TF_VAR_test_db_host."
+  type        = string
+  sensitive   = true
+}
+
+variable "test_db_port" {
+  description = "Port of the test database, supplied as TF_VAR_test_db_port."
+  type        = number
+  sensitive   = true
+}
+
+variable "test_db_database" {
+  description = "Name of the test database, supplied as TF_VAR_test_db_database."
+  type        = string
+  sensitive   = true
+}
+
+variable "test_db_user" {
+  description = "User for the test database, supplied as TF_VAR_test_db_user."
+  type        = string
+  sensitive   = true
+}
+
+variable "test_db_password" {
+  description = "Password for the test database, supplied as TF_VAR_test_db_password."
+  type        = string
+  sensitive   = true
+}
+=== outputs.tf ===
+output "test_env_d1_database_id" {
+  value = module.test_env.d1_database_id
+}
+
+output "test_env_kv_namespace_id" {
+  value = module.test_env.kv_namespace_id
+}
+
+output "test_env_r2_bucket_name" {
+  value = module.test_env.r2_bucket_name
+}
+
+output "test_env_hyperdrive_config_id" {
+  value = module.test_env.hyperdrive_config_id
+}
+
+output "test_env_pages_domain_name" {
+  value = module.test_env.pages_domain_name
+}
+=== variables.tf ===
+variable "cloudflare_api_token" {
+  description = "Cloudflare API token, supplied through the Secrets port as TF_VAR_cloudflare_api_token."
+  type        = string
+  sensitive   = true
+}
+
+variable "cloudflare_account_id" {
+  description = "The Cloudflare account this was imported from."
+  type        = string
+}
+
+variable "email_routing_destinations" {
+  description = "Email routing forward destinations, keyed by the rule they belong to. See IMPORT-REPORT.md."
+  type        = map(string)
+  sensitive   = true
+}
+
+variable "test_db_host" {
+  description = "Address of the test database, supplied as TF_VAR_test_db_host."
+  type        = string
+  sensitive   = true
+}
+
+variable "test_db_port" {
+  description = "Port of the test database, supplied as TF_VAR_test_db_port."
+  type        = number
+  sensitive   = true
+}
+
+variable "test_db_database" {
+  description = "Name of the test database, supplied as TF_VAR_test_db_database."
+  type        = string
+  sensitive   = true
+}
+
+variable "test_db_user" {
+  description = "User for the test database, supplied as TF_VAR_test_db_user."
+  type        = string
+  sensitive   = true
+}
+
+variable "test_db_password" {
+  description = "Password for the test database, supplied as TF_VAR_test_db_password."
+  type        = string
+  sensitive   = true
+}

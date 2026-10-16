@@ -34,6 +34,11 @@ cratefield-auth-client = "0.3"
 # second core in the graph until the venture itself moves.
 cratefield-oauth-client = "0.3"
 percent-encoding = "2"
+# The console's Cloudflare reader and generator (`src/onboard/`): the same
+# `adapters/cloudflare` the infra import uses, read through `ks-core`'s
+# `HttpClient` port over `worker::Fetch`.
+ks-core.workspace = true
+ks-cloudflare = { path = "../../adapters/cloudflare" }
 serde = { version = "1", features = ["derive"] }
 # The setup change's files go to GitHub's contents API base64-encoded.
 base64 = "0.23"
