@@ -1192,8 +1192,9 @@ pub async fn token_for_repo(
 }
 
 /// The installation of one repository, asked of GitHub with the app's JWT.
-/// Returned for use when it belongs to this app, and never stored; `None`
-/// when GitHub has no installation for it (`404`).
+/// Returned for use when it belongs to this app and the console recorded it,
+/// and never stored; `None` when GitHub has no installation for it (`404`)
+/// or it is one the console does not know.
 async fn discover(
     db: Arc<dyn Database>,
     http: &dyn HttpClient,
@@ -1210,7 +1211,20 @@ async fn discover(
         return Ok(None);
     }
     ok(status, "the repository's installation")?;
-    covering_installation(&body, app.app_id)
+    let Some(found) = covering_installation(&body, app.app_id)? else {
+        return Ok(None);
+    };
+    // The app is public, so anyone can install it. Only an installation the
+    // console recorded through the signed-in setup callback is ever used.
+    let recorded = installations(db).await?;
+    Ok(recorded_only(found, &recorded))
+}
+
+/// `found` when the console recorded that installation id, else `None`: a
+/// stranger's installation of the public app is never acted through.
+#[must_use]
+pub fn recorded_only(found: Installation, recorded: &[Installation]) -> Option<Installation> {
+    recorded.iter().any(|known| known.id == found.id).then_some(found)
 }
 
 /// The installation a repository lookup answered with, when it belongs to

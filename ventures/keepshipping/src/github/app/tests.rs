@@ -559,3 +559,16 @@ fn the_delete_link_is_built_from_the_slug_and_owner_not_the_public_page() {
         assert_eq!(checked_advanced_url(&built).as_deref(), Some(built.as_str()));
     }
 }
+
+#[test]
+fn only_a_recorded_installation_is_acted_through() {
+    let one = |id| Installation {
+        id,
+        account: "Someone".into(),
+        account_type: "Organization".into(),
+        selection: "all".into(),
+    };
+    assert_eq!(recorded_only(one(7), &[one(7), one(8)]), Some(one(7)));
+    assert_eq!(recorded_only(one(9), &[one(7), one(8)]), None, "a stranger's installation");
+    assert_eq!(recorded_only(one(7), &[]), None);
+}
