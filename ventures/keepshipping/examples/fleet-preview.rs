@@ -16,7 +16,10 @@
 use keepshipping_waitlist::cloudflare::page::connect_page;
 use keepshipping_waitlist::cloudflare::rollback::{self, Candidate, Panel};
 use keepshipping_waitlist::fleet::{self, Fleet};
-use keepshipping_waitlist::github::page::{State as GitHubState, connect_page as github_page};
+use keepshipping_waitlist::github::app::{AppRow, Installation, Overview};
+use keepshipping_waitlist::github::page::{
+    State as GitHubState, connect_page as github_page, handoff_page,
+};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use std::fs;
 use std::path::Path;
@@ -94,16 +97,7 @@ fn main() {
         "connect-error.html",
         connect_page(None, &[], None, Some("Cloudflare did not accept that token."), None, &now),
     );
-    write("github.html", github_page(GitHubState::Disconnected, None, None, &now));
-    write(
-        "github-connected.html",
-        github_page(
-            GitHubState::Connected { login: Some("nick"), saved: &snapshot.generated_at },
-            None,
-            None,
-            &now,
-        ),
-    );
+    github_pages(&snapshot, &now, &write);
     write("empty.html", fleet::empty_snapshot_page(true));
     write(
         "notice.html",
@@ -114,6 +108,80 @@ fn main() {
         ),
     );
     println!("wrote {}", out.display());
+}
+
+/// The GitHub connection page in every state the App can be in, with the
+/// personal token fallback both connected and not, and the hand-off page the
+/// create form shows before GitHub takes over.
+fn github_pages(snapshot: &Fleet, now: &str, write: &dyn Fn(&str, String)) {
+    let app = AppRow {
+        app_id: 4242,
+        slug: "keep-shipping-console".to_owned(),
+        client_id: "Iv1.preview".to_owned(),
+        html_url: "https://github.com/apps/keep-shipping-console".to_owned(),
+        owner: "keep-shipping".to_owned(),
+    };
+    let installed = Overview {
+        app: Some(app.clone()),
+        installations: vec![
+            Installation {
+                id: 101,
+                account: "nick".to_owned(),
+                account_type: "User".to_owned(),
+                selection: "all".to_owned(),
+            },
+            Installation {
+                id: 202,
+                account: "keep-shipping".to_owned(),
+                account_type: "Organization".to_owned(),
+                selection: "selected".to_owned(),
+            },
+        ],
+    };
+    let connected = GitHubState::Connected { login: Some("nick"), saved: &snapshot.generated_at };
+    // No app yet: the create form, the token open below it.
+    write(
+        "github.html",
+        github_page(&Overview::default(), None, GitHubState::Disconnected, None, None, now),
+    );
+    // A refusal from the create form (a bad organisation name).
+    write(
+        "github-app-error.html",
+        github_page(
+            &Overview::default(),
+            Some("The organisation name can only use letters, numbers and hyphens."),
+            GitHubState::Disconnected,
+            None,
+            None,
+            now,
+        ),
+    );
+    // Created on GitHub, not yet installed anywhere.
+    write(
+        "github-app-created.html",
+        github_page(
+            &Overview { app: Some(app.clone()), installations: Vec::new() },
+            None,
+            GitHubState::Disconnected,
+            None,
+            None,
+            now,
+        ),
+    );
+    // Installed on a personal account and an organisation, token connected.
+    write("github-installed.html", github_page(&installed, None, connected, None, None, now));
+    // The personal token alone, as before the app existed.
+    write("github-token.html", github_page(&Overview::default(), None, connected, None, None, now));
+    write(
+        "github-handoff.html",
+        handoff_page(
+            "Keep Shipping console (keep-shipping)",
+            Some("keep-shipping"),
+            &keepshipping_waitlist::github::app::manifest("Keep Shipping console (keep-shipping)")
+                .to_string(),
+            &keepshipping_waitlist::github::app::create_target(Some("keep-shipping"), "preview"),
+        ),
+    );
 }
 
 /// Every step of the manage-as-code wizard, rendered with made-up findings

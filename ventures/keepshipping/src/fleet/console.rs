@@ -27,11 +27,12 @@ use crate::cloudflare::page::{
     connect_page,
 };
 use crate::cloudflare::rollback;
-use crate::github;
+use crate::github::app as github_app;
 use crate::github::page::{
     CONNECT_PATH as GITHUB_CONNECT_PATH, DISCONNECT_PATH as GITHUB_DISCONNECT_PATH,
-    State as GitHubState, connect_page as github_connect_page, safe_next,
+    State as GitHubState, connect_page as github_connect_page, handoff_page, safe_next,
 };
+use crate::github::{self, webhook};
 use crate::onboard::flow::{self, Reply as WizardReply};
 use crate::secrets;
 use crate::signin::{self, CALLBACK_PATH, Client, LOGIN_PATH, LOGOUT_PATH, Reply};
@@ -50,6 +51,11 @@ pub const REFRESH_PATH: &str = "/console/fleet/refresh";
 /// refused cross-site writes (`write_origin_rejected`) before this runs.
 pub async fn handle(req: &mut Request, env: &Env) -> Option<worker::Result<Response>> {
     let path = req.path();
+    // GitHub posts here with its own signature and no session, so the webhook
+    // is answered before the sign-in gate that every other write passes.
+    if path.trim_end_matches('/') == github_app::WEBHOOK_PATH {
+        return Some(github_webhook(req, env).await);
+    }
     if let Some(step) = sign_in_step(&path) {
         return Some(serve_sign_in(req, env, step).await);
     }
@@ -73,6 +79,12 @@ enum Action {
     /// `GET` shows the GitHub connection page, `POST` stores a pasted token.
     GitHub,
     GitHubDisconnect,
+    /// `POST` stores the manifest's `state` and shows the hand-off to GitHub.
+    GitHubAppNew,
+    /// `GET`: GitHub has created the app; the code is exchanged here.
+    GitHubAppCreated,
+    /// `GET`: the app was installed; the installation is verified here.
+    GitHubAppInstalled,
     /// `POST` re-wraps the stored data keys under the current master key.
     RewrapKeys,
 }
@@ -86,6 +98,9 @@ fn action_for(path: &str) -> Option<Action> {
         DEPLOY_DISCONNECT_PATH => Some(Action::DisconnectDeploy),
         GITHUB_CONNECT_PATH => Some(Action::GitHub),
         GITHUB_DISCONNECT_PATH => Some(Action::GitHubDisconnect),
+        github_app::CREATE_PATH => Some(Action::GitHubAppNew),
+        github_app::CREATED_PATH => Some(Action::GitHubAppCreated),
+        github_app::INSTALLED_PATH => Some(Action::GitHubAppInstalled),
         KEYS_REWRAP_PATH => Some(Action::RewrapKeys),
         _ => None,
     }
@@ -327,21 +342,25 @@ async fn serve_action(req: &mut Request, env: &Env, action: Action) -> worker::R
     let read_only = matches!(req.method(), Method::Get | Method::Head);
     let allowed = match action {
         Action::Connect | Action::GitHub => post || read_only,
+        Action::GitHubAppCreated | Action::GitHubAppInstalled => read_only,
         Action::Disconnect
         | Action::Refresh
         | Action::ConnectDeploy
         | Action::DisconnectDeploy
         | Action::GitHubDisconnect
+        | Action::GitHubAppNew
         | Action::RewrapKeys => post,
     };
     if !allowed {
         let allow = match action {
             Action::Connect | Action::GitHub => "GET, HEAD, POST",
+            Action::GitHubAppCreated | Action::GitHubAppInstalled => "GET, HEAD",
             Action::Disconnect
             | Action::Refresh
             | Action::ConnectDeploy
             | Action::DisconnectDeploy
             | Action::GitHubDisconnect
+            | Action::GitHubAppNew
             | Action::RewrapKeys => "POST",
         };
         return page_with(
@@ -368,6 +387,9 @@ async fn serve_action(req: &mut Request, env: &Env, action: Action) -> worker::R
         Action::GitHub if post => github_save(req, env).await?,
         Action::GitHub => github_form(req, env).await?,
         Action::GitHubDisconnect => github_disconnect(env).await?,
+        Action::GitHubAppNew => github_app_new(req, env).await?,
+        Action::GitHubAppCreated => github_app_created(req, env).await?,
+        Action::GitHubAppInstalled => github_app_installed(req, env).await?,
         Action::RewrapKeys => rewrap_keys(env).await?,
     };
     with_cookies(response, &session.set_cookies)
@@ -454,11 +476,39 @@ async fn connect_save(req: &mut Request, env: &Env, deploy: bool) -> worker::Res
     }
 }
 
-/// The GitHub connection page: who it is connected as, when GitHub can say.
-/// A `next` query names where a successful paste returns the person.
+/// The GitHub connection page: the app, its installations, and the personal
+/// token fallback. A `next` query names where a successful token paste
+/// returns the person.
 async fn github_form(req: &Request, env: &Env) -> worker::Result<Response> {
     let next = query_value(req, "next");
-    let next = next.as_deref().and_then(safe_next);
+    github_page(env, None, next.as_deref().and_then(safe_next)).await
+}
+
+/// The GitHub connection page, rendered from what is stored. `app_error` is a
+/// plain-words refusal from the app's create form.
+async fn github_page(
+    env: &Env,
+    app_error: Option<&str>,
+    next: Option<&str>,
+) -> worker::Result<Response> {
+    let db = match secrets::d1(env) {
+        Ok(db) => db,
+        Err(_) => {
+            return page(
+                503,
+                &notice_page("Could not check the connection", secrets::NO_MASTER_KEY_COPY, None),
+            );
+        }
+    };
+    let overview = match github_app::overview(db).await {
+        Ok(overview) => overview,
+        Err(failed) => {
+            return page(
+                failed.status,
+                &notice_page("Could not check the connection", failed.message, None),
+            );
+        }
+    };
     let legacy = read(env, "HARNESS_SECRET");
     let saved = match github::connected_at(env, legacy.as_deref()).await {
         Ok(saved) => saved,
@@ -469,22 +519,164 @@ async fn github_form(req: &Request, env: &Env) -> worker::Result<Response> {
             );
         }
     };
-    let html = match saved {
+    let token = match saved {
         Some(saved) => {
             let login = match github::client(env, legacy.as_deref()).await {
                 Ok(Some(client)) => client.whoami().await.ok(),
                 _ => None,
             };
-            github_connect_page(
-                GitHubState::Connected { login: login.as_deref(), saved: &saved },
-                None,
-                next,
-                &api::now(),
-            )
+            Some((login, saved))
         }
-        None => github_connect_page(GitHubState::Disconnected, None, next, &api::now()),
+        None => None,
     };
-    page(200, &html)
+    let token_state = match &token {
+        Some((login, saved)) => {
+            GitHubState::Connected { login: login.as_deref(), saved: saved.as_str() }
+        }
+        None => GitHubState::Disconnected,
+    };
+    page(200, &github_connect_page(&overview, app_error, token_state, None, next, &api::now()))
+}
+
+/// The app's create form: the organisation and the name, checked, then a
+/// `state` stored and a page that hands the browser to GitHub with the
+/// manifest.
+async fn github_app_new(req: &mut Request, env: &Env) -> worker::Result<Response> {
+    let body = req.text().await?;
+    if body.len() > 4096 {
+        return github_page(env, Some("The form is larger than it should be."), None).await;
+    }
+    let field = |name: &str| {
+        form_urlencoded::parse(body.as_bytes())
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+            .unwrap_or_default()
+    };
+    let org = match github_app::owner_of(&field("org")) {
+        Ok(org) => org,
+        Err(message) => return github_page(env, Some(message), None).await,
+    };
+    let name = match github_app::name_of(org.as_deref(), &field("name")) {
+        Ok(name) => name,
+        Err(message) => return github_page(env, Some(message), None).await,
+    };
+    let db = match secrets::d1(env) {
+        Ok(db) => db,
+        Err(_) => return github_page(env, Some(secrets::NO_MASTER_KEY_COPY), None).await,
+    };
+    let now = WorkersClock.now().unix_timestamp();
+    let state = match github_app::issue_state(db, now).await {
+        Ok(state) => state,
+        Err(failed) => return github_page(env, Some(failed.message), None).await,
+    };
+    let manifest = github_app::manifest(&name).to_string();
+    let target = github_app::create_target(org.as_deref(), &state);
+    page(200, &handoff_page(&name, org.as_deref(), &manifest, &target))
+}
+
+/// GitHub's redirect after it created the app: the `state` is checked (once,
+/// in time), the code is exchanged and the app recorded. The person is then
+/// sent to install it.
+async fn github_app_created(req: &Request, env: &Env) -> worker::Result<Response> {
+    let back = Some((GITHUB_CONNECT_PATH, "Back to the GitHub connection"));
+    let (Some(code), Some(state)) = (query_value(req, "code"), query_value(req, "state")) else {
+        return page(
+            400,
+            &notice_page(
+                "GitHub App not created",
+                "GitHub's link did not carry the details this console needs. Start again from \
+                 the GitHub connection page.",
+                back,
+            ),
+        );
+    };
+    let now = WorkersClock.now().unix_timestamp();
+    let db = match secrets::d1(env) {
+        Ok(db) => db,
+        Err(_) => return github_page(env, Some(secrets::NO_MASTER_KEY_COPY), None).await,
+    };
+    match github_app::take_state(db.clone(), &state, now).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return page(
+                400,
+                &notice_page("GitHub App not created", github_app::STATE_REFUSED_COPY, back),
+            );
+        }
+        Err(failed) => {
+            return page(
+                failed.status,
+                &notice_page("GitHub App not created", failed.message, back),
+            );
+        }
+    }
+    match github_app::create_from_code(env, db, &FetchClient, &code, now).await {
+        Ok(app) => redirect(303, &github_app::install_url(&app.slug)),
+        Err(failed) => {
+            page(failed.status, &notice_page("GitHub App not created", failed.message, back))
+        }
+    }
+}
+
+/// GitHub's redirect after an installation: the installation is verified with
+/// the app's own JWT (it must be this app's), recorded, and the person goes
+/// back to the connection page.
+async fn github_app_installed(req: &Request, env: &Env) -> worker::Result<Response> {
+    let back = Some((GITHUB_CONNECT_PATH, "Back to the GitHub connection"));
+    let Some(id) = query_value(req, "installation_id").and_then(|id| id.parse::<i64>().ok()) else {
+        return page(
+            400,
+            &notice_page(
+                "Installation not recorded",
+                "GitHub did not say which installation this is. Install the app again from the \
+                 GitHub connection page.",
+                back,
+            ),
+        );
+    };
+    let now = WorkersClock.now().unix_timestamp();
+    let db = match secrets::d1(env) {
+        Ok(db) => db,
+        Err(_) => return github_page(env, Some(secrets::NO_MASTER_KEY_COPY), None).await,
+    };
+    match github_app::record_installation(db, &FetchClient, id, now).await {
+        Ok(_) => redirect(303, GITHUB_CONNECT_PATH),
+        Err(failed) => {
+            page(failed.status, &notice_page("Installation not recorded", failed.message, back))
+        }
+    }
+}
+
+/// The GitHub App's webhook: the request's size and headers, then the body
+/// read, then [`webhook::handle`] decides. No session: the signature is the
+/// proof. Answers an empty body with the status.
+async fn github_webhook(req: &mut Request, env: &Env) -> worker::Result<Response> {
+    if !matches!(req.method(), Method::Post) {
+        return page_with(
+            405,
+            &notice_page("Method not allowed", "The webhook answers POST only.", None),
+            &[("allow", "POST")],
+        );
+    }
+    let declared = req
+        .headers()
+        .get("content-length")
+        .ok()
+        .flatten()
+        .and_then(|length| length.parse::<usize>().ok());
+    if declared.is_some_and(|length| length > webhook::MAX_BODY) {
+        return Ok(Response::empty()?.with_status(413));
+    }
+    let event = req.headers().get("x-github-event").ok().flatten();
+    let signature = req.headers().get("x-hub-signature-256").ok().flatten();
+    let body = req.bytes().await?;
+    let db = match secrets::d1(env) {
+        Ok(db) => db,
+        Err(_) => return Ok(Response::empty()?.with_status(503)),
+    };
+    let now = WorkersClock.now().unix_timestamp();
+    let status = webhook::handle(db, event.as_deref(), signature.as_deref(), &body, now).await;
+    Ok(Response::empty()?.with_status(status))
 }
 
 /// The GitHub paste: the token is checked with GitHub, stored in the vault by
@@ -929,6 +1121,22 @@ mod tests {
             Some(Action::GitHubDisconnect)
         ));
         assert!(action_for("/console/connect/github/x").is_none());
+        // The GitHub App's routes: the create form, and the two GitHub returns.
+        assert!(matches!(
+            action_for("/console/connect/github/app/new"),
+            Some(Action::GitHubAppNew)
+        ));
+        assert!(matches!(
+            action_for("/console/connect/github/app/created"),
+            Some(Action::GitHubAppCreated)
+        ));
+        assert!(matches!(
+            action_for("/console/connect/github/app/installed/"),
+            Some(Action::GitHubAppInstalled)
+        ));
+        assert!(action_for("/console/connect/github/app/new/extra").is_none());
+        // The webhook is not an action: it is answered before the session gate.
+        assert!(action_for("/console/github/webhook").is_none());
     }
 
     #[test]

@@ -123,6 +123,24 @@ code {
 .tile > div { font-size: 1rem; }
 ul.failing { margin: 0.5rem 0 0; padding-left: 1.1rem; font-size: 0.85rem; color: var(--text); }
 
+/* Two columns on a wide screen: the explanation and steps on the left, the
+   action card on the right. One column on a phone. Prose stops at ~70
+   characters a line. */
+.split { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1.5rem; align-items: start; margin: 0 0 1.5rem; }
+.split > * { min-width: 0; }
+.prose { max-width: 70ch; }
+.prose ol.progress { flex-direction: column; gap: 0.6rem; margin: 0; }
+@media (min-width: 60rem) {
+  .split { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 2.25rem; }
+}
+details.token-fallback { margin: 0 0 1.5rem; }
+details.token-fallback > summary { font-weight: 600; color: var(--ink); cursor: pointer; padding: 0.4rem 0; margin-bottom: 1rem; }
+details.token-fallback > summary:hover { text-decoration: underline; }
+ul.installs { list-style: none; margin: 0 0 1rem; padding: 0; }
+ul.installs li { padding: 0.7rem 0; border-top: 1px solid var(--border); }
+ul.installs li:first-child { border-top: 0; padding-top: 0; }
+ul.installs .what { white-space: normal; }
+
 /* Callouts: attention, gaps, the Terraform note, a form error. */
 .callout { border: 1px solid var(--border); border-left-width: 3px; background: var(--surface); padding: 0.9rem 1.1rem; margin: 0 0 1rem; font-size: 0.93rem; }
 .callout h2 { font-size: 0.95rem; margin: 0 0 0.4rem; }

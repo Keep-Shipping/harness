@@ -401,16 +401,48 @@ struct Tokens {
     configured: Option<String>,
     /// The console's own GitHub connection, opened from its stored row.
     stored: Option<String>,
+    db: Arc<dyn Database>,
     http: Arc<dyn HttpClient>,
     base: String,
 }
 
 impl Tokens {
-    /// The client for one record. A record whose edit has its own repository
-    /// (onboarding's) uses the console's connection; every other record uses
-    /// the configured token, else the console's connection. Without the token
-    /// it needs, a record waits and is retried.
-    fn client(&self, own_repository: bool) -> Result<github::GitHub, github::Failure> {
+    /// The client for one record. The console's GitHub App goes first: an
+    /// installation that covers the repository's owner speaks for the record.
+    /// Otherwise a record whose edit has its own repository (onboarding's) uses
+    /// the console's personal token; every other record uses the configured
+    /// token, else the personal token. Without a token it needs, a record
+    /// waits and is retried.
+    async fn client(
+        &self,
+        repo: Option<&str>,
+        own_repository: bool,
+        now: i64,
+    ) -> Result<github::GitHub, github::Failure> {
+        if let Some((owner, name)) = repo.and_then(|repo| repo.split_once('/')) {
+            let app = crate::github::app::token_for_owner(
+                Arc::clone(&self.db),
+                &*self.http,
+                owner,
+                Some(name),
+                now,
+            )
+            .await;
+            match app {
+                Ok(Some(app)) => {
+                    return Ok(github::GitHub::new(
+                        Arc::clone(&self.http),
+                        app.token,
+                        self.base.clone(),
+                    ));
+                }
+                Ok(None) => {}
+                Err(failed) => tracing::warn!(
+                    message = failed.message,
+                    "edits: the github app could not be used; trying the stored token"
+                ),
+            }
+        }
         let token = if own_repository {
             self.stored.clone()
         } else {
@@ -443,12 +475,20 @@ async fn drain(
     let configured = cfg.get_opt("GITHUB_TOKEN");
     let legacy_secret = config.get("HARNESS_SECRET");
     let stored = crate::github::stored_token(Arc::clone(&db), legacy_secret.as_deref()).await;
-    let db: &dyn Database = db.as_ref();
-    if configured.is_none() && stored.is_none() {
+    // The app is a connection too: with it installed there is delivery to do
+    // even when no token is configured or stored.
+    let app = crate::github::app::app_row(Arc::clone(&db)).await.ok().flatten().is_some();
+    if configured.is_none() && stored.is_none() && !app {
         return Ok(cratefield_core::DrainReport::default());
     }
-    let tokens =
-        Tokens { configured, stored, http, base: cfg.get_str("GITHUB_API_BASE", github::API_BASE) };
+    let tokens = Tokens {
+        configured,
+        stored,
+        db: Arc::clone(&db),
+        http,
+        base: cfg.get_str("GITHUB_API_BASE", github::API_BASE),
+    };
+    let db: &dyn Database = db.as_ref();
     Outbox::new(OUTBOX_TABLE)
         .drain_within(
             db,
@@ -470,14 +510,19 @@ async fn handle_record(
     record: OutboxRecord,
 ) -> Processed {
     let now = iso(clock.now());
+    let unix = clock.now().unix_timestamp();
     let outcome = match record.topic.as_str() {
-        TOPIC_OPEN_PR => match tokens.client(false) {
-            Ok(github) => open_edit_pr(&github, db, &record, &now).await,
-            Err(failure) => Err(failure),
-        },
+        TOPIC_OPEN_PR => {
+            let repo = payload_field(&record, "repo");
+            match tokens.client(repo.as_deref(), false, unix).await {
+                Ok(github) => open_edit_pr(&github, db, &record, &now).await,
+                Err(failure) => Err(failure),
+            }
+        }
         TOPIC_DISPATCH => {
             let own = edit_has_own_repository(db, &record).await;
-            match tokens.client(own) {
+            let repo = payload_field(&record, "repo");
+            match tokens.client(repo.as_deref(), own, unix).await {
                 Ok(github) => github.dispatch(&record.payload).await,
                 Err(failure) => Err(failure),
             }
@@ -513,6 +558,13 @@ async fn edit_has_own_repository(db: &dyn Database, record: &OutboxRecord) -> bo
         .and_then(|rows| rows.rows.into_iter().next())
         .and_then(|row| opt_col(&row, "repo"))
         .is_some()
+}
+
+/// A top-level text field of an outbox row's payload (the repository an open
+/// or a dispatch names), when there is one.
+fn payload_field(record: &OutboxRecord, name: &str) -> Option<String> {
+    let payload: Value = serde_json::from_str(&record.payload).ok()?;
+    payload.get(name).and_then(Value::as_str).map(str::to_owned)
 }
 
 /// The edit an outbox row belongs to, from either topic's payload.

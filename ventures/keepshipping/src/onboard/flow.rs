@@ -128,8 +128,8 @@ pub async fn view(env: &Env, secret: Option<&str>, site: &Site, again: bool) -> 
         Ok(record) => record,
         Err(reply) => return reply,
     };
-    let client = match github::client(env, secret).await {
-        Ok(Some(client)) => client,
+    match github::client_for(env, None, secret).await {
+        Ok(Some(_)) => {}
         Ok(None) => {
             return Reply::Html(
                 200,
@@ -142,10 +142,10 @@ pub async fn view(env: &Env, secret: Option<&str>, site: &Site, again: bool) -> 
                 page::notice("Could not check GitHub", failed.message),
             );
         }
-    };
+    }
     match record.status.as_str() {
         "opened" if !again => status(env, site, &record).await,
-        "" | "draft" => repo_step(env, secret, site, &target, &client, &record).await,
+        "" | "draft" => repo_step(env, secret, site, &target, &record).await,
         _ => review(env, secret, site, &target, &record, None).await,
     }
 }
@@ -271,10 +271,9 @@ async fn repo_step(
     secret: Option<&str>,
     site: &Site,
     target: &Target,
-    client: &Client,
     record: &Record,
 ) -> Reply {
-    let repos = match client.list_repos().await {
+    let repos = match github::list_repos(env, secret).await {
         Ok(repos) => repos,
         Err(failed) => {
             return Reply::Html(
@@ -398,11 +397,10 @@ async fn scan(env: &Env, secret: Option<&str>, site: &Site, form: &[(String, Str
     let Some((owner, name)) = wizard::parse_repo(choice) else {
         return refuse_scan(env, site, record, "Choose a repository from the list.", &now).await;
     };
-    let client = match github::client(env, secret).await {
-        Ok(Some(client)) => client,
-        _ => return refuse_scan(env, site, record, NOT_CONNECTED, &now).await,
-    };
-    let repos = match client.list_repos().await {
+    if !matches!(github::client_for(env, None, secret).await, Ok(Some(_))) {
+        return refuse_scan(env, site, record, NOT_CONNECTED, &now).await;
+    }
+    let repos = match github::list_repos(env, secret).await {
         Ok(repos) => repos,
         Err(failed) => return refuse_scan(env, site, record, failed.message, &now).await,
     };
@@ -417,6 +415,10 @@ async fn scan(env: &Env, secret: Option<&str>, site: &Site, form: &[(String, Str
             &now,
         )
         .await;
+    };
+    let client = match github::client_for(env, Some(owner), secret).await {
+        Ok(Some(client)) => client,
+        _ => return refuse_scan(env, site, record, NOT_CONNECTED, &now).await,
     };
     match read_scan(&client, &repo).await {
         Ok(scan) => {
@@ -637,7 +639,7 @@ async fn run_open(
         .await
         .map_err(|failed| Stop::new(STEP_BUCKET, failed.message))?;
 
-    let client = github::client(env, secret)
+    let client = github::client_for(env, Some(owner), secret)
         .await
         .map_err(|failed| Stop::new(STEP_REPO, failed.message))?
         .ok_or(Stop::new(STEP_REPO, NOT_CONNECTED))?;

@@ -1,11 +1,21 @@
-//! The GitHub connection page's HTML: plain words, the link that opens
-//! GitHub's token page, the permissions in words, and the paste form.
-//! Nothing here echoes a token; the form posts back to the worker, which
-//! checks the token with GitHub, seals it and redirects.
+//! The GitHub connection page's HTML. Two ways in, in this order:
+//!
+//! * the GitHub App, the recommended one: its state (not created, created but
+//!   not installed, installed on which accounts), and the form that starts
+//!   its creation through GitHub's manifest flow;
+//! * a personal access token, under "Use a personal access token instead":
+//!   the permissions in words, the link that opens GitHub's token page, and
+//!   the paste form.
+//!
+//! Nothing here echoes a token or a key. The forms post back to the worker,
+//! which checks what they name, and redirects. The pages use the console's
+//! two-column layout: the explanation on the left, the action on the right,
+//! one column on a phone.
 
 use crate::fleet::{Tab, esc, signed_in_layout, time_html};
+use crate::github::app::{self, Installation, Overview};
 
-/// Where the paste form posts, and where the page is shown.
+/// Where the personal token's paste form posts, and where the page is shown.
 pub const CONNECT_PATH: &str = "/console/connect/github";
 /// Where disconnect posts.
 pub const DISCONNECT_PATH: &str = "/console/connect/github/disconnect";
@@ -14,7 +24,8 @@ pub const DISCONNECT_PATH: &str = "/console/connect/github/disconnect";
 /// tick.
 pub const TOKEN_PAGE: &str = "https://github.com/settings/personal-access-tokens/new";
 
-/// The permissions the token needs, each with what it is for in plain words.
+/// The permissions the personal token needs, each with what it is for in plain
+/// words.
 pub const PERMISSIONS: [(&str, &str, &str); 6] = [
     ("Contents", "Read and write", "to read your app's code and to commit the infrastructure code"),
     ("Pull requests", "Read and write", "to open the pull request each change goes through"),
@@ -32,6 +43,19 @@ pub const PERMISSIONS: [(&str, &str, &str); 6] = [
     ("Metadata", "Read-only", "GitHub requires it for every token"),
 ];
 
+/// The permissions the GitHub App asks for, in words: the names GitHub shows
+/// on its own confirmation page.
+const APP_PERMISSIONS: [&str; 8] = [
+    "Contents",
+    "Pull requests",
+    "Workflows",
+    "Secrets",
+    "Actions variables",
+    "Administration",
+    "Actions",
+    "Metadata",
+];
+
 /// Where the connection returns a person to after it is saved: a path on this
 /// console and nowhere else. Anything else (another origin, a protocol-relative
 /// `//host` path, a backslash or a control character) is refused and the page
@@ -45,7 +69,7 @@ pub fn safe_next(raw: &str) -> Option<&str> {
     ok.then_some(raw)
 }
 
-/// What the page shows about the connection.
+/// What the page shows about the personal token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State<'a> {
     /// No token is stored, or the stored one no longer opens.
@@ -60,18 +84,132 @@ pub enum State<'a> {
     },
 }
 
-/// The GitHub connection page. `error` is a plain-words refusal from the
-/// last paste, shown above the form; `next` is where a successful paste
-/// returns the person (already checked by [`safe_next`]); `now` is RFC 3339,
-/// for the relative save time.
+/// The GitHub connection page: the app's state and create form, the personal
+/// token's fallback. `app_error` is a refusal from the app's create form;
+/// `token_error` one from the last token paste; `next` is where a successful
+/// paste returns the person (already checked by [`safe_next`]); `now` is
+/// RFC 3339, for the relative save time.
 #[must_use]
 pub fn connect_page(
-    state: State<'_>,
-    error: Option<&str>,
+    overview: &Overview,
+    app_error: Option<&str>,
+    token: State<'_>,
+    token_error: Option<&str>,
     next: Option<&str>,
     now: &str,
 ) -> String {
-    let status = match state {
+    let app_card = app_card(overview, app_error);
+    let token_open = overview.app.is_none() || matches!(token, State::Connected { .. });
+    let body = format!(
+        "<main id=\"main\" class=\"wrap\">\n\
+         <div class=\"pagehead\"><div>\n<h1>GitHub connection</h1>\n\
+         <p class=\"sub\">The infrastructure code for each site lives in a GitHub repository. \
+         Connecting lets the console read your app repositories and open the pull requests \
+         that set the infrastructure up. Nothing is changed until you approve a pull request.</p>\n\
+         </div></div>\n\
+         <div class=\"split\">\n\
+         <div class=\"prose\">\n\
+         <h2>The GitHub App (recommended)</h2>\n\
+         <p>The app is the console's own identity on GitHub. You install it on the accounts or \
+         organisations that hold your repositories, and choose which repositories it can see. \
+         It works in short sessions and never holds a password.</p>\n\
+         <p class=\"hint\">The app can only create repositories under an organisation. On your \
+         own account, create the empty repository on GitHub first, or connect a personal token \
+         below.</p>\n\
+         </div>\n\
+         <div>\n{app_card}</div>\n\
+         </div>\n\
+         <details class=\"token-fallback\"{open}>\n\
+         <summary>Use a personal access token instead</summary>\n\
+         {token_card}\
+         </details>\n\
+         </main>\n",
+        open = if token_open { " open" } else { "" },
+        token_card = token_card(token, token_error, next, now),
+    );
+    signed_in_layout("GitHub connection", Tab::GitHub, &body)
+}
+
+/// The app's card: the create form, the "Install" step, or the installations.
+fn app_card(overview: &Overview, app_error: Option<&str>) -> String {
+    let error = app_error
+        .map(|message| format!("<p class=\"callout bad\" role=\"alert\">{}</p>\n", esc(message)))
+        .unwrap_or_default();
+    let Some(app) = &overview.app else {
+        return format!(
+            "<section class=\"panel app-card\" aria-labelledby=\"app-title\">\n\
+             <div class=\"status-head\"><h2 id=\"app-title\">GitHub App \
+             <span class=\"tag live\">recommended</span></h2>\
+             <p><span class=\"status unknown\">Not created</span></p></div>\n\
+             <p class=\"muted\">The console creates the app on GitHub, with the permissions it \
+             needs, and keeps its key in the console's secrets store.</p>\n\
+             {error}\
+             <form class=\"connect\" method=\"post\" action=\"{CREATE_PATH}\" autocomplete=\"off\">\n\
+             <label for=\"gh-org\">GitHub organisation</label>\n\
+             <input id=\"gh-org\" name=\"org\" type=\"text\" autocapitalize=\"off\" \
+             spellcheck=\"false\" placeholder=\"Leave blank for your own account\">\n\
+             <p class=\"hint\">The organisation's name as it appears in its GitHub address.</p>\n\
+             <label for=\"gh-app-name\">App name</label>\n\
+             <input id=\"gh-app-name\" name=\"name\" type=\"text\" maxlength=\"64\" \
+             placeholder=\"Keep Shipping console (organisation)\">\n\
+             <p class=\"hint\">GitHub app names are unique across all of GitHub. If this one is \
+             taken, type another.</p>\n\
+             <button class=\"btn primary\" type=\"submit\">Create the GitHub App</button>\n\
+             </form>\n</section>\n",
+            CREATE_PATH = CREATE_PATH,
+        );
+    };
+    let installs = if overview.installations.is_empty() {
+        format!(
+            "<p class=\"muted\">The app is created but not installed on any account yet.</p>\n\
+             <p><a class=\"btn primary\" href=\"{href}\">Install on GitHub ↗</a></p>\n",
+            href = esc(&app::install_url(&app.slug)),
+        )
+    } else {
+        let rows: String = overview.installations.iter().map(installation_row).collect();
+        format!(
+            "<ul class=\"rows installs\">\n{rows}</ul>\n\
+             <p><a class=\"btn\" href=\"{href}\">Add another account ↗</a></p>\n",
+            href = esc(&app::install_url(&app.slug)),
+        )
+    };
+    let status = if overview.installations.is_empty() {
+        "<span class=\"status warn\">Created, not installed</span>"
+    } else {
+        "<span class=\"status ok\">Installed</span>"
+    };
+    format!(
+        "<section class=\"panel app-card\" aria-labelledby=\"app-title\">\n\
+         <div class=\"status-head\"><h2 id=\"app-title\">GitHub App \
+         <span class=\"tag live\">recommended</span></h2><p>{status}</p></div>\n\
+         <p class=\"muted\">App <a href=\"{page}\" rel=\"noopener noreferrer\">{slug}</a>, \
+         created under {owner}.</p>\n\
+         {error}{installs}</section>\n",
+        page = esc(&app.html_url),
+        slug = esc(&app.slug),
+        owner = esc(&app.owner),
+    )
+}
+
+/// One installation: the account, its kind, what the app can see, and the
+/// link to manage it on GitHub.
+fn installation_row(installation: &Installation) -> String {
+    let kind = if installation.is_user() { "Personal" } else { "Organisation" };
+    let reach =
+        if installation.selection == "all" { "all repositories" } else { "selected repositories" };
+    format!(
+        "<li><strong>{account}</strong> <span class=\"tag\">{kind}</span>\
+         <div class=\"what\">{reach} · <a href=\"{manage}\" rel=\"noopener noreferrer\">\
+         Manage on GitHub ↗</a></div></li>\n",
+        account = esc(&installation.account),
+        manage = esc(&app::manage_url(installation)),
+    )
+}
+
+/// The personal token's section: its state, then the steps and the paste form
+/// in the same two columns as the rest of the page.
+fn token_card(token: State<'_>, error: Option<&str>, next: Option<&str>, now: &str) -> String {
+    let status = match token {
         State::Connected { login, saved } => format!(
             "<section class=\"panel status-card\" aria-labelledby=\"status-title\">\n\
              <div class=\"status-head\"><h2 id=\"status-title\"><span class=\"status ok\">Connected</span></h2>\
@@ -99,21 +237,17 @@ pub fn connect_page(
         .map(|(name, access, why)| format!("<li><strong>{name}</strong>, {access}: {why}</li>"))
         .collect::<Vec<_>>()
         .join("\n");
-    let (heading, submit) = match state {
+    let (heading, submit) = match token {
         State::Connected { .. } => ("Replace the token", "Replace the GitHub token"),
         State::Disconnected => ("Connect GitHub", "Connect GitHub"),
     };
     let next_field = next
         .map(|next| format!("<input type=\"hidden\" name=\"next\" value=\"{}\">\n", esc(next)))
         .unwrap_or_default();
-    let body = format!(
-        "<main id=\"main\" class=\"wrap narrow\">\n\
-         <div class=\"pagehead\"><div>\n<h1>GitHub connection</h1>\n\
-         <p class=\"sub\">The infrastructure code for each site lives in a GitHub repository. \
-         Connecting lets the console read your app repositories and open the pull requests \
-         that set the infrastructure up. Nothing is changed until you approve a pull request.</p>\n\
-         </div></div>\n\
-         {status}\
+    format!(
+        "{status}\
+         <div class=\"split\">\n\
+         <div class=\"prose\">\n\
          <ol class=\"steps\">\n\
          <li class=\"panel\">\n<h2>Create a token on GitHub</h2>\n\
          <p>Open GitHub's token page, give the token a name such as <em>Keep Shipping console</em>, \
@@ -124,10 +258,13 @@ pub fn connect_page(
          <details class=\"perms\" open><summary>Give it these permissions</summary>\n\
          <ul>\n{permissions}\n</ul>\n\
          <p class=\"hint\">Set every other permission to <strong>No access</strong>.</p>\n\
-         </details>\n</li>\n\
+         </details>\n</li>\n</ol>\n\
+         </div>\n\
+         <div>\n\
+         <ol class=\"steps\" style=\"counter-reset: step 1\">\n\
          <li class=\"panel\">\n<h2>{heading}</h2>\n\
-         <p>Paste the token below. It is checked with GitHub, sealed with a key only this console \
-         holds, and stored. It is never shown again.</p>\n\
+         <p>Paste the token below. It is checked with GitHub, encrypted, and stored by this \
+         console. It is never shown again.</p>\n\
          {error}\
          <form class=\"connect\" method=\"post\" action=\"{CONNECT_PATH}\" autocomplete=\"off\">\n\
          {next_field}\
@@ -136,59 +273,222 @@ pub fn connect_page(
          autocapitalize=\"off\" spellcheck=\"false\">\n\
          <button class=\"btn primary\" type=\"submit\">{submit}</button>\n\
          </form>\n</li>\n</ol>\n\
+         </div>\n\
+         </div>\n",
+    )
+}
+
+/// Where the create form posts.
+const CREATE_PATH: &str = "/console/connect/github/app/new";
+
+/// The hand-off page: the manifest goes to GitHub in a plain form, which the
+/// person submits. Nothing is created until they press the button on GitHub.
+#[must_use]
+pub fn handoff_page(name: &str, org: Option<&str>, manifest: &str, target: &str) -> String {
+    let owner =
+        org.map_or_else(|| "your own account".to_owned(), |org| format!("the {org} organisation"));
+    let permissions = APP_PERMISSIONS.join(", ");
+    let body = format!(
+        "<main id=\"main\" class=\"wrap\">\n\
+         <div class=\"pagehead\"><div>\n<h1>Create the GitHub App</h1>\n\
+         <p class=\"sub\">GitHub will show the app's details for you to confirm.</p>\n\
+         </div></div>\n\
+         <div class=\"split\">\n\
+         <div class=\"prose\">\n\
+         <p>The app is <strong>{name}</strong>, created under {owner}. It asks for these \
+         permissions: {permissions}.</p>\n\
+         <p class=\"hint\">Nothing is created until you press the button on GitHub. Its webhook \
+         and return links all point at this console.</p>\n\
+         </div>\n\
+         <div>\n\
+         <section class=\"panel\" aria-labelledby=\"handoff-title\">\n\
+         <h2 id=\"handoff-title\">Continue to GitHub</h2>\n\
+         <form method=\"post\" action=\"{target}\">\n\
+         <input type=\"hidden\" name=\"manifest\" value=\"{manifest}\">\n\
+         <button class=\"btn primary\" type=\"submit\">Continue to GitHub ↗</button>\n\
+         </form>\n\
+         <p><a href=\"{back}\">Back to the GitHub connection</a></p>\n\
+         </section>\n\
+         </div>\n\
+         </div>\n\
          </main>\n",
+        name = esc(name),
+        owner = esc(&owner),
+        target = esc(target),
+        manifest = esc(manifest),
+        back = CONNECT_PATH,
     );
-    signed_in_layout("GitHub connection", Tab::GitHub, &body)
+    signed_in_layout("Create the GitHub App", Tab::GitHub, &body)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_disconnected_page_lists_every_permission_and_offers_a_paste() {
-        let page = connect_page(State::Disconnected, None, None, "2026-10-16T09:00:00Z");
-        assert!(page.contains(&format!("href=\"{TOKEN_PAGE}\"")));
-        for (name, _, _) in PERMISSIONS {
-            assert!(page.contains(&format!("<strong>{name}</strong>")), "{name} listed");
+    fn app(slug: &str) -> app::AppRow {
+        app::AppRow {
+            app_id: 42,
+            slug: slug.to_owned(),
+            client_id: "Iv1.abc".to_owned(),
+            html_url: format!("https://github.com/apps/{slug}"),
+            owner: "nick".to_owned(),
         }
-        assert!(page.contains("Read and write"));
+    }
+
+    fn install(id: i64, account: &str, kind: &str, selection: &str) -> Installation {
+        Installation {
+            id,
+            account: account.to_owned(),
+            account_type: kind.to_owned(),
+            selection: selection.to_owned(),
+        }
+    }
+
+    const NOW: &str = "2026-10-16T09:00:00Z";
+
+    #[test]
+    fn with_no_app_the_create_form_is_offered_and_the_token_is_open() {
+        let page = connect_page(&Overview::default(), None, State::Disconnected, None, None, NOW);
+        assert!(page.contains("<span class=\"status unknown\">Not created</span>"));
+        assert!(page.contains("method=\"post\" action=\"/console/connect/github/app/new\""));
+        assert!(page.contains("name=\"org\""));
+        assert!(page.contains("name=\"name\""));
+        assert!(page.contains("<details class=\"token-fallback\" open>"));
+        assert!(page.contains("Use a personal access token instead"));
         assert!(page.contains("method=\"post\" action=\"/console/connect/github\""));
         assert!(page.contains("type=\"password\""));
-        assert!(page.contains("Not connected"));
-        assert!(!page.contains("Disconnect GitHub"), "nothing to disconnect");
+        assert!(!page.contains("Install on GitHub"));
     }
 
     #[test]
-    fn a_connected_page_names_the_account_and_offers_disconnect_never_the_token() {
+    fn created_but_not_installed_offers_the_install_button() {
+        let overview = Overview { app: Some(app("keep-shipping-console")), installations: vec![] };
+        let page = connect_page(&overview, None, State::Disconnected, None, None, NOW);
+        assert!(page.contains("Created, not installed"));
+        assert!(
+            page.contains(
+                "href=\"https://github.com/apps/keep-shipping-console/installations/new\""
+            )
+        );
+        assert!(page.contains("Install on GitHub"));
+        assert!(!page.contains("name=\"org\""), "no second create form");
+        assert!(
+            !page.contains("<details class=\"token-fallback\" open>"),
+            "closed once an app exists"
+        );
+    }
+
+    #[test]
+    fn installed_lists_each_account_with_its_reach_and_manage_link() {
+        let overview = Overview {
+            app: Some(app("keep-shipping-console")),
+            installations: vec![
+                install(7, "nick", "User", "all"),
+                install(9, "keep-shipping", "Organization", "selected"),
+            ],
+        };
+        let page = connect_page(&overview, None, State::Disconnected, None, None, NOW);
+        assert!(page.contains("<span class=\"status ok\">Installed</span>"));
+        assert!(page.contains("<strong>nick</strong>"));
+        assert!(page.contains("all repositories"));
+        assert!(page.contains("https://github.com/settings/installations/7"));
+        assert!(page.contains("<strong>keep-shipping</strong>"));
+        assert!(page.contains("selected repositories"));
+        assert!(
+            page.contains(
+                "https://github.com/organizations/keep-shipping/settings/installations/9"
+            )
+        );
+        assert!(page.contains("Add another account"));
+    }
+
+    #[test]
+    fn a_connected_token_closes_nothing_and_offers_disconnect_never_the_token() {
+        let overview = Overview { app: Some(app("x")), installations: vec![] };
         let page = connect_page(
+            &overview,
+            None,
             State::Connected { login: Some("nick<script>"), saved: "2026-10-15T09:00:00Z" },
             None,
             None,
-            "2026-10-16T09:00:00Z",
+            NOW,
         );
         assert!(page.contains("Signed in to GitHub as <strong>nick&lt;script&gt;</strong>"));
         assert!(page.contains("action=\"/console/connect/github/disconnect\""));
         assert!(page.contains("Replace the GitHub token"));
+        assert!(page.contains("<details class=\"token-fallback\" open>"));
     }
 
     #[test]
     fn a_connected_page_without_the_login_says_so_plainly() {
         let page = connect_page(
+            &Overview::default(),
+            None,
             State::Connected { login: None, saved: "2026-10-15T09:00:00Z" },
             None,
             None,
-            "2026-10-16T09:00:00Z",
+            NOW,
         );
         assert!(page.contains("GitHub could not be asked which account this is"));
     }
 
     #[test]
-    fn an_error_is_escaped_and_announced() {
-        let page =
-            connect_page(State::Disconnected, Some("<b>no</b>"), None, "2026-10-16T09:00:00Z");
-        assert!(page.contains("role=\"alert\""));
-        assert!(page.contains("&lt;b&gt;no&lt;/b&gt;"));
+    fn errors_are_escaped_and_announced() {
+        let page = connect_page(
+            &Overview::default(),
+            Some("<b>org</b>"),
+            State::Disconnected,
+            Some("<i>token</i>"),
+            None,
+            NOW,
+        );
+        assert_eq!(page.matches("role=\"alert\"").count(), 2);
+        assert!(page.contains("&lt;b&gt;org&lt;/b&gt;"));
+        assert!(page.contains("&lt;i&gt;token&lt;/i&gt;"));
+        assert!(!page.contains("<b>org</b>"));
+    }
+
+    #[test]
+    fn account_names_and_links_are_escaped() {
+        let overview = Overview {
+            app: Some(app("x")),
+            installations: vec![install(1, "a\"b<c", "Organization", "all")],
+        };
+        let page = connect_page(&overview, None, State::Disconnected, None, None, NOW);
+        assert!(page.contains("<strong>a&quot;b&lt;c</strong>"));
+        assert!(!page.contains("a\"b<c"));
+    }
+
+    #[test]
+    fn the_personal_account_limitation_is_said_in_one_line() {
+        let page = connect_page(&Overview::default(), None, State::Disconnected, None, None, NOW);
+        assert!(page.contains("can only create repositories under an organisation"));
+    }
+
+    #[test]
+    fn the_token_copy_says_encrypted_and_stored() {
+        let page = connect_page(&Overview::default(), None, State::Disconnected, None, None, NOW);
+        assert!(page.contains("encrypted, and stored by this console"));
+        assert!(!page.contains("sealed with a key only this console holds"));
+    }
+
+    #[test]
+    fn the_handoff_posts_the_manifest_in_a_plain_form_to_github() {
+        let target = app::create_target(Some("keep-shipping"), "abc123");
+        let page = handoff_page(
+            "Keep Shipping console (keep-shipping)",
+            Some("keep-shipping"),
+            "{\"name\":\"<x>\"}",
+            &target,
+        );
+        assert!(page.contains(
+            "method=\"post\" action=\"https://github.com/organizations/keep-shipping/settings/apps/new?state=abc123\""
+        ));
+        assert!(
+            page.contains("name=\"manifest\" value=\"{&quot;name&quot;:&quot;&lt;x&gt;&quot;}\"")
+        );
+        assert!(!page.contains("<script"), "no script: the hand-off is a plain form");
+        assert!(page.contains("Keep Shipping console (keep-shipping)"));
     }
 
     #[test]
@@ -204,10 +504,24 @@ mod tests {
 
     #[test]
     fn a_next_path_is_carried_in_a_hidden_field_and_escaped() {
-        let page =
-            connect_page(State::Disconnected, None, Some("/console/x\"y"), "2026-10-16T09:00:00Z");
+        let page = connect_page(
+            &Overview::default(),
+            None,
+            State::Disconnected,
+            None,
+            Some("/console/x\"y"),
+            NOW,
+        );
         assert!(page.contains("name=\"next\" value=\"/console/x&quot;y\""));
-        let plain = connect_page(State::Disconnected, None, None, "2026-10-16T09:00:00Z");
+        let plain = connect_page(&Overview::default(), None, State::Disconnected, None, None, NOW);
         assert!(!plain.contains("name=\"next\""));
+    }
+
+    #[test]
+    fn the_page_never_carries_a_secret_shaped_value() {
+        let overview = Overview { app: Some(app("x")), installations: vec![] };
+        let page = connect_page(&overview, None, State::Disconnected, None, None, NOW);
+        assert!(!page.contains("BEGIN"), "no key material in the markup");
+        assert!(!page.contains("github_pat_"));
     }
 }

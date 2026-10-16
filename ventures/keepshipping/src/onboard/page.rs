@@ -133,13 +133,13 @@ pub fn wizard(site: &Site, current: Option<Step>, view: View<'_>) -> String {
         View::Status(status) => status_card(&status, &here, site),
     };
     let body = format!(
-        "<main id=\"main\" class=\"wrap narrow\">\n\
+        "<main id=\"main\" class=\"wrap\">\n\
          <nav class=\"crumbs\" aria-label=\"Breadcrumb\"><a href=\"/console/fleet\">&larr; All sites</a>\
          <span aria-hidden=\"true\">/</span><a href=\"/console/fleet/{segment}\">{name}</a></nav>\n\
          <div class=\"pagehead\"><div>\n<h1>Manage {name} as code</h1>\n\
          <p class=\"sub\">Imports this site into a GitHub repository and sets up a test environment. \
          Nothing changes until you approve a pull request.</p>\n</div></div>\n\
-         {progress}\n{card}</main>\n",
+         <div class=\"split\">\n<div class=\"prose\">\n{progress}</div>\n<div>\n{card}</div>\n</div>\n</main>\n",
         segment = site_path_segment(&site.id),
         progress = progress(current),
     );

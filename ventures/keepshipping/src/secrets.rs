@@ -79,6 +79,24 @@ pub enum Error {
     Storage,
 }
 
+/// The legacy description for a value that never had a sealed row: the
+/// GitHub App's secrets (`src/github/app.rs`). Nothing is read from D1 for
+/// it, and nothing is deleted.
+#[must_use]
+pub const fn unsealed() -> Legacy<'static> {
+    Legacy { table: "", info: b"", secret: None }
+}
+
+/// Saves `value` under `name` in the secrets store, for a caller that holds
+/// the Worker `Env`.
+///
+/// # Errors
+///
+/// [`Error::NoMasterKey`] or [`Error::Storage`], as [`Vault::write`].
+pub async fn put_value(env: &Env, name: &str, value: &str) -> Result<(), Error> {
+    Vault::open(env).await?.write(name, value, &unsealed()).await
+}
+
 /// A token as read back: the text, and when it was saved. The `Debug` impl
 /// names the fields and redacts the token.
 pub struct Stored {
@@ -198,7 +216,7 @@ impl Vault {
         })?;
         // The store holds the new value, so the old row is not read while it
         // does. A failed delete is logged, not returned: the save succeeded.
-        if let Err(error) = execute(self.db.as_ref(), &delete_legacy(legacy.table)).await {
+        if let Err(error) = drop_legacy(self.db.as_ref(), legacy.table).await {
             tracing::warn!(
                 table = legacy.table,
                 ?error,
@@ -260,9 +278,7 @@ impl Vault {
                 Ok(Some(value)) => {
                     let token = value.expose_str().map_err(|_| Error::Storage)?.to_owned();
                     let saved_at = self.saved_at(name, actor).await?;
-                    if let Err(error) =
-                        execute(self.db.as_ref(), &delete_legacy(legacy.table)).await
-                    {
+                    if let Err(error) = drop_legacy(self.db.as_ref(), legacy.table).await {
                         tracing::warn!(
                             table = legacy.table,
                             ?error,
@@ -274,7 +290,7 @@ impl Vault {
                 _ => Err(Error::Storage),
             };
         }
-        if let Err(error) = execute(self.db.as_ref(), &delete_legacy(legacy.table)).await {
+        if let Err(error) = drop_legacy(self.db.as_ref(), legacy.table).await {
             tracing::warn!(
                 table = legacy.table,
                 ?error,
@@ -371,7 +387,7 @@ pub async fn forget(env: &Env, name: &str, legacy: &Legacy<'_>) -> Result<(), Er
         tracing::warn!(name, ?error, "console: forgetting a stored token failed");
         Error::Storage
     })?;
-    execute(vault.db.as_ref(), &delete_legacy(legacy.table)).await
+    drop_legacy(vault.db.as_ref(), legacy.table).await
 }
 
 /// The master key once this isolate has loaded it. Set by [`master_key`], read
@@ -469,7 +485,9 @@ async fn load_key_ring(env: &Env) -> Result<HashMap<String, String>, Error> {
     Ok(ring)
 }
 
-fn d1(env: &Env) -> Result<Arc<dyn Database>, Error> {
+/// The console's database, as the port the modules use. Shared by the GitHub
+/// App (`src/github/app.rs`) and the edits module, which hold no `Env`.
+pub(crate) fn d1(env: &Env) -> Result<Arc<dyn Database>, Error> {
     let database = env.d1(DB_BINDING).map_err(|_| Error::Storage)?;
     Ok(Arc::new(D1Database(database)))
 }
@@ -527,6 +545,15 @@ async fn legacy_row(db: &dyn Database, table: &str) -> Result<Option<LegacyRow>,
 
 fn delete_legacy(table: &str) -> Statement {
     Statement::new(format!("DELETE FROM {table} WHERE id = 1"))
+}
+
+/// Deletes a legacy row. A `table` of `""` means the value has no legacy
+/// row at all (see [`unsealed`]), so there is nothing to delete.
+async fn drop_legacy(db: &dyn Database, table: &str) -> Result<(), Error> {
+    if table.is_empty() {
+        return Ok(());
+    }
+    execute(db, &delete_legacy(table)).await
 }
 
 async fn execute(db: &dyn Database, statement: &Statement) -> Result<(), Error> {
