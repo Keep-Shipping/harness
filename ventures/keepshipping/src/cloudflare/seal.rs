@@ -1,9 +1,23 @@
-//! The stored Cloudflare token's encryption: AES-256-GCM, with the key
-//! derived from `HARNESS_SECRET` by HKDF-SHA256 under the fixed info string
-//! [`INFO`]. Each write draws a fresh random 96-bit nonce; the info string
-//! doubles as the AEAD associated data, so a ciphertext sealed for another
-//! purpose will not open here. A wrong secret, a flipped bit, or a swapped
-//! nonce all fail the tag check and read back as "not connected".
+//! LEGACY. The console's first token seal: AES-256-GCM, with the key derived
+//! from `HARNESS_SECRET` by HKDF-SHA256 under a fixed info string. Tokens are
+//! now kept in `cratefield-secrets` (`src/secrets.rs`), and nothing writes
+//! here any more. What remains is the open path, which moves a row sealed
+//! under the old secret into the store the first time it is read, and the
+//! sealing functions the tests use to make such rows.
+//!
+//! TODO: delete this module, and the `console_*_token` and
+//! `console_github_token` tables it reads, after one release on which every
+//! deployment has read its tokens once (the move is logged by table name).
+//!
+//! The info string doubles as the AEAD associated data, so a ciphertext
+//! sealed for another purpose will not open here. A wrong secret, a flipped
+//! bit, or a swapped nonce all fail the tag check and read back as "not
+//! connected".
+
+// Sealing is test-only now: the production build compiles the open path
+// alone, so the sealing functions and the one error variant only they
+// construct are dead there.
+#![cfg_attr(not(test), allow(dead_code, reason = "the production build only opens legacy rows"))]
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};

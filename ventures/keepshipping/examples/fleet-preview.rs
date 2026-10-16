@@ -86,12 +86,13 @@ fn main() {
             &accounts,
             Some(&snapshot.generated_at),
             None,
+            Some(1),
             &now,
         ),
     );
     write(
         "connect-error.html",
-        connect_page(None, &[], None, Some("Cloudflare did not accept that token."), &now),
+        connect_page(None, &[], None, Some("Cloudflare did not accept that token."), None, &now),
     );
     write("github.html", github_page(GitHubState::Disconnected, None, None, &now));
     write(

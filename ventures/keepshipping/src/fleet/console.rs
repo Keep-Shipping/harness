@@ -23,15 +23,17 @@ use super::{
 };
 use crate::cloudflare::api::{self, NOT_CONNECTED};
 use crate::cloudflare::page::{
-    CONNECT_PATH, DEPLOY_CONNECT_PATH, DEPLOY_DISCONNECT_PATH, DISCONNECT_PATH, connect_page,
+    CONNECT_PATH, DEPLOY_CONNECT_PATH, DEPLOY_DISCONNECT_PATH, DISCONNECT_PATH, KEYS_REWRAP_PATH,
+    connect_page,
 };
-use crate::cloudflare::rollback::{self, Panel};
+use crate::cloudflare::rollback;
 use crate::github;
 use crate::github::page::{
     CONNECT_PATH as GITHUB_CONNECT_PATH, DISCONNECT_PATH as GITHUB_DISCONNECT_PATH,
     State as GitHubState, connect_page as github_connect_page, safe_next,
 };
 use crate::onboard::flow::{self, Reply as WizardReply};
+use crate::secrets;
 use crate::signin::{self, CALLBACK_PATH, Client, LOGIN_PATH, LOGOUT_PATH, Reply};
 
 /// `same-origin`, not `no-referrer`: under `no-referrer` Chrome sends
@@ -71,6 +73,8 @@ enum Action {
     /// `GET` shows the GitHub connection page, `POST` stores a pasted token.
     GitHub,
     GitHubDisconnect,
+    /// `POST` re-wraps the stored data keys under the current master key.
+    RewrapKeys,
 }
 
 fn action_for(path: &str) -> Option<Action> {
@@ -82,6 +86,7 @@ fn action_for(path: &str) -> Option<Action> {
         DEPLOY_DISCONNECT_PATH => Some(Action::DisconnectDeploy),
         GITHUB_CONNECT_PATH => Some(Action::GitHub),
         GITHUB_DISCONNECT_PATH => Some(Action::GitHubDisconnect),
+        KEYS_REWRAP_PATH => Some(Action::RewrapKeys),
         _ => None,
     }
 }
@@ -90,11 +95,8 @@ fn action_for(path: &str) -> Option<Action> {
 /// own sweeps and never panics: a missing token is quiet, a failure is a
 /// logged warning, and the previous snapshot stays in place.
 pub async fn scheduled_refresh(env: &Env) {
-    let Some(secret) = read(env, "HARNESS_SECRET") else {
-        tracing::warn!("console: no HARNESS_SECRET, fleet snapshot not refreshed");
-        return;
-    };
-    match api::refresh(env, &secret).await {
+    let legacy = read(env, "HARNESS_SECRET");
+    match api::refresh(env, legacy.as_deref()).await {
         Ok(_) => tracing::info!("console: fleet snapshot refreshed"),
         Err(failed) if failed == NOT_CONNECTED => {}
         Err(failed) => tracing::warn!(message = failed.message, "console: fleet refresh failed"),
@@ -329,7 +331,8 @@ async fn serve_action(req: &mut Request, env: &Env, action: Action) -> worker::R
         | Action::Refresh
         | Action::ConnectDeploy
         | Action::DisconnectDeploy
-        | Action::GitHubDisconnect => post,
+        | Action::GitHubDisconnect
+        | Action::RewrapKeys => post,
     };
     if !allowed {
         let allow = match action {
@@ -338,7 +341,8 @@ async fn serve_action(req: &mut Request, env: &Env, action: Action) -> worker::R
             | Action::Refresh
             | Action::ConnectDeploy
             | Action::DisconnectDeploy
-            | Action::GitHubDisconnect => "POST",
+            | Action::GitHubDisconnect
+            | Action::RewrapKeys => "POST",
         };
         return page_with(
             405,
@@ -364,26 +368,23 @@ async fn serve_action(req: &mut Request, env: &Env, action: Action) -> worker::R
         Action::GitHub if post => github_save(req, env).await?,
         Action::GitHub => github_form(req, env).await?,
         Action::GitHubDisconnect => github_disconnect(env).await?,
+        Action::RewrapKeys => rewrap_keys(env).await?,
     };
     with_cookies(response, &session.set_cookies)
 }
 
-/// Mirrors the secret's absence: the Cloudflare token is sealed with it, so
-/// nothing can be stored without it.
-const SEALER_COPY: &str = "This deployment has no HARNESS_SECRET, which seals the stored Cloudflare \
-     token, so nothing can be connected. Set it (see the README) and deploy again.";
-
 async fn connect_form(env: &Env) -> worker::Result<Response> {
-    let Some(secret) = read(env, "HARNESS_SECRET") else {
-        return page(503, &notice_page("Console not configured", SEALER_COPY, None));
-    };
-    match api::connected_at(env, &secret).await {
+    // The old HARNESS_SECRET is read only to move a token sealed under it
+    // into the vault; a deployment without it still connects.
+    let legacy = read(env, "HARNESS_SECRET");
+    match api::connected_at(env, legacy.as_deref()).await {
         Ok(connected) => {
             let accounts = match connected {
-                Some(_) => api::visible_accounts(env, &secret).await,
+                Some(_) => api::visible_accounts(env, legacy.as_deref()).await,
                 None => Vec::new(),
             };
-            let deploy = api::deploy_connected_at(env, &secret).await.ok().flatten();
+            let deploy = api::deploy_connected_at(env, legacy.as_deref()).await.ok().flatten();
+            let key = secrets::current_key_version(env).await;
             page(
                 200,
                 &connect_page(
@@ -391,6 +392,7 @@ async fn connect_form(env: &Env) -> worker::Result<Response> {
                     &accounts,
                     deploy.as_deref(),
                     None,
+                    key,
                     &api::now(),
                 ),
             )
@@ -403,13 +405,11 @@ async fn connect_form(env: &Env) -> worker::Result<Response> {
 }
 
 /// The paste: the token is read from the form body, sent to Cloudflare to
-/// verify, sealed and stored. Nothing in the answer carries it; a refusal is
+/// verify, stored in the secrets vault and kept there. Nothing in the answer
+/// carries it; a refusal is
 /// shown in words and the form is not kept.
 /// `deploy` picks the deploy token (rollbacks) over the read-only one.
 async fn connect_save(req: &mut Request, env: &Env, deploy: bool) -> worker::Result<Response> {
-    let Some(secret) = read(env, "HARNESS_SECRET") else {
-        return page(503, &notice_page("Console not configured", SEALER_COPY, None));
-    };
     let body = req.text().await?;
     if body.len() > 4096 {
         return page(
@@ -436,9 +436,9 @@ async fn connect_save(req: &mut Request, env: &Env, deploy: bool) -> worker::Res
         );
     }
     let saved = if deploy {
-        api::connect_deploy(env, &secret, &token).await
+        api::connect_deploy(env, &token).await
     } else {
-        api::connect(env, &secret, &token).await
+        api::connect(env, &token).await
     };
     match saved {
         Ok(()) if deploy => redirect(303, CONNECT_PATH),
@@ -459,10 +459,8 @@ async fn connect_save(req: &mut Request, env: &Env, deploy: bool) -> worker::Res
 async fn github_form(req: &Request, env: &Env) -> worker::Result<Response> {
     let next = query_value(req, "next");
     let next = next.as_deref().and_then(safe_next);
-    let Some(secret) = read(env, "HARNESS_SECRET") else {
-        return page(503, &notice_page("Console not configured", SEALER_COPY, None));
-    };
-    let saved = match github::connected_at(env, &secret).await {
+    let legacy = read(env, "HARNESS_SECRET");
+    let saved = match github::connected_at(env, legacy.as_deref()).await {
         Ok(saved) => saved,
         Err(failed) => {
             return page(
@@ -473,7 +471,7 @@ async fn github_form(req: &Request, env: &Env) -> worker::Result<Response> {
     };
     let html = match saved {
         Some(saved) => {
-            let login = match github::client(env, &secret).await {
+            let login = match github::client(env, legacy.as_deref()).await {
                 Ok(Some(client)) => client.whoami().await.ok(),
                 _ => None,
             };
@@ -489,13 +487,10 @@ async fn github_form(req: &Request, env: &Env) -> worker::Result<Response> {
     page(200, &html)
 }
 
-/// The GitHub paste: the token is checked with GitHub, sealed and stored by
+/// The GitHub paste: the token is checked with GitHub, stored in the vault by
 /// [`github::connect`]. A refusal is shown in words; the token is never
 /// echoed back.
 async fn github_save(req: &mut Request, env: &Env) -> worker::Result<Response> {
-    let Some(secret) = read(env, "HARNESS_SECRET") else {
-        return page(503, &notice_page("Console not configured", SEALER_COPY, None));
-    };
     let body = req.text().await?;
     if body.len() > 4096 {
         return page(
@@ -532,7 +527,7 @@ async fn github_save(req: &mut Request, env: &Env) -> worker::Result<Response> {
             ),
         );
     }
-    match github::connect(env, &secret, &token).await {
+    match github::connect(env, &token).await {
         Ok(_) => redirect(303, next),
         Err(failed) => page(
             failed.status,
@@ -554,6 +549,51 @@ async fn github_disconnect(env: &Env) -> worker::Result<Response> {
                 "Could not disconnect",
                 failed.message,
                 Some((GITHUB_CONNECT_PATH, "Back to the GitHub connection")),
+            ),
+        ),
+    }
+}
+
+/// The plain-words result of a re-wrap. Numbers and fixed copy only.
+fn rewrap_copy(keys: usize, version: Option<u32>) -> String {
+    let under = version.map_or_else(
+        || "the current master key".to_owned(),
+        |version| format!("master key version {version}"),
+    );
+    let tail = "The tokens themselves did not change. Once the console works, an older master \
+                key version can be removed from the Secrets Store.";
+    match keys {
+        0 => "No stored data key needed re-encrypting: nothing is saved in the console's store \
+              yet, so there was nothing to move. The tokens are unchanged."
+            .to_owned(),
+        1 => format!("Re-wrapped 1 stored data key under {under}. {tail}"),
+        n => format!("Re-wrapped {n} stored data keys under {under}. {tail}"),
+    }
+}
+
+/// Re-wraps the stored data keys under the current master key version, and
+/// says in plain words what changed. Behind the same authorisation and origin
+/// checks as every other write on this page.
+async fn rewrap_keys(env: &Env) -> worker::Result<Response> {
+    let back = Some((CONNECT_PATH, "Back to the connect page"));
+    match secrets::rewrap(env).await {
+        Ok(report) => page(
+            200,
+            &notice_page(
+                "Re-encrypted with the current key",
+                &rewrap_copy(report.keys, secrets::key_version_of(&report.key_ref)),
+                back,
+            ),
+        ),
+        Err(secrets::Error::NoMasterKey) => {
+            page(503, &notice_page("No master key", secrets::NO_MASTER_KEY_COPY, back))
+        }
+        Err(secrets::Error::Storage) => page(
+            503,
+            &notice_page(
+                "Could not re-encrypt",
+                "The stored keys could not be re-encrypted right now. Try again in a moment.",
+                back,
             ),
         ),
     }
@@ -588,10 +628,8 @@ async fn disconnect_deploy(env: &Env) -> worker::Result<Response> {
 }
 
 async fn refresh(env: &Env) -> worker::Result<Response> {
-    let Some(secret) = read(env, "HARNESS_SECRET") else {
-        return page(503, &notice_page("Console not configured", SEALER_COPY, None));
-    };
-    match api::refresh(env, &secret).await {
+    let legacy = read(env, "HARNESS_SECRET");
+    match api::refresh(env, legacy.as_deref()).await {
         Ok(_) => redirect(303, "/console/fleet"),
         Err(failed) if failed == NOT_CONNECTED => redirect(303, CONNECT_PATH),
         Err(failed) => page(
@@ -663,10 +701,9 @@ async fn fleet_page(
         Ok(Some(raw)) => raw,
         Ok(None) => {
             // Connected: offer a refresh. Not connected: point at the connect page.
-            let connected = match read(env, "HARNESS_SECRET") {
-                Some(secret) => api::connected_at(env, &secret).await.ok().flatten().is_some(),
-                None => false,
-            };
+            let legacy = read(env, "HARNESS_SECRET");
+            let connected =
+                api::connected_at(env, legacy.as_deref()).await.ok().flatten().is_some();
             return page(200, &empty_snapshot_page(connected));
         }
         Err(error) => {
@@ -694,10 +731,8 @@ async fn fleet_page(
                 return no_such_site();
             };
             let now = api::now();
-            let panel = match read(env, "HARNESS_SECRET") {
-                Some(secret) => api::rollback_panel(env, &secret, site).await,
-                None => Panel::NotSupported,
-            };
+            let legacy = read(env, "HARNESS_SECRET");
+            let panel = api::rollback_panel(env, legacy.as_deref(), site).await;
             let rolled = query_value(req, "rolled_back").is_some();
             let top = if rolled { ROLLED_BACK } else { "" };
             let panel = rollback::panel_html(site, &panel, &now);
@@ -711,18 +746,18 @@ async fn fleet_page(
             let Some(site) = snapshot.sites.iter().find(|site| site.id == id).cloned() else {
                 return no_such_site();
             };
-            let Some(secret) = read(env, "HARNESS_SECRET") else {
-                return page(503, &notice_page("Console not configured", SEALER_COPY, None));
-            };
+            // The old HARNESS_SECRET only opens a token sealed under it; the
+            // wizard reads the vault like every other page.
+            let legacy = read(env, "HARNESS_SECRET");
             let reply = if matches!(req.method(), Method::Post) {
                 let body = req.text().await?;
                 let form: Vec<(String, String)> = form_urlencoded::parse(body.as_bytes())
                     .map(|(name, value)| (name.into_owned(), value.into_owned()))
                     .collect();
-                flow::post(env, &secret, &site, email, &form).await
+                flow::post(env, legacy.as_deref(), &site, email, &form).await
             } else {
                 let again = query_value(req, "again").is_some();
-                flow::view(env, &secret, &site, again).await
+                flow::view(env, legacy.as_deref(), &site, again).await
             };
             match reply {
                 WizardReply::Html(status, html) => page(status, &html),
@@ -733,9 +768,7 @@ async fn fleet_page(
             let Some(site) = snapshot.sites.iter().find(|site| site.id == id).cloned() else {
                 return no_such_site();
             };
-            let Some(secret) = read(env, "HARNESS_SECRET") else {
-                return page(503, &notice_page("Console not configured", SEALER_COPY, None));
-            };
+            let legacy = read(env, "HARNESS_SECRET");
             let site_path = format!("/console/fleet/{}", super::site_path_segment(&site.id));
             let back = Some((site_path.as_str(), "Back to the site"));
             if matches!(req.method(), Method::Post) {
@@ -744,7 +777,7 @@ async fn fleet_page(
                     .find(|(name, _)| name == "to")
                     .map(|(_, value)| value.into_owned())
                     .unwrap_or_default();
-                return match api::roll_back(env, &secret, &site, &to).await {
+                return match api::roll_back(env, legacy.as_deref(), &site, &to).await {
                     Ok(()) => redirect(303, &format!("{site_path}?rolled_back=1")),
                     Err(failed) => {
                         page(failed.status, &notice_page("Not rolled back", failed.message, back))
@@ -752,7 +785,7 @@ async fn fleet_page(
                 };
             }
             let to = query_value(req, "to").unwrap_or_default();
-            match api::rollback_choice(env, &secret, &site, &to).await {
+            match api::rollback_choice(env, legacy.as_deref(), &site, &to).await {
                 Ok((chosen, live)) => {
                     page(200, &rollback::confirm_page(&site, &chosen, live.as_ref(), &api::now()))
                 }
@@ -857,7 +890,7 @@ const READ_COPY: &str = "The fleet could not be read right now. Try again shortl
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, action_for};
+    use super::{Action, action_for, rewrap_copy};
     use crate::fleet::{Route, empty_snapshot_page, route};
 
     #[test]
@@ -869,6 +902,23 @@ mod tests {
             Some(Action::Disconnect)
         ));
         assert!(matches!(action_for("/console/fleet/refresh"), Some(Action::Refresh)));
+        assert!(matches!(action_for("/console/connect/keys/rewrap"), Some(Action::RewrapKeys)));
+        assert!(matches!(action_for("/console/connect/keys/rewrap/"), Some(Action::RewrapKeys)));
+        assert!(action_for("/console/connect/keys/rewrap/extra").is_none());
+        assert!(action_for("/console/connect/keys").is_none());
+        // The result copy names only numbers and fixed text.
+        assert!(rewrap_copy(0, Some(2)).contains("nothing"));
+        assert!(
+            rewrap_copy(1, Some(2))
+                .starts_with("Re-wrapped 1 stored data key under master key version 2.")
+        );
+        assert!(
+            rewrap_copy(3, None)
+                .starts_with("Re-wrapped 3 stored data keys under the current master key.")
+        );
+        for keys in [0, 1, 4] {
+            assert!(!rewrap_copy(keys, Some(2)).contains('<'), "no markup in the result copy");
+        }
         // Look-alikes fall through to the harness or the fleet routes.
         assert!(action_for("/console/connect/cloudflarex").is_none());
         assert!(action_for("/console/connect/cloudflare/x/disconnect").is_none());

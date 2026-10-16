@@ -450,6 +450,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "cratefield-kms"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7664e0430bcae74c8a1919acd32dcf8db7e9465825013a455e62ba98840c182"
+dependencies = [
+ "async-trait",
+ "base64",
+ "chacha20poly1305",
+ "getrandom 0.4.3",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "cratefield-mail-templates"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -527,6 +541,25 @@ dependencies = [
  "tracing",
  "wasm-bindgen",
  "worker",
+]
+
+[[package]]
+name = "cratefield-secrets"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "997c5e6cc5380298170681f1a08240467d991f1535429bd9ec9906ed98998f7c"
+dependencies = [
+ "async-trait",
+ "chacha20poly1305",
+ "cratefield-core",
+ "cratefield-kms",
+ "getrandom 0.4.3",
+ "sea-query",
+ "sha2 0.11.0",
+ "thiserror",
+ "time",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -1358,10 +1391,12 @@ dependencies = [
  "cratefield-adapter-turnstile",
  "cratefield-auth-client",
  "cratefield-core",
+ "cratefield-kms",
  "cratefield-mail-templates",
  "cratefield-module-waitlist",
  "cratefield-oauth-client",
  "cratefield-runtime-cloudflare",
+ "cratefield-secrets",
  "cratefield-testing",
  "crypto_box",
  "form_urlencoded",

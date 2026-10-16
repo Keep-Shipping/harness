@@ -85,6 +85,36 @@ binding = "FLEET"
 # Namespace `keepshipping-console-fleet` on Factory0.
 id = "435eb12c7b7f41a9a7dac20b268293f2"
 
+# The console's master key for the tokens it stores (Cloudflare read and
+# deploy, GitHub; `src/secrets.rs`). Three layers: the master key (KEK) lives
+# in a Cloudflare Secrets Store, never in D1 and never printed; each store's
+# data key is wrapped under the KEK and kept in D1 beside the tokens; each
+# token is encrypted under its data key in D1. Until HARNESS_KEK_CURRENT and
+# the version it names load, the token pages say so and store nothing.
+#
+# Layout: HARNESS_KEK_CURRENT holds the decimal version that wraps (for
+# example 1); HARNESS_KEK_V1, HARNESS_KEK_V2, ... hold 32 bytes of key
+# material, standard base64. One source per deployment: once any HARNESS_KEK_*
+# binding below is declared, every version is read from the store; with none
+# declared, plain Worker secrets of the same names are read.
+# Rotation: add HARNESS_KEK_V2 to the store AND add its block below before
+# deploying; set HARNESS_KEK_CURRENT to 2; deploy; then press "Re-encrypt with
+# the current key" on the Cloudflare connection page. Keep V1 until that has
+# run. The README's Deploy section has the one-time commands.
+#
+# The store is Factory0's account-wide default store, shared by every Worker
+# on the account, so the secrets carry a console prefix; the Worker still
+# sees them under the HARNESS_KEK_* binding names the code reads.
+[[secrets_store_secrets]]
+binding = "HARNESS_KEK_CURRENT"
+store_id = "d9a352fe46684054b82c8465f8ec60d6"
+secret_name = "KS_CONSOLE_KEK_CURRENT"
+
+[[secrets_store_secrets]]
+binding = "HARNESS_KEK_V1"
+store_id = "d9a352fe46684054b82c8465f8ec60d6"
+secret_name = "KS_CONSOLE_KEK_V1"
+
 [[routes]]
 pattern = "console.keepshipping.run"
 custom_domain = true

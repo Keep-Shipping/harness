@@ -15,6 +15,40 @@ pub const DISCONNECT_PATH: &str = "/console/connect/cloudflare/disconnect";
 pub const DEPLOY_CONNECT_PATH: &str = "/console/connect/cloudflare/deploy";
 /// Where removing the deploy token posts.
 pub const DEPLOY_DISCONNECT_PATH: &str = "/console/connect/cloudflare/deploy/disconnect";
+/// Where the master key card posts: re-wraps the stored data keys under the
+/// current master key version. Tokens are not re-encrypted.
+pub const KEYS_REWRAP_PATH: &str = "/console/connect/keys/rewrap";
+
+/// The master key card: the current version as a number, and the one action
+/// that moves the stored keys onto it. Only numbers and fixed copy are
+/// rendered, so nothing from the key store reaches the page.
+#[must_use]
+pub fn key_card(version: Option<u32>) -> String {
+    let (status, copy, action) = match version {
+        Some(version) => (
+            format!("Master key version {version}"),
+            "Stored data keys are wrapped under this master key version. Re-encrypting moves \
+             them onto the current version; the tokens themselves do not change."
+                .to_owned(),
+            format!(
+                "<form class=\"rewrap\" method=\"post\" action=\"{KEYS_REWRAP_PATH}\">\
+                 <button class=\"btn\" type=\"submit\">Re-encrypt with the current key</button></form>\n"
+            ),
+        ),
+        None => (
+            "No master key".to_owned(),
+            "The master key is not set up, so stored tokens cannot be read or saved. See the \
+             README, Deploy, for the one-time setup."
+                .to_owned(),
+            String::new(),
+        ),
+    };
+    format!(
+        "<section class=\"panel key-card\" aria-labelledby=\"key-title\">\n\
+         <h2 id=\"key-title\">Master key</h2>\n\
+         <p class=\"muted\">{status}</p>\n<p>{copy}</p>\n{action}</section>\n"
+    )
+}
 
 /// The connect page. `connected_at` is the RFC 3339 time the stored token was
 /// saved (when one is stored and readable), shown relative to `now`, also
@@ -27,6 +61,7 @@ pub fn connect_page(
     accounts: &[String],
     deploy_connected_at: Option<&str>,
     error: Option<&str>,
+    key_version: Option<u32>,
     now: &str,
 ) -> String {
     let permissions = PERMISSIONS
@@ -67,6 +102,7 @@ pub fn connect_page(
     let error = error
         .map(|message| format!("<p class=\"callout bad\" role=\"alert\">{}</p>\n", esc(message)))
         .unwrap_or_default();
+    let key = key_card(key_version);
     let body = format!(
         "<main id=\"main\" class=\"wrap narrow\">\n\
          <div class=\"pagehead\"><div>\n<h1>Cloudflare connection</h1>\n\
@@ -74,7 +110,7 @@ pub fn connect_page(
          sites and Workers, when each was last deployed, and whether HTTPS and DNS are healthy. \
          This token is read-only: it can change nothing. Rollbacks use a separate, optional \
          token, below.</p>\n</div></div>\n\
-         {status}\
+         {status}{key}\
          <ol class=\"steps\">\n\
          <li class=\"panel\">\n<h2>Create a read-only token</h2>\n\
          <p>Cloudflare opens its token page with the permissions already chosen. Check them, \
@@ -156,7 +192,7 @@ mod tests {
 
     #[test]
     fn the_page_links_the_template_and_lists_every_permission_read_only() {
-        let page = connect_page(None, &[], None, None, "2026-10-16T09:00:00Z");
+        let page = connect_page(None, &[], None, None, None, "2026-10-16T09:00:00Z");
         assert!(page.contains("permissionGroupKeys=%5B%7B%22key%22%3A%22zone%22"));
         for (key, _) in PERMISSIONS {
             assert!(page.contains(&format!("<code>{key}</code>")), "{key} listed");
@@ -174,12 +210,25 @@ mod tests {
     }
 
     #[test]
+    fn the_key_card_shows_only_the_version_number_and_the_one_action() {
+        let card = key_card(Some(2));
+        assert!(card.contains("Master key version 2"));
+        assert!(card.contains("action=\"/console/connect/keys/rewrap\""));
+        assert!(card.contains("Re-encrypt with the current key"));
+        let none = key_card(None);
+        assert!(none.contains("No master key"));
+        assert!(!none.contains("<form"), "nothing to re-encrypt without a key");
+        assert!(!card.contains("HARNESS_KEK"), "the key ring's names stay off the page");
+    }
+
+    #[test]
     fn a_connected_page_offers_disconnect_and_never_shows_a_token() {
         let page = connect_page(
             Some("2026-10-15T09:00:00.123456Z"),
             &["Factory0".to_owned()],
             None,
             None,
+            Some(2),
             "2026-10-16T09:00:00Z",
         );
         assert!(page.contains("action=\"/console/connect/cloudflare/disconnect\""));
@@ -191,7 +240,7 @@ mod tests {
 
     #[test]
     fn an_error_is_escaped_and_announced() {
-        let page = connect_page(None, &[], None, Some("<b>nope</b>"), "2026-10-16T09:00:00Z");
+        let page = connect_page(None, &[], None, Some("<b>nope</b>"), None, "2026-10-16T09:00:00Z");
         assert!(page.contains("role=\"alert\""));
         assert!(page.contains("&lt;b&gt;nope&lt;/b&gt;"));
     }

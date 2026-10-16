@@ -28,6 +28,19 @@ cratefield-adapter-turnstile = "0.3"
 # The console fleet view's token verifier (issue #169), shared with the
 # runtime's own `auth_from_env` wiring.
 cratefield-auth-client = "0.3"
+# The console's own credentials (`src/secrets.rs`): envelope encryption from
+# the Cratefield harness. The KEK is read from Cloudflare Secrets Store (or a
+# plain Worker secret) by `cratefield-kms`'s `WorkerSecretKms`; the wrapped
+# data keys and the encrypted tokens live in this venture's D1 database,
+# through the `D1Database` port of `cratefield-runtime-cloudflare` (0.4.2 is
+# the line on cratefield-core 0.8, as the rest of this venture). Both crates
+# are on cratefield-core 0.8, so the graph keeps one core.
+cratefield-kms = "0.2"
+# Pinned at 0.4.0: 0.4.1 moves to cratefield-core 0.9, which would put a second
+# core in the graph until the venture itself moves (the same reason the
+# oauth client is locked above). 0.4.0's own migrations are the ones copied
+# into migrations/0013_console_secrets.sql.
+cratefield-secrets = "=0.4.0"
 # The console sign-in (`src/signin.rs`): PKCE, `state` and the authorize URL
 # from the harness's own OAuth client rather than a hand-rolled copy.
 # Locked at 0.3.0: 0.3.1 moves to cratefield-core 0.9, which would put a
@@ -38,6 +51,9 @@ percent-encoding = "2"
 # `adapters/cloudflare` the infra import uses, read through `ks-core`'s
 # `HttpClient` port over `worker::Fetch`.
 ks-core.workspace = true
+# `cratefield-kms`'s `Kms` port is an async trait; the console's no-key
+# implementation (`src/secrets.rs`) is written against the same macro.
+async-trait = "0.1"
 ks-cloudflare = { path = "../../adapters/cloudflare" }
 serde = { version = "1", features = ["derive"] }
 # The setup change's files go to GitHub's contents API base64-encoded.
@@ -82,7 +98,6 @@ getrandom02 = { package = "getrandom", version = "0.2", default-features = false
 [dev-dependencies]
 # `axum`/`tokio` serve the dev-only page server in `examples/gsc_dev.rs`;
 # `async-trait` is what the example's permissive dev auth port needs.
-async-trait = "0.1"
 axum = { version = "0.8", features = ["tokio", "http1"] }
 cratefield-adapter-sqlite = "0.3"
 cratefield-testing = "0.5"
