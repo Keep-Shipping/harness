@@ -282,3 +282,24 @@ fn run_refused_by_policy_emits_a_final_line() {
     assert!(stderr.contains("refusing to start: step `build`"), "{stderr}");
     assert!(stderr.contains("never allowed for agent (default branch)"), "{stderr}");
 }
+
+/// A park that cannot be written (here `.keepshipping` is a file, so no run
+/// directory can be made under it) still closes the stream it opened: the
+/// last line is `run_finished`, and its `exit` is the process's exit 1.
+#[test]
+fn a_park_that_cannot_be_written_still_closes_the_stream() {
+    let ship = fs::read_to_string(fixtures().join("ship.ks")).expect("the committed fixture");
+    let dir = work_dir("run-json-park-fails", "ship.ks", &ship);
+    fs::write(dir.join(".keepshipping"), "not a directory").expect("block the run store");
+    let (code, stdout, stderr) =
+        keepshipping(&dir, &["run", "--as", "agent", "--format", "json"], &[]);
+    assert_eq!(code, 1, "{stdout}{stderr}");
+    assert_schema_v1(&stdout);
+    assert!(stdout.starts_with("{\"version\":1,\"event\":\"run_started\""), "{stdout}");
+    let last: serde_json::Value =
+        serde_json::from_str(stdout.lines().last().expect("a closing line")).expect("JSON");
+    assert_eq!(last["event"], "run_finished", "{stdout}");
+    assert_eq!(last["status"], "failed", "{stdout}");
+    assert_eq!(last["exit"], 1, "{stdout}");
+    assert!(stderr.contains("could not be parked"), "{stderr}");
+}

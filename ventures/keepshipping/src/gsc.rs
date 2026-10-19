@@ -485,6 +485,11 @@ fn owners_of(raw: &str) -> Result<Vec<String>, Problem> {
     let mut owners: Vec<String> = Vec::new();
     for owner in raw.split([',', '\n']) {
         let owner = owner.trim();
+        if !owner.is_empty() && !plain_email(owner) {
+            return Err(Problem::validation_failed(
+                "each owner should be one email address, like ops@example.com",
+            ));
+        }
         if !owner.is_empty() && !owners.iter().any(|seen| seen.eq_ignore_ascii_case(owner)) {
             owners.push(owner.to_owned());
         }
@@ -495,6 +500,22 @@ fn owners_of(raw: &str) -> Result<Vec<String>, Problem> {
         ));
     }
     Ok(owners)
+}
+
+/// One plain email address: a local part and a dotted domain over the
+/// characters real addresses use — nothing that could quote, escape or
+/// interpolate once it reaches the generated Terraform.
+fn plain_email(owner: &str) -> bool {
+    let Some((local, domain)) = owner.split_once('@') else {
+        return false;
+    };
+    owner.len() <= 254
+        && !local.is_empty()
+        && local.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && domain.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
 }
 
 /// The sitemap named on the form, when there is one: absolute https, on the
@@ -576,12 +597,18 @@ fn percent_decode(text: &str) -> String {
 /// `zone_id`/`name`/`type`/`content`/`ttl`.
 #[must_use]
 pub fn search_console_module(zone: &str, owners: &[&str], sitemap: Option<&str>) -> String {
+    // Owners and the sitemap are typed on a form: each rides as one HCL
+    // string literal, escaped, so a quote cannot close it and `${`/`%{`
+    // cannot open an interpolation (an output's value is evaluated at
+    // apply time, so `${file(...)}` there would read the runner's disk).
+    let hcl = crate::setup::change::hcl_string;
     let owners_block =
-        owners.iter().map(|owner| format!("    \"{owner}\",")).collect::<Vec<_>>().join("\n");
+        owners.iter().map(|owner| format!("    {},", hcl(owner))).collect::<Vec<_>>().join("\n");
     let sitemap_output = match sitemap {
         Some(sitemap) => format!(
             "\n# The sitemap the workflow submits once the property is verified.\n\
-             output \"sitemap_url\" {{\n  description = \"The sitemap gsc.sitemap_submit submits.\"\n  value       = \"{sitemap}\"\n}}\n"
+             output \"sitemap_url\" {{\n  description = \"The sitemap gsc.sitemap_submit submits.\"\n  value       = {}\n}}\n",
+            hcl(sitemap)
         ),
         None => String::new(),
     };
