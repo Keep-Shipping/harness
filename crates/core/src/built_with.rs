@@ -405,7 +405,7 @@ mod tests {
     fn the_summary_names_every_use_with_its_status() {
         assert_eq!(
             summary(),
-            "Cratefield (planned), SupportGenius (planned), Polar (planned), \
+            "Cratefield (live), SupportGenius (planned), Polar (planned), \
              Google Fonts (live), Cloudflare (live)"
         );
     }
