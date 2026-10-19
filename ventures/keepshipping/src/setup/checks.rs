@@ -169,7 +169,7 @@ pub async fn assess(
         ),
         Err(()) => (Err(()), Err(())),
     };
-    let dkim_qname = format!("{}.{}_domainkey.{domain}", desired.dkim_selector, domain);
+    let dkim_qname = super::change::dkim_name(&desired.dkim_selector, domain);
     let dkim_txt =
         Found::of(txt_records(http, &dkim_qname).await.map(|records| !records.is_empty()));
     let dmarc = Found::of(txt_has(http, &format!("_dmarc.{domain}"), "v=DMARC1").await);
