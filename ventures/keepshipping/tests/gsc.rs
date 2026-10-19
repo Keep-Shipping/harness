@@ -636,3 +636,33 @@ fn the_assertion_is_signed_by_the_fixture_key_and_names_the_account() {
         "the assertion carries the claims, never the key"
     );
 }
+
+#[test]
+fn form_values_cannot_inject_terraform() {
+    // The sitemap is free text after its host; in an `output` value an
+    // unescaped `${...}` is evaluated at apply time and a `"` closes the
+    // string. Both must reach the module as literal text.
+    let module = search_console_module(
+        "example.com",
+        &["you@example.com"],
+        Some("https://example.com/${file(\"/etc/passwd\")}\"x"),
+    );
+    // `$${` is HCL's literal `${`; only an undoubled opener interpolates.
+    assert!(!module.replace("$${", "").contains("${file("), "{module}");
+    assert!(module.contains("$${file(\\\"/etc/passwd\\\")}\\\"x"), "{module}");
+
+    // An owner is one email address: anything carrying a quote, a brace
+    // or a space is refused before any Terraform is written.
+    let http = RecordingClient::scripted(vec![]);
+    let kit = kit(http, None, |_| {});
+    for owner in [
+        "a%40example.com%22%5D%7D",             // a@example.com"]}
+        "%24%7Bfile(%22x%22)%7D%40example.com", // ${file("x")}@example.com
+        "not+an+email",
+    ] {
+        let form = format!("zone=example.com&owners={owner}");
+        let response = pollster::block_on(post_module(&kit, &form, None));
+        assert_eq!(response.status, StatusCode::BAD_REQUEST, "{owner}: {}", response.text());
+        assert_eq!(problem_slug(&response.json()), "validation-failed", "{owner}");
+    }
+}

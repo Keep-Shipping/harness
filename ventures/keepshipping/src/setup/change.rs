@@ -200,7 +200,7 @@ pub fn build_change(domain: &str, desired: &Desired, short_id: &str) -> Change {
 /// (`adapters/cloudflare/src/hcl.rs`): quote and backslash, `${` and `%{`
 /// doubled so no interpolation opens, and every control character
 /// escaped, the unnamed ones as `\uXXXX`.
-fn hcl_string(value: &str) -> String {
+pub(crate) fn hcl_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
     let mut characters = value.chars().peekable();
@@ -283,7 +283,7 @@ pub fn dns_tf(domain: &str, desired: &Desired, short_id: &str) -> String {
     if desired.on[DKIM]
         && let Some(key) = desired.dkim_key.as_deref()
     {
-        let name = format!("{}.{}_domainkey.{domain}", desired.dkim_selector, domain);
+        let name = dkim_name(&desired.dkim_selector, domain);
         record(&mut out, "dkim", &name, key);
     }
     if desired.on[DMARC] {
@@ -301,11 +301,18 @@ pub fn dns_tf(domain: &str, desired: &Desired, short_id: &str) -> String {
             &format!(
                 "\n# The MTA-STS policy, served at \
                  https://mta-sts.{domain}/.well-known/mta-sts.txt by this \
-                 Worker.\nresource \"cloudflare_workers_script\" \"mta_sts\" {{\n  \
-                 account_id  = var.cloudflare_account_id\n  script_name = \
-                 \"mta-sts-{slug}\"\n  content     = {}\n}}\n\nresource \
-                 \"cloudflare_workers_route\" \"mta_sts\" {{\n  zone_id   = {zone}\n  \
-                 pattern     = \"mta-sts.{domain}/*\"\n  script_name = \
+                 Worker. `main_module` marks it a module-syntax Worker (it \
+                 exports a fetch handler).\nresource \"cloudflare_workers_script\" \
+                 \"mta_sts\" {{\n  account_id  = var.cloudflare_account_id\n  \
+                 script_name = \"mta-sts-{slug}\"\n  main_module = \"worker.js\"\n  \
+                 content     = {}\n}}\n\n# A route only fires for a proxied \
+                 hostname: this placeholder AAAA (100::, the discard prefix) gives \
+                 mta-sts.{domain} a name that resolves to Cloudflare's edge.\n\
+                 resource \"cloudflare_dns_record\" \"mta_sts_host\" {{\n  \
+                 zone_id = {zone}\n  name    = \"mta-sts.{domain}\"\n  type    = \
+                 \"AAAA\"\n  content = \"100::\"\n  proxied = true\n  ttl     = 1\n}}\n\n\
+                 resource \"cloudflare_workers_route\" \"mta_sts\" {{\n  zone_id = {zone}\n  \
+                 pattern = \"mta-sts.{domain}/*\"\n  script  = \
                  cloudflare_workers_script.mta_sts.script_name\n}}\n",
                 hcl_string(&mta_sts_worker())
             ),
@@ -320,6 +327,12 @@ pub fn dns_tf(domain: &str, desired: &Desired, short_id: &str) -> String {
         );
     }
     out
+}
+
+/// Where a DKIM key lives (RFC 6376 §3.6.2.1): `{selector}._domainkey.{domain}`.
+#[must_use]
+pub(crate) fn dkim_name(selector: &str, domain: &str) -> String {
+    format!("{selector}._domainkey.{domain}")
 }
 
 /// The DMARC record the reports address sits in.
@@ -365,8 +378,8 @@ pub fn summary_md(domain: &str, desired: &Desired) -> String {
     if desired.on[DKIM] {
         if desired.dkim_key.is_some() {
             bullets.push(format!(
-                "- Publish the DKIM key Google gave you under {}.{}_domainkey.{domain}.",
-                desired.dkim_selector, domain
+                "- Publish the DKIM key Google gave you under {}.",
+                dkim_name(&desired.dkim_selector, domain)
             ));
         }
     } else {
@@ -450,5 +463,25 @@ mod tests {
         // JavaScript string mid-policy and the apply would fail.
         assert!(tf.contains("version: STSv1\\\\nmode: testing"), "{tf}");
         assert!(!tf.contains("version: STSv1\nmode"), "{tf}");
+    }
+
+    #[test]
+    fn the_mta_sts_worker_is_reachable_in_provider_v5_shapes() {
+        let tf = dns_tf("example.com", &Desired::seed("example.com"), "abcd1234");
+        // `export default` is module syntax: the v5 script must say so, or
+        // the upload is read as a service-worker script and fails.
+        assert!(tf.contains("main_module = \"worker.js\""), "{tf}");
+        // v5's `cloudflare_workers_route` takes `script`; `script_name` is
+        // not an argument there and fails the plan.
+        let route = tf.split("resource \"cloudflare_workers_route\"").nth(1).expect("a route");
+        assert!(route.contains("script  = cloudflare_workers_script.mta_sts.script_name"), "{tf}");
+        assert!(!route.contains("script_name ="), "{tf}");
+        // A route only fires on a proxied hostname, so the host gets one.
+        let host = tf
+            .split("resource \"cloudflare_dns_record\" \"mta_sts_host\"")
+            .nth(1)
+            .expect("an mta-sts host record");
+        assert!(host.contains("name    = \"mta-sts.example.com\""), "{tf}");
+        assert!(host.contains("proxied = true"), "{tf}");
     }
 }

@@ -17,17 +17,17 @@ crate-type = ["cdylib", "rlib"]
 workspace = true
 
 [dependencies]
-cratefield-core = "0.8"
-cratefield-mail-templates = "0.1"
-cratefield-runtime-cloudflare = "0.4"
-cratefield-module-waitlist = "0.4"
-cratefield-adapter-owlpost = "0.2"
-cratefield-adapter-polar = "0.2"
-cratefield-adapter-resend = "0.4"
-cratefield-adapter-turnstile = "0.3"
+cratefield-core = "0.10.0"
+cratefield-mail-templates = "0.1.3"
+cratefield-runtime-cloudflare = "0.5.0"
+cratefield-module-waitlist = "0.4.4"
+cratefield-adapter-owlpost = "0.2.3"
+cratefield-adapter-polar = "0.2.3"
+cratefield-adapter-resend = "0.4.3"
+cratefield-adapter-turnstile = "0.3.3"
 # The console fleet view's token verifier (issue #169), shared with the
 # runtime's own `auth_from_env` wiring.
-cratefield-auth-client = "0.3"
+cratefield-auth-client = "0.3.4"
 # The console's own credentials (`src/secrets.rs`): envelope encryption from
 # the Cratefield harness. The KEK is read from Cloudflare Secrets Store (or a
 # plain Worker secret) by `cratefield-kms`'s `WorkerSecretKms`; the wrapped
@@ -40,12 +40,12 @@ cratefield-kms = "0.2"
 # core in the graph until the venture itself moves (the same reason the
 # oauth client is locked above). 0.4.0's own migrations are the ones copied
 # into migrations/0013_console_secrets.sql.
-cratefield-secrets = "=0.4.0"
+cratefield-secrets = "=0.4.2"
 # The console sign-in (`src/signin.rs`): PKCE, `state` and the authorize URL
 # from the harness's own OAuth client rather than a hand-rolled copy.
 # Locked at 0.3.0: 0.3.1 moves to cratefield-core 0.9, which would put a
 # second core in the graph until the venture itself moves.
-cratefield-oauth-client = "0.3"
+cratefield-oauth-client = "0.3.2"
 percent-encoding = "2"
 # The console's Cloudflare reader and generator (`src/onboard/`): the same
 # `adapters/cloudflare` the infra import uses, read through `ks-core`'s
@@ -99,8 +99,8 @@ getrandom02 = { package = "getrandom", version = "0.2", default-features = false
 # `axum`/`tokio` serve the dev-only page server in `examples/gsc_dev.rs`;
 # `async-trait` is what the example's permissive dev auth port needs.
 axum = { version = "0.8", features = ["tokio", "http1"] }
-cratefield-adapter-sqlite = "0.3"
-cratefield-testing = "0.5"
+cratefield-adapter-sqlite = "0.3.2"
+cratefield-testing = "0.5.3"
 http = "1"
 insta = "1"
 # `tests/signin.rs` mints ES256 tokens the way the auth service does, so the

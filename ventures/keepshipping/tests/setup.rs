@@ -583,3 +583,63 @@ async fn a_broken_or_wrongly_typed_answer_is_never_a_done() {
     let statuses = chips(&wired).await;
     assert_eq!(chip_of(&statuses, "spf"), "pending", "a CNAME is not an SPF record");
 }
+
+#[pollster::test]
+async fn the_seeded_defaults_send_as_the_first_change() {
+    // A first view seeds the row with the defaults; sending that board
+    // unchanged is the first change, not "nothing new" — otherwise the
+    // pre-filled checklist could never be sent as it stands.
+    let http = FakeHttpClient::scripted({
+        let mut script = nothing_live_script(); // the seeding GET
+        script.extend(github_script());
+        script
+    });
+    let kit = kit(Some(setup_pr(&http)), http.clone(), |_| {});
+    request_as(&kit.router, Method::GET, HERE, "acc_1", None).await; // seed
+    let defaults = ALL_ON.replace("&dkim_key=v%3DDKIM1%3B+k%3Drsa%3B+p%3DMIIBIjANBgkq", "");
+    let response = request_as(&kit.router, Method::POST, HERE, "acc_1", Some(&defaults)).await;
+    assert_eq!(response.status, StatusCode::SEE_OTHER);
+    let expected = format!("{HERE}?note=saved");
+    assert_eq!(
+        response.headers.get("location").and_then(|value| value.to_str().ok()),
+        Some(expected.as_str())
+    );
+    let captured = http.captured();
+    assert!(captured.iter().any(|(_, uri, _)| uri.ends_with("/pulls")), "{captured:?}");
+    let rows = pollster::block_on(
+        kit.db.query(&Statement::new("SELECT COUNT(*) AS changes FROM setup_changes".to_owned())),
+    )
+    .expect("the count reads");
+    assert_eq!(rows.first().and_then(|row| row.get::<i64>("changes")), Some(1));
+}
+
+#[pollster::test]
+async fn dkim_lives_under_selector_dot_domainkey() {
+    // RFC 6376: the key is published at `{selector}._domainkey.{domain}`,
+    // and that is also the name the live check asks DoH about.
+    let http = FakeHttpClient::scripted({
+        let mut script = github_script();
+        script.extend(nothing_live_script()); // the status GET
+        script
+    });
+    let kit = kit(Some(setup_pr(&http)), http.clone(), |_| {});
+    request_as(&kit.router, Method::POST, HERE, "acc_1", Some(ALL_ON)).await;
+    let rows = pollster::block_on(kit.db.query(&Statement::with_values(
+        "SELECT files, summary_md FROM setup_changes WHERE domain = ?",
+        vec![DOMAIN.into()],
+    )))
+    .expect("the change reads");
+    let files = rows.first().and_then(|row| row.get::<String>("files")).expect("files");
+    assert!(files.contains("google._domainkey.example.test"), "{files}");
+    assert!(!files.contains("example.test_domainkey"), "{files}");
+    let summary = rows.first().and_then(|row| row.get::<String>("summary_md")).expect("summary");
+    assert!(summary.contains("google._domainkey.example.test"), "{summary}");
+    chips(&kit).await;
+    assert!(
+        http.captured()
+            .iter()
+            .any(|(_, uri, _)| uri.contains("name=google._domainkey.example.test&type=TXT")),
+        "{:?}",
+        http.captured()
+    );
+}

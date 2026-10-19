@@ -471,8 +471,13 @@ async fn submit(
             return oops();
         }
     };
-    let unchanged = !prior.differs_records(&desired)
-        || latest.as_ref().is_some_and(|stored| stored.matches(&submitted));
+    // "Unchanged" needs a change on file to be unchanged *from*: a first
+    // view seeds the row with the defaults, so a board that was never sent
+    // reads as equal to what is stored — and the defaults themselves are
+    // the first change to send.
+    let unchanged = latest
+        .as_ref()
+        .is_some_and(|stored| !prior.differs_records(&desired) || stored.matches(&submitted));
     if unchanged {
         if let (Some(pr), Some(_)) =
             (&state.pr, latest.as_ref().filter(|stored| stored.pr_url.is_none()))
