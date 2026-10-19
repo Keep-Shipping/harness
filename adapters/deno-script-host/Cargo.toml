@@ -14,7 +14,7 @@ sha2.workspace = true
 # Deflate *decompression* only: the release archive is one deflated entry and
 # nothing here ever compresses, so the zopfli/aes/time features of the default
 # set would be dead weight in every `keepshipping` binary.
-zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 # `mkfifo`, for the secret pipe. Safe API; the crate forbids `unsafe`.
 nix = { version = "0.31", default-features = false, features = ["fs"] }
 

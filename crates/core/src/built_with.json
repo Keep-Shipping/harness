@@ -11,8 +11,8 @@
       "url": "https://cratefield.com/",
       "role": "framework",
       "phrase": "Built with",
-      "status": "planned",
-      "note": "The hosted parts (waitlist, approvals, run logs) are planned as a Cratefield venture."
+      "status": "live",
+      "note": "The waitlist Worker at api.keepshipping.run runs on the Cratefield harness waitlist module; approvals and run logs are planned as Cratefield modules."
     },
     {
       "id": "FZ-008",
