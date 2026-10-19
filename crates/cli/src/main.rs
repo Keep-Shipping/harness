@@ -439,7 +439,11 @@ fn selected(
             drive::WaitReason::Approval { question: why }
         };
         let Some(run) = parking.park(&step, &[], &on) else {
-            return ExitCode::from(1);
+            // The stream opened above, and the contract is that its last
+            // line says how the run ended — a park that could not be
+            // written is a failure, and says so.
+            finish_line(o.format, "failed", ks_engine::exec::EXIT_FAILED, &[("step", &step)]);
+            return ExitCode::from(ks_engine::exec::EXIT_FAILED);
         };
         // The stream opened, so it has to close here too: this park never
         // reaches the outcome match below.
