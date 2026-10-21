@@ -240,7 +240,7 @@ Reading `apply.digest` on a run-time-only kind is an error pointing at
 a did-you-mean hint.
 
 **Script steps.** A step whose kind is a relative path to a `.ts` file
-(`./ship/migrate.ts`, read against the directory holding the `ship.ks`) is a
+(for example, `./ship/migrate.ts`, read against the directory holding the `ship.ks`) is a
 script step: the escape hatch for the work the language has no name for. The
 path may not reach outside that directory — a `..` component or an absolute
 path is an error (KS0101). Its inputs are unchecked for now and, until the
