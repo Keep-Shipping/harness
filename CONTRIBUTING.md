@@ -1,5 +1,11 @@
 # Contributing
 
+## Bounties and outside pull requests
+
+There are no bounties on this project. Issues here are the team's planning notes, not paid tasks.
+Pull requests from people outside the team are only reviewed when the change was discussed in the
+issue first and a maintainer agreed to it. Other pull requests are closed without review.
+
 Read first: [README.md](README.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/REPRODUCIBILITY.md](docs/REPRODUCIBILITY.md) and the [ADR index](docs/adr/README.md). The plan lives in the issues, starting with the master plan, [#1](https://github.com/Keep-Shipping/harness/issues/1).
 
 ## Rules
