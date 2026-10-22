@@ -706,8 +706,24 @@ mod tests {
         let mut permissions = std::fs::metadata(&probe).expect("the script").permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
         std::fs::set_permissions(&probe, permissions).expect("the script");
-        let error =
-            IacCli::new(IacKind::OpenTofu, &probe).expect_err("a failing exit is no version");
+        // On Linux, a write descriptor that another test thread's `fork` has
+        // inherited keeps the script "busy" until that child execs, so the
+        // first exec of a freshly written script can fail with ETXTBSY before
+        // the script ever runs. That is not an answer from the tool, so retry
+        // that one error; any other outcome is asserted as before.
+        let mut attempts = 0;
+        let error = loop {
+            match IacCli::new(IacKind::OpenTofu, &probe) {
+                Err(IacError::Tool { ref message, exit_code: None })
+                    if message.contains("Text file busy") && attempts < 500 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => break error,
+                Ok(_) => panic!("a failing exit is no version"),
+            }
+        };
         std::fs::remove_file(&probe).ok();
         assert!(matches!(error, IacError::Tool { exit_code: Some(3), .. }), "{error:?}");
     }
