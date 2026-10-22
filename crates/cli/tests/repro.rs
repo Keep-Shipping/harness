@@ -36,7 +36,7 @@ fn fixture() -> PathBuf {
 fn repro_warns_on_every_moving_input() {
     let (code, out, _) = check_in(&fixture(), &["--repro"]);
     for finding in [
-        "`FROM node:20` is not pinned to a digest",
+        "`FROM node:22.23.4` is not pinned to a digest",
         "`apt-get update` is not pinned to a snapshot",
         "`ADD https://example.com/tool.tar.gz` has no checksum",
     ] {
