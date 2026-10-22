@@ -240,7 +240,8 @@ Reading `apply.digest` on a run-time-only kind is an error pointing at
 a did-you-mean hint.
 
 **Script steps.** A step whose kind is a relative path to a `.ts` file
-(for example, `./ship/migrate.ts`, read against the directory holding the `ship.ks`) is a
+(for example, `./ship/migrate.ts`, read against the directory holding the `ship.ks`; see
+[sdk/ts/examples/migrate.ts](../sdk/ts/examples/migrate.ts) for a real example) is a
 script step: the escape hatch for the work the language has no name for. The
 path may not reach outside that directory — a `..` component or an absolute
 path is an error (KS0101). Its inputs are unchecked for now and, until the
@@ -276,7 +277,8 @@ files says nothing, and its outputs stay unchecked: `check` never fails for a
 file it did not see.
 
 **Script steps.** A step whose *kind* is the path of a TypeScript module —
-`migrate: ./ship/migrate.ts` — is a script step, and there is no kind to
+for example `migrate: ./ship/migrate.ts` (see [sdk/ts/examples/migrate.ts](../sdk/ts/examples/migrate.ts)
+for a real example) — is a script step, and there is no kind to
 register: the kind is the module. `check` reads what that module declares by
 importing it with `@keepshipping/sdk` resolved to a bundled stub (no
 `npm install`, no network) and taking the `step()` descriptor off the default
