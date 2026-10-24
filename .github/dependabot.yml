@@ -47,7 +47,7 @@ updates:
           - "*"
 
   # The TypeScript SDK.
-  - package-ecosystem: npm
+  - package-ecosystem: bun
     directory: /sdk/ts
     schedule:
       interval: weekly
@@ -57,13 +57,13 @@ updates:
       default-days: 7
     open-pull-requests-limit: 10
     groups:
-      npm-sdk-dependencies:
+      bun-sdk-dependencies:
         applies-to: version-updates
         patterns:
           - "*"
 
   # The VS Code extension.
-  - package-ecosystem: npm
+  - package-ecosystem: bun
     directory: /editors/vscode
     schedule:
       interval: weekly
@@ -78,7 +78,7 @@ updates:
       default-days: 7
     open-pull-requests-limit: 10
     groups:
-      npm-editors-dependencies:
+      bun-editors-dependencies:
         applies-to: version-updates
         patterns:
           - "*"

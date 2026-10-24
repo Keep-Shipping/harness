@@ -3,3 +3,5 @@ test/**
 node_modules/.bin/**
 package-lock.json
 .gitignore
+bun.lock
+extension.js
