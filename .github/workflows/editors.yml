@@ -76,23 +76,20 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        # setup-node v7, not v4: v5 turned the package-manager cache on by
-        # default, and `package-manager-cache: false` is the only supported way
-        # back off. This workflow also runs on `vscode-v*` tags and publishes to
-        # the marketplace, so a cache entry written by an untrusted pull-request
-        # run and restored here would reach every user's editor. v4 had no such
-        # switch, so the audit was unsatisfiable there.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        # no-cache: this workflow runs on `vscode-v*` tags and publishes to the
+        # marketplace, so nothing restored from a cache written by an untrusted
+        # pull-request run may reach it.
         with:
-          node-version: '22.23.4'
-          package-manager-cache: false
+          bun-version: '1.3.6'
+          no-cache: true
 
       - name: Build the .vsix
         working-directory: editors/vscode
         run: |
-          npm ci
-          npx vsce package --pre-release \
-            || { echo "::error::vsce could not package the extension. Fix: run 'npm ci && npx vsce package --pre-release' in editors/vscode locally."; exit 1; }
+          bun install --frozen-lockfile
+          bun run package \
+            || { echo "::error::vsce could not package the extension. Fix: run 'bun install --frozen-lockfile && bun run package' in editors/vscode locally."; exit 1; }
 
       - name: Upload the .vsix
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -120,24 +117,24 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          node-version: '22.23.4'
+          bun-version: '1.3.6'
           # Same reason as the `vscode` job above, and here it matters most:
           # this is the job that holds VSCE_PAT and publishes.
-          package-manager-cache: false
+          no-cache: true
 
       # Marketplace versions are immutable, so a tag that disagrees with
       # package.json is unpublishable: catch it before `vsce publish`.
       - name: The tag must be the version in package.json
         working-directory: editors/vscode
         run: |
-          npm ci
+          bun install --frozen-lockfile
           # Read the version into its own variable rather than nesting
-          # `node -p "…"` inside the `test`'s own double quotes: the inner
+          # `bun -p "…"` inside the `test`'s own double quotes: the inner
           # quotes are legal bash but unreadable, and shellcheck reads the
           # nesting as an unterminated string.
-          version=$(node -p "require('./package.json').version")
+          version=$(bun -p "require('./package.json').version")
           test "${GITHUB_REF_NAME#vscode-v}" = "$version" \
             || { echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version. Fix: rename the tag to vscode-v${version}."; exit 1; }
 
@@ -156,5 +153,5 @@ jobs:
           vsix=(./*.vsix)
           ((${#vsix[@]} == 1)) \
             || { echo "::error::expected exactly 1 .vsix, found ${#vsix[@]}. Fix: check the 'vscode' job's upload step ran and uploaded one file."; exit 1; }
-          npx vsce publish --pre-release --packagePath "${vsix[0]}" \
+          bunx @vscode/vsce publish --pre-release --packagePath "${vsix[0]}" \
             || { echo "::error::vsce publish failed. Fix: check secrets.VSCE_PAT is set, the 'marketplace' environment still has its protection rule, and the publisher in editors/vscode/package.json matches the marketplace account."; exit 1; }

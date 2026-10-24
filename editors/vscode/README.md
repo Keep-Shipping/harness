@@ -14,6 +14,6 @@ Set `keepshipping.server.path` if the `keepshipping` binary is not on `PATH`
 ## Packaging
 
 ```sh
-npm ci
-npx vsce package --pre-release
+bun install --frozen-lockfile
+bun run package
 ```

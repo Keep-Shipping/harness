@@ -15,12 +15,12 @@ explicit path to it.
 
 `editors/vscode` is a pre-release extension under the `Keep-Shipping`
 publisher; `keepshipping.server.path` overrides the binary (default
-`keepshipping`). To build a `.vsix` locally:
+`keepshipping`). To build a `.vsix` locally (Bun 1.3.6):
 
 ```sh
 cd editors/vscode
-npm ci
-npx vsce package --pre-release
+bun install --frozen-lockfile
+bun run package
 ```
 
 ## Tree-sitter grammar
