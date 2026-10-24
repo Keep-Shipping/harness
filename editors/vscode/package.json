@@ -6,9 +6,13 @@
   "version": "0.0.1",
   "preview": true,
   "license": "MIT",
-  "categories": ["Programming Languages"],
-  "engines": { "vscode": "^1.91.0" },
-  "main": "./extension.js",
+  "categories": [
+    "Programming Languages"
+  ],
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "main": "./dist/extension.js",
   "repository": {
     "type": "git",
     "url": "https://github.com/Keep-Shipping/harness",
@@ -18,9 +22,16 @@
     "languages": [
       {
         "id": "keepshipping",
-        "aliases": ["Keep Shipping", "keepshipping"],
-        "filenames": ["ship.ks"],
-        "filenamePatterns": ["*.ship.ks"],
+        "aliases": [
+          "Keep Shipping",
+          "keepshipping"
+        ],
+        "filenames": [
+          "ship.ks"
+        ],
+        "filenamePatterns": [
+          "*.ship.ks"
+        ],
         "configuration": "./language-configuration.json"
       }
     ],
@@ -41,7 +52,11 @@
         },
         "keepshipping.trace.server": {
           "type": "string",
-          "enum": ["off", "messages", "verbose"],
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
           "default": "off",
           "description": "Trace the communication between VS Code and the language server."
         }
@@ -49,13 +64,14 @@
     }
   },
   "scripts": {
-    "package": "vsce package --pre-release",
-    "publish": "vsce publish --pre-release"
+    "build": "bun build ./extension.js --target=node --format=cjs --external vscode --outfile=dist/extension.js",
+    "package": "bun run build && bunx @vscode/vsce package --pre-release --no-dependencies",
+    "publish": "bun run build && bunx @vscode/vsce publish --pre-release --no-dependencies"
   },
   "dependencies": {
-    "vscode-languageclient": "^10.1.2"
+    "vscode-languageclient": "10.1.2"
   },
   "devDependencies": {
-    "@vscode/vsce": "^4.0.0"
+    "@vscode/vsce": "4.0.0"
   }
 }

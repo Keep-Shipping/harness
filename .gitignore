@@ -22,3 +22,6 @@ sdk/ts/node_modules/
 .keepshipping/
 # Saved plan files written by `tofu plan -out` — binary, and full of secrets
 .ks/
+
+# npm lockfiles are not used; the repo is bun-only (bun.lock)
+package-lock.json

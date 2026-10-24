@@ -56,8 +56,8 @@ To run the step itself from the command line with hand-picked inputs instead, `k
 ## Developing the SDK
 
 ```sh
-npm ci
-npm run check   # type-check src, test and examples
-npm run build   # dist/
-npm test        # node --test
+bun install --frozen-lockfile
+bun run check   # type-check src, test and examples
+bun run build   # dist/
+bun run test    # node --test
 ```
