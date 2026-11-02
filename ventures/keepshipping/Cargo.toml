@@ -27,7 +27,7 @@ cratefield-adapter-resend = "0.4.3"
 cratefield-adapter-turnstile = "0.3.3"
 # The console fleet view's token verifier (issue #169), shared with the
 # runtime's own `auth_from_env` wiring.
-cratefield-auth-client = "0.3.4"
+cratefield-auth-client = "0.4.2"
 # The console's own credentials (`src/secrets.rs`): envelope encryption from
 # the Cratefield harness. The KEK is read from Cloudflare Secrets Store (or a
 # plain Worker secret) by `cratefield-kms`'s `WorkerSecretKms`; the wrapped
