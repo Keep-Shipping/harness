@@ -69,9 +69,9 @@
     "publish": "bun run build && bunx @vscode/vsce publish --pre-release --no-dependencies"
   },
   "dependencies": {
-    "vscode-languageclient": "10.1.2"
+    "vscode-languageclient": "11.0.0"
   },
   "devDependencies": {
-    "@vscode/vsce": "4.0.0"
+    "@vscode/vsce": "4.1.0"
   }
 }
