@@ -27,7 +27,7 @@ cratefield-adapter-resend = "0.4.3"
 cratefield-adapter-turnstile = "0.3.3"
 # The console fleet view's token verifier (issue #169), shared with the
 # runtime's own `auth_from_env` wiring.
-cratefield-auth-client = "0.3.4"
+cratefield-auth-client = "0.4.2"
 # The console's own credentials (`src/secrets.rs`): envelope encryption from
 # the Cratefield harness. The KEK is read from Cloudflare Secrets Store (or a
 # plain Worker secret) by `cratefield-kms`'s `WorkerSecretKms`; the wrapped
@@ -84,7 +84,7 @@ sha2 = "0.11"
 hmac = "0.13"
 time = { version = "0.3", default-features = false, features = ["std", "formatting", "parsing", "macros"] }
 tracing = "0.1"
-worker = { version = "0.8.5", default-features = false, features = ["d1"] }
+worker = { version = "0.9.0", default-features = false, features = ["d1"] }
 
 # ulid (through cratefield-core) draws its randomness from getrandom, whose
 # wasm32 backend is opt-in per leaf crate. Never compiled on native targets.

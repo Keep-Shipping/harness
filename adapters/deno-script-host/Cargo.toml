@@ -16,7 +16,7 @@ sha2.workspace = true
 # set would be dead weight in every `keepshipping` binary.
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 # `mkfifo`, for the secret pipe. Safe API; the crate forbids `unsafe`.
-nix = { version = "0.31", default-features = false, features = ["fs"] }
+nix = { version = "0.32", default-features = false, features = ["fs"] }
 
 [dev-dependencies]
 ks-testing.workspace = true
